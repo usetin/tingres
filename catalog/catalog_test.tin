@@ -2,81 +2,38 @@ package catalog
 
 import "../txn"
 import "../store"
+import "../types"
 import "crucible"
+import "mint"
 import "quarry"
+import "twine"
 
-fn testCatalog(name str) !(store.Store, txn.Manager, Catalog) {
+fn testDir(name str) str {
 	let dir = quarry.TempDir() + "/tingres-catalog-" + name
 	quarry.RemoveAll(dir) catch _ { }
-	mut db = try store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false})
+	return dir
+}
+
+fn testCatalog(name str) !(store.Store, txn.Manager, Catalog) {
+	let dir = testDir(name)
+	mut db = try store.Open(dir, store.Options{BufferPages: 32, SyncOnWrite: false})
 	let manager = try txn.NewManager(mut db)
 	let c = try Open(mut db, manager)
 	return db, manager, c
 }
 
-fn beginCatalogTest(m mut txn.Manager, iso txn.Isolation) !txn.Txn {
-	return try m.Begin(iso)
+fn visibleRows(c Catalog, rel str) []RawRow {
+	let snap = c.bootSnapshot()
+	mut out = []RawRow{}
+	for row in c.rows[rel] {
+		if c.visible(snap, rel, row) {
+			out = append(out, row)
+		}
+	}
+	return out
 }
 
-fn abortCatalogTest(t mut crucible.T, m mut txn.Manager, tx mut txn.Txn) {
-	m.Abort(mut tx) catch err { t.Error("abort: {err}") }
-}
-
-fn TestBootstrapAndTypeOids(t mut crucible.T) {
-	let (_, _, c) = testCatalog("bootstrap") catch err {
-		t.Error("catalog: {err}")
-		return
-	}
-	crucible.Equal(mut t, "pg_namespace oid", tableOid(mut t, "pg_namespace", c.SystemTable("pg_namespace")), u32(2615))
-	crucible.Equal(mut t, "public namespace oid", c.tables[2200].Oid, u32(2200))
-	if let intOid = c.LookupType("integer") {
-		crucible.Equal(mut t, "int alias oid", intOid, u32(23))
-	} else {
-		t.Error("integer type is not registered")
-	}
-	crucible.Equal(mut t, "unknown type", c.LookupType("made_up") == nil, true)
-}
-
-fn TestTransactionalTableVisibility(t mut crucible.T) {
-	let (_, m0, c0) = testCatalog("visibility") catch err {
-		t.Error("catalog: {err}")
-		return
-	}
-	mut m = m0
-	mut c = c0
-	mut creator = beginCatalogTest(mut m, txn.Isolation.ReadCommitted) catch err {
-		t.Error("begin creator: {err}")
-		return
-	}
-	let beforeVersion = c.Version()
-	let table = c.CreateTable(creator, TableDef{Schema: "public", Name: "accounts", Columns: []ColumnDef{ColumnDef{Name: "id", Type: 23, Typmod: -1, Nullable: false}}}) catch err {
-		t.Error("create table: {err}")
-		return
-	}
-	crucible.Equal(mut t, "catalog version advances", c.Version() > beforeVersion, true)
-	crucible.Equal(mut t, "new relation is hidden in its create command", isMissing(c.LookupTable(creator, "public", "accounts")), true)
-	creator.CommandCounterIncrement()
-	crucible.Equal(mut t, "new relation appears next command", tableOid(mut t, "next command", c.LookupTable(creator, "public", "accounts")), table.Oid)
-	crucible.NoFault("commit create", m.Commit(mut creator))
-	mut reader = beginCatalogTest(mut m, txn.Isolation.ReadCommitted) catch err {
-		t.Error("begin reader: {err}")
-		return
-	}
-	crucible.Equal(mut t, "committed relation appears to other transaction", tableOid(mut t, "committed lookup", c.LookupTable(reader, "", "accounts")), table.Oid)
-	mut dropper = beginCatalogTest(mut m, txn.Isolation.ReadCommitted) catch err {
-		t.Error("begin dropper: {err}")
-		return
-	}
-	crucible.NoFault("drop relation", c.DropTable(dropper, table, false))
-	crucible.Equal(mut t, "drop stays visible within its command", tableOid(mut t, "same command", c.LookupTable(dropper, "public", "accounts")), table.Oid)
-	dropper.CommandCounterIncrement()
-	crucible.Equal(mut t, "drop hides relation next command", isMissing(c.LookupTable(dropper, "public", "accounts")), true)
-	abortCatalogTest(mut t, mut m, mut dropper)
-	crucible.Equal(mut t, "aborted drop restores relation", tableOid(mut t, "after abort", c.LookupTable(reader, "public", "accounts")), table.Oid)
-	abortCatalogTest(mut t, mut m, mut reader)
-}
-
-fn tableOid(t mut crucible.T, label str, table ?Table) Oid {
+fn oidOf(t mut crucible.T, label str, table ?Table) u32 {
 	if let value = table {
 		return value.Oid
 	}
@@ -84,17 +41,364 @@ fn tableOid(t mut crucible.T, label str, table ?Table) Oid {
 	return 0
 }
 
-fn isMissing(table ?Table) bool {
-	return table == nil
+fn faultCode(err fault) str {
+	let text = types.ErrorMessage(err)
+	if len(text) >= 5 {
+		return text[0:5]
+	}
+	return text
 }
 
-fn BenchmarkCatalogLookup(b mut crucible.B) {
-	let (_, manager0, catalog0) = testCatalog("bench-lookup") catch _ { return }
-	mut manager = manager0
-	let catalog = catalog0
-	let tx = manager.Begin(txn.Isolation.ReadCommitted) catch _ { return }
-	for i in 0..b.N {
-		let table = arena { catalog.LookupTable(tx, "pg_catalog", "pg_class") }
-		if table == nil || i < 0 { continue }
+fn TestBootstrapAndTypeOids(t mut crucible.T) {
+	let (_, m0, c) = testCatalog("bootstrap") catch err {
+		t.Error("catalog: {err}")
+		return
 	}
+	mut m = m0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	crucible.Equal(mut t, "pg_namespace oid", oidOf(mut t, "pg_namespace", c.SystemTable("pg_namespace")), u32(2615))
+	crucible.Equal(mut t, "pg_class oid", oidOf(mut t, "pg_class", c.SystemTable("pg_class")), u32(1259))
+	crucible.Equal(mut t, "pg_attribute oid", oidOf(mut t, "pg_attribute", c.SystemTable("pg_attribute")), u32(1249))
+	crucible.Equal(mut t, "pg_type oid", oidOf(mut t, "pg_type", c.SystemTable("pg_type")), u32(1247))
+	crucible.Equal(mut t, "public namespace oid", c.LookupNamespace(tx, "public"), u32(2200))
+	crucible.Equal(mut t, "pg_catalog namespace oid", c.LookupNamespace(tx, "pg_catalog"), u32(11))
+	if let intOid = c.LookupType("integer") {
+		crucible.Equal(mut t, "int alias oid", intOid, u32(23))
+	} else {
+		t.Error("integer type is not registered")
+	}
+	crucible.Equal(mut t, "unknown type", c.LookupType("made_up") == nil, true)
+	// pg_class columns come from the real heap-backed pg_attribute rows.
+	if let cls = c.SystemTable("pg_class") {
+		crucible.Equal(mut t, "pg_class column count", len(cls.Cols), 33)
+		crucible.Equal(mut t, "pg_class first column", cls.Cols[0].Name, "oid")
+		crucible.Equal(mut t, "pg_class column 2 type", cls.Cols[1].Type, u32(19))
+	}
+	crucible.Equal(mut t, "system relation count", len(visibleRows(c, "pg_class")) >= 13, true)
+	crucible.NoFault("abort", m.Abort(mut tx))
+}
+
+fn TestGoldenSeed(t mut crucible.T) {
+	let (_, _, c) = testCatalog("golden") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	let typeGolden = quarry.ReadFile("catalog/testdata/pg_type_golden.txt") catch err {
+		t.Error("golden read: {err}")
+		return
+	}
+	mut found = make(map[u32]str)
+	for row in visibleRows(c, "pg_type") {
+		if u32(c.intField("pg_type", row, "typnamespace")) != 11 {
+			continue
+		}
+		let oid = u32(c.intField("pg_type", row, "oid"))
+		found[oid] = c.textField("pg_type", row, "typtype") + " " + c.textField("pg_type", row, "typcategory")
+	}
+	mut checked = 0
+	for line in twine.Split(twine.TrimSpace(typeGolden), "\n") {
+		let parts = twine.Split(line, "\t")
+		if len(parts) != 4 {
+			continue
+		}
+		let oidNum = mint.Atoi(parts[0]) catch _ { continue }
+		let oid = u32(oidNum)
+		let want = parts[2] + " " + parts[3]
+		let (got, ok) = found[oid]
+		if !ok {
+			t.Error("pg_type oid {oid} ({parts[1]}) missing")
+			continue
+		}
+		if got != want {
+			t.Error("pg_type oid {oid}: got {got}, want {want}")
+		}
+		checked += 1
+	}
+	crucible.Equal(mut t, "pg_type golden rows checked", checked, 469)
+
+	let nsGolden = quarry.ReadFile("catalog/testdata/pg_namespace_golden.txt") catch err {
+		t.Error("namespace golden read: {err}")
+		return
+	}
+	mut snap = c.bootSnapshot()
+	for line in twine.Split(twine.TrimSpace(nsGolden), "\n") {
+		let parts = twine.Split(line, "\t")
+		if len(parts) != 3 {
+			continue
+		}
+		let oidNum = mint.Atoi(parts[0]) catch _ { continue }
+		let name = c.namespaceName(snap, u32(oidNum))
+		crucible.Equal(mut t, "namespace {parts[1]}", name, parts[1])
+	}
+}
+
+fn TestTransactionalDdl(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("ddl") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut creator = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let beforeVersion = c.Version()
+	let table = c.CreateTable(creator, TableDef{Schema: "public", Name: "accounts", Columns: []ColumnDef{ColumnDef{Name: "id", Type: 23, Typmod: -1, Nullable: false, NotNull: true}, ColumnDef{Name: "name", Type: 25, Typmod: -1, Nullable: true}}}) catch err {
+		t.Error("create table: {err}")
+		return
+	}
+	crucible.Equal(mut t, "version advanced", c.Version() > beforeVersion, true)
+	crucible.Equal(mut t, "hidden in create command", c.LookupTable(creator, "public", "accounts") == nil, true)
+	creator.CommandCounterIncrement()
+	if let t2 = c.LookupTable(creator, "public", "accounts") {
+		crucible.Equal(mut t, "visible next command", t2.Oid, table.Oid)
+		crucible.Equal(mut t, "columns", len(t2.Cols), 2)
+		crucible.Equal(mut t, "not null", t2.Cols[0].Nullable, false)
+	} else {
+		t.Error("table not visible next command")
+	}
+	crucible.NoFault("commit", m.Commit(mut creator))
+	mut reader = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin reader: {err}")
+		return
+	}
+	if let t2 = c.LookupTable(reader, "", "accounts") {
+		crucible.Equal(mut t, "visible to other txn", t2.Oid, table.Oid)
+	} else {
+		t.Error("committed table not visible")
+	}
+	// Aborted drop restores the table.
+	mut dropper = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin dropper: {err}")
+		return
+	}
+	crucible.NoFault("drop", c.DropTable(dropper, table, false))
+	dropper.CommandCounterIncrement()
+	crucible.Equal(mut t, "hidden after drop", c.LookupTable(dropper, "public", "accounts") == nil, true)
+	crucible.NoFault("abort drop", m.Abort(mut dropper))
+	if let t2 = c.LookupTable(reader, "public", "accounts") {
+		crucible.Equal(mut t, "restored after abort", t2.Oid, table.Oid)
+	} else {
+		t.Error("aborted drop did not restore")
+	}
+	crucible.NoFault("abort reader", m.Abort(mut reader))
+}
+
+fn TestReopenPersistence(t mut crucible.T) {
+	let dir = testDir("reopen")
+	mut db = store.Open(dir, store.Options{BufferPages: 32, SyncOnWrite: false}) catch err {
+		t.Error("open: {err}")
+		return
+	}
+	let m0 = txn.NewManager(mut db) catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut manager = m0
+	mut c = Open(mut db, m0) catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut tx = manager.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let table = c.CreateTable(tx, TableDef{Schema: "public", Name: "persisted", Columns: []ColumnDef{ColumnDef{Name: "id", Type: 23, Typmod: -1}, ColumnDef{Name: "v", Type: 25, Typmod: -1}}}) catch err {
+		t.Error("create: {err}")
+		return
+	}
+	crucible.NoFault("commit", manager.Commit(mut tx))
+	crucible.NoFault("close", db.Close())
+
+	mut db2 = store.Open(dir, store.Options{BufferPages: 32, SyncOnWrite: false}) catch err {
+		t.Error("reopen: {err}")
+		return
+	}
+	let m2 = txn.NewManager(mut db2) catch err {
+		t.Error("manager2: {err}")
+		return
+	}
+	mut c2 = Open(mut db2, m2) catch err {
+		t.Error("catalog2: {err}")
+		return
+	}
+	mut tx2 = m2.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin2: {err}")
+		return
+	}
+	if let t2 = c2.LookupTable(tx2, "public", "persisted") {
+		crucible.Equal(mut t, "persisted oid", t2.Oid, table.Oid)
+		crucible.Equal(mut t, "persisted columns", len(t2.Cols), 2)
+	} else {
+		t.Error("table did not survive reopen")
+	}
+	crucible.Equal(mut t, "pg_type survived", oidOf(mut t, "pg_type", c2.SystemTable("pg_type")), u32(1247))
+	crucible.NoFault("abort2", m2.Abort(mut tx2))
+	db2.Close() catch _ { }
+}
+
+fn dropCode(c mut Catalog, t txn.Txn, tbl Table, cascade bool) str {
+	mut code = ""
+	c.DropTable(t, tbl, cascade) catch err {
+		code = faultCode(err)
+	}
+	return code
+}
+
+fn indexCode(c mut Catalog, t txn.Txn, def IndexDef) str {
+	mut code = ""
+	c.CreateIndex(t, def) catch err {
+		code = faultCode(err)
+	}
+	return code
+}
+
+fn TestSqlStates(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("sqlstates") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let def = TableDef{Schema: "public", Name: "t1", Columns: []ColumnDef{ColumnDef{Name: "a", Type: 23, Typmod: -1}}}
+	let (table, createErr) = c.CreateTable(tx, def)
+	if createErr != nil {
+		t.Error("create: {createErr}")
+		return
+	}
+	tx.CommandCounterIncrement()
+	let (_, dupErr) = c.CreateTable(tx, def)
+	crucible.Equal(mut t, "duplicate table 42P07", faultCode(dupErr), "42P07")
+	let (_, dupColErr) = c.CreateTable(tx, TableDef{Schema: "public", Name: "t2", Columns: []ColumnDef{ColumnDef{Name: "a", Type: 23, Typmod: -1}, ColumnDef{Name: "a", Type: 25, Typmod: -1}}})
+	crucible.Equal(mut t, "duplicate column 42701", faultCode(dupColErr), "42701")
+	let (_, badSchemaErr) = c.CreateTable(tx, TableDef{Schema: "nope", Name: "t3", Columns: []ColumnDef{ColumnDef{Name: "a", Type: 23, Typmod: -1}}})
+	crucible.Equal(mut t, "unknown schema 3F000", faultCode(badSchemaErr), "3F000")
+	crucible.Equal(mut t, "missing table 42P01", dropCode(mut c, tx, Table{Oid: 999999, Name: "ghost"}, false), "42P01")
+	crucible.Equal(mut t, "index ok", indexCode(mut c, tx, IndexDef{Table: table, Name: "t1_a_idx", Unique: false, Cols: []i16{1}}), "")
+	tx.CommandCounterIncrement()
+	crucible.Equal(mut t, "dependent restrict 2BP01", dropCode(mut c, tx, table, false), "2BP01")
+	crucible.Equal(mut t, "cascade drop ok", dropCode(mut c, tx, table, true), "")
+	crucible.NoFault("abort", m.Abort(mut tx))
+}
+
+fn TestSequences(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("sequences") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let seq = c.CreateSequence(tx, SequenceDef{Schema: "public", Name: "s1", Type: 20, Start: 10, Increment: 5, Min: 1, Max: 1000, Cache: 1, Cycle: false}) catch err {
+		t.Error("create sequence: {err}")
+		return
+	}
+	tx.CommandCounterIncrement()
+	let first = c.Nextval(tx, seq) catch err {
+		t.Error("nextval: {err}")
+		return
+	}
+	crucible.Equal(mut t, "first nextval returns start", first, i64(10))
+	let second = c.Nextval(tx, seq) catch _ { i64(-1) }
+	crucible.Equal(mut t, "second nextval", second, i64(15))
+	let cur = c.Currval(seq) catch _ { i64(-1) }
+	crucible.Equal(mut t, "currval", cur, i64(15))
+	crucible.NoFault("setval", c.Setval(tx, seq, 100))
+	let after = c.Nextval(tx, seq) catch _ { i64(-1) }
+	crucible.Equal(mut t, "after setval", after, i64(105))
+	crucible.NoFault("abort", m.Abort(mut tx))
+}
+
+fn TestAlterTable(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("alter") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let table = c.CreateTable(tx, TableDef{Schema: "public", Name: "t", Columns: []ColumnDef{ColumnDef{Name: "a", Type: 23, Typmod: -1}}}) catch err {
+		t.Error("create: {err}")
+		return
+	}
+	tx.CommandCounterIncrement()
+	let added = c.AlterTableAddColumn(tx, table, ColumnDef{Name: "b", Type: 25, Typmod: -1, Nullable: true}) catch err {
+		t.Error("add column: {err}")
+		return
+	}
+	_ = added
+	tx.CommandCounterIncrement()
+	if let t2 = c.LookupTable(tx, "public", "t") {
+		crucible.Equal(mut t, "two columns after add", len(t2.Cols), 2)
+	} else {
+		t.Error("table missing after add")
+	}
+	crucible.NoFault("rename column", c.AlterTableRenameColumn(tx, table, "b", "c"))
+	tx.CommandCounterIncrement()
+	if let t2 = c.LookupTable(tx, "public", "t") {
+		crucible.Equal(mut t, "renamed column", t2.Cols[1].Name, "c")
+	}
+	crucible.NoFault("drop column", c.AlterTableDropColumn(tx, table, "c", false))
+	tx.CommandCounterIncrement()
+	if let t2 = c.LookupTable(tx, "public", "t") {
+		crucible.Equal(mut t, "one column after drop", len(t2.Cols), 1)
+	}
+	crucible.NoFault("rename table", c.AlterTableRename(tx, table, "t_renamed"))
+	tx.CommandCounterIncrement()
+	crucible.Equal(mut t, "renamed table found", c.LookupTable(tx, "public", "t_renamed") != nil, true)
+	crucible.Equal(mut t, "old name gone", c.LookupTable(tx, "public", "t") == nil, true)
+	crucible.NoFault("abort", m.Abort(mut tx))
+}
+
+fn TestCreateIndexAndSchema(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("index") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let (schemaOid, schemaErr) = c.CreateSchema(tx, "app")
+	if schemaErr != nil {
+		t.Error("create schema: {schemaErr}")
+		return
+	}
+	crucible.Equal(mut t, "create schema oid", schemaOid != 0, true)
+	tx.CommandCounterIncrement()
+	let table = c.CreateTable(tx, TableDef{Schema: "app", Name: "items", Columns: []ColumnDef{ColumnDef{Name: "id", Type: 23, Typmod: -1}, ColumnDef{Name: "code", Type: 25, Typmod: -1}}}) catch err {
+		t.Error("create table: {err}")
+		return
+	}
+	tx.CommandCounterIncrement()
+	let (idx, idxErr) = c.CreateIndex(tx, IndexDef{Table: table, Name: "items_code_idx", Unique: true, Cols: []i16{2}})
+	if idxErr != nil {
+		t.Error("create index: {idxErr}")
+		return
+	}
+	tx.CommandCounterIncrement()
+	if let t2 = c.LookupTable(tx, "app", "items") {
+		crucible.Equal(mut t, "index recorded", len(t2.Indexes), 1)
+	} else {
+		t.Error("table missing")
+	}
+	crucible.Equal(mut t, "index unique", idx.Unique, true)
+	crucible.NoFault("drop index", c.DropIndex(tx, idx.Oid))
+	crucible.NoFault("abort", m.Abort(mut tx))
 }

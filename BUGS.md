@@ -29,6 +29,10 @@
   `tests/compiler_bugs/inline_value_struct_enum_const.tin`, expected `a 23 1` / `b 23 2`). Blocked:
   `plan/analyze.tin` and `plan/planner.tin` constant construction (worked around by always materialising the
   datum into a local first).
+- NEEDS-TIN: a package-level `const` with a composite value crashes the compiler with
+  `index out of range [-1] with length 0` in `check_const_value` (repro `tests/compiler_bugs/const_slice_str.tin`,
+  `const xs = []str{"a"}`). Use a function returning the value or a package-level `let` meanwhile; the catalog seed
+  is a function. Blocked file: `catalog/seed.tin`.
 
 ## Compiler diagnostics that shaped the code (not bugs, but worth knowing)
 
@@ -53,6 +57,9 @@
   instead of 23). It is stack-layout dependent: construction through a helper that binds the datum to a local
   first is correct. All constant construction in `plan/` goes through `mkConstExpr`/`mkInt4Const`/`mkBoolConst`/
   `mkStrConst`/`mkNullConst` to avoid it.
+- `tests/compiler_bugs/const_slice_str.tin`: a package-level `const` whose value is a composite (for example
+  `const xs = []str{"a"}`) crashes the compiler with `index out of range [-1] with length 0` in
+  `check_const_value`. `catalog/seed.tin` therefore returns its generated seed from a function.
 
 ## Reproduced bugs in other tingres packages
 
