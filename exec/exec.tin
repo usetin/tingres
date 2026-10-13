@@ -1,108 +1,192 @@
 package exec
 
-// Value is a SQL scalar used by the standalone executor core.
-type Value enum {
-	Null
-	Bool(v bool)
-	Int(v i64)
-	Float(v f64)
-	Text(v str)
+import "../types"
+
+const oppushconst i64 = 1
+const oploadcolumn i64 = 2
+const oploadparam i64 = 3
+const opadd i64 = 4
+const opsubtract i64 = 5
+const opmultiply i64 = 6
+const opdivide i64 = 7
+const opmodulo i64 = 8
+const opequal i64 = 9
+const opnotequal i64 = 10
+const opless i64 = 11
+const oplessequal i64 = 12
+const opgreater i64 = 13
+const opgreaterequal i64 = 14
+const opand i64 = 15
+const opor i64 = 16
+const opnot i64 = 17
+const opisnull i64 = 18
+const opisnotnull i64 = 19
+const opnegate i64 = 20
+const opcast i64 = 21
+const opcall i64 = 22
+const opjump i64 = 23
+const opjumpiffalse i64 = 24
+const opjumpiftrue i64 = 25
+const opshortand i64 = 26
+const opshortor i64 = 27
+
+// Instruction is one operation in a compact typed expression program.
+type Instruction value struct {
+	ConstantIndex i64
+	Column i64
+	Type u32
+	Name str
+	ArgCount i64
+	JumpTo i64
+	Code i64
 }
 
-// Row is one executor tuple.
-type Row = []Value
-
-// Op identifies one expression instruction.
-type Op enum {
-	PushConst
-	LoadColumn
-	Add
-	Equal
-	Less
-	And
-	Or
-	Not
-	IsNull
+// Program stores compact instructions separately from its shared constant pool.
+type Program struct {
+	Code []Instruction
+	Constants []types.Datum
 }
 
-// Instruction is one stack-machine expression operation.
-type Instruction struct {
-	Op      Op
-	Value   Value
-	Column  i64
+// AddConstant appends a datum to the program pool and returns its push instruction.
+fn AddConstant(program mut Program, value types.Datum) Instruction {
+	program.Constants = append(program.Constants, value)
+	return Instruction{Code: oppushconst, ConstantIndex: len(program.Constants) - 1}
 }
 
-// Cursor is a pull source that returns one row at a time and then end-of-stream.
+// NewProgram creates an empty expression program.
+fn NewProgram() Program {
+	return Program{Code: []Instruction{}, Constants: []types.Datum{}}
+}
+
+// Push appends a constant to the program pool and emits a push instruction.
+fn (p mut Program) Push(v types.Datum) {
+	p.Constants = append(p.Constants, v)
+	p.Code = append(p.Code, Instruction{Code: oppushconst, ConstantIndex: len(p.Constants) - 1})
+}
+
+// Op appends an instruction with the given opcode.
+fn (p mut Program) Op(code i64) {
+	p.Code = append(p.Code, Instruction{Code: code})
+}
+
+// Column appends an instruction to load a row column.
+fn (p mut Program) Column(idx i64) {
+	p.Code = append(p.Code, Instruction{Code: oploadcolumn, Column: idx})
+}
+
+// Param appends an instruction to load a query parameter.
+fn (p mut Program) Param(idx i64) {
+	p.Code = append(p.Code, Instruction{Code: oploadparam, Column: idx})
+}
+
+// NewFilterCursor creates a filter cursor with empty initial eval context.
+fn NewFilterCursor(input dyn Cursor, test Program) FilterCursor {
+	return FilterCursor{
+		Input: input,
+		Test: test,
+		Params: []types.Datum{},
+		Eval: EvalContext{stack: []types.Datum{}},
+	}
+}
+
+// NewProjectCursor creates a project cursor with empty initial eval context.
+fn NewProjectCursor(input dyn Cursor, exprs []Program) ProjectCursor {
+	return ProjectCursor{
+		Input: input,
+		Exprs: exprs,
+		Params: []types.Datum{},
+		Eval: EvalContext{stack: []types.Datum{}},
+	}
+}
+
+// EvalContext reuses one expression stack across rows.
+type EvalContext struct {
+	stack []types.Datum
+}
+
+// Cursor is a pull source that returns one shared SQL row at a time.
 shape Cursor {
-	mut Next() !(Row, bool)
+	mut Next() !([]types.Datum, bool)
 }
 
 // ValuesCursor reads rows from an in-memory source.
 type ValuesCursor struct {
-	Rows  []Row
+	Rows [][]types.Datum
 	Index i64
 }
 
-// Next returns one row and advances the cursor.
-fn (c mut ValuesCursor) Next() !(Row, bool) {
+// Next returns the next row and advances the source.
+fn (c mut ValuesCursor) Next() !([]types.Datum, bool) {
 	if c.Index >= len(c.Rows) {
-		return []Value{}, false
+		return []types.Datum{}, false
 	}
 	let row = c.Rows[c.Index]
 	c.Index += 1
 	return row, true
 }
 
-// FilterCursor returns input rows whose predicate evaluates to SQL TRUE.
+// FilterCursor returns rows whose predicate evaluates to SQL TRUE.
 type FilterCursor struct {
 	Input dyn Cursor
-	Test  []Instruction
+	Test Program
+	Params []types.Datum
+	Eval EvalContext
 }
 
 // Next pulls until a row passes the predicate or the input ends.
-fn (c mut FilterCursor) Next() !(Row, bool) {
+fn (c mut FilterCursor) Next() !([]types.Datum, bool) {
 	for {
 		let (row, ok) = try c.Input.Next()
 		if !ok {
-			return []Value{}, false
+			return []types.Datum{}, false
 		}
-		let result = try Eval(c.Test, row)
+		let result = try c.Eval.Evaluate(c.Test, row, c.Params)
 		if isTrue(result) {
 			return row, true
 		}
 	}
 }
 
-// ProjectCursor evaluates one expression per output column.
+// ProjectCursor evaluates one expression for each output column.
 type ProjectCursor struct {
 	Input dyn Cursor
-	Exprs [][]Instruction
+	Exprs []Program
+	Params []types.Datum
+	Eval EvalContext
 }
 
 // Next projects one input row.
-fn (c mut ProjectCursor) Next() !(Row, bool) {
+fn (c mut ProjectCursor) Next() !([]types.Datum, bool) {
 	let (row, ok) = try c.Input.Next()
 	if !ok {
-		return []Value{}, false
+		return []types.Datum{}, false
 	}
-	mut result = []Value{}
+	mut result = []types.Datum{}
 	for expr in c.Exprs {
-		let value = try Eval(expr, row)
+		let value = try c.Eval.Evaluate(expr, row, c.Params)
 		result = append(result, value)
 	}
 	return result, true
 }
 
-// LimitCursor stops after a fixed number of rows.
+// LimitCursor stops after a fixed number of rows and skips its offset first.
 type LimitCursor struct {
 	Input dyn Cursor
-	Left  i64
+	Left i64
+	Offset i64
 }
 
-// Next returns rows until the limit is exhausted.
-fn (c mut LimitCursor) Next() !(Row, bool) {
+// Next returns rows until the offset and limit are exhausted.
+fn (c mut LimitCursor) Next() !([]types.Datum, bool) {
+	for c.Offset > 0 {
+		let (_, ok) = try c.Input.Next()
+		if !ok {
+			return []types.Datum{}, false
+		}
+		c.Offset -= 1
+	}
 	if c.Left <= 0 {
-		return []Value{}, false
+		return []types.Datum{}, false
 	}
 	let (row, ok) = try c.Input.Next()
 	if ok {
@@ -112,143 +196,218 @@ fn (c mut LimitCursor) Next() !(Row, bool) {
 }
 
 // Eval evaluates a postfix expression with SQL NULL behavior.
-fn Eval(code []Instruction, row Row) !Value {
-	mut stack = []Value{}
-	for instruction in code {
-		match instruction.Op {
-			PushConst => {
-				stack = append(stack, instruction.Value)
+fn Eval(program Program, row []types.Datum) !types.Datum {
+	mut context = EvalContext{}
+	return try context.Evaluate(program, row, []types.Datum{})
+}
+
+// EvalWithParams evaluates an expression over a row and positional parameters.
+fn EvalWithParams(program Program, row []types.Datum, params []types.Datum) !types.Datum {
+	mut context = EvalContext{}
+	return try context.Evaluate(program, row, params)
+}
+
+// Evaluate runs a compiled program while retaining stack capacity between rows.
+fn (context mut EvalContext) Evaluate(program Program, row []types.Datum, params []types.Datum) !types.Datum {
+	context.stack = context.stack[:0]
+	mut pc = i64(0)
+	for pc < len(program.Code) {
+		let instruction = program.Code[pc]
+		match instruction.Code {
+			oppushconst => {
+				if instruction.ConstantIndex < 0 || instruction.ConstantIndex >= len(program.Constants) { try expressionError("XX000", "executor constant index out of range") }
+				context.stack = append(context.stack, program.Constants[instruction.ConstantIndex])
 			}
-			LoadColumn => {
+			oploadcolumn => {
 				if instruction.Column < 0 || instruction.Column >= len(row) {
-					fail "XX000 executor column index out of range"
+					try expressionError("XX000", "executor column index out of range")
 				}
-				stack = append(stack, row[instruction.Column])
+				context.stack = append(context.stack, row[instruction.Column])
 			}
-			Not, IsNull => {
-				if len(stack) < 1 {
-					fail "XX000 invalid expression stack"
+			oploadparam => {
+				if instruction.Column < 1 || instruction.Column > len(params) {
+					try expressionError("42P02", "there is no parameter ${instruction.Column}")
 				}
-				let value = stack[len(stack) - 1]
-				stack = stack[:len(stack) - 1]
-				if instruction.Op == Op.Not {
-					stack = append(stack, notValue(value))
-				} else {
-					stack = append(stack, Value.Bool(isNull(value)))
+				context.stack = append(context.stack, params[instruction.Column - 1])
+			}
+			opjump => {
+				pc = instruction.JumpTo
+				continue
+			}
+			opjumpiffalse, opjumpiftrue, opshortand, opshortor => {
+				if len(context.stack) < 1 {
+					try expressionError("XX000", "invalid expression stack")
+				}
+				let value = context.stack[len(context.stack) - 1]
+				if instruction.Code == opjumpiffalse && isFalse(value) || instruction.Code == opjumpiftrue && isTrue(value) || instruction.Code == opshortand && isFalse(value) || instruction.Code == opshortor && isTrue(value) {
+					pc = instruction.JumpTo
+					continue
 				}
 			}
-			Add, Equal, Less, And, Or => {
-				if len(stack) < 2 {
-					fail "XX000 invalid expression stack"
+			opnot, opisnull, opisnotnull, opnegate, opcast => {
+				if len(context.stack) < 1 {
+					try expressionError("XX000", "invalid expression stack")
 				}
-				let right = stack[len(stack) - 1]
-				let left = stack[len(stack) - 2]
-				stack = stack[:len(stack) - 2]
-				let value = try binary(instruction.Op, left, right)
-				stack = append(stack, value)
+				let value = context.stack[len(context.stack) - 1]
+				context.stack = context.stack[:len(context.stack) - 1]
+				mut result = types.Null()
+				match instruction.Code {
+					opnot => result = try applyUnary("NOT", value)
+					opisnull => result = types.FromBool(types.IsNull(value))
+					opisnotnull => result = types.FromBool(!types.IsNull(value))
+					opnegate => result = try negate(value)
+					opcast => result = try types.Cast(value, instruction.Type)
+					_ => { }
+				}
+				context.stack = append(context.stack, result)
+			}
+			opcall => {
+				if instruction.ArgCount < 0 || instruction.ArgCount > len(context.stack) {
+					try expressionError("XX000", "invalid function argument stack")
+				}
+				let start = len(context.stack) - instruction.ArgCount
+				let args = context.stack[start:]
+				context.stack = context.stack[:start]
+				let value = try callBuiltin(instruction.Name, args)
+				context.stack = append(context.stack, value)
+			}
+			opadd, opsubtract, opmultiply, opdivide, opmodulo, opequal, opnotequal, opless, oplessequal, opgreater, opgreaterequal, opand, opor => {
+				if len(context.stack) < 2 {
+					try expressionError("XX000", "invalid expression stack")
+				}
+				let right = context.stack[len(context.stack) - 1]
+				let left = context.stack[len(context.stack) - 2]
+				context.stack = context.stack[:len(context.stack) - 2]
+				let value = try binary(instruction.Code, left, right, instruction.Type)
+				context.stack = append(context.stack, value)
 			}
 		}
+		pc += 1
 	}
-	if len(stack) != 1 {
-		fail "XX000 invalid expression result"
+	if len(context.stack) != 1 {
+		try expressionError("XX000", "invalid expression result")
 	}
-	return stack[0]
+	return context.stack[0]
 }
 
-fn binary(op Op, left Value, right Value) !Value {
-	if op == Op.And || op == Op.Or {
-		return booleanBinary(op, left, right)
-	}
-	if isNull(left) || isNull(right) {
-		return Value.Null
-	}
+fn binary(op i64, left types.Datum, right types.Datum, resultType u32) !types.Datum {
+	let name = operatorName(op)
+	return try applyOperator(name, left, right, resultType)
+}
+
+fn operatorName(op i64) str {
 	match op {
-		Add => {
-			match left {
-				Int(a) => {
-					match right {
-						Int(b) => { return Value.Int(a + b) }
-						_ => { fail "42883 operator does not exist: integer + non-integer" }
-					}
-				}
-				Float(a) => {
-					match right {
-						Float(b) => { return Value.Float(a + b) }
-						_ => { fail "42883 operator does not exist: float + non-float" }
-					}
-				}
-				_ => { fail "42883 operator does not exist: non-numeric +" }
-			}
-		}
-		Equal => { return Value.Bool(equalValue(left, right)) }
-		Less => { return Value.Bool(lessValue(left, right)) }
-		_ => { fail "XX000 invalid binary expression operation" }
+		opadd => return "+"
+		opsubtract => return "-"
+		opmultiply => return "*"
+		opdivide => return "/"
+		opmodulo => return "%"
+		opequal => return "="
+		opnotequal => return "<>"
+		opless => return "<"
+		oplessequal => return "<="
+		opgreater => return ">"
+		opgreaterequal => return ">="
+		opand => return "AND"
+		opor => return "OR"
+		_ => return ""
 	}
-	fail "XX000 invalid binary expression operation"
 }
 
-fn booleanBinary(op Op, left Value, right Value) Value {
-	let leftNull = isNull(left)
-	let rightNull = isNull(right)
-	let leftTrue = isTrue(left)
-	let rightTrue = isTrue(right)
-	let leftFalse = isFalse(left)
-	let rightFalse = isFalse(right)
-	if op == Op.And {
-		if leftFalse || rightFalse {
-			return Value.Bool(false)
-		}
-		if leftNull || rightNull {
-			return Value.Null
-		}
-		return Value.Bool(leftTrue && rightTrue)
+fn applyOperator(name str, left types.Datum, right types.Datum, resultType u32) !types.Datum {
+	if name == "" { try expressionError("XX000", "invalid binary expression operation") }
+	mut leftOid = left.Oid()
+	mut rightOid = right.Oid()
+	if name == "AND" || name == "OR" {
+		if leftOid == 0 { leftOid = types.BoolOid }
+		if rightOid == 0 { rightOid = types.BoolOid }
+	} else if leftOid == 0 && rightOid != 0 {
+		leftOid = rightOid
+	} else if rightOid == 0 && leftOid != 0 {
+		rightOid = leftOid
+	} else if leftOid == 0 && rightOid == 0 {
+		leftOid = types.UnknownLiteralOid
+		rightOid = types.UnknownLiteralOid
 	}
-	if leftTrue || rightTrue {
-		return Value.Bool(true)
+	if let f = types.LookupOperator(name, leftOid, rightOid) {
+		let value = try f.Call([]types.Datum{left, right})
+		if resultType != 0 && !types.IsNull(value) && value.Oid() != resultType { return try types.Cast(value, resultType) }
+		return value
 	}
-	if leftNull || rightNull {
-		return Value.Null
-	}
-	return Value.Bool(false)
+	try expressionError("42883", "operator does not exist: {typeName(leftOid)} {name} {typeName(rightOid)}")
+	return types.Null()
 }
 
-fn equalValue(left Value, right Value) bool {
-	match left {
-		Bool(a) => { match right { Bool(b) => { return a == b } _ => { return false } } }
-		Int(a) => { match right { Int(b) => { return a == b } _ => { return false } } }
-		Float(a) => { match right { Float(b) => { return a == b } _ => { return false } } }
-		Text(a) => { match right { Text(b) => { return a == b } _ => { return false } } }
-		Null => { return false }
+fn typeName(oid u32) str {
+	match oid {
+		types.BoolOid => return "boolean"
+		types.Int2Oid => return "smallint"
+		types.Int4Oid => return "integer"
+		types.Int8Oid => return "bigint"
+		types.Float4Oid => return "real"
+		types.Float8Oid => return "double precision"
+		types.NumericOid => return "numeric"
+		types.TextOid => return "text"
+		types.VarcharOid => return "character varying"
+		types.ByteaOid => return "bytea"
+		_ => return "unknown"
 	}
-	return false
 }
 
-fn lessValue(left Value, right Value) bool {
-	match left {
-		Int(a) => { match right { Int(b) => { return a < b } _ => { return false } } }
-		Float(a) => { match right { Float(b) => { return a < b } _ => { return false } } }
-		Text(a) => { match right { Text(b) => { return a < b } _ => { return false } } }
-		_ => { return false }
+fn negate(value types.Datum) !types.Datum {
+	return try applyUnary("-", value)
+}
+
+fn callBuiltin(name str, args []types.Datum) !types.Datum {
+	let normalized = lowerName(name)
+	if normalized == "coalesce" {
+		for arg in args { if !types.IsNull(arg) { return arg } }
+		return types.Null()
 	}
-	return false
-}
-
-fn isNull(v Value) bool {
-	match v { Null => { return true } _ => { return false } }
-}
-
-fn isTrue(v Value) bool {
-	match v { Bool(b) => { return b } _ => { return false } }
-}
-
-fn isFalse(v Value) bool {
-	match v { Bool(b) => { return !b } _ => { return false } }
-}
-
-fn notValue(v Value) Value {
-	match v {
-		Null => { return Value.Null }
-		Bool(b) => { return Value.Bool(!b) }
-		_ => { return Value.Null }
+	if normalized == "nullif" {
+		if len(args) != 2 { try expressionError("42883", "function nullif requires two arguments") }
+		let equal = try applyOperator("=", args[0], args[1], types.BoolOid)
+		if isTrue(equal) { return types.Null() }
+		return args[0]
 	}
+	mut argOids = []u32{}
+	for arg in args {
+		if types.IsNull(arg) { argOids = append(argOids, types.UnknownLiteralOid) } else { argOids = append(argOids, arg.Oid()) }
+	}
+	if let f = types.LookupFunc(normalized, argOids) { return try f.Call(args) }
+	mut signature = ""
+	for i, oid in argOids {
+		if i > 0 { signature += ", " }
+		signature += typeName(oid)
+	}
+	try expressionError("42883", "function {normalized}({signature}) does not exist")
+	return types.Null()
+}
+
+fn applyUnary(name str, value types.Datum) !types.Datum {
+	mut oid = value.Oid()
+	if types.IsNull(value) { oid = types.BoolOid }
+	if let f = types.LookupFunc(name, []u32{oid}) { return try f.Call([]types.Datum{value}) }
+	try expressionError("42883", "operator does not exist: {name} {typeName(oid)}")
+	return types.Null()
+}
+
+fn lowerName(s str) str {
+	mut out = ""
+	for _, c in s {
+		if c >= 'A' && c <= 'Z' { out += str(c + 32) } else { out += str(c) }
+	}
+	return out
+}
+
+fn expressionError(code str, message str) ! {
+	try types.ErrorFault(types.NewPgError(code, message, "", "", 0))
+}
+
+fn isTrue(v types.Datum) bool {
+	return !types.IsNull(v) && v.Oid() == types.BoolOid && v.Text() == "true"
+}
+
+fn isFalse(v types.Datum) bool {
+	return !types.IsNull(v) && v.Oid() == types.BoolOid && v.Text() == "false"
 }
