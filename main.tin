@@ -1,25 +1,103 @@
 package main
 
+// tingres: PostgreSQL in Tin. Flags, configuration and startup; the listener and the
+// session loop live in ./server, the wire protocol in ./proto.
+
 import "lever"
+import "fault"
 import "mint"
-import "./proto"
 import "quarry"
 import "say"
 import "./server"
+import "./store"
+import "twine"
 
 fn main() ! {
-	let data = lever.Str("data", "data", "database data directory")
+	let data = lever.Str("data", "data", "database data directory (created if missing)")
 	let listen = lever.Str("listen", "127.0.0.1:5432", "PostgreSQL listen address")
-	let maxConnections = lever.Int("max-connections", env_int("TINGRES_MAX_CONNECTIONS", 100), "maximum open client connections")
-	let auth = lever.Str("auth", "trust", "authentication: trust or scram-sha-256")
-	let password = lever.Str("password", quarry.Getenv("TINGRES_PASSWORD"), "SCRAM password")
+	let role = lever.Str("role", "postgres", "role accepted at startup (empty accepts any)")
+	let database = lever.Str("database", "postgres", "database accepted at startup (empty accepts any)")
+	let auth = lever.Str("auth", "trust", "authentication when no pg_hba.conf rule matches: trust, password, md5, scram-sha-256")
+	let password = lever.Str("password", quarry.Getenv("TINGRES_PASSWORD"), "password for password, md5 and scram-sha-256 authentication")
+	let engine = lever.Str("engine", "auto", "query engine: auto, real or fake")
+	let maxConnections = lever.Int("max-connections", env_int("TINGRES_MAX_CONNECTIONS", 100), "maximum number of open client connections")
+	let tlsCert = lever.Str("tls-cert", "", "PEM certificate chain file (enables TLS, sslmode=require)")
+	let tlsKey = lever.Str("tls-key", "", "PEM private key file for --tls-cert")
+	let idleTimeout = lever.Int("idle-timeout", 0, "idle session timeout in milliseconds (0 disables it)")
+	let startupTimeout = lever.Int("startup-timeout", 10000, "startup and authentication timeout in milliseconds")
+	let logMinDuration = lever.Int("log-min-duration", -1, "log statements slower than this in milliseconds (-1 disables it)")
+	let shutdownFile = lever.Str("shutdown-file", "", "graceful shutdown when this file appears (stand-in for SIGTERM)")
+	let reloadFile = lever.Str("reload-file", "", "reload pg_hba.conf when this file appears (stand-in for SIGHUP)")
+	let bufferPages = lever.Int("buffer-pages", 0, "buffer pool pages (0 uses the library default)")
 	let args = quarry.Args()
 	try lever.Parse(args[1:])
-	_ = data.Val() // M1 has no storage layer yet.
-	say.Line("tingres listening on {listen.Val()}")
-	try server.Serve(listen.Val(), proto.Config{User: "postgres", Database: "postgres", Auth: auth.Val(), Password: password.Val(), MaxConnections: maxConnections.Val()})
+
+	try quarry.MkdirAll(data.Val())
+	mut cfg = server.Config{
+		Data: data.Val(),
+		Listen: listen.Val(),
+		Role: role.Val(),
+		Database: database.Val(),
+		Auth: auth.Val(),
+		Password: password.Val(),
+		MaxConnections: maxConnections.Val(),
+		StartupTimeout: milliseconds(startupTimeout.Val()),
+		IdleTimeout: milliseconds(idleTimeout.Val()),
+		LogMinDurationMs: logMinDuration.Val(),
+		ShutdownFile: shutdownFile.Val(),
+		ReloadFile: reloadFile.Val(),
+		PidFile: "",
+		TlsCertFile: tlsCert.Val(),
+		TlsKeyFile: tlsKey.Val(),
+		TlsCert: "",
+		TlsKey: "",
+		ServerVersion: "17.3 (tingres 0.1)",
+		Engine: engine.Val(),
+		Fake: false,
+		Hba: server.ReadHba(data.Val() + "/pg_hba.conf"),
+	}
+	if tlsCert.Val() != "" {
+		cfg.TlsCert = try quarry.ReadFile(tlsCert.Val())
+		cfg.TlsKey = try quarry.ReadFile(tlsKey.Val())
+		say.Line("tingres: TLS enabled (sslmode=require)")
+	}
+	let opts = store.Options{BufferPages: bufferPages.Val(), SharedBuffersBytes: 0, WalRingBytes: 0, SyncOnWrite: true}
+	mut engineState = try server.OpenEngine(data.Val(), opts)
+	let mode = twine.ToLower(engine.Val())
+	if mode == "fake" {
+		cfg.Fake = true
+	} else if mode == "real" {
+		cfg.Fake = false
+	} else if mode == "auto" {
+		let works = guard {
+			server.ProbeRealEngine(mut engineState)
+		} catch err {
+			say.Line("tingres: probing the real engine panicked: {fault.Message(err)}")
+			false
+		}
+		cfg.Fake = !works
+		if cfg.Fake {
+			say.Line("tingres: exec.Session does not run SQL end to end yet; using the conformance engine (--engine real forces it)")
+		}
+	} else {
+		fail "unknown --engine {engine.Val()}: expected auto, real or fake"
+	}
+	cfg.PidFile = try server.WritePidFile(data.Val(), listen.Val())
+	defer server.RemovePidFile(cfg.PidFile)
+	try server.Serve(listen.Val(), cfg, engineState)
+	mut closing = engineState
+	closing.Close() catch _ {
+	}
+	say.Line("tingres: stopped")
 }
 
+// milliseconds converts a flag's milliseconds to nanoseconds (0 stays 0).
+fn milliseconds(value i64) i64 {
+	if value <= 0 { return 0 }
+	return value * 1000000
+}
+
+// env_int reads an integer environment variable, falling back on anything unparsable.
 fn env_int(name str, fallback i64) i64 {
 	let value = quarry.Getenv(name)
 	if value == "" { return fallback }
