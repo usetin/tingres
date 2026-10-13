@@ -700,6 +700,161 @@ break } }
 	}
 }
 
+// concatI64 copies two i64 slices into one.
+fn concatI64(a []i64, b []i64) []i64 {
+	mut out = []i64{}
+	for x in a { out = append(out, x) }
+	for x in b { out = append(out, x) }
+	return out
+}
+
+// concatColDesc copies two column-descriptor slices into one.
+fn concatColDesc(a []ColDesc, b []ColDesc) []ColDesc {
+	mut out = []ColDesc{}
+	for x in a { out = append(out, x) }
+	for x in b { out = append(out, x) }
+	return out
+}
+
+// fromItemRanges returns the range-table indices a FROM item provides.
+fn fromItemRanges(item FromClauseItem) []i64 {
+	match item {
+		Table(t) => { return []i64{t.RangeIndex} }
+		Subquery(s) => { return []i64{s.RangeIndex} }
+		Values(v) => { return []i64{v.RangeIndex} }
+		Function(f) => { return []i64{f.RangeIndex} }
+		Join(j) => { return concatI64(fromItemRanges(j.Left), fromItemRanges(j.Right)) }
+	}
+	return []i64{}
+}
+
+// rangesContain reports whether set contains every element of want.
+fn rangesContain(set []i64, want []i64) bool {
+	for w in want {
+		mut found = false
+		for x in set {
+			if x == w {
+				found = true
+				break
+			}
+		}
+		if !found { return false }
+	}
+	return true
+}
+
+// rangesOverlap reports whether the two sets share an element.
+fn rangesOverlap(a []i64, b []i64) bool {
+	for x in a {
+		for y in b {
+			if x == y { return true }
+		}
+	}
+	return false
+}
+
+// exprSide classifies an expression by which side of a join it references.
+// 1 = left only, 2 = right only, 0 = neither or both.
+fn exprSide(e Expr, left []i64, right []i64) i64 {
+	let refs = exprReferencedRanges(e)
+	mut anyLeft = false
+	mut anyRight = false
+	for r in refs {
+		mut inLeft = false
+		for l in left {
+			if l == r {
+				inLeft = true
+				break
+			}
+		}
+		mut inRight = false
+		for rr in right {
+			if rr == r {
+				inRight = true
+				break
+			}
+		}
+		if inLeft { anyLeft = true }
+		if inRight { anyRight = true }
+		if !inLeft && !inRight { return 0 }
+	}
+	if anyLeft && anyRight { return 0 }
+	if anyLeft { return 1 }
+	if anyRight { return 2 }
+	return 0
+}
+
+// applicableJoinQuals selects quals that connect the current relation set to a
+// new relation and become fully evaluable once it joins.
+fn applicableJoinQuals(quals []Expr, current []i64, candidate []i64) []Expr {
+	mut out = []Expr{}
+	for q in quals {
+		let refs = exprReferencedRanges(q)
+		if !rangesOverlap(refs, candidate) { continue }
+		if !rangesContain(concatI64(current, candidate), refs) { continue }
+		out = append(out, q)
+	}
+	return out
+}
+
+// planJoinPair builds a join node for two inputs, choosing a hash join when an
+// equality connecting the two sides exists, otherwise a nested loop.
+fn planJoinPair(left Plan, leftRanges []i64, right Plan, rightRanges []i64, quals []Expr, jt JoinType) Plan {
+	mut leftKeys = []Expr{}
+	mut rightKeys = []Expr{}
+	mut rest = []Expr{}
+	mut hasEqui = false
+	for q in quals {
+		mut handled = false
+		match q {
+			OpCall(op) => {
+				if op.Op == "=" && len(op.Args) == 2 {
+					let aSide = exprSide(op.Args[0], leftRanges, rightRanges)
+					let bSide = exprSide(op.Args[1], leftRanges, rightRanges)
+					if aSide == 1 && bSide == 2 {
+						leftKeys = append(leftKeys, op.Args[0])
+						rightKeys = append(rightKeys, op.Args[1])
+						hasEqui = true
+						handled = true
+					} else if aSide == 2 && bSide == 1 {
+						leftKeys = append(leftKeys, op.Args[1])
+						rightKeys = append(rightKeys, op.Args[0])
+						hasEqui = true
+						handled = true
+					}
+				}
+			}
+			_ => {}
+		}
+		if !handled { rest = append(rest, q) }
+	}
+	let outRows = left.Cost().Rows * right.Cost().Rows * 0.1 + 1.0
+	let width = left.Cost().Width + right.Cost().Width
+	let cols = concatColDesc(left.Cols(), right.Cols())
+	if hasEqui {
+		let cost = costHashJoin(left.Cost(), right.Cost(), outRows, width)
+		return Plan.HashJoin(HashJoinNode{
+			Left: left,
+			Right: right,
+			JoinType: jt,
+			LeftKeys: leftKeys,
+			RightKeys: rightKeys,
+			Quals: rest,
+			Cols: cols,
+			Cost: cost,
+		})
+	}
+	let cost = costNestLoop(left.Cost(), right.Cost(), outRows, width)
+	return Plan.NestLoop(NestLoopNode{
+		Left: left,
+		Right: right,
+		JoinType: jt,
+		Quals: rest,
+		Cols: cols,
+		Cost: cost,
+	})
+}
+
 fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals []Expr) !Plan {
 	match item {
 		Table(tbl) => {
@@ -736,54 +891,13 @@ fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals
 			let leftPlan = try planFromItem(c, tx, mut leftItem, allQuals)
 			mut rightItem = j.Right
 			let rightPlan = try planFromItem(c, tx, mut rightItem, allQuals)
+			let leftRanges = fromItemRanges(j.Left)
+			let rightRanges = fromItemRanges(j.Right)
 			mut joinQuals = []Expr{}
 			for q in j.Quals {
 				joinQuals = append(joinQuals, foldExpr(q))
 			}
-
-			// Check if equijoin operator exists
-			mut isEqui = false
-			mut leftKeys = []Expr{}
-			mut rightKeys = []Expr{}
-			if len(joinQuals) > 0 {
-				match joinQuals[0] {
-					OpCall(op) => {
-						if op.Op == "=" && len(op.Args) == 2 {
-							isEqui = true
-							leftKeys = append(leftKeys, op.Args[0])
-							rightKeys = append(rightKeys, op.Args[1])
-						}
-					}
-					_ => {}
-				}
-			}
-
-			let totalRows = leftPlan.Cost().Rows * rightPlan.Cost().Rows * 0.1 + 1.0
-			let totalWidth = leftPlan.Cost().Width + rightPlan.Cost().Width
-
-			if isEqui {
-				let hjCost = costHashJoin(leftPlan.Cost(), rightPlan.Cost(), totalRows, totalWidth)
-				return Plan.HashJoin(HashJoinNode{
-					Left: leftPlan,
-					Right: rightPlan,
-					JoinType: j.JoinType,
-					LeftKeys: leftKeys,
-					RightKeys: rightKeys,
-					Quals: joinQuals,
-					Cols: j.Cols,
-					Cost: hjCost,
-				})
-			} else {
-				let nlCost = costNestLoop(leftPlan.Cost(), rightPlan.Cost(), totalRows, totalWidth)
-				return Plan.NestLoop(NestLoopNode{
-					Left: leftPlan,
-					Right: rightPlan,
-					JoinType: j.JoinType,
-					Quals: joinQuals,
-					Cols: j.Cols,
-					Cost: nlCost,
-				})
-			}
+			return planJoinPair(leftPlan, leftRanges, rightPlan, rightRanges, joinQuals, j.JoinType)
 		}
 		Function(_) => {
 			return Plan.Result(ResultNode{
@@ -796,52 +910,70 @@ fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals
 	}
 }
 
+// planFromJoinList orders comma-separated FROM items greedily: it starts from
+// the cheapest relation and repeatedly adds the relation whose join is cheapest,
+// pushing each WHERE qual into the join that first makes it evaluable.
 fn planFromJoinList(c catalog.Catalog, tx txn.Txn, items mut []FromClauseItem, allQuals []Expr) !Plan {
-	mut currentPlan = try planFromItem(c, tx, mut items[0], allQuals)
-	mut i = 1
-	for i < len(items) {
-		let nextPlan = try planFromItem(c, tx, mut items[i], allQuals)
-		mut mergedCols = []ColDesc{}
-		for col in currentPlan.Cols() {
-			mergedCols = append(mergedCols, col)
-		}
-		for col in nextPlan.Cols() {
-			mergedCols = append(mergedCols, col)
-		}
-		let totalRows = currentPlan.Cost().Rows * nextPlan.Cost().Rows
-		let totalWidth = currentPlan.Cost().Width + nextPlan.Cost().Width
-		let nlCost = costNestLoop(currentPlan.Cost(), nextPlan.Cost(), totalRows, totalWidth)
-		currentPlan = Plan.NestLoop(NestLoopNode{
-			Left: currentPlan,
-			Right: nextPlan,
-			JoinType: JoinType.Inner,
-			Quals: []Expr{},
-			Cols: mergedCols,
-			Cost: nlCost,
-		})
-		i += 1
+	mut plans = []Plan{}
+	mut ranges = [][]i64{}
+	for item in items {
+		let p = try planFromItem(c, tx, mut item, allQuals)
+		plans = append(plans, p)
+		ranges = append(ranges, fromItemRanges(item))
 	}
 
-	// Attach remaining multi-table quals
-	mut unpushedQuals = []Expr{}
+	mut joinQuals = []Expr{}
 	for q in allQuals {
-		let ranges = exprReferencedRanges(q)
-		if len(ranges) > 1 {
-			unpushedQuals = append(unpushedQuals, foldExpr(q))
+		if len(exprReferencedRanges(q)) > 1 {
+			joinQuals = append(joinQuals, foldExpr(q))
 		}
 	}
-	if len(unpushedQuals) > 0 {
-		let filterCond = combineConjunction(unpushedQuals)
-		if let fc = filterCond {
-			currentPlan = Plan.Filter(FilterNode{
-				Input: currentPlan,
-				Predicate: fc,
-				Cols: currentPlan.Cols(),
-				Cost: currentPlan.Cost(),
-			})
+
+	if len(plans) == 0 {
+		return Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}})
+	}
+
+	mut start = 0
+	for i in 1..len(plans) {
+		if plans[i].Cost().Total < plans[start].Cost().Total {
+			start = i
 		}
 	}
-	return currentPlan
+	mut current = plans[start]
+	mut currentRanges = ranges[start]
+	mut remaining = []i64{}
+	for i in 0..len(plans) {
+		if i != start { remaining = append(remaining, i64(i)) }
+	}
+
+	for len(remaining) > 0 {
+		mut bestPos = 0
+		mut bestPlan = plans[remaining[0]]
+		mut bestRanges = ranges[remaining[0]]
+		mut bestQuals = []Expr{}
+		mut bestCost = -1.0
+		for pos, j in remaining {
+			let applicable = applicableJoinQuals(joinQuals, currentRanges, ranges[j])
+			let cand = planJoinPair(current, currentRanges, plans[j], ranges[j], applicable, JoinType.Inner)
+			if bestCost < 0.0 || cand.Cost().Total < bestCost {
+				bestCost = cand.Cost().Total
+				bestPos = pos
+				bestPlan = plans[j]
+				bestRanges = ranges[j]
+				bestQuals = applicable
+			}
+		}
+		current = planJoinPair(current, currentRanges, bestPlan, bestRanges, bestQuals, JoinType.Inner)
+		for r in bestRanges {
+			currentRanges = append(currentRanges, r)
+		}
+		mut newRemaining = []i64{}
+		for pos, j in remaining {
+			if pos != bestPos { newRemaining = append(newRemaining, j) }
+		}
+		remaining = newRemaining
+	}
+	return current
 }
 
 // --- Index selection ---------------------------------------------------------
