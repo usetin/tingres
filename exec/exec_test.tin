@@ -1,36 +1,118 @@
 package exec
 
+import "../types"
 import "crucible"
 
+type DatumProbe struct {
+	Value types.Datum
+	N i64
+}
+
 fn TestThreeValuedLogic(t mut crucible.T) {
-	let andCode = []Instruction{Instruction{Op: Op.PushConst, Value: Value.Null}, Instruction{Op: Op.PushConst, Value: Value.Bool(false)}, Instruction{Op: Op.And, Value: Value.Null}}
-	let andValue = Eval(andCode, []Value{}) catch _ { Value.Null }
-	t.True("NULL AND false is false", andValue == Value.Bool(false))
-	let orCode = []Instruction{Instruction{Op: Op.PushConst, Value: Value.Null}, Instruction{Op: Op.PushConst, Value: Value.Bool(true)}, Instruction{Op: Op.Or, Value: Value.Null}}
-	let orValue = Eval(orCode, []Value{}) catch _ { Value.Null }
-	t.True("NULL OR true is true", orValue == Value.Bool(true))
-	let nullCode = []Instruction{Instruction{Op: Op.PushConst, Value: Value.Null}, Instruction{Op: Op.Not, Value: Value.Null}}
-	let nullValue = Eval(nullCode, []Value{}) catch _ { Value.Bool(false) }
-	t.True("NOT NULL remains NULL", isNull(nullValue))
+	let falseDatum = types.FromBool(false)
+	t.True("false Datum is nonnull", !types.IsNull(falseDatum))
+	t.True("false Datum has bool OID", falseDatum.Oid() == types.BoolOid)
+	t.True("false Datum text", falseDatum.Text() == "false")
+	t.True("false Datum predicate", isFalse(falseDatum))
+	let regularDatumProbe = DatumProbe{Value: falseDatum, N: 1}
+	t.True("regular struct keeps Datum field", isFalse(regularDatumProbe.Value))
+	let nullBool = types.Null()
+	t.True("null Datum", types.IsNull(nullBool))
+	let (directAnd, directAndErr) = binary(opand, nullBool, falseDatum, 0)
+	t.NoFault("direct AND", directAndErr)
+	t.True("direct NULL AND false", isFalse(directAnd))
+	t.True("operator enum preserves variant", Instruction{Code: opand, ConstantIndex: 0, Column: 0, Type: 0, Name: "", ArgCount: 0, JumpTo: 0}.Code == opand)
+
+	mut andProg = NewProgram()
+	andProg.Push(types.Null())
+	andProg.Push(types.FromBool(false))
+	andProg.Op(opand)
+	let (andValue, andErr) = Eval(andProg, []types.Datum{})
+	t.NoFault("NULL AND false evaluation", andErr)
+	if !isFalse(andValue) { t.Error("AND result oid={andValue.Oid()} null={types.IsNull(andValue)} text={andValue.Text()}") }
+	t.True("NULL AND false is false", isFalse(andValue))
+
+	mut orProg = NewProgram()
+	orProg.Push(types.Null())
+	orProg.Push(types.FromBool(true))
+	orProg.Op(opor)
+	let (orValue, orErr) = Eval(orProg, []types.Datum{})
+	t.NoFault("NULL OR true evaluation", orErr)
+	if !isTrue(orValue) { t.Error("OR result oid={orValue.Oid()} null={types.IsNull(orValue)} text={orValue.Text()}") }
+	t.True("NULL OR true is true", isTrue(orValue))
+
+	mut nullProg = NewProgram()
+	nullProg.Push(types.Null())
+	nullProg.Op(opnot)
+	let (nullValue, nullErr) = Eval(nullProg, []types.Datum{})
+	t.NoFault("NOT NULL evaluation", nullErr)
+	t.True("NOT NULL remains NULL", types.IsNull(nullValue))
+}
+
+fn TestShortCircuitAndParameters(t mut crucible.T) {
+	mut shortProg = NewProgram()
+	shortProg.Push(types.FromBool(false))
+	shortProg.Code = append(shortProg.Code, Instruction{Code: opshortand, ConstantIndex: 0, Column: 0, Type: 0, Name: "", ArgCount: 0, JumpTo: 4})
+	shortProg.Column(10)
+	shortProg.Op(opand)
+	let (short, shortErr) = Eval(shortProg, []types.Datum{})
+	t.NoFault("short circuit evaluation", shortErr)
+	t.True("false AND does not evaluate right side", isFalse(short))
+
+	mut paramProg = NewProgram()
+	paramProg.Param(1)
+	let (param, paramErr) = EvalWithParams(paramProg, []types.Datum{}, []types.Datum{types.FromI64(types.Int4Oid, 17)})
+	t.NoFault("parameter evaluation", paramErr)
+	crucible.Equal(mut t, "parameter value", param.Text(), "17")
 }
 
 fn TestPullOperators(t mut crucible.T) {
-	let data = ValuesCursor{Rows: []Row{[]Value{Value.Int(1)}, []Value{Value.Int(2)}, []Value{Value.Int(3)}}}
-	let filter = FilterCursor{Input: data, Test: []Instruction{Instruction{Op: Op.LoadColumn, Column: 0, Value: Value.Null}, Instruction{Op: Op.PushConst, Value: Value.Int(3)}, Instruction{Op: Op.Less, Value: Value.Null}}}
-	let project = ProjectCursor{Input: filter, Exprs: [][]Instruction{[]Instruction{Instruction{Op: Op.LoadColumn, Column: 0, Value: Value.Null}, Instruction{Op: Op.PushConst, Value: Value.Int(10)}, Instruction{Op: Op.Add, Value: Value.Null}}}}
-	mut lim = LimitCursor{Input: project, Left: 1}
+	let data = ValuesCursor{Rows: [][]types.Datum{
+		[]types.Datum{types.FromI64(types.Int4Oid, 1)},
+		[]types.Datum{types.FromI64(types.Int4Oid, 2)},
+		[]types.Datum{types.FromI64(types.Int4Oid, 3)},
+	}, Index: 0}
+
+	mut filterProg = NewProgram()
+	filterProg.Column(0)
+	filterProg.Push(types.FromI64(types.Int4Oid, 3))
+	filterProg.Op(opless)
+	let filter = NewFilterCursor(data, filterProg)
+
+	mut projProg = NewProgram()
+	projProg.Column(0)
+	projProg.Push(types.FromI64(types.Int4Oid, 10))
+	projProg.Op(opadd)
+	let project = NewProjectCursor(filter, []Program{projProg})
+
+	mut lim = LimitCursor{Input: project, Left: 1, Offset: 0}
 	let (first, hasFirst, firstErr) = lim.Next()
 	t.NoFault("first pull", firstErr)
 	t.True("projected row exists", hasFirst)
-	t.True("projected value", first[0] == Value.Int(11))
+	t.True("projected row width", len(first) == 1)
+	if len(first) == 1 { t.True("projected value", first[0].Text() == "11") }
 	let (_, hasSecond, secondErr) = lim.Next()
 	t.NoFault("second pull", secondErr)
 	t.True("limit stops", !hasSecond)
 }
 
-fn TestExpressionErrors(t mut crucible.T) {
-	let (_, bad) = Eval([]Instruction{Instruction{Op: Op.LoadColumn, Column: 4, Value: Value.Null}}, []Value{Value.Int(1)})
+fn TestExpressionErrorsAndNullPropagates(t mut crucible.T) {
+	mut badProg = NewProgram()
+	badProg.Column(4)
+	let (_, bad) = Eval(badProg, []types.Datum{types.FromI64(types.Int4Oid, 1)})
 	t.HasFault("column out of range", bad)
-	let (_, wrong) = Eval([]Instruction{Instruction{Op: Op.PushConst, Value: Value.Text("a")}, Instruction{Op: Op.PushConst, Value: Value.Int(1)}, Instruction{Op: Op.Add, Value: Value.Null}}, []Value{})
+
+	mut wrongProg = NewProgram()
+	wrongProg.Push(types.FromStr(types.TextOid, "a"))
+	wrongProg.Push(types.FromI64(types.Int4Oid, 1))
+	wrongProg.Op(opadd)
+	let (_, wrong) = Eval(wrongProg, []types.Datum{})
 	t.HasFault("unsupported addition", wrong)
+
+	mut nullProg = NewProgram()
+	nullProg.Push(types.Null())
+	nullProg.Push(types.FromI64(types.Int4Oid, 5))
+	nullProg.Op(opadd)
+	let nullResult = Eval(nullProg, []types.Datum{}) catch _ { types.FromI64(types.Int4Oid, 0) }
+	t.True("strict operator returns NULL", types.IsNull(nullResult))
 }

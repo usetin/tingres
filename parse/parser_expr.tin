@@ -175,9 +175,10 @@ fn expressionPrecedence(word str, kind str) i64 {
 	if word == "or" { return 1 }
 	if word == "and" { return 2 }
 	if word == "isnull" || word == "notnull" || word == "is" || word == "in" || word == "not" || word == "between" || word == "like" || word == "ilike" || word == "similar" { return 4 }
-	if word == "=" || word == "!=" || word == "<>" || word == "<" || word == ">" || word == "<=" || word == ">=" { return 4 }
+	if word == "=" || word == "!=" || word == "<>" || word == "<" || word == ">" || word == "<=" || word == ">=" || word == "~" || word == "~*" || word == "!~" || word == "!~*" || word == "@>" || word == "<@" { return 4 }
 	if kind == "operator" {
-		if word == "::" { return 9 }
+		if word == "->" || word == "->>" || word == "#>" || word == "#>>" { return 9 }
+		if word == "::" { return 10 }
 		if word == "^" { return 8 }
 		if word == "*" || word == "/" || word == "%" { return 7 }
 		if word == "+" || word == "-" { return 6 }
