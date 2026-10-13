@@ -1,0 +1,7 @@
+package main
+
+import "say"
+
+fn main() {
+	say.Line("tingres: PostgreSQL in Tin (skeleton)")
+}
