@@ -224,7 +224,7 @@ fn aggregateFinal(name str, ret Oid, state AggState) !Datum {
 	if name == "avg" {
 		if !state.HasValue { return Null() }
 		if ret == NumericOid {
-			return try NumericDivide(FromStr(NumericOid, state.Text), FromStr(NumericOid, mint.Itoa(state.Count)))
+			return try NumericDiv(FromStr(NumericOid, state.Text), FromStr(NumericOid, mint.Itoa(state.Count)))
 		}
 		return FromF64(Float8Oid, state.F/f64(state.Count))
 	}

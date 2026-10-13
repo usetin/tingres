@@ -29,29 +29,6 @@ fn registerMathFuncs(funcs mut []Func) {
 	registerFunc(mut funcs, function("pi", []Oid{}, Float8Oid, false, false, fn(args []Datum) !Datum { return try mathConstant("pi") }))
 	registerFunc(mut funcs, function("random", []Oid{}, Float8Oid, false, true, fn(args []Datum) !Datum { return try mathConstant("random") }))
 	registerFunc(mut funcs, function1("setseed", []Oid{Float8Oid}, VoidOid, true, true, fn(p1 Datum) !Datum { return try mathSeed(p1) }))
-	registerNumericMathFuncs(mut funcs)
-}
-
-fn registerNumericMathFuncs(funcs mut []Func) {
-	for _, name in []str{"abs", "@"} {
-		registerFunc(mut funcs, function1(name, []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericAbs(a) }))
-	}
-	registerFunc(mut funcs, function1("sign", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericSign(a) }))
-	registerFunc(mut funcs, function2("mod", []Oid{NumericOid, NumericOid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try NumericModulo(a, b) }))
-	registerFunc(mut funcs, function2("div", []Oid{NumericOid, NumericOid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try numericDiv(a, b) }))
-	for _, name in []str{"ceil", "ceiling"} {
-		registerFunc(mut funcs, function1(name, []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericCeil(a) }))
-	}
-	registerFunc(mut funcs, function1("floor", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericFloor(a) }))
-	registerFunc(mut funcs, function1("round", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericRound(a, 0) }))
-	registerFunc(mut funcs, function1("trunc", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericTrunc(a, 0) }))
-	registerFunc(mut funcs, function2("round", []Oid{NumericOid, Int4Oid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try NumericRound(a, b.i) }))
-	registerFunc(mut funcs, function2("trunc", []Oid{NumericOid, Int4Oid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return NumericTrunc(a, b.i) }))
-}
-
-fn numericDiv(a Datum, b Datum) !Datum {
-	let quotient = try NumericDivide(a, b)
-	return NumericTrunc(quotient, 0)
 }
 
 fn mathUnary(name str, arg Datum) !Datum {

@@ -345,6 +345,114 @@ fn TestIndexSelection(t mut crucible.T) {
 	cleanupTestEnv(env)
 }
 
+fn TestJoinOrderingAndMethods(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "join_order")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	// An equijoin in WHERE pushes into a hash join instead of a filter on top.
+	let stmt1 = parseSql("SELECT * FROM users, orders WHERE users.id = orders.user_id") catch err {
+		t.Error("parse equijoin: " + types.ErrorMessage(err))
+		return
+	}
+	let prep1 = Prepare(env.Cat, env.Txn, stmt1, []u32{}) catch err {
+		t.Error("prepare equijoin: " + types.ErrorMessage(err))
+		return
+	}
+	match prep1.Plan {
+		HashJoin(hj) => {
+			crucible.Equal(mut t, "hash join keys", len(hj.LeftKeys), 1)
+			crucible.Equal(mut t, "hash join has no leftover filter", len(hj.Quals), 0)
+		}
+		_ => { t.Error("expected HashJoin for WHERE equijoin") }
+	}
+
+	// A cartesian product stays a nested loop.
+	let stmt2 = parseSql("SELECT * FROM users, orders") catch err {
+		t.Error("parse cross: " + types.ErrorMessage(err))
+		return
+	}
+	let prep2 = Prepare(env.Cat, env.Txn, stmt2, []u32{}) catch err {
+		t.Error("prepare cross: " + types.ErrorMessage(err))
+		return
+	}
+	match prep2.Plan {
+		NestLoop(nl) => {
+			crucible.Equal(mut t, "cross join type", nl.JoinType, JoinType.Inner)
+		}
+		Project(p) => {
+			match p.Input {
+				NestLoop(_) => {}
+				_ => { t.Error("expected NestLoop under Project for cross join") }
+			}
+		}
+		_ => { t.Error("expected NestLoop for cross join") }
+	}
+
+	// A non-equi join condition stays a nested loop with a join filter.
+	let stmt3 = parseSql("SELECT * FROM users, orders WHERE users.id < orders.user_id") catch err {
+		t.Error("parse non-equi: " + types.ErrorMessage(err))
+		return
+	}
+	let prep3 = Prepare(env.Cat, env.Txn, stmt3, []u32{}) catch err {
+		t.Error("prepare non-equi: " + types.ErrorMessage(err))
+		return
+	}
+	match prep3.Plan {
+		NestLoop(nl) => {
+			crucible.Equal(mut t, "non-equi join filter", len(nl.Quals), 1)
+		}
+		_ => { t.Error("expected NestLoop for non-equi join") }
+	}
+
+	cleanupTestEnv(env)
+}
+
+fn TestTopNSort(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "topn")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	// ORDER BY + constant LIMIT becomes a bounded top-N sort.
+	let stmt1 = parseSql("SELECT * FROM users ORDER BY age LIMIT 5") catch err {
+		t.Error("parse topn: " + types.ErrorMessage(err))
+		return
+	}
+	let prep1 = Prepare(env.Cat, env.Txn, stmt1, []u32{}) catch err {
+		t.Error("prepare topn: " + types.ErrorMessage(err))
+		return
+	}
+	match prep1.Plan {
+		Limit(l) => {
+			match l.Input {
+				Sort(s) => {
+					crucible.Equal(mut t, "top-N sort limit", s.Limit, 5)
+				}
+				_ => { t.Error("expected Sort under Limit") }
+			}
+		}
+		_ => { t.Error("expected Limit at the top") }
+	}
+
+	// An unbounded ORDER BY keeps Limit = -1.
+	let stmt2 = parseSql("SELECT * FROM users ORDER BY age") catch err {
+		t.Error("parse sort: " + types.ErrorMessage(err))
+		return
+	}
+	let prep2 = Prepare(env.Cat, env.Txn, stmt2, []u32{}) catch err {
+		t.Error("prepare sort: " + types.ErrorMessage(err))
+		return
+	}
+	match prep2.Plan {
+		Sort(s) => {
+			crucible.Equal(mut t, "unbounded sort limit", s.Limit, -1)
+		}
+		_ => { t.Error("expected Sort") }
+	}
+
+	cleanupTestEnv(env)
+}
+
 fn TestPlannerAdditionalQueryShapes(t mut crucible.T) {
 	let envOpt = setupTestEnv(mut t, "planner_shapes")
 	if envOpt == nil { return }

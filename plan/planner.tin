@@ -4,6 +4,7 @@ import "../types"
 import "../catalog"
 import "../txn"
 import "say"
+import "mint"
 
 const SeqPageCost = 1.0
 const RandomPageCost = 4.0
@@ -425,13 +426,13 @@ fn PlanQuery(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
 			return try planSelect(c, tx, mut query)
 		}
 		"INSERT" => {
-			return try planInsert(c, tx, query)
+			return try planInsert(c, tx, mut query)
 		}
 		"UPDATE" => {
-			return try planUpdate(c, tx, query)
+			return try planUpdate(c, tx, mut query)
 		}
 		"DELETE" => {
-			return try planDelete(c, tx, query)
+			return try planDelete(c, tx, mut query)
 		}
 		_ => {
 			return Plan.Result(ResultNode{
@@ -502,13 +503,29 @@ break } }
 		}
 		let numAggs = i64(len(aggRefs))
 		let aggCost = costAgg(currentPlan.Cost(), currentPlan.Cost().Rows, 1.0, numAggs, currentPlan.Cost().Width)
-		aggregatedPlan = Plan.HashAgg(HashAggNode{
-			Input: currentPlan,
-			GroupKeys: grpKeys,
-			Aggs: aggRefs,
-			Cols: currentPlan.Cols(),
-			Cost: aggCost,
-		})
+		// Sorted aggregation when the input already arrives ordered on the group
+		// keys (single pass, no hash table); otherwise hash aggregation.
+		mut groupSortKeys = []SortKey{}
+		for g in grpKeys {
+			groupSortKeys = append(groupSortKeys, SortKey{Expr: g, Descending: false, NullsFirst: false})
+		}
+		if len(grpKeys) > 0 && planProvidesOrder(currentPlan, groupSortKeys) {
+			aggregatedPlan = Plan.GroupAgg(GroupAggNode{
+				Input: currentPlan,
+				GroupKeys: grpKeys,
+				Aggs: aggRefs,
+				Cols: currentPlan.Cols(),
+				Cost: aggCost,
+			})
+		} else {
+			aggregatedPlan = Plan.HashAgg(HashAggNode{
+				Input: currentPlan,
+				GroupKeys: grpKeys,
+				Aggs: aggRefs,
+				Cols: currentPlan.Cols(),
+				Cost: aggCost,
+			})
+		}
 	}
 
 	// 3. HAVING
@@ -570,7 +587,8 @@ break } }
 		})
 	}
 
-	// 6. ORDER BY
+	// 6. ORDER BY (top-N when a constant LIMIT bounds the sort)
+	let topN = exprConstInt(query.Limit)
 	mut sortedPlan = distinctPlan
 	if len(query.OrderBy) > 0 {
 		mut sortKeys = []SortKey{}
@@ -585,7 +603,7 @@ break } }
 		sortedPlan = Plan.Sort(SortNode{
 			Input: distinctPlan,
 			Keys: sortKeys,
-			Limit: -1,
+			Limit: topN,
 			Cols: outCols,
 			Cost: sCost,
 		})
@@ -608,6 +626,72 @@ break } }
 	}
 
 	return finalPlan
+}
+
+// exprConstInt returns the non-negative integer value of a constant expression,
+// or -1 when it is absent or not a constant integer.
+fn exprConstInt(e ?Expr) i64 {
+	if let x = e {
+		match x {
+			Const(c) => {
+				if types.IsNull(c.Value) { return -1 }
+				let n = mint.Atoi(c.Value.Text()) catch _ { return -1 }
+				if n < 0 { return -1 }
+				return n
+			}
+			_ => { return -1 }
+		}
+	}
+	return -1
+}
+
+// sameSimpleExpr reports whether two expressions are structurally identical for
+// the leaf forms that order-key comparison needs.
+fn sameSimpleExpr(a Expr, b Expr) bool {
+	match a {
+		ColRef(ca) => {
+			match b {
+				ColRef(cb) => { return ca.Slot == cb.Slot && ca.RangeIndex == cb.RangeIndex }
+				_ => { return false }
+			}
+		}
+		Const(ca) => {
+			match b {
+				Const(cb) => { return ca.Value.Oid() == cb.Value.Oid() && ca.Value.Text() == cb.Value.Text() }
+				_ => { return false }
+			}
+		}
+		OpCall(oa) => {
+			match b {
+				OpCall(ob) => {
+					if oa.Op != ob.Op || len(oa.Args) != len(ob.Args) { return false }
+					for i in 0..len(oa.Args) {
+						if !sameSimpleExpr(oa.Args[i], ob.Args[i]) { return false }
+					}
+					return true
+				}
+				_ => { return false }
+			}
+		}
+		_ => { return false }
+	}
+	return false
+}
+
+// planProvidesOrder reports whether a plan's output is already sorted on the
+// requested keys (a prefix match of an existing Sort node's keys).
+fn planProvidesOrder(p Plan, wanted []SortKey) bool {
+	match p {
+		Sort(n) => {
+			if len(n.Keys) < len(wanted) { return false }
+			for i, w in wanted {
+				if n.Keys[i].Descending != w.Descending { return false }
+				if !sameSimpleExpr(n.Keys[i].Expr, w.Expr) { return false }
+			}
+			return true
+		}
+		_ => { return false }
+	}
 }
 
 // isIdentityProjection reports whether exprs is exactly the input columns in order.
@@ -700,6 +784,161 @@ break } }
 	}
 }
 
+// concatI64 copies two i64 slices into one.
+fn concatI64(a []i64, b []i64) []i64 {
+	mut out = []i64{}
+	for x in a { out = append(out, x) }
+	for x in b { out = append(out, x) }
+	return out
+}
+
+// concatColDesc copies two column-descriptor slices into one.
+fn concatColDesc(a []ColDesc, b []ColDesc) []ColDesc {
+	mut out = []ColDesc{}
+	for x in a { out = append(out, x) }
+	for x in b { out = append(out, x) }
+	return out
+}
+
+// fromItemRanges returns the range-table indices a FROM item provides.
+fn fromItemRanges(item FromClauseItem) []i64 {
+	match item {
+		Table(t) => { return []i64{t.RangeIndex} }
+		Subquery(s) => { return []i64{s.RangeIndex} }
+		Values(v) => { return []i64{v.RangeIndex} }
+		Function(f) => { return []i64{f.RangeIndex} }
+		Join(j) => { return concatI64(fromItemRanges(j.Left), fromItemRanges(j.Right)) }
+	}
+	return []i64{}
+}
+
+// rangesContain reports whether set contains every element of want.
+fn rangesContain(set []i64, want []i64) bool {
+	for w in want {
+		mut found = false
+		for x in set {
+			if x == w {
+				found = true
+				break
+			}
+		}
+		if !found { return false }
+	}
+	return true
+}
+
+// rangesOverlap reports whether the two sets share an element.
+fn rangesOverlap(a []i64, b []i64) bool {
+	for x in a {
+		for y in b {
+			if x == y { return true }
+		}
+	}
+	return false
+}
+
+// exprSide classifies an expression by which side of a join it references.
+// 1 = left only, 2 = right only, 0 = neither or both.
+fn exprSide(e Expr, left []i64, right []i64) i64 {
+	let refs = exprReferencedRanges(e)
+	mut anyLeft = false
+	mut anyRight = false
+	for r in refs {
+		mut inLeft = false
+		for l in left {
+			if l == r {
+				inLeft = true
+				break
+			}
+		}
+		mut inRight = false
+		for rr in right {
+			if rr == r {
+				inRight = true
+				break
+			}
+		}
+		if inLeft { anyLeft = true }
+		if inRight { anyRight = true }
+		if !inLeft && !inRight { return 0 }
+	}
+	if anyLeft && anyRight { return 0 }
+	if anyLeft { return 1 }
+	if anyRight { return 2 }
+	return 0
+}
+
+// applicableJoinQuals selects quals that connect the current relation set to a
+// new relation and become fully evaluable once it joins.
+fn applicableJoinQuals(quals []Expr, current []i64, candidate []i64) []Expr {
+	mut out = []Expr{}
+	for q in quals {
+		let refs = exprReferencedRanges(q)
+		if !rangesOverlap(refs, candidate) { continue }
+		if !rangesContain(concatI64(current, candidate), refs) { continue }
+		out = append(out, q)
+	}
+	return out
+}
+
+// planJoinPair builds a join node for two inputs, choosing a hash join when an
+// equality connecting the two sides exists, otherwise a nested loop.
+fn planJoinPair(left Plan, leftRanges []i64, right Plan, rightRanges []i64, quals []Expr, jt JoinType) Plan {
+	mut leftKeys = []Expr{}
+	mut rightKeys = []Expr{}
+	mut rest = []Expr{}
+	mut hasEqui = false
+	for q in quals {
+		mut handled = false
+		match q {
+			OpCall(op) => {
+				if op.Op == "=" && len(op.Args) == 2 {
+					let aSide = exprSide(op.Args[0], leftRanges, rightRanges)
+					let bSide = exprSide(op.Args[1], leftRanges, rightRanges)
+					if aSide == 1 && bSide == 2 {
+						leftKeys = append(leftKeys, op.Args[0])
+						rightKeys = append(rightKeys, op.Args[1])
+						hasEqui = true
+						handled = true
+					} else if aSide == 2 && bSide == 1 {
+						leftKeys = append(leftKeys, op.Args[1])
+						rightKeys = append(rightKeys, op.Args[0])
+						hasEqui = true
+						handled = true
+					}
+				}
+			}
+			_ => {}
+		}
+		if !handled { rest = append(rest, q) }
+	}
+	let outRows = left.Cost().Rows * right.Cost().Rows * 0.1 + 1.0
+	let width = left.Cost().Width + right.Cost().Width
+	let cols = concatColDesc(left.Cols(), right.Cols())
+	if hasEqui {
+		let cost = costHashJoin(left.Cost(), right.Cost(), outRows, width)
+		return Plan.HashJoin(HashJoinNode{
+			Left: left,
+			Right: right,
+			JoinType: jt,
+			LeftKeys: leftKeys,
+			RightKeys: rightKeys,
+			Quals: rest,
+			Cols: cols,
+			Cost: cost,
+		})
+	}
+	let cost = costNestLoop(left.Cost(), right.Cost(), outRows, width)
+	return Plan.NestLoop(NestLoopNode{
+		Left: left,
+		Right: right,
+		JoinType: jt,
+		Quals: rest,
+		Cols: cols,
+		Cost: cost,
+	})
+}
+
 fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals []Expr) !Plan {
 	match item {
 		Table(tbl) => {
@@ -736,54 +975,13 @@ fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals
 			let leftPlan = try planFromItem(c, tx, mut leftItem, allQuals)
 			mut rightItem = j.Right
 			let rightPlan = try planFromItem(c, tx, mut rightItem, allQuals)
+			let leftRanges = fromItemRanges(j.Left)
+			let rightRanges = fromItemRanges(j.Right)
 			mut joinQuals = []Expr{}
 			for q in j.Quals {
 				joinQuals = append(joinQuals, foldExpr(q))
 			}
-
-			// Check if equijoin operator exists
-			mut isEqui = false
-			mut leftKeys = []Expr{}
-			mut rightKeys = []Expr{}
-			if len(joinQuals) > 0 {
-				match joinQuals[0] {
-					OpCall(op) => {
-						if op.Op == "=" && len(op.Args) == 2 {
-							isEqui = true
-							leftKeys = append(leftKeys, op.Args[0])
-							rightKeys = append(rightKeys, op.Args[1])
-						}
-					}
-					_ => {}
-				}
-			}
-
-			let totalRows = leftPlan.Cost().Rows * rightPlan.Cost().Rows * 0.1 + 1.0
-			let totalWidth = leftPlan.Cost().Width + rightPlan.Cost().Width
-
-			if isEqui {
-				let hjCost = costHashJoin(leftPlan.Cost(), rightPlan.Cost(), totalRows, totalWidth)
-				return Plan.HashJoin(HashJoinNode{
-					Left: leftPlan,
-					Right: rightPlan,
-					JoinType: j.JoinType,
-					LeftKeys: leftKeys,
-					RightKeys: rightKeys,
-					Quals: joinQuals,
-					Cols: j.Cols,
-					Cost: hjCost,
-				})
-			} else {
-				let nlCost = costNestLoop(leftPlan.Cost(), rightPlan.Cost(), totalRows, totalWidth)
-				return Plan.NestLoop(NestLoopNode{
-					Left: leftPlan,
-					Right: rightPlan,
-					JoinType: j.JoinType,
-					Quals: joinQuals,
-					Cols: j.Cols,
-					Cost: nlCost,
-				})
-			}
+			return planJoinPair(leftPlan, leftRanges, rightPlan, rightRanges, joinQuals, j.JoinType)
 		}
 		Function(_) => {
 			return Plan.Result(ResultNode{
@@ -796,52 +994,70 @@ fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals
 	}
 }
 
+// planFromJoinList orders comma-separated FROM items greedily: it starts from
+// the cheapest relation and repeatedly adds the relation whose join is cheapest,
+// pushing each WHERE qual into the join that first makes it evaluable.
 fn planFromJoinList(c catalog.Catalog, tx txn.Txn, items mut []FromClauseItem, allQuals []Expr) !Plan {
-	mut currentPlan = try planFromItem(c, tx, mut items[0], allQuals)
-	mut i = 1
-	for i < len(items) {
-		let nextPlan = try planFromItem(c, tx, mut items[i], allQuals)
-		mut mergedCols = []ColDesc{}
-		for col in currentPlan.Cols() {
-			mergedCols = append(mergedCols, col)
-		}
-		for col in nextPlan.Cols() {
-			mergedCols = append(mergedCols, col)
-		}
-		let totalRows = currentPlan.Cost().Rows * nextPlan.Cost().Rows
-		let totalWidth = currentPlan.Cost().Width + nextPlan.Cost().Width
-		let nlCost = costNestLoop(currentPlan.Cost(), nextPlan.Cost(), totalRows, totalWidth)
-		currentPlan = Plan.NestLoop(NestLoopNode{
-			Left: currentPlan,
-			Right: nextPlan,
-			JoinType: JoinType.Inner,
-			Quals: []Expr{},
-			Cols: mergedCols,
-			Cost: nlCost,
-		})
-		i += 1
+	mut plans = []Plan{}
+	mut ranges = [][]i64{}
+	for item in items {
+		let p = try planFromItem(c, tx, mut item, allQuals)
+		plans = append(plans, p)
+		ranges = append(ranges, fromItemRanges(item))
 	}
 
-	// Attach remaining multi-table quals
-	mut unpushedQuals = []Expr{}
+	mut joinQuals = []Expr{}
 	for q in allQuals {
-		let ranges = exprReferencedRanges(q)
-		if len(ranges) > 1 {
-			unpushedQuals = append(unpushedQuals, foldExpr(q))
+		if len(exprReferencedRanges(q)) > 1 {
+			joinQuals = append(joinQuals, foldExpr(q))
 		}
 	}
-	if len(unpushedQuals) > 0 {
-		let filterCond = combineConjunction(unpushedQuals)
-		if let fc = filterCond {
-			currentPlan = Plan.Filter(FilterNode{
-				Input: currentPlan,
-				Predicate: fc,
-				Cols: currentPlan.Cols(),
-				Cost: currentPlan.Cost(),
-			})
+
+	if len(plans) == 0 {
+		return Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}})
+	}
+
+	mut start = 0
+	for i in 1..len(plans) {
+		if plans[i].Cost().Total < plans[start].Cost().Total {
+			start = i
 		}
 	}
-	return currentPlan
+	mut current = plans[start]
+	mut currentRanges = ranges[start]
+	mut remaining = []i64{}
+	for i in 0..len(plans) {
+		if i != start { remaining = append(remaining, i64(i)) }
+	}
+
+	for len(remaining) > 0 {
+		mut bestPos = 0
+		mut bestPlan = plans[remaining[0]]
+		mut bestRanges = ranges[remaining[0]]
+		mut bestQuals = []Expr{}
+		mut bestCost = -1.0
+		for pos, j in remaining {
+			let applicable = applicableJoinQuals(joinQuals, currentRanges, ranges[j])
+			let cand = planJoinPair(current, currentRanges, plans[j], ranges[j], applicable, JoinType.Inner)
+			if bestCost < 0.0 || cand.Cost().Total < bestCost {
+				bestCost = cand.Cost().Total
+				bestPos = pos
+				bestPlan = plans[j]
+				bestRanges = ranges[j]
+				bestQuals = applicable
+			}
+		}
+		current = planJoinPair(current, currentRanges, bestPlan, bestRanges, bestQuals, JoinType.Inner)
+		for r in bestRanges {
+			currentRanges = append(currentRanges, r)
+		}
+		mut newRemaining = []i64{}
+		for pos, j in remaining {
+			if pos != bestPos { newRemaining = append(newRemaining, j) }
+		}
+		remaining = newRemaining
+	}
+	return current
 }
 
 // --- Index selection ---------------------------------------------------------
@@ -1033,86 +1249,126 @@ fn planTableScan(c catalog.Catalog, tx txn.Txn, tbl FromTable, allQuals []Expr) 
 	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tbl.Name + "\" does not exist"))
 }
 
-fn planInsert(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery) !Plan {
+// dmlTargetTable returns the single target relation of a DML query.
+fn dmlTargetTable(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery, verb str) !catalog.Table {
 	if len(query.From) == 0 {
-		fail types.ErrorFault(types.NewError("42P01", "missing target table for INSERT"))
+		fail types.ErrorFault(types.NewError("42P01", "missing target table for " + verb))
 	}
-	let tbl = query.From[0]
-	match tbl {
+	match query.From[0] {
 		Table(t) => {
 			if let catTable = c.LookupTable(tx, t.Schema, t.Name) {
-				return Plan.ModifyTable(ModifyTableNode{
-					Kind: ModifyKind.Insert,
-					Table: catTable,
-					Source: Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}}),
-					TargetCols: []i16{},
-					OnConflict: nil,
-					Returning: []Expr{},
-					Cols: []ColDesc{},
-					Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
-				})
+				return catTable
 			}
-			fail types.ErrorFault(types.NewError("42P01", "relation \"" + t.Name + "\" does not exist"))
 		}
-		_ => {
-			fail types.ErrorFault(types.NewError("42P01", "invalid target table for INSERT"))
-		}
+		_ => {}
 	}
-	fail types.ErrorFault(types.NewError("42P01", "invalid target table for INSERT"))
+	fail types.ErrorFault(types.NewError("42P01", "invalid target table for " + verb))
 }
 
-fn planUpdate(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery) !Plan {
-	if len(query.From) == 0 {
-		fail types.ErrorFault(types.NewError("42P01", "missing target table for UPDATE"))
-	}
-	let tbl = query.From[0]
-	match tbl {
-		Table(t) => {
-			if let catTable = c.LookupTable(tx, t.Schema, t.Name) {
-				return Plan.ModifyTable(ModifyTableNode{
-					Kind: ModifyKind.Update,
-					Table: catTable,
-					Source: Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}}),
-					TargetCols: []i16{},
-					OnConflict: nil,
-					Returning: []Expr{},
-					Cols: []ColDesc{},
-					Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
-				})
+fn planInsert(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
+	let catTable = try dmlTargetTable(c, tx, query, "INSERT")
+
+	mut source = Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}})
+	if len(query.InsertRows) > 0 {
+		mut rowsCols = []ColDesc{}
+		for j, attno in query.InsertCols {
+			mut cd = ColDesc{Name: "column", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: i16(j + 1), RangeIndex: 0, SourceName: ""}
+			for col in catTable.Cols {
+				if col.Number == attno {
+					cd = ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: catTable.Oid, Attno: col.Number, RangeIndex: 0, SourceName: catTable.Name}
+				}
 			}
-			fail types.ErrorFault(types.NewError("42P01", "relation \"" + t.Name + "\" does not exist"))
+			rowsCols = append(rowsCols, cd)
 		}
-		_ => {
-			fail types.ErrorFault(types.NewError("42P01", "invalid target table for UPDATE"))
+		source = Plan.Values(ValuesNode{
+			Rows: query.InsertRows,
+			Cols: rowsCols,
+			Cost: Cost{Startup: 0.0, Total: f64(len(query.InsertRows)) * CpuTupleCost, Rows: f64(len(query.InsertRows)), Width: i64(len(rowsCols) * 8)},
+		})
+	} else if query.HasInsertQuery {
+		if let sq = query.InsertQuery {
+			mut q = sq
+			source = try PlanQuery(c, tx, mut q)
 		}
 	}
-	fail types.ErrorFault(types.NewError("42P01", "invalid target table for UPDATE"))
+
+	return Plan.ModifyTable(ModifyTableNode{
+		Kind: ModifyKind.Insert,
+		Table: catTable,
+		Source: source,
+		TargetCols: query.InsertCols,
+		OnConflict: query.OnConflict,
+		Returning: query.Returning,
+		Cols: query.ReturningCols,
+		Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
+	})
 }
 
-fn planDelete(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery) !Plan {
-	if len(query.From) == 0 {
-		fail types.ErrorFault(types.NewError("42P01", "missing target table for DELETE"))
+fn planUpdate(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
+	let catTable = try dmlTargetTable(c, tx, query, "UPDATE")
+
+	mut foldedWhere ?Expr = nil
+	if let w = query.Where {
+		foldedWhere = foldExpr(w)
 	}
-	let tbl = query.From[0]
-	match tbl {
-		Table(t) => {
-			if let catTable = c.LookupTable(tx, t.Schema, t.Name) {
-				return Plan.ModifyTable(ModifyTableNode{
-					Kind: ModifyKind.Delete,
-					Table: catTable,
-					Source: Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}}),
-					TargetCols: []i16{},
-					OnConflict: nil,
-					Returning: []Expr{},
-					Cols: []ColDesc{},
-					Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
-				})
+	let allQuals = splitConjunction(foldedWhere)
+	mut item = query.From[0]
+	let scan = try planFromItem(c, tx, mut item, allQuals)
+
+	// The update source emits one full table row per matched row: SET expressions
+	// replace their columns, all other columns pass through.
+	mut exprs = []Expr{}
+	for i, col in catTable.Cols {
+		mut replaced = false
+		for j, attno in query.SetCols {
+			if i64(attno) == i64(col.Number) && j < len(query.SetExprs) {
+				exprs = append(exprs, query.SetExprs[j])
+				replaced = true
+				break
 			}
-			fail types.ErrorFault(types.NewError("42P01", "relation \"" + t.Name + "\" does not exist"))
 		}
-		_ => {
-			fail types.ErrorFault(types.NewError("42P01", "invalid target table for DELETE"))
+		if !replaced {
+			exprs = append(exprs, Expr.ColRef(ColRefExpr{Slot: i64(i), RangeIndex: 1, AttNo: col.Number, Type: col.Type}))
 		}
 	}
-	fail types.ErrorFault(types.NewError("42P01", "invalid target table for DELETE"))
+	let source = Plan.Project(ProjectNode{
+		Input: scan,
+		Exprs: exprs,
+		Cols: scan.Cols(),
+		Cost: scan.Cost(),
+	})
+
+	return Plan.ModifyTable(ModifyTableNode{
+		Kind: ModifyKind.Update,
+		Table: catTable,
+		Source: source,
+		TargetCols: query.SetCols,
+		OnConflict: nil,
+		Returning: query.Returning,
+		Cols: query.ReturningCols,
+		Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
+	})
+}
+
+fn planDelete(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
+	let catTable = try dmlTargetTable(c, tx, query, "DELETE")
+
+	mut foldedWhere ?Expr = nil
+	if let w = query.Where {
+		foldedWhere = foldExpr(w)
+	}
+	let allQuals = splitConjunction(foldedWhere)
+	mut item = query.From[0]
+	let scan = try planFromItem(c, tx, mut item, allQuals)
+
+	return Plan.ModifyTable(ModifyTableNode{
+		Kind: ModifyKind.Delete,
+		Table: catTable,
+		Source: scan,
+		TargetCols: []i16{},
+		OnConflict: nil,
+		Returning: query.Returning,
+		Cols: query.ReturningCols,
+		Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
+	})
 }
