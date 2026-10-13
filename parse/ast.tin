@@ -1,0 +1,1060 @@
+package parse
+
+// Stmt is the closed set of PostgreSQL statement forms understood by parse.
+type Stmt enum {
+	Select(SelectStmt)
+	Insert(InsertStmt)
+	Update(UpdateStmt)
+	Delete(DeleteStmt)
+	CreateTable(CreateTableStmt)
+	AlterTable(AlterTableStmt)
+	Drop(DropStmt)
+	CreateIndex(CreateIndexStmt)
+	CreateView(CreateViewStmt)
+	CreateSequence(CreateSequenceStmt)
+	AlterSequence(AlterSequenceStmt)
+	CreateSchema(CreateSchemaStmt)
+	CreateType(CreateTypeStmt)
+	CreateFunction(CreateFunctionStmt)
+	Truncate(TruncateStmt)
+	Transaction(TransactionStmt)
+	VariableSet(VariableSetStmt)
+	Explain(ExplainStmt)
+	Copy(CopyStmt)
+	Prepare(PrepareStmt)
+	Execute(ExecuteStmt)
+	Deallocate(DeallocateStmt)
+	Vacuum(VacuumStmt)
+	Analyze(AnalyzeStmt)
+	Discard(DiscardStmt)
+	Comment(CommentStmt)
+	Grant(GrantStmt)
+	Revoke(RevokeStmt)
+	CreateRole(CreateRoleStmt)
+	AlterRole(AlterRoleStmt)
+	DropRole(DropRoleStmt)
+	Listen(ListenStmt)
+	Notify(NotifyStmt)
+	Unlisten(UnlistenStmt)
+	Lock(LockStmt)
+	Do(DoStmt)
+	Checkpoint(CheckpointStmt)
+	Call(CallStmt)
+}
+
+// Expr is the closed set of expression forms understood by parse.
+type Expr enum {
+	Literal(LiteralExpr)
+	ColumnRef(ColumnRefExpr)
+	Param(ParamExpr)
+	Unary(UnaryExpr)
+	Binary(BinaryExpr)
+	Boolean(BooleanExpr)
+	Is(IsExpr)
+	Between(BetweenExpr)
+	In(InExpr)
+	Like(LikeExpr)
+	Quantified(QuantifiedExpr)
+	Exists(ExistsExpr)
+	Subquery(SubqueryExpr)
+	Array(ArrayExpr)
+	ArraySubquery(ArraySubqueryExpr)
+	Subscript(SubscriptExpr)
+	Row(RowExpr)
+	Field(FieldExpr)
+	Case(CaseExpr)
+	Call(FunctionCallExpr)
+	Special(SpecialExpr)
+	Cast(CastExpr)
+	Collate(CollateExpr)
+	AtTimeZone(AtTimeZoneExpr)
+	Default(DefaultExpr)
+}
+
+// ParseError carries PostgreSQL SQLSTATE and the 1-based source character offset.
+type ParseError struct {
+	Pos i64
+	Message str
+	Code str
+}
+
+// Identifier preserves a parsed identifier and whether PostgreSQL quoted it.
+type Identifier struct {
+	Pos i64
+	Name str
+	Quoted bool
+}
+
+// QualifiedName is a one to three part SQL name.
+type QualifiedName struct {
+	Pos i64
+	Parts []Identifier
+}
+
+// LiteralExpr stores the literal class and canonical token spelling.
+type LiteralExpr struct {
+	Pos i64
+	Kind str
+	Value str
+}
+
+// ColumnRefExpr stores qualified column names and a terminal star.
+type ColumnRefExpr struct {
+	Pos i64
+	Parts []Identifier
+	Star bool
+}
+
+// ParamExpr is a numbered extended-query parameter.
+type ParamExpr struct {
+	Pos i64
+	N i64
+}
+
+// UnaryExpr is a prefix or postfix unary operator application.
+type UnaryExpr struct {
+	Pos i64
+	Op str
+	Operand Expr
+}
+
+// BinaryExpr is a PostgreSQL or user-defined operator application.
+type BinaryExpr struct {
+	Pos i64
+	Left Expr
+	Op str
+	Right Expr
+}
+
+// BooleanExpr combines expressions with AND or OR.
+type BooleanExpr struct {
+	Pos i64
+	Op str
+	Args []Expr
+}
+
+// IsExpr represents IS tests, including DISTINCT FROM.
+type IsExpr struct {
+	Pos i64
+	Operand Expr
+	Test str
+	Negated bool
+	Right ?Expr
+}
+
+// BetweenExpr represents BETWEEN and its symmetric and negated forms.
+type BetweenExpr struct {
+	Pos i64
+	Operand Expr
+	Lower Expr
+	Upper Expr
+	Symmetric bool
+	Negated bool
+}
+
+// InExpr represents an IN list or query.
+type InExpr struct {
+	Pos i64
+	Operand Expr
+	Items []Expr
+	Query ?SelectStmt
+	Negated bool
+}
+
+// LikeExpr represents LIKE, ILIKE, SIMILAR TO, and ESCAPE.
+type LikeExpr struct {
+	Pos i64
+	Operand Expr
+	Pattern Expr
+	Kind str
+	Escape ?Expr
+	Negated bool
+}
+
+// QuantifiedExpr represents operator ANY, ALL, or SOME over an array or query.
+type QuantifiedExpr struct {
+	Pos i64
+	Left Expr
+	Op str
+	Quantifier str
+	Array Expr
+	Query ?SelectStmt
+}
+
+// ExistsExpr represents EXISTS (query).
+type ExistsExpr struct {
+	Pos i64
+	Query SelectStmt
+}
+
+// SubqueryExpr represents a scalar query expression.
+type SubqueryExpr struct {
+	Pos i64
+	Query SelectStmt
+}
+
+// ArrayExpr represents ARRAY[...].
+type ArrayExpr struct {
+	Pos i64
+	Elements []Expr
+}
+
+// ArraySubqueryExpr represents ARRAY(query).
+type ArraySubqueryExpr struct {
+	Pos i64
+	Query SelectStmt
+}
+
+// SubscriptIndex represents an array subscript or slice bound pair.
+type SubscriptIndex struct {
+	Pos i64
+	Lower ?Expr
+	Upper ?Expr
+	Slice bool
+}
+
+// SubscriptExpr represents array subscripting and slicing.
+type SubscriptExpr struct {
+	Pos i64
+	Array Expr
+	Indices []SubscriptIndex
+}
+
+// RowExpr represents ROW(...) and implicit parenthesized row constructors.
+type RowExpr struct {
+	Pos i64
+	Fields []Expr
+	Explicit bool
+}
+
+// FieldExpr represents a composite field selection.
+type FieldExpr struct {
+	Pos i64
+	Value Expr
+	Field Identifier
+}
+
+// WhenClause is one WHEN/THEN arm of a CASE expression.
+type WhenClause struct {
+	Pos i64
+	Condition Expr
+	Result Expr
+}
+
+// CaseExpr represents searched and simple CASE expressions.
+type CaseExpr struct {
+	Pos i64
+	Operand ?Expr
+	Whens []WhenClause
+	ElseExpr ?Expr
+}
+
+// FunctionArgument is a positional, named, or VARIADIC function argument.
+type FunctionArgument struct {
+	Pos i64
+	Name ?Identifier
+	Value Expr
+	Variadic bool
+}
+
+// WindowFrameBound stores one boundary of a window frame.
+type WindowFrameBound struct {
+	Pos i64
+	Kind str
+	Offset ?Expr
+}
+
+// WindowFrame represents ROWS, RANGE, or GROUPS framing.
+type WindowFrame struct {
+	Pos i64
+	Mode str
+	Start WindowFrameBound
+	End ?WindowFrameBound
+	Exclude str
+}
+
+// WindowSpec is a named or inline SQL window specification.
+type WindowSpec struct {
+	Pos i64
+	Name ?Identifier
+	PartitionBy []Expr
+	OrderBy []SortBy
+	Frame ?WindowFrame
+}
+
+// FunctionCallExpr stores ordinary and aggregate function-call decorations.
+type FunctionCallExpr struct {
+	Pos i64
+	Name QualifiedName
+	Distinct bool
+	All bool
+	Args []FunctionArgument
+	OrderBy []SortBy
+	Filter ?Expr
+	Over ?WindowSpec
+	WithinGroup []SortBy
+}
+
+// SpecialExpr stores SQL special forms such as EXTRACT, TRIM, and SUBSTRING.
+type SpecialExpr struct {
+	Pos i64
+	Name str
+	Args []Expr
+	Field ?Identifier
+	FromExpr ?Expr
+	ForExpr ?Expr
+	Using str
+}
+
+// TypeModifier is one parenthesized type modifier.
+type TypeModifier struct {
+	Pos i64
+	Value Expr
+}
+
+// ArrayBound represents one declared array dimension.
+type ArrayBound struct {
+	Pos i64
+	Length ?Expr
+}
+
+// TypeName is a schema-qualified SQL type with modifiers and array bounds.
+type TypeName struct {
+	Pos i64
+	Name QualifiedName
+	Modifiers []TypeModifier
+	ArrayBounds []ArrayBound
+	WithTimeZone bool
+	IntervalFields str
+}
+
+// CastExpr represents CAST(value AS type) or value::type.
+type CastExpr struct {
+	Pos i64
+	Value Expr
+	TypeName TypeName
+	Syntax str
+}
+
+// CollateExpr applies a collation to an expression.
+type CollateExpr struct {
+	Pos i64
+	Value Expr
+	Collation QualifiedName
+}
+
+// AtTimeZoneExpr represents value AT TIME ZONE zone.
+type AtTimeZoneExpr struct {
+	Pos i64
+	Value Expr
+	Zone Expr
+}
+
+// DefaultExpr is the DEFAULT keyword in value positions.
+type DefaultExpr struct {
+	Pos i64
+}
+
+// WithClause stores a WITH clause and its common table expressions.
+type WithClause struct {
+	Pos i64
+	Recursive bool
+	Ctes []CommonTableExpr
+}
+
+// CommonTableExpr is one named CTE.
+type CommonTableExpr struct {
+	Pos i64
+	Name Identifier
+	Columns []Identifier
+	Materialized str
+	Query SelectStmt
+}
+
+// SortBy is an ORDER BY expression and its ordering decorations.
+type SortBy struct {
+	Pos i64
+	Value Expr
+	Direction str
+	Nulls str
+	UsingOperator str
+}
+
+// TargetEntry is one SELECT or RETURNING target with an optional alias.
+type TargetEntry struct {
+	Pos i64
+	Value Expr
+	Alias ?Identifier
+}
+
+// GroupingElement is a GROUP BY expression or grouping construct.
+type GroupingElement struct {
+	Pos i64
+	Kind str
+	Value ?Expr
+	Items []GroupingElement
+}
+
+// NamedWindow is one WINDOW clause definition.
+type NamedWindow struct {
+	Pos i64
+	Name Identifier
+	Spec WindowSpec
+}
+
+// SelectCore is a SELECT without set-operation composition.
+type SelectCore struct {
+	Pos i64
+	Distinct str
+	DistinctOn []Expr
+	Targets []TargetEntry
+	From []FromItem
+	Where ?Expr
+	GroupBy []GroupingElement
+	Having ?Expr
+	Windows []NamedWindow
+}
+
+// QueryBody is a SELECT core, VALUES source, or set operation.
+type QueryBody enum {
+	Core(SelectCore)
+	Values(ValuesQuery)
+	Set(SetOperation)
+}
+
+// SetOperation combines query bodies with UNION, INTERSECT, or EXCEPT.
+type SetOperation struct {
+	Pos i64
+	Left QueryBody
+	Op str
+	All bool
+	Right QueryBody
+}
+
+// ValuesQuery is a VALUES row source.
+type ValuesQuery struct {
+	Pos i64
+	Rows [][]Expr
+}
+
+// LockingClause represents SELECT FOR UPDATE/SHARE locking.
+type LockingClause struct {
+	Pos i64
+	Strength str
+	Of []QualifiedName
+	Wait str
+}
+
+// SelectStmt is a complete SELECT-family statement.
+type SelectStmt struct {
+	Pos i64
+	With ?WithClause
+	Body QueryBody
+	OrderBy []SortBy
+	Limit ?Expr
+	Offset ?Expr
+	Fetch str
+	FetchCount ?Expr
+	Locking []LockingClause
+}
+
+// AliasClause stores a relation alias and optional column aliases.
+type AliasClause struct {
+	Pos i64
+	Name Identifier
+	Columns []Identifier
+}
+
+// JoinCondition is an ON expression or USING column list.
+type OnCondition struct {
+	Pos i64
+	Value Expr
+}
+
+// UsingCondition stores the columns named by a USING clause.
+type UsingCondition struct {
+	Pos i64
+	Columns []Identifier
+}
+
+// JoinCondition is an ON expression or USING column list.
+type JoinCondition enum {
+	On(OnCondition)
+	Using(UsingCondition)
+}
+
+// TableRef is a named relation in FROM.
+type TableRef struct {
+	Pos i64
+	Name QualifiedName
+	Alias ?AliasClause
+}
+
+// SubqueryRef is a parenthesized query in FROM.
+type SubqueryRef struct {
+	Pos i64
+	Query SelectStmt
+	Alias ?AliasClause
+	Lateral bool
+}
+
+// ValuesRef is a VALUES source in FROM.
+type ValuesRef struct {
+	Pos i64
+	Values ValuesQuery
+	Alias ?AliasClause
+	Lateral bool
+}
+
+// FunctionRef is a function source in FROM.
+type FunctionRef struct {
+	Pos i64
+	Function Expr
+	Columns []Identifier
+	Alias ?AliasClause
+	Lateral bool
+	WithOrdinality bool
+}
+
+// JoinExpr is a joined FROM item.
+type JoinExpr struct {
+	Pos i64
+	Left FromItem
+	Right FromItem
+	JoinType str
+	Natural bool
+	Condition ?JoinCondition
+	Alias ?AliasClause
+}
+
+// FromItem is one relation, derived table, function, VALUES, or join.
+type FromItem enum {
+	Table(TableRef)
+	Subquery(SubqueryRef)
+	Values(ValuesRef)
+	Function(FunctionRef)
+	Join(JoinExpr)
+}
+
+// Assignment is one UPDATE or ON CONFLICT SET item.
+type Assignment struct {
+	Pos i64
+	Columns []Identifier
+	Value Expr
+}
+
+// InsertSource is VALUES, DEFAULT VALUES, or a query source.
+type DefaultValuesSource struct {
+	Pos i64
+}
+
+// InsertSource is VALUES, DEFAULT VALUES, or a query source.
+type InsertSource enum {
+	Values(ValuesQuery)
+	DefaultValues(DefaultValuesSource)
+	Query(SelectStmt)
+}
+
+// ConflictTarget stores ON CONFLICT inference or a named constraint.
+type ConflictTarget struct {
+	Pos i64
+	Columns []Expr
+	Where ?Expr
+	Constraint ?Identifier
+}
+
+// ConflictAction stores DO NOTHING or DO UPDATE details.
+type ConflictAction struct {
+	Pos i64
+	Kind str
+	Assignments []Assignment
+	Where ?Expr
+}
+
+// OnConflictClause is an INSERT conflict clause.
+type OnConflictClause struct {
+	Pos i64
+	Target ?ConflictTarget
+	Action ConflictAction
+}
+
+// InsertStmt stores an INSERT command and RETURNING targets.
+type InsertStmt struct {
+	Pos i64
+	With ?WithClause
+	Orientation str
+	Table QualifiedName
+	Columns []Identifier
+	Overriding str
+	Source InsertSource
+	Conflict ?OnConflictClause
+	Returning []TargetEntry
+}
+
+// UpdateStmt stores an UPDATE command.
+type UpdateStmt struct {
+	Pos i64
+	With ?WithClause
+	Table QualifiedName
+	Alias ?AliasClause
+	Assignments []Assignment
+	From []FromItem
+	Where ?Expr
+	WhereCurrentOf ?Identifier
+	Returning []TargetEntry
+}
+
+// DeleteStmt stores a DELETE command.
+type DeleteStmt struct {
+	Pos i64
+	With ?WithClause
+	Table QualifiedName
+	Alias ?AliasClause
+	Using []FromItem
+	Where ?Expr
+	WhereCurrentOf ?Identifier
+	Returning []TargetEntry
+}
+
+// TableElement is a column definition or table constraint.
+type TableElement enum {
+	Column(ColumnDef)
+	Constraint(TableConstraint)
+}
+
+// ColumnDef stores a column name, type, and column-level attributes.
+type ColumnDef struct {
+	Pos i64
+	Name Identifier
+	TypeName TypeName
+	Default ?Expr
+	Nullability str
+	Collation ?QualifiedName
+	Constraints []TableConstraint
+	Generated str
+	GeneratedExpr ?Expr
+	Identity str
+}
+
+// ReferenceAction stores a foreign-key action.
+type ReferenceAction struct {
+	Pos i64
+	Event str
+	Action str
+}
+
+// TableConstraint stores primary, unique, check, foreign-key, or exclusion rules.
+type TableConstraint struct {
+	Pos i64
+	Name ?Identifier
+	Kind str
+	Columns []Identifier
+	Expressions []Expr
+	Deferrable str
+	Initially str
+	References ?QualifiedName
+	ReferenceColumns []Identifier
+	ReferenceActions []ReferenceAction
+	MatchType str
+	Include []Identifier
+	Where ?Expr
+}
+
+// LikeClause stores CREATE TABLE LIKE options.
+type LikeClause struct {
+	Pos i64
+	Table QualifiedName
+	Options []str
+}
+
+// PartitionBy stores a PARTITION BY method and key expressions.
+type PartitionBy struct {
+	Pos i64
+	Method str
+	Keys []Expr
+}
+
+// CreateTableStmt stores CREATE TABLE and CREATE TABLE AS.
+type CreateTableStmt struct {
+	Pos i64
+	Temporary str
+	IfNotExists bool
+	Table QualifiedName
+	Elements []TableElement
+	Like []LikeClause
+	Inherits []QualifiedName
+	PartitionBy ?PartitionBy
+	AsQuery ?SelectStmt
+	WithData bool
+}
+
+// AlterTableCommand is one ALTER TABLE action.
+type AlterTableCommand struct {
+	Pos i64
+	Kind str
+	Name ?Identifier
+	NewName ?Identifier
+	Column ?ColumnDef
+	Constraint ?TableConstraint
+	TypeName ?TypeName
+	Expression ?Expr
+	Behavior str
+}
+
+// AlterTableStmt stores a list of ALTER TABLE actions.
+type AlterTableStmt struct {
+	Pos i64
+	IfExists bool
+	Table QualifiedName
+	Commands []AlterTableCommand
+	Behavior str
+}
+
+// DropStmt stores DROP object commands, including multi-name forms.
+type DropStmt struct {
+	Pos i64
+	ObjectType str
+	IfExists bool
+	Names []QualifiedName
+	Arguments [][]TypeName
+	Behavior str
+}
+
+// IndexElement is one index key, either a column or expression.
+type IndexElement struct {
+	Pos i64
+	Name ?Identifier
+	Expression ?Expr
+	Opclass ?QualifiedName
+	Direction str
+	Nulls str
+}
+
+// CreateIndexStmt stores CREATE INDEX options and keys.
+type CreateIndexStmt struct {
+	Pos i64
+	Unique bool
+	Concurrently bool
+	IfNotExists bool
+	Name ?QualifiedName
+	Table QualifiedName
+	Method str
+	Keys []IndexElement
+	Include []IndexElement
+	Where ?Expr
+}
+
+// CreateViewStmt stores CREATE VIEW query and check-option settings.
+type CreateViewStmt struct {
+	Pos i64
+	OrReplace bool
+	Temporary str
+	IfNotExists bool
+	Name QualifiedName
+	Columns []Identifier
+	Query SelectStmt
+	CheckOption str
+}
+
+// SequenceOption stores one CREATE/ALTER SEQUENCE option.
+type SequenceOption struct {
+	Pos i64
+	Name str
+	Value ?Expr
+}
+
+// CreateSequenceStmt stores CREATE SEQUENCE options.
+type CreateSequenceStmt struct {
+	Pos i64
+	Temporary bool
+	IfNotExists bool
+	Name QualifiedName
+	Options []SequenceOption
+}
+
+// AlterSequenceStmt stores ALTER SEQUENCE options.
+type AlterSequenceStmt struct {
+	Pos i64
+	IfExists bool
+	Name QualifiedName
+	Options []SequenceOption
+}
+
+// CreateSchemaStmt stores a CREATE SCHEMA command.
+type CreateSchemaStmt struct {
+	Pos i64
+	IfNotExists bool
+	Name Identifier
+	Authorization ?Identifier
+}
+
+// CompositeAttribute is one attribute of a composite type.
+type CompositeAttribute struct {
+	Pos i64
+	Name Identifier
+	TypeName TypeName
+	Collation ?QualifiedName
+}
+
+// CreateTypeStmt stores enum and composite type definitions.
+type CreateTypeStmt struct {
+	Pos i64
+	Name QualifiedName
+	Kind str
+	Labels []str
+	Attributes []CompositeAttribute
+}
+
+// FunctionParameter is one CREATE FUNCTION parameter.
+type FunctionParameter struct {
+	Pos i64
+	Name ?Identifier
+	Mode str
+	TypeName TypeName
+	Default ?Expr
+}
+
+// FunctionOption is one CREATE FUNCTION option.
+type FunctionOption struct {
+	Pos i64
+	Name str
+	Value str
+}
+
+// CreateFunctionStmt stores function signature, body, language, and options.
+type CreateFunctionStmt struct {
+	Pos i64
+	OrReplace bool
+	Name QualifiedName
+	Parameters []FunctionParameter
+	Returns ?TypeName
+	ReturnSet bool
+	Options []FunctionOption
+	Body str
+	Language str
+}
+
+// TruncateStmt stores a TRUNCATE command.
+type TruncateStmt struct {
+	Pos i64
+	Tables []QualifiedName
+	RestartIdentity str
+	Behavior str
+}
+
+// TransactionMode is one BEGIN/START TRANSACTION mode.
+type TransactionMode struct {
+	Pos i64
+	Kind str
+	Value str
+}
+
+// TransactionStmt stores transaction control commands.
+type TransactionStmt struct {
+	Pos i64
+	Kind str
+	Name ?Identifier
+	Chain bool
+	Modes []TransactionMode
+}
+
+// VariableSetStmt represents SET, RESET, or SHOW.
+type VariableSetStmt struct {
+	Pos i64
+	Kind str
+	Scope str
+	Name str
+	Values []Expr
+	Default bool
+	Local bool
+}
+
+// ExplainOption is one EXPLAIN option and optional value.
+type ExplainOption struct {
+	Pos i64
+	Name str
+	Value ?Expr
+}
+
+// ExplainStmt stores EXPLAIN options and a nested statement.
+type ExplainStmt struct {
+	Pos i64
+	Options []ExplainOption
+	Statement Stmt
+}
+
+// CopyOption stores COPY option values.
+type CopyOption struct {
+	Pos i64
+	Name str
+	Values []str
+}
+
+// CopyStmt represents COPY table/query TO or FROM a source.
+type CopyStmt struct {
+	Pos i64
+	Table ?QualifiedName
+	Query ?SelectStmt
+	Columns []Identifier
+	Direction str
+	Source str
+	Filename ?str
+	Program bool
+	Options []CopyOption
+}
+
+// PrepareStmt stores a prepared statement definition.
+type PrepareStmt struct {
+	Pos i64
+	Name Identifier
+	ParameterTypes []TypeName
+	Statement Stmt
+}
+
+// ExecuteStmt stores EXECUTE and its parameter expressions.
+type ExecuteStmt struct {
+	Pos i64
+	Name Identifier
+	Parameters []Expr
+}
+
+// DeallocateStmt stores DEALLOCATE [PREPARE] name or ALL.
+type DeallocateStmt struct {
+	Pos i64
+	Name ?Identifier
+	All bool
+}
+
+// VacuumStmt stores VACUUM options and optional relation/column targets.
+type VacuumStmt struct {
+	Pos i64
+	Full bool
+	Freeze bool
+	Verbose bool
+	Analyze bool
+	DisablePageSkipping bool
+	Parallel ?Expr
+	Table ?QualifiedName
+	Columns []Identifier
+}
+
+// AnalyzeStmt stores ANALYZE and optional relation/column targets.
+type AnalyzeStmt struct {
+	Pos i64
+	Verbose bool
+	Table ?QualifiedName
+	Columns []Identifier
+}
+
+// DiscardStmt stores DISCARD ALL, PLANS, or TEMP.
+type DiscardStmt struct {
+	Pos i64
+	Target str
+}
+
+// CommentStmt stores COMMENT ON object IS text.
+type CommentStmt struct {
+	Pos i64
+	ObjectType str
+	Name QualifiedName
+	Text ?str
+}
+
+// GrantStmt stores GRANT privileges and recipients.
+type GrantStmt struct {
+	Pos i64
+	Privileges []str
+	ObjectType str
+	Objects []QualifiedName
+	Roles []Identifier
+	GrantOption bool
+}
+
+// RevokeStmt stores REVOKE privileges and recipients.
+type RevokeStmt struct {
+	Pos i64
+	GrantOptionFor bool
+	Privileges []str
+	ObjectType str
+	Objects []QualifiedName
+	Roles []Identifier
+	Behavior str
+}
+
+// RoleOption stores one CREATE/ALTER ROLE option.
+type RoleOption struct {
+	Pos i64
+	Name str
+	Value ?Expr
+}
+
+// CreateRoleStmt stores CREATE ROLE or CREATE USER options.
+type CreateRoleStmt struct {
+	Pos i64
+	Name Identifier
+	Options []RoleOption
+}
+
+// AlterRoleStmt stores ALTER ROLE options.
+type AlterRoleStmt struct {
+	Pos i64
+	Name Identifier
+	Database ?Identifier
+	Options []RoleOption
+}
+
+// DropRoleStmt stores DROP ROLE/USER names and behavior.
+type DropRoleStmt struct {
+	Pos i64
+	IfExists bool
+	Roles []Identifier
+	Behavior str
+}
+
+// ListenStmt subscribes to a notification channel.
+type ListenStmt struct {
+	Pos i64
+	Channel Identifier
+}
+
+// NotifyStmt sends a payload to a notification channel.
+type NotifyStmt struct {
+	Pos i64
+	Channel Identifier
+	Payload ?str
+}
+
+// UnlistenStmt removes one or all notification subscriptions.
+type UnlistenStmt struct {
+	Pos i64
+	Channel ?Identifier
+	All bool
+}
+
+// LockStmt stores LOCK TABLE relations and lock mode.
+type LockStmt struct {
+	Pos i64
+	Tables []QualifiedName
+	Mode str
+	Wait str
+}
+
+// DoStmt stores a procedural DO body and language.
+type DoStmt struct {
+	Pos i64
+	Body str
+	Language str
+}
+
+// CheckpointStmt represents CHECKPOINT.
+type CheckpointStmt struct {
+	Pos i64
+}
+
+// CallStmt stores a procedure call.
+type CallStmt struct {
+	Pos i64
+	Name QualifiedName
+	Arguments []FunctionArgument
+}
+
