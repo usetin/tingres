@@ -1,0 +1,767 @@
+package exec
+
+import "../catalog"
+import "../txn"
+import "../types"
+import "../parse"
+import "atomic"
+import "mint"
+import "twine"
+import "fault"
+
+// Session holds connection-scoped execution state.
+type Session struct {
+	Catalog catalog.Catalog
+	Manager txn.Manager
+	User str
+	Database str
+	state TxnState
+	currentTxn ?txn.Txn
+	savepoints []Savepoint
+	gucs map[str]GucEntry
+	localGucs []LocalGucChange
+	implicitGucs []LocalGucChange
+	canceled atomic.Bool
+}
+
+// NewSession creates an execution session with default GUC parameters.
+fn NewSession(c catalog.Catalog, m txn.Manager, user str, db str) Session {
+	return Session{
+		Catalog: c,
+		Manager: m,
+		User: user,
+		Database: db,
+		state: TxnState.Idle,
+		currentTxn: nil,
+		savepoints: []Savepoint{},
+		gucs: initGucTable(user),
+		localGucs: []LocalGucChange{},
+		implicitGucs: []LocalGucChange{},
+		canceled: atomic.NewBool(false),
+	}
+}
+
+// State returns the session transaction block state.
+fn (s Session) State() TxnState {
+	return s.state
+}
+
+// StatusChar returns the ReadyForQuery status byte for the session.
+fn (s Session) StatusChar() u8 {
+	return s.state.StatusChar()
+}
+
+// Cancel sets the cancel flag for this session. Safe from another lane.
+fn (s Session) Cancel() {
+	s.canceled.Store(true)
+}
+
+// ResetCancel clears the session cancel flag.
+fn (s Session) ResetCancel() {
+	s.canceled.Store(false)
+}
+
+// IsCanceled returns whether Cancel was requested.
+fn (s Session) IsCanceled() bool {
+	return s.canceled.Load()
+}
+
+// Simple executes every statement in sql, reporting results to out.
+fn (s mut Session) Simple(sql str, out mut dyn Sink) ! {
+	if s.canceled.Load() {
+		try types.ErrorFault(types.NewPgError("57014", "canceling statement due to user request", "", "", 0))
+	}
+	let stmts = splitSimpleQuery(sql)
+	if len(stmts) == 0 {
+		return
+	}
+
+	// Check if this simple query has explicit transaction control statements
+	mut hasExplicitTxn = false
+	for stmtSql in stmts {
+		let trimmed = twine.TrimSpace(stmtSql)
+		if isTxnStart(trimmed) || isTxnEnd(trimmed) {
+			hasExplicitTxn = true
+			break
+		}
+	}
+
+	// Implicit transaction wrapping if currently Idle and no explicit transaction block commands
+	if s.state == TxnState.Idle && !hasExplicitTxn {
+		mut t = try s.Manager.Begin(s.defaultIsolation())
+		s.currentTxn = t
+		mut hasErr = false
+		mut errPayload = types.PgError{}
+		for stmtSql in stmts {
+			if s.canceled.Load() {
+				s.Manager.Abort(mut t) catch _ {}
+				s.currentTxn = nil
+				s.rollbackLocalGucs()
+				try types.ErrorFault(types.NewPgError("57014", "canceling statement due to user request", "", "", 0))
+			}
+			s.executeSingle(stmtSql, mut out) catch err {
+				hasErr = true
+				errPayload = types.ErrorFromFault(err)
+				break
+			}
+		}
+		if hasErr {
+			s.Manager.Abort(mut t) catch _ {}
+			s.currentTxn = nil
+			s.rollbackLocalGucs()
+			s.rollbackImplicitGucs()
+			try types.ErrorFault(errPayload)
+		}
+		try s.Manager.Commit(mut t)
+		s.currentTxn = nil
+		s.rollbackLocalGucs()
+		s.implicitGucs = []LocalGucChange{}
+		return
+	}
+
+	// Explicit transaction mode or already in transaction / aborted
+	for stmtSql in stmts {
+		if s.canceled.Load() {
+			if s.state == TxnState.InTxn {
+				s.state = TxnState.Aborted
+			}
+			try types.ErrorFault(types.NewPgError("57014", "canceling statement due to user request", "", "", 0))
+		}
+		s.executeSingle(stmtSql, mut out) catch err {
+			if s.state == TxnState.InTxn {
+				s.state = TxnState.Aborted
+			}
+			fail err
+		}
+	}
+}
+
+fn (s mut Session) executeSingle(sql str, out mut dyn Sink) ! {
+	let trimmed = twine.TrimSpace(sql)
+	if trimmed == "" {
+		return
+	}
+
+	// Check for GUC statements: SET, RESET, SHOW
+	let handledGuc = try s.executeGucStatement(trimmed, mut out)
+	if handledGuc {
+		return
+	}
+
+	// Parse with parse package
+	let parseResult = parse.Parse(trimmed) catch err {
+		let (posVal, hasPos) = parse.ErrorPos(err)
+		mut pos = i32(0)
+		if hasPos { pos = i32(posVal) }
+		let code = parse.ErrorCode(err)
+		let rawMsg = fault.Message(err)
+		try types.ErrorFault(types.NewPgError(code, rawMsg, "", "", pos))
+		return
+	}
+
+	for astStmt in parseResult {
+		try s.executeAst(astStmt, mut out)
+	}
+}
+
+fn (s mut Session) executeAst(stmt parse.Stmt, out mut dyn Sink) ! {
+	match stmt {
+		Transaction(t) => {
+			try s.executeTransaction(t, mut out)
+		}
+		VariableSet(v) => {
+			try s.executeVariableSetAst(v, mut out)
+		}
+		Checkpoint => {
+			if s.state == TxnState.Aborted {
+				try s.abortedError()
+			}
+			out.CommandComplete("CHECKPOINT")
+		}
+		_ => {
+			if s.state == TxnState.Aborted {
+				try s.abortedError()
+			}
+			// Plan and execute other statements once plan nodes land
+			out.CommandComplete("OK")
+		}
+	}
+}
+
+fn (s mut Session) executeTransaction(t parse.TransactionStmt, out mut dyn Sink) ! {
+	match t.Kind {
+		"begin", "start" => {
+			if s.state == TxnState.InTxn {
+				out.Notice(Notice{Message: "there is already a transaction in progress", Code: "25001", Detail: "", Hint: ""})
+				out.CommandComplete("BEGIN")
+				return
+			}
+			if s.state == TxnState.Aborted {
+				try s.abortedError()
+			}
+			mut iso = s.defaultIsolation()
+			for mode in t.Modes {
+				if mode.Kind == "isolation level" {
+					iso = parseIsolation(mode.Value)
+				}
+			}
+			mut txnObj = try s.Manager.Begin(iso)
+			s.currentTxn = txnObj
+			s.state = TxnState.InTxn
+			s.savepoints = []Savepoint{}
+			out.CommandComplete("BEGIN")
+		}
+		"commit" => {
+			if s.state == TxnState.Idle {
+				out.Notice(Notice{Message: "there is no transaction in progress", Code: "25P01", Detail: "", Hint: ""})
+				out.CommandComplete("COMMIT")
+				return
+			}
+			if s.state == TxnState.Aborted {
+				if let txnObj = s.currentTxn {
+					mut tObj = txnObj
+					s.Manager.Abort(mut tObj) catch _ {}
+				}
+				s.currentTxn = nil
+				s.state = TxnState.Idle
+				s.savepoints = []Savepoint{}
+				s.rollbackLocalGucs()
+				out.Notice(Notice{Message: "there is no transaction in progress", Code: "25P01", Detail: "", Hint: ""})
+				out.CommandComplete("ROLLBACK")
+				return
+			}
+			if let txnObj = s.currentTxn {
+				mut tObj = txnObj
+				try s.Manager.Commit(mut tObj)
+			}
+			s.currentTxn = nil
+			s.state = TxnState.Idle
+			s.savepoints = []Savepoint{}
+			s.rollbackLocalGucs()
+			out.CommandComplete("COMMIT")
+		}
+		"rollback" => {
+			if s.state == TxnState.Idle {
+				out.Notice(Notice{Message: "there is no transaction in progress", Code: "25P01", Detail: "", Hint: ""})
+				out.CommandComplete("ROLLBACK")
+				return
+			}
+			if let txnObj = s.currentTxn {
+				mut tObj = txnObj
+				s.Manager.Abort(mut tObj) catch _ {}
+			}
+			s.currentTxn = nil
+			s.state = TxnState.Idle
+			s.savepoints = []Savepoint{}
+			s.rollbackLocalGucs()
+			out.CommandComplete("ROLLBACK")
+		}
+		"savepoint" => {
+			if s.state == TxnState.Idle {
+				try types.ErrorFault(types.NewPgError("25P01", "SAVEPOINT can only be used in transaction blocks", "", "", 0))
+			}
+			if s.state == TxnState.Aborted {
+				try s.abortedError()
+			}
+			mut name = ""
+			if let id = t.Name {
+				name = id.Name
+			}
+			if name == "" {
+				try types.ErrorFault(types.NewPgError("42601", "syntax error at or near \"SAVEPOINT\"", "", "", 0))
+			}
+			mut cid = u32(0)
+			if let txnObj = s.currentTxn {
+				cid = txnObj.CommandID()
+			}
+			s.savepoints = append(s.savepoints, Savepoint{Name: name, Cid: cid, LocalGucCount: len(s.localGucs)})
+			out.CommandComplete("SAVEPOINT")
+		}
+		"rollback to" => {
+			if s.state == TxnState.Idle {
+				try types.ErrorFault(types.NewPgError("25P01", "ROLLBACK TO SAVEPOINT can only be used in transaction blocks", "", "", 0))
+			}
+			mut name = ""
+			if let id = t.Name {
+				name = id.Name
+			}
+			let idx = s.findSavepoint(name)
+			if idx < 0 {
+				try types.ErrorFault(types.NewPgError("3E000", "savepoint \"{name}\" does not exist", "", "", 0))
+			}
+			let sp = s.savepoints[idx]
+			s.rollbackLocalGucsTo(sp.LocalGucCount)
+			s.savepoints = s.savepoints[:idx+1]
+			s.state = TxnState.InTxn
+			out.CommandComplete("ROLLBACK")
+		}
+		"release" => {
+			if s.state == TxnState.Idle {
+				try types.ErrorFault(types.NewPgError("25P01", "RELEASE SAVEPOINT can only be used in transaction blocks", "", "", 0))
+			}
+			if s.state == TxnState.Aborted {
+				try s.abortedError()
+			}
+			mut name = ""
+			if let id = t.Name {
+				name = id.Name
+			}
+			let idx = s.findSavepoint(name)
+			if idx < 0 {
+				try types.ErrorFault(types.NewPgError("3E000", "savepoint \"{name}\" does not exist", "", "", 0))
+			}
+			s.savepoints = s.savepoints[:idx]
+			out.CommandComplete("RELEASE")
+		}
+		_ => {
+			out.CommandComplete("OK")
+		}
+	}
+}
+
+fn (s mut Session) executeGucStatement(sql str, out mut dyn Sink) !bool {
+	let lower = twine.ToLower(sql)
+	if twine.HasPrefix(lower, "set ") {
+		if s.state == TxnState.Aborted {
+			try s.abortedError()
+		}
+		try s.executeSetString(sql[4:])
+		out.CommandComplete("SET")
+		return true
+	}
+	if twine.HasPrefix(lower, "reset ") {
+		if s.state == TxnState.Aborted {
+			try s.abortedError()
+		}
+		try s.executeResetString(sql[6:])
+		out.CommandComplete("RESET")
+		return true
+	}
+	if twine.HasPrefix(lower, "show ") {
+		if s.state == TxnState.Aborted {
+			try s.abortedError()
+		}
+		try s.executeShowString(sql[5:], mut out)
+		out.CommandComplete("SHOW")
+		return true
+	}
+	return false
+}
+
+fn (s mut Session) executeSetString(params str) ! {
+	mut sParams = twine.TrimSpace(params)
+	let lower = twine.ToLower(sParams)
+	mut isLocal = false
+	if twine.HasPrefix(lower, "local ") {
+		isLocal = true
+		sParams = twine.TrimSpace(sParams[6:])
+	} else if twine.HasPrefix(lower, "session ") {
+		sParams = twine.TrimSpace(sParams[8:])
+	}
+
+	// Look for '=' or 'to'
+	mut name = ""
+	mut val = ""
+	let eqIdx = twine.IndexByte(sParams, 61) // '=' is 61
+	if eqIdx >= 0 {
+		name = twine.TrimSpace(sParams[:eqIdx])
+		val = twine.TrimSpace(sParams[eqIdx+1:])
+	} else {
+		let lParams = twine.ToLower(sParams)
+		let idx = twine.Index(lParams, " to ")
+		if idx >= 0 {
+			name = twine.TrimSpace(sParams[:idx])
+			val = twine.TrimSpace(sParams[idx+4:])
+		} else {
+			let spaceIdx = twine.IndexByte(sParams, 32)
+			if spaceIdx >= 0 {
+				name = twine.TrimSpace(sParams[:spaceIdx])
+				val = twine.TrimSpace(sParams[spaceIdx+1:])
+			} else {
+				try types.ErrorFault(types.NewPgError("42601", "syntax error in SET statement", "", "", 0))
+			}
+		}
+	}
+
+	try s.SetGuc(name, val, isLocal)
+}
+
+fn (s mut Session) executeResetString(params str) ! {
+	let trimmed = twine.TrimSpace(params)
+	let lower = twine.ToLower(trimmed)
+	if lower == "all" {
+		try s.ResetAllGucs()
+		return
+	}
+	try s.ResetGuc(trimmed)
+}
+
+fn (s mut Session) executeShowString(params str, out mut dyn Sink) ! {
+	let trimmed = twine.TrimSpace(params)
+	let lower = twine.ToLower(trimmed)
+	if lower == "all" {
+		try s.ShowAllGucs(mut out)
+		return
+	}
+	try s.ShowGuc(trimmed, mut out)
+}
+
+fn (s mut Session) executeVariableSetAst(v parse.VariableSetStmt, out mut dyn Sink) ! {
+	if s.state == TxnState.Aborted {
+		try s.abortedError()
+	}
+	match v.Kind {
+		"set" => {
+			mut val = ""
+			if len(v.Values) > 0 {
+				val = exprToString(v.Values[0])
+			}
+			try s.SetGuc(v.Name, val, v.Local)
+			out.CommandComplete("SET")
+		}
+		"reset" => {
+			if v.Name == "all" || v.Default {
+				try s.ResetAllGucs()
+			} else {
+				try s.ResetGuc(v.Name)
+			}
+			out.CommandComplete("RESET")
+		}
+		"show" => {
+			if v.Name == "all" {
+				try s.ShowAllGucs(mut out)
+			} else {
+				try s.ShowGuc(v.Name, mut out)
+			}
+			out.CommandComplete("SHOW")
+		}
+		_ => {}
+	}
+}
+
+// SetGuc sets a parameter value, optionally marking it transaction-local.
+fn (s mut Session) SetGuc(name str, val str, local bool) ! {
+	let (canon, validated) = try ValidateGuc(name, val)
+	let (existing, ok) = s.gucs[canon]
+	if ok && existing.ReadOnly {
+		try types.ErrorFault(types.NewPgError("55P02", "parameter \"{existing.Name}\" cannot be changed", "", "", 0))
+	}
+	if local || s.state == TxnState.InTxn {
+		let oldVal = match ok { true => existing.Value _ => "" }
+		s.localGucs = append(s.localGucs, LocalGucChange{Name: canon, OldValue: oldVal})
+	} else if s.currentTxn != nil {
+		let oldVal = match ok { true => existing.Value _ => "" }
+		s.implicitGucs = append(s.implicitGucs, LocalGucChange{Name: canon, OldValue: oldVal})
+	}
+	mut updated = existing
+	updated.Value = validated
+	s.gucs[canon] = updated
+
+	if canon == "search_path" {
+		s.updateCatalogSearchPath(validated)
+	}
+}
+
+// ResetGuc restores a parameter to its default value.
+fn (s mut Session) ResetGuc(name str) ! {
+	let canon = CanonicalGucName(name)
+	let (existing, ok) = s.gucs[canon]
+	if !ok {
+		try types.ErrorFault(types.NewPgError("42704", "unrecognized configuration parameter \"{name}\"", "", "", 0))
+	}
+	if existing.ReadOnly {
+		try types.ErrorFault(types.NewPgError("55P02", "parameter \"{existing.Name}\" cannot be changed", "", "", 0))
+	}
+	if s.state == TxnState.InTxn {
+		s.localGucs = append(s.localGucs, LocalGucChange{Name: canon, OldValue: existing.Value})
+	} else if s.currentTxn != nil {
+		s.implicitGucs = append(s.implicitGucs, LocalGucChange{Name: canon, OldValue: existing.Value})
+	}
+	mut updated = existing
+	updated.Value = existing.DefaultValue
+	s.gucs[canon] = updated
+
+	if canon == "search_path" {
+		s.updateCatalogSearchPath(existing.DefaultValue)
+	}
+}
+
+// ResetAllGucs restores all writable parameters to their defaults.
+fn (s mut Session) ResetAllGucs() ! {
+	for name, entry in s.gucs {
+		if !entry.ReadOnly {
+			try s.ResetGuc(name)
+		}
+	}
+}
+
+// GetGuc returns the current value of a parameter.
+fn (s Session) GetGuc(name str) ?str {
+	let canon = CanonicalGucName(name)
+	let (entry, ok) = s.gucs[canon]
+	if ok {
+		return entry.Value
+	}
+	return nil
+}
+
+// Guc returns the current value of a parameter or empty string if not found.
+fn (s Session) Guc(name str) str {
+	let canon = CanonicalGucName(name)
+	let (entry, ok) = s.gucs[canon]
+	if ok {
+		return entry.Value
+	}
+	return ""
+}
+
+// ShowGuc outputs a single parameter setting to out.
+fn (s Session) ShowGuc(name str, out mut dyn Sink) ! {
+	let canon = CanonicalGucName(name)
+	let (entry, ok) = s.gucs[canon]
+	if !ok {
+		try types.ErrorFault(types.NewPgError("42704", "unrecognized configuration parameter \"{name}\"", "", "", 0))
+	}
+	let cols = []ColDesc{ColDesc{Name: entry.Name, Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 1}}
+	out.RowDescription(cols, []i16{0})
+	out.DataRow([]types.Datum{types.FromStr(types.TextOid, entry.Value)})
+}
+
+// ShowAllGucs outputs all configuration parameters to out.
+fn (s Session) ShowAllGucs(out mut dyn Sink) ! {
+	let cols = []ColDesc{
+		ColDesc{Name: "name", Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 1},
+		ColDesc{Name: "setting", Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 2},
+		ColDesc{Name: "description", Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 3},
+	}
+	out.RowDescription(cols, []i16{0, 0, 0})
+	for _, entry in s.gucs {
+		out.DataRow([]types.Datum{
+			types.FromStr(types.TextOid, entry.Name),
+			types.FromStr(types.TextOid, entry.Value),
+			types.FromStr(types.TextOid, entry.Description),
+		})
+	}
+}
+
+// SetConfig sets a configuration parameter via the set_config SQL function.
+fn (s mut Session) SetConfig(name str, val str, isLocal bool) !str {
+	try s.SetGuc(name, val, isLocal)
+	return val
+}
+
+// CurrentSetting retrieves a configuration parameter via current_setting.
+fn (s Session) CurrentSetting(name str, missingOk bool) !str {
+	let val = s.GetGuc(name)
+	if val != nil {
+		return val
+	}
+	if missingOk {
+		return ""
+	}
+	try types.ErrorFault(types.NewPgError("42704", "unrecognized configuration parameter \"{name}\"", "", "", 0))
+	return ""
+}
+
+// ParameterStatusList returns parameters reported upon startup and change.
+fn (s Session) ParameterStatusList() []GucStatus {
+	mut list = []GucStatus{}
+	for _, entry in s.gucs {
+		if entry.Report {
+			list = append(list, GucStatus{Name: entry.Name, Value: entry.Value})
+		}
+	}
+	return list
+}
+
+// Parse prepares an extended-protocol statement skeleton.
+fn (s mut Session) Parse(name str, sql str, paramOids []u32) ! {
+	_ = name
+	_ = sql
+	_ = paramOids
+}
+
+// Bind binds parameters to a prepared portal skeleton.
+fn (s mut Session) Bind(portal str, stmt str, params []types.Datum, resultFormats []i16) ! {
+	_ = portal
+	_ = stmt
+	_ = params
+	_ = resultFormats
+}
+
+// Execute runs a bound portal skeleton.
+fn (s mut Session) Execute(portal str, maxRows i64, out mut dyn Sink) ! {
+	_ = portal
+	_ = maxRows
+	_ = out
+}
+
+// Describe describes a prepared statement or portal skeleton.
+fn (s Session) Describe(kind u8, name str) !Description {
+	_ = kind
+	_ = name
+	return Description{Cols: []ColDesc{}, ParamOids: []u32{}}
+}
+
+// Description holds metadata about a statement or portal.
+type Description struct {
+	Cols []ColDesc
+	ParamOids []u32
+}
+
+fn (s mut Session) rollbackImplicitGucs() {
+	for len(s.implicitGucs) > 0 {
+		let change = s.implicitGucs[len(s.implicitGucs)-1]
+		s.implicitGucs = s.implicitGucs[:len(s.implicitGucs)-1]
+		let (entry, ok) = s.gucs[change.Name]
+		if ok {
+			mut updated = entry
+			updated.Value = change.OldValue
+			s.gucs[change.Name] = updated
+			if change.Name == "search_path" {
+				s.updateCatalogSearchPath(change.OldValue)
+			}
+		}
+	}
+}
+
+fn (s mut Session) rollbackLocalGucs() {
+	s.rollbackLocalGucsTo(0)
+}
+
+fn (s mut Session) rollbackLocalGucsTo(target i64) {
+	for len(s.localGucs) > target {
+		let change = s.localGucs[len(s.localGucs)-1]
+		s.localGucs = s.localGucs[:len(s.localGucs)-1]
+		let (entry, ok) = s.gucs[change.Name]
+		if ok {
+			mut updated = entry
+			updated.Value = change.OldValue
+			s.gucs[change.Name] = updated
+			if change.Name == "search_path" {
+				s.updateCatalogSearchPath(change.OldValue)
+			}
+		}
+	}
+}
+
+fn (s mut Session) updateCatalogSearchPath(pathStr str) {
+	if let txnObj = s.currentTxn {
+		let parts = twine.Split(pathStr, ",")
+		mut schemas = []str{}
+		for p in parts {
+			mut clean = twine.TrimSpace(p)
+			if len(clean) >= 2 && clean[0] == 34 && clean[len(clean)-1] == 34 {
+				clean = clean[1:len(clean)-1]
+			}
+			if clean == "$user" {
+				clean = s.User
+			}
+			if clean != "" {
+				schemas = append(schemas, clean)
+			}
+		}
+		s.Catalog.SetSearchPath(txnObj, schemas)
+	}
+}
+
+fn (s Session) defaultIsolation() txn.Isolation {
+	let (entry, ok) = s.gucs["default_transaction_isolation"]
+	if ok {
+		return parseIsolation(entry.Value)
+	}
+	return txn.Isolation.ReadCommitted
+}
+
+fn parseIsolation(val str) txn.Isolation {
+	let lower = CanonicalGucName(val)
+	if lower == "repeatable read" {
+		return txn.Isolation.RepeatableRead
+	}
+	if lower == "serializable" {
+		return txn.Isolation.Serializable
+	}
+	return txn.Isolation.ReadCommitted
+}
+
+fn (s Session) findSavepoint(name str) i64 {
+	for i in 0..len(s.savepoints) {
+		let idx = len(s.savepoints) - 1 - i
+		if s.savepoints[idx].Name == name {
+			return idx
+		}
+	}
+	return -1
+}
+
+fn (s Session) abortedError() ! {
+	try types.ErrorFault(types.NewPgError("25P02", "current transaction is aborted, commands ignored until end of transaction block", "", "", 0))
+}
+
+fn splitSimpleQuery(sql str) []str {
+	mut stmts = []str{}
+	mut start = 0
+	mut inSingle = false
+	mut inDouble = false
+	mut parens = 0
+	mut i = 0
+
+	for i < len(sql) {
+		let c = sql[i]
+		if !inSingle && !inDouble {
+			if c == 39 {
+				inSingle = true
+			} else if c == 34 {
+				inDouble = true
+			} else if c == '(' {
+				parens += 1
+			} else if c == ')' {
+				if parens > 0 { parens -= 1 }
+			} else if c == ';' && parens == 0 {
+				let s = twine.TrimSpace(sql[start:i])
+				if s != "" {
+					stmts = append(stmts, s)
+				}
+				start = i + 1
+			}
+		} else if inSingle && c == 39 {
+			if i + 1 < len(sql) && sql[i+1] == 39 {
+				i += 1 // skip escaped quote
+			} else {
+				inSingle = false
+			}
+		} else if inDouble && c == 34 {
+			if i + 1 < len(sql) && sql[i+1] == 34 {
+				i += 1
+			} else {
+				inDouble = false
+			}
+		}
+		i += 1
+	}
+
+	if start < len(sql) {
+		let s = twine.TrimSpace(sql[start:])
+		if s != "" {
+			stmts = append(stmts, s)
+		}
+	}
+	return stmts
+}
+
+fn isTxnStart(s str) bool {
+	let lower = twine.ToLower(s)
+	return twine.HasPrefix(lower, "begin") || twine.HasPrefix(lower, "start transaction")
+}
+
+fn isTxnEnd(s str) bool {
+	let lower = twine.ToLower(s)
+	return twine.HasPrefix(lower, "commit") || twine.HasPrefix(lower, "end") || twine.HasPrefix(lower, "rollback") || twine.HasPrefix(lower, "abort")
+}
+
+fn exprToString(expr parse.Expr) str {
+	match expr {
+		Literal(lit) => return lit.Value
+		_ => return ""
+	}
+}
