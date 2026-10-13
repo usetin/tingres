@@ -97,6 +97,7 @@ type HeapRelation struct {
 type Store struct {
 	dir str
 	opts Options
+	files RelationFiles
 	closed bool
 	lastLsn u64
 	relations map[u32]HeapRelation
@@ -135,11 +136,22 @@ fn Open(dir str, opts Options) !Store {
 	try quarry.MkdirAll(dir)
 	let wal = dir + "/wal/00000001.wal"
 	try quarry.MkdirAll(dir + "/wal")
-	let bytes = quarry.ReadFile(wal) catch _ {
+	let hasWal = quarry.Exists(wal)
+	mut bytes = ""
+	if hasWal {
+		bytes = try quarry.ReadFile(wal)
+	} else {
+		if quarry.Exists(dir + "/base") {
+			fail "store: relation files exist without a WAL"
+		}
 		try quarry.WriteFile(wal, "")
-		return Store{dir: dir, opts: opts, relations: map[u32]HeapRelation{}, recordKinds: map[u8]str{}}
 	}
-	mut s = Store{dir: dir, opts: opts, relations: map[u32]HeapRelation{}, recordKinds: map[u8]str{}}
+	try quarry.RemoveAll(dir + "/base")
+	mut files = try NewRelationFiles(dir)
+	mut s = Store{dir: dir, opts: opts, files: files, relations: map[u32]HeapRelation{}, recordKinds: map[u8]str{}}
+	if !hasWal {
+		return s
+	}
 	return try recoverWal(mut s, bytes)
 }
 
@@ -161,67 +173,95 @@ fn (s mut Store) CreateHeap(rel RelId) ! {
 	if exists {
 		fail "store: relation already exists"
 	}
-	s.relations[u32(rel)] = HeapRelation{Tuples: []HeapTuple{}}
 	try s.appendWal(1, rel, Tid{page: 0, slot: 0}, TupleHeader{xmin: 0, xmax: 0, cid: 0, infomask: 0, ctid: Tid{page: 0, slot: 0}}, []u8{})
+	try s.files.Create(rel)
+	s.relations[u32(rel)] = HeapRelation{Tuples: []HeapTuple{}}
 }
 
-// DropRel removes an in-memory relation and records the drop.
+// DropRel records the drop before removing the relation file.
 fn (s mut Store) DropRel(rel RelId) ! {
-	delete(s.relations, u32(rel))
 	try s.appendWal(2, rel, Tid{page: 0, slot: 0}, TupleHeader{xmin: 0, xmax: 0, cid: 0, infomask: 0, ctid: Tid{page: 0, slot: 0}}, []u8{})
+	try s.Sync(s.CurrentLsn())
+	try s.files.Drop(rel)
+	delete(s.relations, u32(rel))
 }
 
 // HeapInsert appends a tuple version and returns its stable TID.
 fn (s mut Store) HeapInsert(x XidCtx, rel RelId, payload []u8) !Tid {
-	if len(payload) > PageSize-pageHeaderSize-32 {
+	if len(payload) > PageSize-pageHeaderSize-linePointerSize-24 {
 		fail "store: tuple too large"
 	}
 	let (r, ok) = s.relations[u32(rel)]
 	if !ok {
 		fail "store: relation does not exist"
 	}
-	let slot = u16(len(r.Tuples)+1)
-	let tid = Tid{page: 0, slot: slot}
+	let (pageNo, page, slot) = try findTuplePage(s.files, rel, 24+len(payload))
+	let tid = Tid{page: pageNo, slot: slot}
 	let h = TupleHeader{xmin: x.xid, xmax: 0, cid: x.cid, infomask: 0, ctid: tid}
 	let tuple = HeapTuple{Header: h, Tid: tid, Payload: copyBytes(payload)}
+	try s.appendWal(3, rel, tid, h, payload)
+	mut p = page
+	let actualSlot = try p.Insert(encodeTupleRecord(h, payload))
+	if actualSlot != slot {
+		fail "store: page line pointer changed during insert"
+	}
+	p.SetLsn(s.lastLsn)
+	try s.files.WritePage(rel, pageNo, p)
 	r.Tuples = append(r.Tuples, tuple)
 	s.relations[u32(rel)] = r
-	try s.appendWal(3, rel, tid, h, payload)
 	return tid
 }
 
 // HeapDelete sets xmax on a tuple version. Visibility is decided by txn.
 fn (s mut Store) HeapDelete(x XidCtx, rel RelId, t Tid) ! {
 	let (r, ok) = s.relations[u32(rel)]
-	if !ok || i64(t.slot) <= 0 || i64(t.slot) > len(r.Tuples) {
+	if !ok {
 		fail "store: invalid tuple id"
 	}
-	let i = i64(t.slot)-1
+	let i = tupleIndex(r.Tuples, t)
+	if i < 0 {
+		fail "store: invalid tuple id"
+	}
 	let old = r.Tuples[i]
 	let h = TupleHeader{xmin: old.Header.xmin, xmax: x.xid, cid: old.Header.cid, infomask: old.Header.infomask, ctid: old.Header.ctid}
+	try s.appendWal(4, rel, t, h, []u8{})
+	try replaceTupleFile(mut s.files, rel, t, h, s.lastLsn)
 	r.Tuples[i].Header = h
 	s.relations[u32(rel)] = r
-	try s.appendWal(4, rel, t, h, []u8{})
 }
 
 // HeapFetch returns the tuple version at TID. The caller may reuse out as scratch.
 fn (s Store) HeapFetch(rel RelId, t Tid, out []u8) !HeapTuple {
 	let (r, ok) = s.relations[u32(rel)]
-	if !ok || i64(t.slot) <= 0 || i64(t.slot) > len(r.Tuples) {
+	if !ok {
 		fail "store: invalid tuple id"
 	}
-	let tuple = r.Tuples[i64(t.slot)-1]
+	let p = try s.files.ReadPage(rel, t.page)
+	let raw = try p.Item(t.slot)
+	let tuple = try decodeTupleRecord(t, raw)
 	_ = out
 	return tuple
 }
 
 // HeapScan returns every tuple version in physical order.
 fn (s Store) HeapScan(rel RelId) HeapScan {
-	let (r, ok) = s.relations[u32(rel)]
+	let (_, ok) = s.relations[u32(rel)]
 	if !ok {
 		return HeapScan{tuples: []HeapTuple{}}
 	}
-	return HeapScan{tuples: r.Tuples}
+	let count = s.files.PageCount(rel) catch _ { 0 }
+	mut tuples = []HeapTuple{}
+	for block in 0..i64(count) {
+		let p = s.files.ReadPage(rel, PageNo(block)) catch _ { continue }
+		let slots = p.Header().Slots
+		for slot in 1..i64(slots)+1 {
+			let tid = Tid{page: PageNo(block), slot: u16(slot)}
+			let raw = p.Item(tid.slot) catch _ { continue }
+			let tuple = decodeTupleRecord(tid, raw) catch _ { continue }
+			tuples = append(tuples, tuple)
+		}
+	}
+	return HeapScan{tuples: tuples}
 }
 
 // Next yields the next tuple and whether one was present.
@@ -237,15 +277,19 @@ fn (scan mut HeapScan) Next() (HeapTuple, bool) {
 // SetHint updates tuple hint bits through a WAL record.
 fn (s mut Store) SetHint(rel RelId, t Tid, bits u16) ! {
 	let (r, ok) = s.relations[u32(rel)]
-	if !ok || i64(t.slot) <= 0 || i64(t.slot) > len(r.Tuples) {
+	if !ok {
 		fail "store: invalid tuple id"
 	}
-	let i = i64(t.slot)-1
+	let i = tupleIndex(r.Tuples, t)
+	if i < 0 {
+		fail "store: invalid tuple id"
+	}
 	let old = r.Tuples[i].Header
 	let h = TupleHeader{xmin: old.xmin, xmax: old.xmax, cid: old.cid, infomask: old.infomask | bits, ctid: old.ctid}
+	try s.appendWal(5, rel, t, h, []u8{})
+	try replaceTupleFile(mut s.files, rel, t, h, s.lastLsn)
 	r.Tuples[i].Header = h
 	s.relations[u32(rel)] = r
-	try s.appendWal(5, rel, t, h, []u8{})
 }
 
 // RegisterRecordKind reserves an extensible kind identifier for a neighbour package.
@@ -355,6 +399,61 @@ fn (s mut Store) appendWal(kind u8, rel RelId, tid Tid, h TupleHeader, payload [
 	}
 }
 
+fn findTuplePage(files RelationFiles, rel RelId, recordSize i64) !(PageNo, Page, u16) {
+	let count = try files.PageCount(rel)
+	for i in 0..i64(count) {
+		let block = PageNo(i)
+		mut p = try files.ReadPage(rel, block)
+		if p.FreeSpace() >= recordSize+linePointerSize {
+			return block, p, p.Header().Slots+1
+		}
+	}
+	return PageNo(count), NewPage(), u16(1)
+}
+
+fn encodeTupleRecord(h TupleHeader, payload []u8) []u8 {
+	mut data = make([]u8, 24+len(payload))
+	writeU32(mut data, 0, h.xmin)
+	writeU32(mut data, 4, h.xmax)
+	writeU32(mut data, 8, h.cid)
+	writeU16(mut data, 12, h.infomask)
+	writeU32(mut data, 14, u32(h.ctid.page))
+	writeU16(mut data, 18, h.ctid.slot)
+	writeU32(mut data, 20, u32(len(payload)))
+	copy(data[24:], payload)
+	return data
+}
+
+fn decodeTupleRecord(t Tid, data []u8) !HeapTuple {
+	if len(data) < 24 {
+		fail "store: invalid tuple record"
+	}
+	let n = i64(readU32(data, 20))
+	if n != len(data)-24 {
+		fail "store: invalid tuple payload length"
+	}
+	let h = TupleHeader{xmin: readU32(data, 0), xmax: readU32(data, 4), cid: readU32(data, 8), infomask: readU16(data, 12), ctid: Tid{page: PageNo(readU32(data, 14)), slot: readU16(data, 18)}}
+	return HeapTuple{Header: h, Tid: t, Payload: copyBytes(data[24:])}
+}
+
+fn replaceTupleFile(files mut RelationFiles, rel RelId, tid Tid, h TupleHeader, lsn u64) ! {
+	mut p = try files.ReadPage(rel, tid.page)
+	let raw = try p.Item(tid.slot)
+	let old = try decodeTupleRecord(tid, raw)
+	try p.SetItem(tid.slot, encodeTupleRecord(h, old.Payload))
+	p.SetLsn(lsn)
+	try files.WritePage(rel, tid.page, p)
+}
+
+fn tupleIndex(tuples []HeapTuple, tid Tid) i64 {
+	for i, tuple in tuples {
+		if tuple.Tid == tid {
+			return i64(i)
+		}
+	}
+	return -1
+}
+
 fn recoverWal(s mut Store, data str) !Store {
 	mut out = s
 	let b = []u8(data)
@@ -374,20 +473,32 @@ fn recoverWal(s mut Store, data str) !Store {
 		let tid = Tid{page: PageNo(readU32(body, 8)), slot: readU16(body, 12)}
 		let h = TupleHeader{xmin: readU32(body, 16), xmax: readU32(body, 20), cid: readU32(body, 24), infomask: readU16(body, 28), ctid: Tid{page: PageNo(readU32(body, 30)), slot: readU16(body, 34)}}
 		if kind == 1 {
+			try out.files.Create(RelId(rel))
 			out.relations[rel] = HeapRelation{Tuples: []HeapTuple{}}
 		} else if kind == 2 {
+			try out.files.Drop(RelId(rel))
 			delete(out.relations, rel)
 		} else if kind == 3 {
 			let (r, ok) = out.relations[rel]
 			if ok {
 				let p = copyBytes(body[36:])
+				let (pageNo, page, slot) = try findTuplePage(out.files, RelId(rel), 24+len(p))
+				if pageNo != tid.page || slot != tid.slot {
+					fail "store: WAL tuple location does not match relation pages"
+				}
+				mut pageCopy = page
+				_ = try pageCopy.Insert(encodeTupleRecord(h, p))
+				pageCopy.SetLsn(u64(off+8+n))
+				try out.files.WritePage(RelId(rel), pageNo, pageCopy)
 				r.Tuples = append(r.Tuples, HeapTuple{Header: h, Tid: tid, Payload: p})
 				out.relations[rel] = r
 			}
 		} else if kind == 4 || kind == 5 {
 			let (r, ok) = out.relations[rel]
-			if ok && i64(tid.slot) > 0 && i64(tid.slot) <= len(r.Tuples) {
-				r.Tuples[i64(tid.slot)-1].Header = h
+			let i = tupleIndex(r.Tuples, tid)
+			if ok && i >= 0 {
+				try replaceTupleFile(mut out.files, RelId(rel), tid, h, u64(off+8+n))
+				r.Tuples[i].Header = h
 				out.relations[rel] = r
 			}
 		}
