@@ -85,6 +85,7 @@ type Conn struct {
 	pid u32
 	secretKey u32
 	closed bool
+	out []u8
 }
 
 type Cursor struct { at i64 }
@@ -131,52 +132,78 @@ fn EncodeFrame(kind u8, payload []u8) []u8 {
 	return packet(kind, payload)
 }
 
-fn (c Conn) send(kind u8, payload []u8) ! {
-	let b = packet(kind, payload)
-	try c.sock.WriteBytes(b)
+fn begin_frame(out mut []u8, kind u8) i64 {
+	let start = len(out)
+	out = append(out, kind, 0, 0, 0, 0)
+	return start
 }
 
-fn (c Conn) auth_message(code i64, body []u8) ! {
-	mut p = []u8{}
-	putbe(mut p, code, 4)
-	p = append(p, body...)
-	try c.send('R', p)
+fn end_frame(out mut []u8, start i64) {
+	let n = len(out) - start - 1
+	out[start+1] = u8(n >> 24)
+	out[start+2] = u8(n >> 16)
+	out[start+3] = u8(n >> 8)
+	out[start+4] = u8(n)
 }
 
-fn (c Conn) auth_ok() ! {
+fn (c mut Conn) send(kind u8, payload []u8) ! {
+	let start = begin_frame(mut c.out, kind)
+	c.out = append(c.out, payload...)
+	end_frame(mut c.out, start)
+}
+
+fn (c mut Conn) flush() ! {
+	if len(c.out) == 0 { return }
+	try c.sock.WriteBytes(c.out)
+	c.out = c.out[:0]
+}
+
+fn (c mut Conn) auth_message(code i64, body []u8) ! {
+	let start = begin_frame(mut c.out, 'R')
+	putbe(mut c.out, code, 4)
+	c.out = append(c.out, body...)
+	end_frame(mut c.out, start)
+	try c.flush()
+}
+
+fn (c mut Conn) auth_ok() ! {
 	try c.auth_message(0, []u8{})
 }
 
-fn (c Conn) parameter(name str, value str) ! {
-	mut p = []u8{}
-	cstr(mut p, name)
-	cstr(mut p, value)
-	try c.send('S', p)
+fn (c mut Conn) parameter(name str, value str) ! {
+	let start = begin_frame(mut c.out, 'S')
+	cstr(mut c.out, name)
+	cstr(mut c.out, value)
+	end_frame(mut c.out, start)
 }
 
-fn (c Conn) ready(status u8) ! {
-	try c.send('Z', []u8{status})
+fn (c mut Conn) ready(status u8) ! {
+	let start = begin_frame(mut c.out, 'Z')
+	c.out = append(c.out, status)
+	end_frame(mut c.out, start)
+	try c.flush()
 }
 
-fn (c Conn) error(fields ErrorFields) ! {
-	mut p = []u8{}
-	error_field(mut p, 'S', fields.Severity)
-	error_field(mut p, 'V', fields.Severity)
-	error_field(mut p, 'C', fields.Code)
-	error_field(mut p, 'M', fields.Message)
-	if fields.Detail != "" { error_field(mut p, 'D', fields.Detail) }
-	if fields.Hint != "" { error_field(mut p, 'H', fields.Hint) }
-	if fields.Position > 0 { error_field(mut p, 'P', mint.Itoa(i64(fields.Position))) }
-	if fields.Where != "" { error_field(mut p, 'W', fields.Where) }
-	if fields.File != "" { error_field(mut p, 'F', fields.File) }
-	if fields.Line != "" { error_field(mut p, 'L', fields.Line) }
-	if fields.Routine != "" { error_field(mut p, 'R', fields.Routine) }
-	p = append(p, 0)
-	try c.send('E', p)
+fn (c mut Conn) error(fields ErrorFields) ! {
+	let start = begin_frame(mut c.out, 'E')
+	error_field(mut c.out, 'S', fields.Severity)
+	error_field(mut c.out, 'V', fields.Severity)
+	error_field(mut c.out, 'C', fields.Code)
+	error_field(mut c.out, 'M', fields.Message)
+	if fields.Detail != "" { error_field(mut c.out, 'D', fields.Detail) }
+	if fields.Hint != "" { error_field(mut c.out, 'H', fields.Hint) }
+	if fields.Position > 0 { error_field(mut c.out, 'P', mint.Itoa(i64(fields.Position))) }
+	if fields.Where != "" { error_field(mut c.out, 'W', fields.Where) }
+	if fields.File != "" { error_field(mut c.out, 'F', fields.File) }
+	if fields.Line != "" { error_field(mut c.out, 'L', fields.Line) }
+	if fields.Routine != "" { error_field(mut c.out, 'R', fields.Routine) }
+	c.out = append(c.out, 0)
+	end_frame(mut c.out, start)
 }
 
-fn bad_request(c Conn, code str, message str) ! {
+fn bad_request(c mut Conn, code str, message str) ! {
 	try c.error(ErrorFields{Severity: "FATAL", Code: code, Message: message})
+	try c.flush()
 }
 
 fn startup_packet(sock wire.Conn) !(i64, []u8) {
@@ -233,7 +260,7 @@ fn scram_attrs(s str) !map[u8]str {
 	return attrs
 }
 
-fn (c Conn) scram(password str) ! {
+fn (c mut Conn) scram(password str) ! {
 	mut offered = []u8{}
 	for i in 0..len("SCRAM-SHA-256") { offered = append(offered, u8("SCRAM-SHA-256"[i])) }
 	offered = append(offered, 0, 0)
@@ -292,7 +319,7 @@ fn (c Conn) scram(password str) ! {
 // Accept performs startup negotiation and authentication on an accepted socket.
 fn Accept(sock wire.Conn, cfg Config) !Conn {
 	let token = seal.RandomBytes(8)
-	let c = Conn{sock: sock, startup: Startup{Parameters: make(map[str]str)}, pid: u32(be(token, 0, 4)), secretKey: u32(be(token, 4, 4))}
+	let c = Conn{sock: sock, startup: Startup{Parameters: make(map[str]str)}, pid: u32(be(token, 0, 4)), secretKey: u32(be(token, 4, 4)), out: make([]u8, 0, 4096)}
 	mut version = i64(0)
 	mut body = []u8{}
 	for {
@@ -310,11 +337,11 @@ fn Accept(sock wire.Conn, cfg Config) !Conn {
 	mut conn = c
 	conn.startup = startup
 	if cfg.User != "" && startup.User != cfg.User {
-		try bad_request(conn, "28000", "role \"{startup.User}\" does not exist")
+		try bad_request(mut conn, "28000", "role \"{startup.User}\" does not exist")
 		fail "proto: configured role mismatch"
 	}
 	if cfg.Database != "" && startup.Database != "" && startup.Database != cfg.Database {
-		try bad_request(conn, "3D000", "database \"{startup.Database}\" does not exist")
+		try bad_request(mut conn, "3D000", "database \"{startup.Database}\" does not exist")
 		fail "proto: configured database mismatch"
 	}
 	let auth = cfg.Auth
@@ -322,13 +349,13 @@ fn Accept(sock wire.Conn, cfg Config) !Conn {
 		try conn.auth_ok()
 	} else if auth == "scram-sha-256" {
 		conn.scram(cfg.Password) catch err {
-			bad_request(conn, "28P01", "password authentication failed") catch _ {
+			bad_request(mut conn, "28P01", "password authentication failed") catch _ {
 			}
 			fail err
 		}
 		try conn.auth_ok()
 	} else {
-		try bad_request(conn, "0A000", "authentication method is not supported")
+		try bad_request(mut conn, "0A000", "authentication method is not supported")
 		fail "proto: unsupported authentication method"
 	}
 	try conn.parameter("server_version", "17.0-tingres")
@@ -343,6 +370,23 @@ fn Accept(sock wire.Conn, cfg Config) !Conn {
 	try conn.send('K', key)
 	try conn.ready('I')
 	return conn
+}
+
+// RejectStartup reads through SSL/GSS negotiation and sends a fatal startup error.
+fn RejectStartup(sock wire.Conn, code str, message str) ! {
+	for {
+		let (version, _) = try startup_packet(sock)
+		if version == sslRequest || version == gssRequest {
+			try sock.Write("N")
+			continue
+		}
+		if version == cancelRequest {
+			return
+		}
+		mut c = Conn{sock: sock, startup: Startup{Parameters: make(map[str]str)}, pid: 0, secretKey: 0, out: make([]u8, 0, 256)}
+		try bad_request(mut c, code, message)
+		return
+	}
 }
 
 fn (c Conn) read_frontend() !Message {
@@ -383,64 +427,86 @@ fn (c Conn) Startup() Startup {
 	return c.startup
 }
 
+// SetTimeout sets the read and write wait limit for this connection.
+fn (c mut Conn) SetTimeout(ns i64) {
+	c.sock.SetTimeout(ns)
+}
+
 // SendError sends a PostgreSQL ErrorResponse.
-fn (c Conn) SendError(fields ErrorFields) ! {
+fn (c mut Conn) SendError(fields ErrorFields) ! {
 	try c.error(fields)
 }
 
 // SendReadyForQuery sends ReadyForQuery with transaction status I, T or E.
-fn (c Conn) SendReadyForQuery(status u8) ! {
+fn (c mut Conn) SendReadyForQuery(status u8) ! {
 	if status != 'I' && status != 'T' && status != 'E' { fail "proto: invalid transaction status" }
 	try c.ready(status)
 }
 
 // SendCommandComplete sends CommandComplete.
-fn (c Conn) SendCommandComplete(tag str) ! {
-	mut p = []u8{}
-	cstr(mut p, tag)
-	try c.send('C', p)
+fn (c mut Conn) SendCommandComplete(tag str) ! {
+	let start = begin_frame(mut c.out, 'C')
+	cstr(mut c.out, tag)
+	end_frame(mut c.out, start)
 }
 
-// SendRowDescription sends a text-format RowDescription.
-fn (c Conn) SendRowDescription(cols []Column) ! {
-	mut p = []u8{}
-	putbe(mut p, len(cols), 2)
+fn encode_row_description(out mut []u8, cols []Column) {
+	let start = begin_frame(mut out, 'T')
+	putbe(mut out, len(cols), 2)
 	for col in cols {
-		cstr(mut p, col.Name)
-		putbe(mut p, i64(col.TableOid), 4)
-		putbe(mut p, i64(col.Attribute), 2)
-		putbe(mut p, i64(col.TypeOid), 4)
-		putbe(mut p, i64(col.TypeSize), 2)
-		putbe(mut p, i64(col.TypeMod), 4)
-		putbe(mut p, i64(col.Format), 2)
+		cstr(mut out, col.Name)
+		putbe(mut out, i64(col.TableOid), 4)
+		putbe(mut out, i64(col.Attribute), 2)
+		putbe(mut out, i64(col.TypeOid), 4)
+		putbe(mut out, i64(col.TypeSize), 2)
+		putbe(mut out, i64(col.TypeMod), 4)
+		putbe(mut out, i64(col.Format), 2)
 	}
-	try c.send('T', p)
+	end_frame(mut out, start)
+}
+
+fn encode_data_row(out mut []u8, cells []Cell) {
+	let start = begin_frame(mut out, 'D')
+	putbe(mut out, len(cells), 2)
+	for cell in cells {
+		if cell.Null {
+			putbe(mut out, -1, 4)
+		} else {
+			putbe(mut out, len(cell.Value), 4)
+			for i in 0..len(cell.Value) { out = append(out, u8(cell.Value[i])) }
+		}
+	}
+	end_frame(mut out, start)
+}
+
+// SendRowDescription sends a text-format RowDescription into the reusable output buffer.
+fn (c mut Conn) SendRowDescription(cols []Column) ! {
+	encode_row_description(mut c.out, cols)
 }
 
 // SendDataRow sends one row in text format; NULL cells use length -1.
-fn (c Conn) SendDataRow(cells []Cell) ! {
-	mut p = []u8{}
-	putbe(mut p, len(cells), 2)
-	for cell in cells {
-		if cell.Null { putbe(mut p, -1, 4) } else { putbe(mut p, len(cell.Value), 4)
-			for i in 0..len(cell.Value) { p = append(p, u8(cell.Value[i])) } }
-	}
-	try c.send('D', p)
+fn (c mut Conn) SendDataRow(cells []Cell) ! {
+	encode_data_row(mut c.out, cells)
 }
 
 // SendEmptyQueryResponse sends EmptyQueryResponse.
-fn (c Conn) SendEmptyQueryResponse() ! {
+fn (c mut Conn) SendEmptyQueryResponse() ! {
 	try c.send('I', []u8{})
 }
 
 // SendParseComplete sends ParseComplete.
-fn (c Conn) SendParseComplete() ! { try c.send('1', []u8{}) }
+fn (c mut Conn) SendParseComplete() ! { try c.send('1', []u8{}) }
 // SendBindComplete sends BindComplete.
-fn (c Conn) SendBindComplete() ! { try c.send('2', []u8{}) }
+fn (c mut Conn) SendBindComplete() ! { try c.send('2', []u8{}) }
 // SendCloseComplete sends CloseComplete.
-fn (c Conn) SendCloseComplete() ! { try c.send('3', []u8{}) }
+fn (c mut Conn) SendCloseComplete() ! { try c.send('3', []u8{}) }
 // SendNoData sends NoData.
-fn (c Conn) SendNoData() ! { try c.send('n', []u8{}) }
+fn (c mut Conn) SendNoData() ! { try c.send('n', []u8{}) }
+
+// Flush writes backend messages buffered since the last ReadyForQuery.
+fn (c mut Conn) Flush() ! {
+	try c.flush()
+}
 
 // Close closes the network connection.
 fn (c mut Conn) Close() {

@@ -2,7 +2,7 @@
 TIN ?= $(HOME)/dev/extra/tin/tin
 BIN := bin/server
 
-.PHONY: all build test check fmt clean client diff
+.PHONY: all build test check fmt clean client diff concurrency
 
 all: build
 
@@ -13,10 +13,11 @@ build:
 check:
 	$(TIN) check main.tin
 
-test:
+test: build
 	$(TIN) test proto
 	$(TIN) test server
 	$(TIN) test tests
+	python3 tests/concurrency.py $(BIN)/tingres
 
 client:
 	mkdir -p $(BIN)
@@ -24,6 +25,9 @@ client:
 
 diff: build client
 	./tests/diff.sh
+
+concurrency: build
+	python3 tests/concurrency.py $(BIN)/tingres
 
 fmt:
 	$(TIN) fmt -w .
