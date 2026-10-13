@@ -17,9 +17,6 @@ fn registerByteaUuidFuncs(funcs mut []Func) {
 	registerFunc(mut funcs, function("substring", []Oid{ByteaOid, Int4Oid, Int4Oid}, ByteaOid, true, false, fn(args []Datum) !Datum { return try byteaSubstring(args[0], args[1].i, args[2].i) }))
 	registerFunc(mut funcs, function("get_byte", []Oid{ByteaOid, Int4Oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try byteaGetByte(args[0], args[1].i) }))
 	registerFunc(mut funcs, function("gen_random_uuid", []Oid{}, UuidOid, false, true, fn(args []Datum) !Datum { return try randomUuid() }))
-	for _, name in []str{"regexp_replace", "regexp_match", "regexp_matches", "regexp_split_to_array"} {
-		registerFunc(mut funcs, function(name, []Oid{TextOid, TextOid, TextOid}, TextOid, true, false, fn(args []Datum) !Datum { fail "regular expression functions are not supported" }))
-	}
 }
 
 fn byteaSubstring(value Datum, start i64, count i64) !Datum {
