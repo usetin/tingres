@@ -2,6 +2,7 @@ package parse
 
 import "crucible"
 import "fault"
+import "quarry"
 
 fn TestLexAndStatements(t mut crucible.T) {
 	let statements = Parse("CREATE TABLE t (id int, name text); INSERT INTO t VALUES (1, 'x'); SELECT id, name FROM t WHERE id = 1 ORDER BY id LIMIT 2; BEGIN; COMMIT") catch err {
@@ -58,15 +59,84 @@ fn TestCorpusFiveHundredStatements(t mut crucible.T) {
 }
 
 fn TestMutationInputsDoNotCrash(t mut crucible.T) {
-	let seeds = []str{"", "SELECT", "SELECT '", "/*", "$x$", "SELECT (((", "SELECT 1 +", "INSERT INTO", "\xff\x00;"}
-	for seed in seeds {
-		for cut in 0..len(seed) + 1 {
-			let input = seed[:cut]
-			let parsed = Parse(input) catch _ { []Stmt{} }
-			if len(parsed) > 99 { t.Error("impossible parser output") }
-		}
+	let seeds = []str{
+		"SELECT 1",
+		"SELECT a, b FROM t WHERE a > 10 ORDER BY b DESC LIMIT 5",
+		"INSERT INTO t (id, a) VALUES (1, 2) ON CONFLICT DO NOTHING",
+		"UPDATE t SET a = 1 WHERE b = 2",
+		"DELETE FROM t WHERE id = 1",
+		"CREATE TABLE t (id int PRIMARY KEY, val text NOT NULL)",
+		"ALTER TABLE t ADD COLUMN c text",
+		"DROP TABLE IF EXISTS t CASCADE",
+		"WITH cte AS (SELECT 1 AS x) SELECT * FROM cte",
+		"SELECT 1 UNION ALL SELECT 2",
+		"SELECT CASE WHEN a = 1 THEN 'x' ELSE 'y' END",
+		"SELECT f(x) OVER (PARTITION BY a ORDER BY b)",
+		"/* comment */ SELECT 1 -- line comment",
+		"SELECT 'string with escapes '' and \\\\'",
+		"SELECT $$dollar$$",
 	}
-	crucible.True("mutated inputs completed", true)
+
+	mut rngState u64 = 0x853c49e6748fea9b
+	let totalIterations = 200_000
+	mut batch = 0
+	mut failCount = 0
+
+	for batch < 200 {
+		arena {
+			for step in 0..1000 {
+				rngState ^= rngState << 13
+				rngState ^= rngState >> 7
+				rngState ^= rngState << 17
+				let op = (rngState >> 32) % 5
+				let seedIdx = i64((rngState >> 40) % u64(len(seeds)))
+				let seed = seeds[seedIdx]
+				mut mutated = ""
+
+				if op == 0 {
+					// 1. Truncation
+					let cut = i64((rngState >> 48) % u64(len(seed) + 1))
+					mutated = seed[:cut]
+				} else if op == 1 {
+					// 2. Byte flip
+					if len(seed) > 0 {
+						let pos = i64((rngState >> 48) % u64(len(seed)))
+						let b = u8((rngState >> 56) & 0xff)
+						mutated = seed[:pos] + str([]u8{b}) + seed[pos + 1:]
+					}
+				} else if op == 2 {
+					// 3. Splicing
+					let seedIdx2 = i64((rngState >> 48) % u64(len(seeds)))
+					let seed2 = seeds[seedIdx2]
+					let p1 = i64((rngState >> 20) % u64(len(seed) + 1))
+					let p2 = i64((rngState >> 26) % u64(len(seed2) + 1))
+					mutated = seed[:p1] + seed2[p2:]
+				} else if op == 3 {
+					// 4. Deep nesting
+					let n = i64((rngState >> 48) % 60)
+					mut pre = ""
+					mut post = ""
+					for j in 0..n { pre += "("
+						post += ")" }
+					mutated = pre + seed + post
+				} else {
+					// 5. Corrupted bytes injection
+					let bad = str([]u8{0x00, 0xff, 0xfe, 0x80, 0x7f})
+					let pos = i64((rngState >> 48) % u64(len(seed) + 1))
+					mutated = seed[:pos] + bad + seed[pos:]
+				}
+
+				let parsed = Parse(mutated) catch _ { []Stmt{} }
+				if len(parsed) > 1000 {
+					failCount += 1
+				}
+			}
+		}
+		batch += 1
+	}
+
+	crucible.EqI("impossible parser output count", failCount, 0)
+	crucible.True("200k mutated inputs completed without crash", true)
 }
 
 fn BenchmarkParse100kSimpleStatements(b mut crucible.B) {
@@ -423,4 +493,166 @@ fn TestAllStatementCoverage(t mut crucible.T) {
 			crucible.EqS("reparsed kind for statement {i}", stmtKind(reparsed[0]), expectedKinds[i])
 		}
 	}
+}
+
+fn TestParseErrorWordingAndCodes(t mut crucible.T) {
+	// 1. Syntax error at end of input
+	let _ = Parse("SELECT 1 +") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code at end of input", pe.Code, "42601")
+		crucible.EqS("msg at end of input", pe.Message, "syntax error at end of input")
+		crucible.EqI("pos at end of input", pe.Pos, 11)
+		[]Stmt{}
+	}
+
+	// 2. Syntax error at or near
+	let _ = Parse("SELECT FROM") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code at or near", pe.Code, "42601")
+		crucible.EqS("msg at or near", pe.Message, "syntax error at or near \"FROM\"")
+		crucible.EqI("pos at or near", pe.Pos, 8)
+		[]Stmt{}
+	}
+
+	// 3. Unterminated quoted string
+	let _ = Parse("SELECT 'unterminated") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code unterminated string", pe.Code, "42601")
+		crucible.True("msg unterminated string", hasText(pe.Message, "unterminated quoted string at or near"))
+		crucible.EqI("pos unterminated string", pe.Pos, 8)
+		[]Stmt{}
+	}
+
+	// 4. Trailing junk after numeric literal
+	let _ = Parse("SELECT 1a") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code trailing junk", pe.Code, "42601")
+		crucible.True("msg trailing junk", hasText(pe.Message, "trailing junk after numeric literal at or near \"1a\""))
+		crucible.EqI("pos trailing junk", pe.Pos, 8)
+		[]Stmt{}
+	}
+
+	// 5. Stack depth limit exceeded
+	mut deepSql = "SELECT "
+	for i in 0..300 { deepSql += "(" }
+	deepSql += "1"
+	for i in 0..300 { deepSql += ")" }
+	let _ = Parse(deepSql) catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code stack depth", pe.Code, "54001")
+		crucible.EqS("msg stack depth", pe.Message, "stack depth limit exceeded")
+		[]Stmt{}
+	}
+}
+
+fn findTestdataFile(name str) str {
+	let candidates = []str{
+		"parse/testdata/" + name,
+		"testdata/" + name,
+		"/Users/mhomsi/dev/extra/tingres-wt/parse/parse/testdata/" + name,
+	}
+	for cand in candidates {
+		let content = quarry.ReadFile(cand) catch _ { "" }
+		if len(content) > 0 { return cand }
+	}
+	return ""
+}
+
+fn TestValidCorpus(t mut crucible.T) {
+	let path = findTestdataFile("valid.sql")
+	crucible.True("found valid.sql", len(path) > 0)
+	let content = quarry.ReadFile(path) catch err {
+		t.Error("failed reading valid.sql: {err}")
+		""
+	}
+	let stmts = Parse(content) catch err {
+		t.Error("failed parsing valid.sql: {err}")
+		[]Stmt{}
+	}
+	crucible.True("valid corpus >= 1500 stmts", len(stmts) >= 1500)
+
+	mut roundtripFailures = 0
+	mut at = 0
+	for at < len(stmts) {
+		let end = min(at + 100, len(stmts))
+		roundtripFailures += checkRoundtripBatch(stmts, at, end)
+		at += 100
+	}
+	crucible.EqI("deparse roundtrip failures", roundtripFailures, 0)
+}
+
+fn TestInvalidCorpus(t mut crucible.T) {
+	let pathSql = findTestdataFile("invalid.sql")
+	crucible.True("found invalid.sql", len(pathSql) > 0)
+	let contentSql = quarry.ReadFile(pathSql) catch err {
+		t.Error("failed reading invalid.sql: {err}")
+		""
+	}
+	let pathExp = findTestdataFile("invalid_expected.txt")
+	crucible.True("found invalid_expected.txt", len(pathExp) > 0)
+	let contentExp = quarry.ReadFile(pathExp) catch err {
+		t.Error("failed reading invalid_expected.txt: {err}")
+		""
+	}
+
+	let sqlLines = splitLines(contentSql)
+	let expLines = splitLines(contentExp)
+	crucible.True("invalid corpus >= 200 statements", len(sqlLines) >= 200)
+	crucible.EqI("sql and expected lines match", len(sqlLines), len(expLines))
+
+	mut acceptedCount = 0
+	mut posMatches = 0
+	for i in 0..len(sqlLines) {
+		let line = sqlLines[i]
+		if len(line) == 0 { continue }
+		let parsed = Parse(line) catch err {
+			let pe = ToParseError(err)
+			crucible.EqS("error code is 42601", pe.Code, "42601")
+			if pe.Pos > 0 { posMatches += 1 }
+			[]Stmt{}
+		}
+		if len(parsed) > 0 {
+			acceptedCount += 1
+		}
+	}
+	crucible.EqI("invalid statements accepted", acceptedCount, 0)
+	crucible.True("all error positions valid", posMatches == len(sqlLines))
+}
+
+fn splitLines(s str) []str {
+	mut out = []str{}
+	mut start = 0
+	for i in 0..len(s) {
+		if s[i] == 10 {
+			let line = trimRightCarriage(s[start:i])
+			if len(line) > 0 { out = append(out, line) }
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		let line = trimRightCarriage(s[start:])
+		if len(line) > 0 { out = append(out, line) }
+	}
+	return out
+}
+
+fn trimRightCarriage(s str) str {
+	if len(s) > 0 && s[len(s) - 1] == 13 { return s[:len(s) - 1] }
+	return s
+}
+
+fn checkRoundtripBatch(stmts []Stmt, start i64, end i64) i64 {
+	mut failures = 0
+	for i in start..end {
+		let deparsed = Deparse(stmts[i])
+		if len(deparsed) == 0 {
+			failures += 1
+			continue
+		}
+		let reparsed = Parse(deparsed) catch _ { []Stmt{} }
+		if len(reparsed) != 1 || stmtKind(reparsed[0]) != stmtKind(stmts[i]) || Deparse(reparsed[0]) != deparsed {
+			failures += 1
+		}
+	}
+	return failures
 }

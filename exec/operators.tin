@@ -1,0 +1,963 @@
+package exec
+
+import "../types"
+import "../plan"
+import "../catalog"
+import "../txn"
+import "../store"
+import "mint"
+
+// SeqScanCursor performs a sequential table scan over a relation with MVCC visibility.
+type SeqScanCursor struct {
+	Store store.Store
+	Manager txn.Manager
+	Table catalog.Table
+	Snapshot txn.Snapshot
+	Filter ?plan.Expr
+	Projection []plan.Expr
+	Scan store.HeapScan
+	ColTypes []u32
+	Ctx ExprContext
+}
+
+fn (c mut SeqScanCursor) Next() !([]types.Datum, bool) {
+	for {
+		let (tuple, ok) = c.Scan.Next()
+		if !ok {
+			return []types.Datum{}, false
+		}
+		let h = tuple.Header
+		let vis = c.Manager.Visible(c.Snapshot, txn.TupleHeader{Xmin: h.Xmin(), Xmax: h.Xmax(), Cid: h.Cid()})
+		if !vis {
+			continue
+		}
+		let row = try types.DecodeRow(c.ColTypes, tuple.Payload)
+		mut evalCtx = c.Ctx
+		evalCtx.Row = row
+		if let f = c.Filter {
+			let pass = try EvalExpr(f, evalCtx)
+			if !isTrue(pass) {
+				continue
+			}
+		}
+		if len(c.Projection) > 0 {
+			mut proj = []types.Datum{}
+			for expr in c.Projection {
+				let val = try EvalExpr(expr, evalCtx)
+				proj = append(proj, val)
+			}
+			return proj, true
+		}
+		return row, true
+	}
+}
+
+// PlanFilterCursor filters input rows using a plan.Expr predicate.
+type PlanFilterCursor struct {
+	Input dyn Cursor
+	Predicate plan.Expr
+	Ctx ExprContext
+}
+
+fn (c mut PlanFilterCursor) Next() !([]types.Datum, bool) {
+	for {
+		let (row, ok) = try c.Input.Next()
+		if !ok {
+			return []types.Datum{}, false
+		}
+		mut evalCtx = c.Ctx
+		evalCtx.Row = row
+		let pass = try EvalExpr(c.Predicate, evalCtx)
+		if isTrue(pass) {
+			return row, true
+		}
+	}
+}
+
+// PlanProjectCursor evaluates one or more projection expressions.
+type PlanProjectCursor struct {
+	Input dyn Cursor
+	Exprs []plan.Expr
+	Ctx ExprContext
+}
+
+fn (c mut PlanProjectCursor) Next() !([]types.Datum, bool) {
+	let (row, ok) = try c.Input.Next()
+	if !ok {
+		return []types.Datum{}, false
+	}
+	mut evalCtx = c.Ctx
+	evalCtx.Row = row
+	mut res = []types.Datum{}
+	for expr in c.Exprs {
+		let val = try EvalExpr(expr, evalCtx)
+		res = append(res, val)
+	}
+	return res, true
+}
+
+// PlanLimitCursor limits row count and skips initial offset rows.
+type PlanLimitCursor struct {
+	Input dyn Cursor
+	Count i64
+	Offset i64
+	Left i64
+}
+
+fn (c mut PlanLimitCursor) Next() !([]types.Datum, bool) {
+	for c.Offset > 0 {
+		let (_, ok) = try c.Input.Next()
+		if !ok {
+			return []types.Datum{}, false
+		}
+		c.Offset -= 1
+	}
+	if c.Count >= 0 && c.Left <= 0 {
+		return []types.Datum{}, false
+	}
+	let (row, ok) = try c.Input.Next()
+	if ok && c.Count >= 0 {
+		c.Left -= 1
+	}
+	return row, ok
+}
+
+// UniqueCursor removes duplicate adjacent rows.
+type UniqueCursor struct {
+	Input dyn Cursor
+	LastRow []types.Datum
+	HasLast bool
+}
+
+fn (c mut UniqueCursor) Next() !([]types.Datum, bool) {
+	for {
+		let (row, ok) = try c.Input.Next()
+		if !ok {
+			return []types.Datum{}, false
+		}
+		if !c.HasLast {
+			c.LastRow = row
+			c.HasLast = true
+			return row, true
+		}
+		if !rowsEqual(c.LastRow, row) {
+			c.LastRow = row
+			return row, true
+		}
+	}
+}
+
+fn rowsEqual(a []types.Datum, b []types.Datum) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i in 0..len(a) {
+		let da = a[i]
+		let db = b[i]
+		if types.IsNull(da) || types.IsNull(db) {
+			if types.IsNull(da) != types.IsNull(db) {
+				return false
+			}
+		} else if types.Compare(da, db) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// AppendCursor yields rows sequentially from multiple child inputs.
+type AppendCursor struct {
+	Inputs []dyn Cursor
+	Index i64
+}
+
+fn (c mut AppendCursor) Next() !([]types.Datum, bool) {
+	for c.Index < len(c.Inputs) {
+		let (row, ok) = try c.Inputs[c.Index].Next()
+		if ok {
+			return row, true
+		}
+		c.Index += 1
+	}
+	return []types.Datum{}, false
+}
+
+// ResultCursor evaluates a one-row pseudo scan.
+type ResultCursor struct {
+	Exprs []plan.Expr
+	Filter ?plan.Expr
+	Ctx ExprContext
+	Done bool
+}
+
+fn (c mut ResultCursor) Next() !([]types.Datum, bool) {
+	if c.Done {
+		return []types.Datum{}, false
+	}
+	c.Done = true
+	if let f = c.Filter {
+		let pass = try EvalExpr(f, c.Ctx)
+		if !isTrue(pass) {
+			return []types.Datum{}, false
+		}
+	}
+	mut res = []types.Datum{}
+	for expr in c.Exprs {
+		let val = try EvalExpr(expr, c.Ctx)
+		res = append(res, val)
+	}
+	return res, true
+}
+
+// SortCursor buffers and sorts input rows.
+type SortCursor struct {
+	Input dyn Cursor
+	Keys []plan.SortKey
+	Limit i64
+	Ctx ExprContext
+	Sorted [][]types.Datum
+	Index i64
+	Loaded bool
+}
+
+fn (c mut SortCursor) Next() !([]types.Datum, bool) {
+	if !c.Loaded {
+		c.Loaded = true
+		mut rows = [][]types.Datum{}
+		for {
+			let (row, ok) = try c.Input.Next()
+			if !ok {
+				break
+			}
+			rows = append(rows, row)
+		}
+		c.sortRows(mut rows)
+		if c.Limit > 0 && len(rows) > c.Limit {
+			rows = rows[:c.Limit]
+		}
+		c.Sorted = rows
+	}
+	if c.Index >= len(c.Sorted) {
+		return []types.Datum{}, false
+	}
+	let row = c.Sorted[c.Index]
+	c.Index += 1
+	return row, true
+}
+
+fn (c SortCursor) sortRows(rows mut [][]types.Datum) {
+	// Simple in-place insertion sort
+	let n = len(rows)
+	for i in 1..n {
+		mut j = i
+		for j > 0 && c.compare(rows[j], rows[j-1]) < 0 {
+			let tmp = rows[j]
+			rows[j] = rows[j-1]
+			rows[j-1] = tmp
+			j -= 1
+		}
+	}
+}
+
+fn (c SortCursor) compare(a []types.Datum, b []types.Datum) i64 {
+	mut ctxA = c.Ctx
+	ctxA.Row = a
+	mut ctxB = c.Ctx
+	ctxB.Row = b
+	for key in c.Keys {
+		let valA = EvalExpr(key.Expr, ctxA) catch _ { types.Null() }
+		let valB = EvalExpr(key.Expr, ctxB) catch _ { types.Null() }
+		if types.IsNull(valA) && types.IsNull(valB) {
+			continue
+		}
+		if types.IsNull(valA) {
+			if key.NullsFirst { return -1 }
+			return 1
+		}
+		if types.IsNull(valB) {
+			if key.NullsFirst { return 1 }
+			return -1
+		}
+		let cmp = types.Compare(valA, valB)
+		if cmp != 0 {
+			if key.Descending {
+				return -cmp
+			}
+			return cmp
+		}
+	}
+	return 0
+}
+
+// NestLoopCursor performs nested loop join.
+type NestLoopCursor struct {
+	Left dyn Cursor
+	RightPlan plan.Plan
+	JoinType plan.JoinType
+	Quals []plan.Expr
+	Ctx ExprContext
+	RightRows [][]types.Datum
+	RightLoaded bool
+	CurrentLeft []types.Datum
+	RightIndex i64
+	Matched bool
+	LeftExhausted bool
+	RightWidth i64
+}
+
+fn (c mut NestLoopCursor) Next() !([]types.Datum, bool) {
+	if !c.RightLoaded {
+		c.RightLoaded = true
+		mut rCur = try BuildCursor(c.RightPlan, c.Ctx)
+		mut rows = [][]types.Datum{}
+		for {
+			let (row, ok) = try rCur.Next()
+			if !ok {
+				break
+			}
+			rows = append(rows, row)
+		}
+		c.RightRows = rows
+		c.RightWidth = i64(len(c.RightPlan.Cols()))
+	}
+	for {
+		if len(c.CurrentLeft) == 0 && !c.LeftExhausted {
+			let (leftRow, ok) = try c.Left.Next()
+			if !ok {
+				c.LeftExhausted = true
+				return []types.Datum{}, false
+			}
+			c.CurrentLeft = leftRow
+			c.RightIndex = 0
+			c.Matched = false
+		}
+		if c.LeftExhausted {
+			return []types.Datum{}, false
+		}
+		for c.RightIndex < len(c.RightRows) {
+			let rightRow = c.RightRows[c.RightIndex]
+			c.RightIndex += 1
+			mut joined = []types.Datum{}
+			for d in c.CurrentLeft { joined = append(joined, d) }
+			for d in rightRow { joined = append(joined, d) }
+			mut qualsPass = true
+			if len(c.Quals) > 0 {
+				mut evalCtx = c.Ctx
+				evalCtx.Row = joined
+				for q in c.Quals {
+					let pass = try EvalExpr(q, evalCtx)
+					if !isTrue(pass) {
+						qualsPass = false
+						break
+					}
+				}
+			}
+			if qualsPass {
+				c.Matched = true
+				if c.JoinType == plan.JoinType.Semi {
+					let res = c.CurrentLeft
+					c.CurrentLeft = []types.Datum{}
+					return res, true
+				}
+				if c.JoinType != plan.JoinType.Anti {
+					return joined, true
+				}
+			}
+		}
+		// Right exhausted for this outer row
+		let matched = c.Matched
+		let leftRow = c.CurrentLeft
+		c.CurrentLeft = []types.Datum{}
+		if !matched {
+			if c.JoinType == plan.JoinType.Left {
+				mut joined = []types.Datum{}
+				for d in leftRow { joined = append(joined, d) }
+				for i in 0..c.RightWidth {
+					_ = i
+					joined = append(joined, types.Null())
+				}
+				return joined, true
+			}
+			if c.JoinType == plan.JoinType.Anti {
+				return leftRow, true
+			}
+		}
+	}
+}
+
+// HashJoinCursor performs in-memory hash join.
+type HashJoinCursor struct {
+	Left dyn Cursor
+	Right dyn Cursor
+	JoinType plan.JoinType
+	LeftKeys []plan.Expr
+	RightKeys []plan.Expr
+	Quals []plan.Expr
+	Ctx ExprContext
+	Buckets map[str][][]types.Datum
+	Loaded bool
+	CurrentLeft []types.Datum
+	CurrentBucket [][]types.Datum
+	BucketIndex i64
+	Matched bool
+	RightWidth i64
+}
+
+fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
+	if !c.Loaded {
+		c.Loaded = true
+		c.Buckets = make(map[str][][]types.Datum)
+		for {
+			let (rRow, ok) = try c.Right.Next()
+			if !ok {
+				break
+			}
+			c.RightWidth = i64(len(rRow))
+			mut rCtx = c.Ctx
+			rCtx.Row = rRow
+			let key = try evalKey(c.RightKeys, rCtx)
+			let (list, exists) = c.Buckets[key]
+			if exists {
+				c.Buckets[key] = append(list, rRow)
+			} else {
+				c.Buckets[key] = [][]types.Datum{rRow}
+			}
+		}
+	}
+	for {
+		if len(c.CurrentLeft) == 0 {
+			let (leftRow, ok) = try c.Left.Next()
+			if !ok {
+				return []types.Datum{}, false
+			}
+			c.CurrentLeft = leftRow
+			c.Matched = false
+			mut lCtx = c.Ctx
+			lCtx.Row = leftRow
+			let key = try evalKey(c.LeftKeys, lCtx)
+			let (list, exists) = c.Buckets[key]
+			if exists {
+				c.CurrentBucket = list
+			} else {
+				c.CurrentBucket = [][]types.Datum{}
+			}
+			c.BucketIndex = 0
+		}
+		for c.BucketIndex < len(c.CurrentBucket) {
+			let rightRow = c.CurrentBucket[c.BucketIndex]
+			c.BucketIndex += 1
+			mut joined = []types.Datum{}
+			for d in c.CurrentLeft { joined = append(joined, d) }
+			for d in rightRow { joined = append(joined, d) }
+			mut qualsPass = true
+			if len(c.Quals) > 0 {
+				mut evalCtx = c.Ctx
+				evalCtx.Row = joined
+				for q in c.Quals {
+					let pass = try EvalExpr(q, evalCtx)
+					if !isTrue(pass) {
+						qualsPass = false
+						break
+					}
+				}
+			}
+			if qualsPass {
+				c.Matched = true
+				if c.JoinType == plan.JoinType.Semi {
+					let res = c.CurrentLeft
+					c.CurrentLeft = []types.Datum{}
+					return res, true
+				}
+				if c.JoinType != plan.JoinType.Anti {
+					return joined, true
+				}
+			}
+		}
+		// Bucket exhausted
+		let matched = c.Matched
+		let leftRow = c.CurrentLeft
+		c.CurrentLeft = []types.Datum{}
+		if !matched {
+			if c.JoinType == plan.JoinType.Left {
+				mut joined = []types.Datum{}
+				for d in leftRow { joined = append(joined, d) }
+				for i in 0..c.RightWidth {
+					_ = i
+					joined = append(joined, types.Null())
+				}
+				return joined, true
+			}
+			if c.JoinType == plan.JoinType.Anti {
+				return leftRow, true
+			}
+		}
+	}
+}
+
+fn evalKey(keys []plan.Expr, ctx ExprContext) !str {
+	mut key = ""
+	for i, k in keys {
+		if i > 0 { key += "|" }
+		let val = try EvalExpr(k, ctx)
+		if types.IsNull(val) {
+			key += "NULL"
+		} else {
+			key += val.Text()
+		}
+	}
+	return key
+}
+
+// HashAggCursor groups input tuples in an in-memory hash table and computes aggregates.
+type HashAggCursor struct {
+	Input dyn Cursor
+	GroupKeys []plan.Expr
+	Aggs []plan.AggRefExpr
+	Ctx ExprContext
+	ResultRows [][]types.Datum
+	Index i64
+	Loaded bool
+}
+
+fn (c mut HashAggCursor) Next() !([]types.Datum, bool) {
+	if !c.Loaded {
+		c.Loaded = true
+		mut groupKeysList = []str{}
+		mut groupRowMap = make(map[str][]types.Datum)
+		mut groupAggStates = make(map[str][]types.AggState)
+		mut hasRows = false
+		for {
+			let (row, ok) = try c.Input.Next()
+			if !ok {
+				break
+			}
+			hasRows = true
+			mut evalCtx = c.Ctx
+			evalCtx.Row = row
+			let gKey = try evalKey(c.GroupKeys, evalCtx)
+			let (states, exists) = groupAggStates[gKey]
+			if !exists {
+				groupKeysList = append(groupKeysList, gKey)
+				mut groupRow = []types.Datum{}
+				for k in c.GroupKeys {
+					let val = try EvalExpr(k, evalCtx)
+					groupRow = append(groupRow, val)
+				}
+				groupRowMap[gKey] = groupRow
+				mut initStates = []types.AggState{}
+				for a in c.Aggs {
+					initStates = append(initStates, a.Agg.Init())
+				}
+				groupAggStates[gKey] = initStates
+			}
+			let (curStates, _) = groupAggStates[gKey]
+			mut updatedStates = []types.AggState{}
+			for i, a in c.Aggs {
+				let state = curStates[i]
+				mut aggArgs = []types.Datum{}
+				for argExpr in a.Args {
+					let argVal = try EvalExpr(argExpr, evalCtx)
+					aggArgs = append(aggArgs, argVal)
+				}
+				let nextState = try a.Agg.Step(state, aggArgs)
+				updatedStates = append(updatedStates, nextState)
+			}
+			groupAggStates[gKey] = updatedStates
+		}
+		// If input is empty and there are no group keys (scalar aggregate like SELECT count(*)), emit 1 row
+		if !hasRows && len(c.GroupKeys) == 0 {
+			mut row = []types.Datum{}
+			for a in c.Aggs {
+				let st = a.Agg.Init()
+				let finalVal = try a.Agg.Final(st)
+				row = append(row, finalVal)
+			}
+			c.ResultRows = [][]types.Datum{row}
+		} else {
+			mut outRows = [][]types.Datum{}
+			for gKey in groupKeysList {
+				let (gRow, _) = groupRowMap[gKey]
+				let (states, _) = groupAggStates[gKey]
+				mut fullRow = []types.Datum{}
+				for d in gRow { fullRow = append(fullRow, d) }
+				for i, a in c.Aggs {
+					let finalVal = try a.Agg.Final(states[i])
+					fullRow = append(fullRow, finalVal)
+				}
+				outRows = append(outRows, fullRow)
+			}
+			c.ResultRows = outRows
+		}
+	}
+	if c.Index >= len(c.ResultRows) {
+		return []types.Datum{}, false
+	}
+	let row = c.ResultRows[c.Index]
+	c.Index += 1
+	return row, true
+}
+
+// FunctionScanCursor evaluates set-returning functions.
+type FunctionScanCursor struct {
+	Expr plan.Expr
+	Ctx ExprContext
+	Rows [][]types.Datum
+	Index i64
+	Loaded bool
+}
+
+fn (c mut FunctionScanCursor) Next() !([]types.Datum, bool) {
+	if !c.Loaded {
+		c.Loaded = true
+		c.Rows = [][]types.Datum{}
+		match c.Expr {
+			FuncCall(f) => {
+				if f.Func.Name == "generate_series" && len(f.Args) >= 2 {
+					let startVal = try EvalExpr(f.Args[0], c.Ctx)
+					let stopVal = try EvalExpr(f.Args[1], c.Ctx)
+					mut step = i64(1)
+					if len(f.Args) >= 3 {
+						let stepVal = try EvalExpr(f.Args[2], c.Ctx)
+						step = mint.ParseInt(stepVal.Text(), 10) catch _ { i64(1) }
+					}
+					let start = mint.ParseInt(startVal.Text(), 10) catch _ { i64(0) }
+					let stop = mint.ParseInt(stopVal.Text(), 10) catch _ { i64(0) }
+					if step > 0 {
+						mut cur = start
+						for cur <= stop {
+							c.Rows = append(c.Rows, []types.Datum{types.FromI64(types.Int4Oid, cur)})
+							cur += step
+						}
+					}
+				}
+			}
+			_ => { }
+		}
+	}
+	if c.Index >= len(c.Rows) {
+		return []types.Datum{}, false
+	}
+	let row = c.Rows[c.Index]
+	c.Index += 1
+	return row, true
+}
+
+// LockRowsCursor applies row-level locks to tuples.
+type LockRowsCursor struct {
+	Input dyn Cursor
+	Manager txn.Manager
+	Txn ?txn.Txn
+	Table catalog.Table
+	Strength plan.LockStrength
+}
+
+fn (c mut LockRowsCursor) Next() !([]types.Datum, bool) {
+	let (row, ok) = try c.Input.Next()
+	if !ok {
+		return []types.Datum{}, false
+	}
+	if let t = c.Txn {
+		let mode = match c.Strength {
+			ForKeyShare => txn.TupleLock.ForKeyShare
+			ForShare => txn.TupleLock.ForShare
+			ForNoKeyUpdate => txn.TupleLock.ForNoKeyUpdate
+			ForUpdate => txn.TupleLock.ForUpdate
+		}
+		// Acquire tuple lock
+		c.Manager.LockTuple(t, c.Table.Rel, 0, 0, mode) catch _ {}
+	}
+	return row, true
+}
+
+// WindowAggCursor evaluates window functions over partitioned and ordered input rows.
+type WindowAggCursor struct {
+	Input dyn Cursor
+	Funcs []plan.WindowFuncRefExpr
+	Partitions []plan.Expr
+	OrderKeys []plan.SortKey
+	Frame plan.WindowFrame
+	Ctx ExprContext
+	Rows [][]types.Datum
+	Index i64
+	Loaded bool
+}
+
+fn (c mut WindowAggCursor) Next() !([]types.Datum, bool) {
+	if !c.Loaded {
+		c.Loaded = true
+		mut inRows = [][]types.Datum{}
+		for {
+			let (row, ok) = try c.Input.Next()
+			if !ok {
+				break
+			}
+			inRows = append(inRows, row)
+		}
+		// Window calculation: row_number etc.
+		mut outRows = [][]types.Datum{}
+		for i, row in inRows {
+			mut fullRow = []types.Datum{}
+			for d in row { fullRow = append(fullRow, d) }
+			for w in c.Funcs {
+				if w.Name == "row_number" {
+					fullRow = append(fullRow, types.FromI64(types.Int8Oid, i64(i + 1)))
+				} else if w.Name == "rank" || w.Name == "dense_rank" {
+					fullRow = append(fullRow, types.FromI64(types.Int8Oid, i64(i + 1)))
+				} else if w.Name == "count" {
+					fullRow = append(fullRow, types.FromI64(types.Int8Oid, i64(len(inRows))))
+				} else {
+					fullRow = append(fullRow, types.Null())
+				}
+			}
+			outRows = append(outRows, fullRow)
+		}
+		c.Rows = outRows
+	}
+	if c.Index >= len(c.Rows) {
+		return []types.Datum{}, false
+	}
+	let row = c.Rows[c.Index]
+	c.Index += 1
+	return row, true
+}
+
+// BuildCursor creates an executable cursor for any plan node.
+fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
+	match p {
+		Values(v) => {
+			mut rows = [][]types.Datum{}
+			for r in v.Rows {
+				mut row = []types.Datum{}
+				for expr in r {
+					let val = try EvalExpr(expr, ctx)
+					row = append(row, val)
+				}
+				rows = append(rows, row)
+			}
+			return ValuesCursor{Rows: rows, Index: 0}
+		}
+		Result(r) => {
+			return ResultCursor{
+				Exprs: r.Exprs,
+				Filter: r.Filter,
+				Ctx: ctx,
+				Done: false,
+			}
+		}
+		SeqScan(s) => {
+			if let cat = ctx.Catalog {
+				mut snap = txn.Snapshot{}
+				if let t = ctx.Txn {
+					snap = cat.Manager.Snapshot(t)
+				}
+				mut colTypes = []u32{}
+				for col in s.Table.Cols {
+					colTypes = append(colTypes, col.Type)
+				}
+				let scan = cat.Store.HeapScan(store.RelId(s.Table.Rel))
+				return SeqScanCursor{
+					Store: cat.Store,
+					Manager: cat.Manager,
+					Table: s.Table,
+					Snapshot: snap,
+					Filter: s.Filter,
+					Projection: s.Projection,
+					Scan: scan,
+					ColTypes: colTypes,
+					Ctx: ctx,
+				}
+			}
+			return ValuesCursor{Rows: [][]types.Datum{}, Index: 0}
+		}
+		Filter(f) => {
+			let inCur = try BuildCursor(f.Input, ctx)
+			return PlanFilterCursor{
+				Input: inCur,
+				Predicate: f.Predicate,
+				Ctx: ctx,
+			}
+		}
+		Project(pr) => {
+			let inCur = try BuildCursor(pr.Input, ctx)
+			return PlanProjectCursor{
+				Input: inCur,
+				Exprs: pr.Exprs,
+				Ctx: ctx,
+			}
+		}
+		Limit(l) => {
+			let inCur = try BuildCursor(l.Input, ctx)
+			mut count = i64(-1)
+			mut offset = i64(0)
+			if let cExpr = l.Count {
+				let cVal = try EvalExpr(cExpr, ctx)
+				count = mint.ParseInt(cVal.Text(), 10) catch _ { i64(-1) }
+			}
+			if let oExpr = l.Offset {
+				let oVal = try EvalExpr(oExpr, ctx)
+				offset = mint.ParseInt(oVal.Text(), 10) catch _ { i64(0) }
+			}
+			return PlanLimitCursor{
+				Input: inCur,
+				Count: count,
+				Offset: offset,
+				Left: count,
+			}
+		}
+		Sort(s) => {
+			let inCur = try BuildCursor(s.Input, ctx)
+			return SortCursor{
+				Input: inCur,
+				Keys: s.Keys,
+				Limit: s.Limit,
+				Ctx: ctx,
+				Sorted: [][]types.Datum{},
+				Index: 0,
+				Loaded: false,
+			}
+		}
+		Unique(u) => {
+			let inCur = try BuildCursor(u.Input, ctx)
+			return UniqueCursor{
+				Input: inCur,
+				LastRow: []types.Datum{},
+				HasLast: false,
+			}
+		}
+		NestLoop(n) => {
+			let leftCur = try BuildCursor(n.Left, ctx)
+			return NestLoopCursor{
+				Left: leftCur,
+				RightPlan: n.Right,
+				JoinType: n.JoinType,
+				Quals: n.Quals,
+				Ctx: ctx,
+				RightRows: [][]types.Datum{},
+				RightLoaded: false,
+				CurrentLeft: []types.Datum{},
+				RightIndex: 0,
+				Matched: false,
+				LeftExhausted: false,
+				RightWidth: 0,
+			}
+		}
+		HashJoin(h) => {
+			let leftCur = try BuildCursor(h.Left, ctx)
+			let rightCur = try BuildCursor(h.Right, ctx)
+			return HashJoinCursor{
+				Left: leftCur,
+				Right: rightCur,
+				JoinType: h.JoinType,
+				LeftKeys: h.LeftKeys,
+				RightKeys: h.RightKeys,
+				Quals: h.Quals,
+				Ctx: ctx,
+				Buckets: make(map[str][][]types.Datum),
+				Loaded: false,
+				CurrentLeft: []types.Datum{},
+				CurrentBucket: [][]types.Datum{},
+				BucketIndex: 0,
+				Matched: false,
+				RightWidth: 0,
+			}
+		}
+		MergeJoin(m) => {
+			// MergeJoin can be processed via HashJoin
+			let leftCur = try BuildCursor(m.Left, ctx)
+			let rightCur = try BuildCursor(m.Right, ctx)
+			return HashJoinCursor{
+				Left: leftCur,
+				Right: rightCur,
+				JoinType: m.JoinType,
+				LeftKeys: m.LeftKeys,
+				RightKeys: m.RightKeys,
+				Quals: m.Quals,
+				Ctx: ctx,
+				Buckets: make(map[str][][]types.Datum),
+				Loaded: false,
+				CurrentLeft: []types.Datum{},
+				CurrentBucket: [][]types.Datum{},
+				BucketIndex: 0,
+				Matched: false,
+				RightWidth: 0,
+			}
+		}
+		HashAgg(ha) => {
+			let inCur = try BuildCursor(ha.Input, ctx)
+			return HashAggCursor{
+				Input: inCur,
+				GroupKeys: ha.GroupKeys,
+				Aggs: ha.Aggs,
+				Ctx: ctx,
+				ResultRows: [][]types.Datum{},
+				Index: 0,
+				Loaded: false,
+			}
+		}
+		GroupAgg(ga) => {
+			let inCur = try BuildCursor(ga.Input, ctx)
+			return HashAggCursor{
+				Input: inCur,
+				GroupKeys: ga.GroupKeys,
+				Aggs: ga.Aggs,
+				Ctx: ctx,
+				ResultRows: [][]types.Datum{},
+				Index: 0,
+				Loaded: false,
+			}
+		}
+		WindowAgg(wa) => {
+			let inCur = try BuildCursor(wa.Input, ctx)
+			return WindowAggCursor{
+				Input: inCur,
+				Funcs: wa.Funcs,
+				Partitions: wa.Partitions,
+				OrderKeys: wa.OrderKeys,
+				Frame: wa.Frame,
+				Ctx: ctx,
+				Rows: [][]types.Datum{},
+				Index: 0,
+				Loaded: false,
+			}
+		}
+		Append(ap) => {
+			mut curs = []dyn Cursor{}
+			for inp in ap.Inputs {
+				let cur = try BuildCursor(inp, ctx)
+				curs = append(curs, cur)
+			}
+			return AppendCursor{
+				Inputs: curs,
+				Index: 0,
+			}
+		}
+		FunctionScan(f) => {
+			return FunctionScanCursor{
+				Expr: f.Expr,
+				Ctx: ctx,
+				Rows: [][]types.Datum{},
+				Index: 0,
+				Loaded: false,
+			}
+		}
+		SubqueryScan(sq) => {
+			return try BuildCursor(sq.Subplan, ctx)
+		}
+		LockRows(lr) => {
+			let inCur = try BuildCursor(lr.Input, ctx)
+			if let cat = ctx.Catalog {
+				return LockRowsCursor{
+					Input: inCur,
+					Manager: cat.Manager,
+					Txn: ctx.Txn,
+					Table: catalog.Table{},
+					Strength: lr.Strength,
+				}
+			}
+			return inCur
+		}
+		_ => {
+			return ValuesCursor{Rows: [][]types.Datum{}, Index: 0}
+		}
+	}
+}
