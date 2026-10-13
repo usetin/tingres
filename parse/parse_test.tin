@@ -109,9 +109,39 @@ fn stmtKind(statement Stmt) str {
 		Update(_) => "update"
 		Delete(_) => "delete"
 		CreateTable(_) => "create_table"
+		AlterTable(_) => "alter_table"
+		Drop(_) => "drop"
+		CreateIndex(_) => "create_index"
+		CreateView(_) => "create_view"
+		CreateSequence(_) => "create_sequence"
+		AlterSequence(_) => "alter_sequence"
+		CreateSchema(_) => "create_schema"
+		CreateType(_) => "create_type"
+		CreateFunction(_) => "create_function"
+		Truncate(_) => "truncate"
 		Transaction(_) => "transaction"
+		VariableSet(_) => "variable_set"
+		Explain(_) => "explain"
+		Copy(_) => "copy"
+		Prepare(_) => "prepare"
+		Execute(_) => "execute"
+		Deallocate(_) => "deallocate"
+		Vacuum(_) => "vacuum"
+		Analyze(_) => "analyze"
+		Discard(_) => "discard"
+		Comment(_) => "comment"
+		Grant(_) => "grant"
+		Revoke(_) => "revoke"
+		CreateRole(_) => "create_role"
+		AlterRole(_) => "alter_role"
+		DropRole(_) => "drop_role"
+		Listen(_) => "listen"
+		Notify(_) => "notify"
+		Unlisten(_) => "unlisten"
+		Lock(_) => "lock"
+		Do(_) => "do"
 		Checkpoint(_) => "checkpoint"
-		_ => "other"
+		Call(_) => "call"
 	}
 }
 
@@ -246,4 +276,110 @@ fn TestWindowFrameParsing(t mut crucible.T) {
 		return
 	}
 	crucible.EqS("window close remains", parser.text(), ")")
+}
+
+fn TestAllStatementCoverage(t mut crucible.T) {
+	let sqls = []str{
+		"SELECT 1",
+		"INSERT INTO t VALUES (1)",
+		"UPDATE t SET a = 1",
+		"DELETE FROM t WHERE a = 1",
+		"CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY, v int GENERATED ALWAYS AS (id + 1) STORED, name text COLLATE \"C\", CONSTRAINT pk PRIMARY KEY (id))",
+		"ALTER TABLE t ADD COLUMN c text",
+		"DROP TABLE IF EXISTS t CASCADE",
+		"CREATE UNIQUE INDEX CONCURRENTLY idx_t ON t (a DESC NULLS LAST) WHERE a > 0",
+		"CREATE OR REPLACE VIEW v AS SELECT 1 WITH CHECK OPTION",
+		"CREATE SEQUENCE s INCREMENT BY 1 MINVALUE 1 START WITH 1",
+		"ALTER SEQUENCE s RESTART WITH 100",
+		"CREATE SCHEMA IF NOT EXISTS s AUTHORIZATION alice",
+		"CREATE TYPE mood AS ENUM ('happy', 'sad')",
+		"CREATE FUNCTION f(x int) RETURNS int LANGUAGE sql AS 'SELECT x + 1'",
+		"TRUNCATE TABLE t RESTART IDENTITY CASCADE",
+		"BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY",
+		"SET work_mem = '64MB'",
+		"RESET search_path",
+		"SHOW time zone",
+		"EXPLAIN (ANALYZE, VERBOSE) SELECT 1",
+		"COPY t FROM 'data.csv' WITH (FORMAT csv, HEADER)",
+		"PREPARE q (int) AS SELECT $1",
+		"EXECUTE q(42)",
+		"DEALLOCATE q",
+		"VACUUM FULL t",
+		"ANALYZE VERBOSE t",
+		"DISCARD ALL",
+		"COMMENT ON TABLE t IS 'sample'",
+		"GRANT SELECT, INSERT ON TABLE t TO alice WITH GRANT OPTION",
+		"REVOKE SELECT ON TABLE t FROM alice CASCADE",
+		"CREATE ROLE alice WITH LOGIN PASSWORD 'pass'",
+		"ALTER ROLE alice WITH SUPERUSER",
+		"DROP ROLE IF EXISTS alice",
+		"LISTEN events",
+		"NOTIFY events, 'hello'",
+		"UNLISTEN *",
+		"LOCK TABLE t IN EXCLUSIVE MODE NOWAIT",
+		"DO LANGUAGE plpgsql 'BEGIN NULL; END'",
+		"CHECKPOINT",
+		"CALL my_proc(1, 'test')",
+	}
+
+	let expectedKinds = []str{
+		"select",
+		"insert",
+		"update",
+		"delete",
+		"create_table",
+		"alter_table",
+		"drop",
+		"create_index",
+		"create_view",
+		"create_sequence",
+		"alter_sequence",
+		"create_schema",
+		"create_type",
+		"create_function",
+		"truncate",
+		"transaction",
+		"variable_set",
+		"variable_set",
+		"variable_set",
+		"explain",
+		"copy",
+		"prepare",
+		"execute",
+		"deallocate",
+		"vacuum",
+		"analyze",
+		"discard",
+		"comment",
+		"grant",
+		"revoke",
+		"create_role",
+		"alter_role",
+		"drop_role",
+		"listen",
+		"notify",
+		"unlisten",
+		"lock",
+		"do",
+		"checkpoint",
+		"call",
+	}
+
+	for i, sql in sqls {
+		let statements = Parse(sql) catch err {
+			t.Error("statement {i} failed to parse: {sql}, error: {err}")
+			continue
+		}
+		crucible.EqI("count for statement {i}", len(statements), 1)
+		crucible.EqS("kind for statement {i}: {sql}", stmtKind(statements[0]), expectedKinds[i])
+		let deparsed = Deparse(statements[0])
+		if len(deparsed) > 0 {
+			let reparsed = Parse(deparsed) catch err {
+				t.Error("deparsed statement {i} failed to reparse: {deparsed}, error: {err}")
+				continue
+			}
+			crucible.EqI("reparsed count for statement {i}", len(reparsed), 1)
+			crucible.EqS("reparsed kind for statement {i}", stmtKind(reparsed[0]), expectedKinds[i])
+		}
+	}
 }
