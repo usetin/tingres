@@ -203,14 +203,55 @@ fn TestExpressionFormsAndPrecedence(t mut crucible.T) {
 		"OVERLAY(x PLACING y FROM 2 FOR 3)",
 		"current_timestamp(3) AT TIME ZONE 'UTC'",
 		"f(DISTINCT x ORDER BY y) FILTER (WHERE x > 0) OVER (PARTITION BY a ORDER BY b ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)",
+		"data->'key'->>'nested'",
+		"tags @> ARRAY['a', 'b']",
+		"tags <@ ARRAY['a', 'b']",
+		"name ~ '^[a-z]+$'",
+		"name ~* 'abc'",
+		"name !~ '^[0-9]'",
+		"name !~* 'xyz'",
+		"s LIKE '%foo%' ESCAPE '\\'",
+		"s NOT ILIKE 'bar%'",
+		"s SIMILAR TO '(a|b)%'",
+		"x > ALL(SELECT val FROM tbl)",
+		"x <= SOME(ARRAY[1, 2, 3])",
+		"DATE '2023-01-01'",
+		"INTERVAL '1 year 2 months'",
+		"TIME '12:30:00'",
+		"TIMESTAMP '2023-01-01 12:00:00'",
+		"percentile_disc(0.5) WITHIN GROUP (ORDER BY val)",
+		"func(VARIADIC arr)",
+		"func(a => 1, b => 2)",
+		"func(a := 1, b := 2)",
+		"CURRENT_DATE",
+		"CURRENT_TIME",
+		"CURRENT_USER",
+		"SESSION_USER",
+		"col COLLATE \"C\"",
+		"arr[1][2]",
+		"t.field",
+		"$1 + $2",
+		"a IS NULL",
+		"b IS NOT NULL",
+		"c IS TRUE",
+		"d IS NOT FALSE",
+		"e IS UNKNOWN",
+		"x IS NOT UNKNOWN",
+		"a || b",
+		"x ^ y",
+		"~x",
 	}
 	for expression in expressions {
-		let _ = ParseExpr(expression) catch err {
+		let parsed = ParseExpr(expression) catch err {
 			t.Error("expression rejected ({expression}): {err}")
 			return
 		}
+		let deparsed = DeparseExpr(parsed)
+		if len(deparsed) == 0 {
+			t.Error("deparsed expression empty for: {expression}")
+		}
 	}
-	crucible.EqI("expression variants", len(expressions), 21)
+	crucible.EqI("expression variants", len(expressions), 58)
 }
 
 fn TestSelectClausesAndCtes(t mut crucible.T) {
