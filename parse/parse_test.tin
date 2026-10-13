@@ -2,6 +2,7 @@ package parse
 
 import "crucible"
 import "fault"
+import "quarry"
 
 fn TestLexAndStatements(t mut crucible.T) {
 	let statements = Parse("CREATE TABLE t (id int, name text); INSERT INTO t VALUES (1, 'x'); SELECT id, name FROM t WHERE id = 1 ORDER BY id LIMIT 2; BEGIN; COMMIT") catch err {
@@ -9,8 +10,8 @@ fn TestLexAndStatements(t mut crucible.T) {
 		return
 	}
 	crucible.EqI("five statements", len(statements), 5)
-	crucible.EqS("create classification", statements[0].Kind(), "create_table")
-	crucible.EqS("select classification", statements[2].Kind(), "select")
+	crucible.EqS("create classification", stmtKind(statements[0]), "create_table")
+	crucible.EqS("select classification", stmtKind(statements[2]), "select")
 	crucible.EqS("deparse select", Deparse(statements[2]), "SELECT id, name FROM t WHERE id = 1 ORDER BY id LIMIT 2")
 }
 
@@ -20,7 +21,7 @@ fn TestLexerQuotesCommentsAndDollarStrings(t mut crucible.T) {
 		return
 	}
 	crucible.EqI("quoted statement count", len(statements), 1)
-	crucible.EqS("quoted select", statements[0].Kind(), "select")
+	crucible.EqS("quoted select", stmtKind(statements[0]), "select")
 }
 
 fn TestExpressionPrecedence(t mut crucible.T) {
@@ -28,8 +29,8 @@ fn TestExpressionPrecedence(t mut crucible.T) {
 		t.Error("expression rejected: {err}")
 		return
 	}
-	crucible.EqS("expression kind", expr.NodeKind(), "binary")
-	crucible.EqS("boolean precedence", expr.Text(), "(((a + (b * 3)) = $2) and notc)")
+	crucible.EqS("expression kind", exprKind(expr), "boolean")
+	crucible.EqS("boolean precedence", DeparseExpr(expr), "(((a + (b * 3)) = $2) AND (NOT c))")
 }
 
 fn TestSyntaxFaultHasPosition(t mut crucible.T) {
@@ -58,15 +59,84 @@ fn TestCorpusFiveHundredStatements(t mut crucible.T) {
 }
 
 fn TestMutationInputsDoNotCrash(t mut crucible.T) {
-	let seeds = []str{"", "SELECT", "SELECT '", "/*", "$x$", "SELECT (((", "SELECT 1 +", "INSERT INTO", "\xff\x00;"}
-	for seed in seeds {
-		for cut in 0..len(seed) + 1 {
-			let input = seed[:cut]
-			let parsed = Parse(input) catch _ { []Stmt{} }
-			if len(parsed) > 99 { t.Error("impossible parser output") }
-		}
+	let seeds = []str{
+		"SELECT 1",
+		"SELECT a, b FROM t WHERE a > 10 ORDER BY b DESC LIMIT 5",
+		"INSERT INTO t (id, a) VALUES (1, 2) ON CONFLICT DO NOTHING",
+		"UPDATE t SET a = 1 WHERE b = 2",
+		"DELETE FROM t WHERE id = 1",
+		"CREATE TABLE t (id int PRIMARY KEY, val text NOT NULL)",
+		"ALTER TABLE t ADD COLUMN c text",
+		"DROP TABLE IF EXISTS t CASCADE",
+		"WITH cte AS (SELECT 1 AS x) SELECT * FROM cte",
+		"SELECT 1 UNION ALL SELECT 2",
+		"SELECT CASE WHEN a = 1 THEN 'x' ELSE 'y' END",
+		"SELECT f(x) OVER (PARTITION BY a ORDER BY b)",
+		"/* comment */ SELECT 1 -- line comment",
+		"SELECT 'string with escapes '' and \\\\'",
+		"SELECT $$dollar$$",
 	}
-	crucible.True("mutated inputs completed", true)
+
+	mut rngState u64 = 0x853c49e6748fea9b
+	let totalIterations = 200_000
+	mut batch = 0
+	mut failCount = 0
+
+	for batch < 200 {
+		arena {
+			for step in 0..1000 {
+				rngState ^= rngState << 13
+				rngState ^= rngState >> 7
+				rngState ^= rngState << 17
+				let op = (rngState >> 32) % 5
+				let seedIdx = i64((rngState >> 40) % u64(len(seeds)))
+				let seed = seeds[seedIdx]
+				mut mutated = ""
+
+				if op == 0 {
+					// 1. Truncation
+					let cut = i64((rngState >> 48) % u64(len(seed) + 1))
+					mutated = seed[:cut]
+				} else if op == 1 {
+					// 2. Byte flip
+					if len(seed) > 0 {
+						let pos = i64((rngState >> 48) % u64(len(seed)))
+						let b = u8((rngState >> 56) & 0xff)
+						mutated = seed[:pos] + str([]u8{b}) + seed[pos + 1:]
+					}
+				} else if op == 2 {
+					// 3. Splicing
+					let seedIdx2 = i64((rngState >> 48) % u64(len(seeds)))
+					let seed2 = seeds[seedIdx2]
+					let p1 = i64((rngState >> 20) % u64(len(seed) + 1))
+					let p2 = i64((rngState >> 26) % u64(len(seed2) + 1))
+					mutated = seed[:p1] + seed2[p2:]
+				} else if op == 3 {
+					// 4. Deep nesting
+					let n = i64((rngState >> 48) % 60)
+					mut pre = ""
+					mut post = ""
+					for j in 0..n { pre += "("
+						post += ")" }
+					mutated = pre + seed + post
+				} else {
+					// 5. Corrupted bytes injection
+					let bad = str([]u8{0x00, 0xff, 0xfe, 0x80, 0x7f})
+					let pos = i64((rngState >> 48) % u64(len(seed) + 1))
+					mutated = seed[:pos] + bad + seed[pos:]
+				}
+
+				let parsed = Parse(mutated) catch _ { []Stmt{} }
+				if len(parsed) > 1000 {
+					failCount += 1
+				}
+			}
+		}
+		batch += 1
+	}
+
+	crucible.EqI("impossible parser output count", failCount, 0)
+	crucible.True("200k mutated inputs completed without crash", true)
 }
 
 fn BenchmarkParse100kSimpleStatements(b mut crucible.B) {
@@ -100,4 +170,489 @@ fn hasText(text str, needle str) bool {
 		if text[i:i + len(needle)] == needle { return true }
 	}
 	return false
+}
+
+fn stmtKind(statement Stmt) str {
+	return match statement {
+		Select(_) => "select"
+		Insert(_) => "insert"
+		Update(_) => "update"
+		Delete(_) => "delete"
+		CreateTable(_) => "create_table"
+		AlterTable(_) => "alter_table"
+		Drop(_) => "drop"
+		CreateIndex(_) => "create_index"
+		CreateView(_) => "create_view"
+		CreateSequence(_) => "create_sequence"
+		AlterSequence(_) => "alter_sequence"
+		CreateSchema(_) => "create_schema"
+		CreateType(_) => "create_type"
+		CreateFunction(_) => "create_function"
+		Truncate(_) => "truncate"
+		Transaction(_) => "transaction"
+		VariableSet(_) => "variable_set"
+		Explain(_) => "explain"
+		Copy(_) => "copy"
+		Prepare(_) => "prepare"
+		Execute(_) => "execute"
+		Deallocate(_) => "deallocate"
+		Vacuum(_) => "vacuum"
+		Analyze(_) => "analyze"
+		Discard(_) => "discard"
+		Comment(_) => "comment"
+		Grant(_) => "grant"
+		Revoke(_) => "revoke"
+		CreateRole(_) => "create_role"
+		AlterRole(_) => "alter_role"
+		DropRole(_) => "drop_role"
+		Listen(_) => "listen"
+		Notify(_) => "notify"
+		Unlisten(_) => "unlisten"
+		Lock(_) => "lock"
+		Do(_) => "do"
+		Checkpoint(_) => "checkpoint"
+		Call(_) => "call"
+	}
+}
+
+fn exprKind(value Expr) str {
+	return match value {
+		Binary(_) => "binary"
+		Boolean(_) => "boolean"
+		_ => "other"
+	}
+}
+
+fn TestPostgresKeywordClassesAndLexicalForms(t mut crucible.T) {
+	let tokens = lex("SELECT user AS user, between, int, \"MixedCase\", U&\"d\\0061t\", E'it\\'s', $tag$semi;colon$tag$, $2, 1_000, 1.25e-3, ::, :=, =>, ..") catch err {
+		t.Error("PostgreSQL lexical forms rejected: {err}")
+		return
+	}
+	crucible.EqS("reserved SELECT", tokens[0].KeywordClass, "reserved")
+	crucible.EqS("reserved USER", tokens[1].KeywordClass, "reserved")
+	crucible.EqS("col_name BETWEEN", tokens[5].KeywordClass, "col_name")
+	crucible.EqS("col_name INT", tokens[7].KeywordClass, "col_name")
+	crucible.EqS("quoted identifier", tokens[9].Kind, "quoted")
+	crucible.EqS("Unicode escaped identifier", decodeIdentifier(tokens[11].Text).Name, "dat")
+	crucible.EqS("escaped string", tokens[13].Kind, "string")
+	crucible.EqS("dollar quoted string", tokens[15].Kind, "string")
+	crucible.EqS("numbered parameter", tokens[17].Kind, "param")
+	crucible.EqS("underscore numeric", tokens[19].Kind, "number")
+	crucible.EqI("first token character position", tokens[0].Pos, 1)
+}
+
+fn TestReservedWordColumnLabel(t mut crucible.T) {
+	let statements = Parse("SELECT 1 AS user") catch err {
+		t.Error("reserved column label rejected: {err}")
+		return
+	}
+	crucible.EqI("one statement", len(statements), 1)
+	crucible.EqS("reserved label preserved", Deparse(statements[0]), "SELECT 1 AS user")
+}
+
+fn TestExpressionFormsAndPrecedence(t mut crucible.T) {
+	let expressions = []str{
+		"a IS NOT DISTINCT FROM b",
+		"x NOT BETWEEN SYMMETRIC 1 AND 3",
+		"x NOT IN (1, 2, 3)",
+		"x = ANY(ARRAY[1, 2])",
+		"EXISTS (SELECT 1 WHERE x = 1)",
+		"(SELECT x FROM t)",
+		"ARRAY(SELECT x FROM t)",
+		"arr[1:3]",
+		"ROW(1, 2)",
+		"(a, b)",
+		"CASE WHEN x > 0 THEN y ELSE z END",
+		"COALESCE(NULLIF(a, b), greatest(c, d))",
+		"CAST(x AS numeric(10, 2))",
+		"x::varchar(10)[]",
+		"EXTRACT(year FROM ts)",
+		"SUBSTRING(x FROM 2 FOR 3)",
+		"POSITION('a' IN x)",
+		"TRIM(BOTH 'x' FROM name)",
+		"OVERLAY(x PLACING y FROM 2 FOR 3)",
+		"current_timestamp(3) AT TIME ZONE 'UTC'",
+		"f(DISTINCT x ORDER BY y) FILTER (WHERE x > 0) OVER (PARTITION BY a ORDER BY b ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)",
+		"data->'key'->>'nested'",
+		"tags @> ARRAY['a', 'b']",
+		"tags <@ ARRAY['a', 'b']",
+		"name ~ '^[a-z]+$'",
+		"name ~* 'abc'",
+		"name !~ '^[0-9]'",
+		"name !~* 'xyz'",
+		"s LIKE '%foo%' ESCAPE '\\'",
+		"s NOT ILIKE 'bar%'",
+		"s SIMILAR TO '(a|b)%'",
+		"x > ALL(SELECT val FROM tbl)",
+		"x <= SOME(ARRAY[1, 2, 3])",
+		"DATE '2023-01-01'",
+		"INTERVAL '1 year 2 months'",
+		"TIME '12:30:00'",
+		"TIMESTAMP '2023-01-01 12:00:00'",
+		"percentile_disc(0.5) WITHIN GROUP (ORDER BY val)",
+		"func(VARIADIC arr)",
+		"func(a => 1, b => 2)",
+		"func(a := 1, b := 2)",
+		"CURRENT_DATE",
+		"CURRENT_TIME",
+		"CURRENT_USER",
+		"SESSION_USER",
+		"col COLLATE \"C\"",
+		"arr[1][2]",
+		"t.field",
+		"$1 + $2",
+		"a IS NULL",
+		"b IS NOT NULL",
+		"c IS TRUE",
+		"d IS NOT FALSE",
+		"e IS UNKNOWN",
+		"x IS NOT UNKNOWN",
+		"a || b",
+		"x ^ y",
+		"~x",
+	}
+	for expression in expressions {
+		let parsed = ParseExpr(expression) catch err {
+			t.Error("expression rejected ({expression}): {err}")
+			return
+		}
+		let deparsed = DeparseExpr(parsed)
+		if len(deparsed) == 0 {
+			t.Error("deparsed expression empty for: {expression}")
+		}
+	}
+	crucible.EqI("expression variants", len(expressions), 58)
+}
+
+fn TestSelectClausesAndCtes(t mut crucible.T) {
+	let cases = []str{
+		"SELECT 1 WINDOW w AS (PARTITION BY n ORDER BY n ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)",
+		"SELECT n FROM nums GROUP BY ROLLUP(n) HAVING count(*) > 0",
+		"SELECT n FROM nums ORDER BY n DESC NULLS LAST FETCH FIRST 10 ROWS WITH TIES",
+		"SELECT n FROM nums FOR UPDATE OF nums SKIP LOCKED",
+		"WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 4) SELECT DISTINCT ON (n) n FROM nums LEFT JOIN other USING (n) WHERE n > 0",
+	}
+	mut statements = []Stmt{}
+	for sql in cases {
+		let parsed = Parse(sql) catch err {
+			t.Error("select clauses rejected ({sql}): {err}")
+			return
+		}
+		statements = parsed
+	}
+	crucible.EqI("one select", len(statements), 1)
+	crucible.EqS("select statement class", stmtKind(statements[0]), "select")
+	let rendered = Deparse(statements[0])
+	let reparsed = Parse(rendered) catch err {
+		t.Error("select deparse rejected: {err}")
+		return
+	}
+	crucible.EqS("select round trip", Deparse(reparsed[0]), rendered)
+}
+
+fn TestWindowFrameParsing(t mut crucible.T) {
+	let sql = "PARTITION BY n ORDER BY n ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)"
+	let tokens = lex(sql) catch err {
+		t.Error("window tokens rejected: {err}")
+		return
+	}
+	mut parser = Parser{Source: sql, Tokens: tokens, At: 0, Depth: 0}
+	let _ = parser.expect("partition") catch err {
+		t.Error("partition expected: {err}")
+		return
+	}
+	let _ = parser.expect("by") catch err {
+		t.Error("partition by expected: {err}")
+		return
+	}
+	let _ = parser.parseExpressionListUntilAny("order", "rows", "range", "groups", ")") catch err {
+		t.Error("partition keys rejected: {err}")
+		return
+	}
+	let _ = parser.expect("order") catch err {
+		t.Error("order expected: {err}")
+		return
+	}
+	let _ = parser.expect("by") catch err {
+		t.Error("order by expected: {err}")
+		return
+	}
+	let _ = parser.parseSortListUntilAny("rows", "range", "groups", ")") catch err {
+		t.Error("window order rejected: {err}")
+		return
+	}
+	crucible.EqS("frame starts here", parser.text(), "rows")
+	let _ = parser.parseWindowFrame() catch err {
+		t.Error("window frame rejected: {err}")
+		return
+	}
+	crucible.EqS("window close remains", parser.text(), ")")
+}
+
+fn TestAllStatementCoverage(t mut crucible.T) {
+	let sqls = []str{
+		"SELECT 1",
+		"INSERT INTO t VALUES (1)",
+		"UPDATE t SET a = 1",
+		"DELETE FROM t WHERE a = 1",
+		"CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY, v int GENERATED ALWAYS AS (id + 1) STORED, name text COLLATE \"C\", CONSTRAINT pk PRIMARY KEY (id))",
+		"ALTER TABLE t ADD COLUMN c text",
+		"DROP TABLE IF EXISTS t CASCADE",
+		"CREATE UNIQUE INDEX CONCURRENTLY idx_t ON t (a DESC NULLS LAST) WHERE a > 0",
+		"CREATE OR REPLACE VIEW v AS SELECT 1 WITH CHECK OPTION",
+		"CREATE SEQUENCE s INCREMENT BY 1 MINVALUE 1 START WITH 1",
+		"ALTER SEQUENCE s RESTART WITH 100",
+		"CREATE SCHEMA IF NOT EXISTS s AUTHORIZATION alice",
+		"CREATE TYPE mood AS ENUM ('happy', 'sad')",
+		"CREATE FUNCTION f(x int) RETURNS int LANGUAGE sql AS 'SELECT x + 1'",
+		"TRUNCATE TABLE t RESTART IDENTITY CASCADE",
+		"BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY",
+		"SET work_mem = '64MB'",
+		"RESET search_path",
+		"SHOW time zone",
+		"EXPLAIN (ANALYZE, VERBOSE) SELECT 1",
+		"COPY t FROM 'data.csv' WITH (FORMAT csv, HEADER)",
+		"PREPARE q (int) AS SELECT $1",
+		"EXECUTE q(42)",
+		"DEALLOCATE q",
+		"VACUUM FULL t",
+		"ANALYZE VERBOSE t",
+		"DISCARD ALL",
+		"COMMENT ON TABLE t IS 'sample'",
+		"GRANT SELECT, INSERT ON TABLE t TO alice WITH GRANT OPTION",
+		"REVOKE SELECT ON TABLE t FROM alice CASCADE",
+		"CREATE ROLE alice WITH LOGIN PASSWORD 'pass'",
+		"ALTER ROLE alice WITH SUPERUSER",
+		"DROP ROLE IF EXISTS alice",
+		"LISTEN events",
+		"NOTIFY events, 'hello'",
+		"UNLISTEN *",
+		"LOCK TABLE t IN EXCLUSIVE MODE NOWAIT",
+		"DO LANGUAGE plpgsql 'BEGIN NULL; END'",
+		"CHECKPOINT",
+		"CALL my_proc(1, 'test')",
+	}
+
+	let expectedKinds = []str{
+		"select",
+		"insert",
+		"update",
+		"delete",
+		"create_table",
+		"alter_table",
+		"drop",
+		"create_index",
+		"create_view",
+		"create_sequence",
+		"alter_sequence",
+		"create_schema",
+		"create_type",
+		"create_function",
+		"truncate",
+		"transaction",
+		"variable_set",
+		"variable_set",
+		"variable_set",
+		"explain",
+		"copy",
+		"prepare",
+		"execute",
+		"deallocate",
+		"vacuum",
+		"analyze",
+		"discard",
+		"comment",
+		"grant",
+		"revoke",
+		"create_role",
+		"alter_role",
+		"drop_role",
+		"listen",
+		"notify",
+		"unlisten",
+		"lock",
+		"do",
+		"checkpoint",
+		"call",
+	}
+
+	for i, sql in sqls {
+		let statements = Parse(sql) catch err {
+			t.Error("statement {i} failed to parse: {sql}, error: {err}")
+			continue
+		}
+		crucible.EqI("count for statement {i}", len(statements), 1)
+		crucible.EqS("kind for statement {i}: {sql}", stmtKind(statements[0]), expectedKinds[i])
+		let deparsed = Deparse(statements[0])
+		if len(deparsed) > 0 {
+			let reparsed = Parse(deparsed) catch err {
+				t.Error("deparsed statement {i} failed to reparse: {deparsed}, error: {err}")
+				continue
+			}
+			crucible.EqI("reparsed count for statement {i}", len(reparsed), 1)
+			crucible.EqS("reparsed kind for statement {i}", stmtKind(reparsed[0]), expectedKinds[i])
+		}
+	}
+}
+
+fn TestParseErrorWordingAndCodes(t mut crucible.T) {
+	// 1. Syntax error at end of input
+	let _ = Parse("SELECT 1 +") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code at end of input", pe.Code, "42601")
+		crucible.EqS("msg at end of input", pe.Message, "syntax error at end of input")
+		crucible.EqI("pos at end of input", pe.Pos, 11)
+		[]Stmt{}
+	}
+
+	// 2. Syntax error at or near
+	let _ = Parse("SELECT FROM") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code at or near", pe.Code, "42601")
+		crucible.EqS("msg at or near", pe.Message, "syntax error at or near \"FROM\"")
+		crucible.EqI("pos at or near", pe.Pos, 8)
+		[]Stmt{}
+	}
+
+	// 3. Unterminated quoted string
+	let _ = Parse("SELECT 'unterminated") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code unterminated string", pe.Code, "42601")
+		crucible.True("msg unterminated string", hasText(pe.Message, "unterminated quoted string at or near"))
+		crucible.EqI("pos unterminated string", pe.Pos, 8)
+		[]Stmt{}
+	}
+
+	// 4. Trailing junk after numeric literal
+	let _ = Parse("SELECT 1a") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code trailing junk", pe.Code, "42601")
+		crucible.True("msg trailing junk", hasText(pe.Message, "trailing junk after numeric literal at or near \"1a\""))
+		crucible.EqI("pos trailing junk", pe.Pos, 8)
+		[]Stmt{}
+	}
+
+	// 5. Stack depth limit exceeded
+	mut deepSql = "SELECT "
+	for i in 0..300 { deepSql += "(" }
+	deepSql += "1"
+	for i in 0..300 { deepSql += ")" }
+	let _ = Parse(deepSql) catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code stack depth", pe.Code, "54001")
+		crucible.EqS("msg stack depth", pe.Message, "stack depth limit exceeded")
+		[]Stmt{}
+	}
+}
+
+fn findTestdataFile(name str) str {
+	let candidates = []str{
+		"parse/testdata/" + name,
+		"testdata/" + name,
+		"/Users/mhomsi/dev/extra/tingres-wt/parse/parse/testdata/" + name,
+	}
+	for cand in candidates {
+		let content = quarry.ReadFile(cand) catch _ { "" }
+		if len(content) > 0 { return cand }
+	}
+	return ""
+}
+
+fn TestValidCorpus(t mut crucible.T) {
+	let path = findTestdataFile("valid.sql")
+	crucible.True("found valid.sql", len(path) > 0)
+	let content = quarry.ReadFile(path) catch err {
+		t.Error("failed reading valid.sql: {err}")
+		""
+	}
+	let stmts = Parse(content) catch err {
+		t.Error("failed parsing valid.sql: {err}")
+		[]Stmt{}
+	}
+	crucible.True("valid corpus >= 1500 stmts", len(stmts) >= 1500)
+
+	mut roundtripFailures = 0
+	mut at = 0
+	for at < len(stmts) {
+		let end = min(at + 100, len(stmts))
+		roundtripFailures += checkRoundtripBatch(stmts, at, end)
+		at += 100
+	}
+	crucible.EqI("deparse roundtrip failures", roundtripFailures, 0)
+}
+
+fn TestInvalidCorpus(t mut crucible.T) {
+	let pathSql = findTestdataFile("invalid.sql")
+	crucible.True("found invalid.sql", len(pathSql) > 0)
+	let contentSql = quarry.ReadFile(pathSql) catch err {
+		t.Error("failed reading invalid.sql: {err}")
+		""
+	}
+	let pathExp = findTestdataFile("invalid_expected.txt")
+	crucible.True("found invalid_expected.txt", len(pathExp) > 0)
+	let contentExp = quarry.ReadFile(pathExp) catch err {
+		t.Error("failed reading invalid_expected.txt: {err}")
+		""
+	}
+
+	let sqlLines = splitLines(contentSql)
+	let expLines = splitLines(contentExp)
+	crucible.True("invalid corpus >= 200 statements", len(sqlLines) >= 200)
+	crucible.EqI("sql and expected lines match", len(sqlLines), len(expLines))
+
+	mut acceptedCount = 0
+	mut posMatches = 0
+	for i in 0..len(sqlLines) {
+		let line = sqlLines[i]
+		if len(line) == 0 { continue }
+		let parsed = Parse(line) catch err {
+			let pe = ToParseError(err)
+			crucible.EqS("error code is 42601", pe.Code, "42601")
+			if pe.Pos > 0 { posMatches += 1 }
+			[]Stmt{}
+		}
+		if len(parsed) > 0 {
+			acceptedCount += 1
+		}
+	}
+	crucible.EqI("invalid statements accepted", acceptedCount, 0)
+	crucible.True("all error positions valid", posMatches == len(sqlLines))
+}
+
+fn splitLines(s str) []str {
+	mut out = []str{}
+	mut start = 0
+	for i in 0..len(s) {
+		if s[i] == 10 {
+			let line = trimRightCarriage(s[start:i])
+			if len(line) > 0 { out = append(out, line) }
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		let line = trimRightCarriage(s[start:])
+		if len(line) > 0 { out = append(out, line) }
+	}
+	return out
+}
+
+fn trimRightCarriage(s str) str {
+	if len(s) > 0 && s[len(s) - 1] == 13 { return s[:len(s) - 1] }
+	return s
+}
+
+fn checkRoundtripBatch(stmts []Stmt, start i64, end i64) i64 {
+	mut failures = 0
+	for i in start..end {
+		let deparsed = Deparse(stmts[i])
+		if len(deparsed) == 0 {
+			failures += 1
+			continue
+		}
+		let reparsed = Parse(deparsed) catch _ { []Stmt{} }
+		if len(reparsed) != 1 || stmtKind(reparsed[0]) != stmtKind(stmts[i]) || Deparse(reparsed[0]) != deparsed {
+			failures += 1
+		}
+	}
+	return failures
 }

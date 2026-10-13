@@ -1,0 +1,267 @@
+package exec
+
+import "../types"
+import "mint"
+import "twine"
+
+// GucEntry represents one configuration parameter.
+type GucEntry struct {
+	Name str
+	Value str
+	DefaultValue str
+	Description str
+	Report bool
+	ReadOnly bool
+}
+
+// GucStatus is a name/value pair reported in ParameterStatus messages.
+type GucStatus struct {
+	Name str
+	Value str
+}
+
+// LocalGucChange records a setting modified in a transaction block.
+type LocalGucChange struct {
+	Name str
+	OldValue str
+}
+
+// initGucTable populates standard PostgreSQL configuration parameters.
+fn initGucTable(user str) map[str]GucEntry {
+	mut gucs = make(map[str]GucEntry)
+	addGuc(mut gucs, "search_path", "\"$user\", public", "Sets the schema search order for names that are not schema-qualified.", false, false)
+	addGuc(mut gucs, "datestyle", "ISO, MDY", "Displays the current date and time style.", true, false)
+	addGuc(mut gucs, "timezone", "UTC", "Sets the time zone for displaying and interpreting time stamps.", true, false)
+	addGuc(mut gucs, "client_encoding", "UTF8", "Sets the client's character set encoding.", true, false)
+	addGuc(mut gucs, "standard_conforming_strings", "on", "Causes '...' to treat backslashes literally in strings.", true, false)
+	addGuc(mut gucs, "application_name", "", "Sets the application name to be reported in statistics and logs.", true, false)
+	addGuc(mut gucs, "statement_timeout", "0", "Sets the maximum allowed duration of any statement.", false, false)
+	addGuc(mut gucs, "lock_timeout", "0", "Sets the maximum allowed duration of any wait for a lock.", false, false)
+	addGuc(mut gucs, "default_transaction_isolation", "read committed", "Sets the transaction isolation level of each new transaction.", false, false)
+	addGuc(mut gucs, "extra_float_digits", "1", "Sets the number of digits displayed for floating-point values.", false, false)
+	addGuc(mut gucs, "work_mem", "4MB", "Sets the maximum memory to be used for query workspaces.", false, false)
+	addGuc(mut gucs, "server_version", "17.0 (tingres)", "Shows the server version.", true, true)
+	addGuc(mut gucs, "server_encoding", "UTF8", "Sets the server (database) character set encoding.", true, true)
+	addGuc(mut gucs, "is_superuser", "on", "Shows whether the current role has superuser privileges.", true, true)
+	addGuc(mut gucs, "session_authorization", user, "Sets the session user name.", true, true)
+	addGuc(mut gucs, "transaction_isolation", "read committed", "Sets the current transaction's isolation level.", false, true)
+	addGuc(mut gucs, "transaction_read_only", "off", "Sets the current transaction's read-only status.", false, false)
+	addGuc(mut gucs, "intervalstyle", "postgres", "Sets the display format for interval values.", true, false)
+	addGuc(mut gucs, "integer_datetimes", "on", "Datetimes are integer based.", true, true)
+	return gucs
+}
+
+fn addGuc(gucs mut map[str]GucEntry, name str, defaultValue str, description str, report bool, readOnly bool) {
+	gucs[name] = GucEntry{
+		Name: name,
+		Value: defaultValue,
+		DefaultValue: defaultValue,
+		Description: description,
+		Report: report,
+		ReadOnly: readOnly,
+	}
+}
+
+// CanonicalGucName normalizes a parameter name to lowercase without whitespace.
+fn CanonicalGucName(name str) str {
+	mut s = twine.TrimSpace(name)
+	mut out = ""
+	for _, c in s {
+		if c >= 'A' && c <= 'Z' {
+			out += str(c + 32)
+		} else {
+			out += str(c)
+		}
+	}
+	return out
+}
+
+// ValidateGuc validates and normalizes a GUC setting value.
+fn ValidateGuc(name str, val str) !(str, str) {
+	let key = CanonicalGucName(name)
+	let rawVal = twine.TrimSpace(val)
+	// Strip surrounding single quotes if present
+	mut cleanVal = rawVal
+	if len(cleanVal) >= 2 && cleanVal[0] == 39 && cleanVal[len(cleanVal)-1] == 39 {
+		cleanVal = cleanVal[1:len(cleanVal)-1]
+	}
+
+	match key {
+		"search_path" => {
+			return key, cleanVal
+		}
+		"datestyle" => {
+			let validated = try validateDateStyle(cleanVal)
+			return key, validated
+		}
+		"timezone" => {
+			if cleanVal == "" {
+				try types.ErrorFault(types.NewPgError("22023", "invalid value for parameter \"TimeZone\": \"\"", "", "", 0))
+			}
+			return key, cleanVal
+		}
+		"client_encoding" => {
+			let upper = toUpper(cleanVal)
+			if upper != "UTF8" && upper != "UTF-8" && upper != "UNICODE" {
+				try types.ErrorFault(types.NewPgError("22023", "invalid value for parameter \"client_encoding\": \"{cleanVal}\"", "", "", 0))
+			}
+			return key, "UTF8"
+		}
+		"standard_conforming_strings", "transaction_read_only" => {
+			let b = try parseBoolGuc(cleanVal, key)
+			mut out = "off"
+			if b { out = "on" }
+			return key, out
+		}
+		"application_name" => {
+			return key, cleanVal
+		}
+		"statement_timeout", "lock_timeout" => {
+			let ms = try parseTimeoutGuc(cleanVal, key)
+			return key, mint.Itoa(ms)
+		}
+		"default_transaction_isolation" => {
+			let lower = CanonicalGucName(cleanVal)
+			if lower != "read committed" && lower != "repeatable read" && lower != "serializable" && lower != "read uncommitted" {
+				try types.ErrorFault(types.NewPgError("22023", "invalid value for parameter \"default_transaction_isolation\": \"{cleanVal}\"", "", "", 0))
+			}
+			return key, lower
+		}
+		"extra_float_digits" => {
+			let n = mint.Atoi(cleanVal) catch _ {
+				try types.ErrorFault(types.NewPgError("22023", "invalid value for parameter \"extra_float_digits\": \"{cleanVal}\"", "", "", 0))
+				0
+			}
+			if n < -15 || n > 3 {
+				try types.ErrorFault(types.NewPgError("22023", "{cleanVal} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)", "", "", 0))
+			}
+			return key, cleanVal
+		}
+		"work_mem" => {
+			try validateMemoryGuc(cleanVal, key)
+			return key, cleanVal
+		}
+		"server_version", "server_encoding", "is_superuser", "session_authorization", "transaction_isolation", "integer_datetimes", "intervalstyle" => {
+			return key, cleanVal
+		}
+		_ => {
+			try types.ErrorFault(types.NewPgError("42704", "unrecognized configuration parameter \"{name}\"", "", "", 0))
+			return "", ""
+		}
+	}
+}
+
+fn parseBoolGuc(val str, name str) !bool {
+	let lower = CanonicalGucName(val)
+	if lower == "on" || lower == "true" || lower == "yes" || lower == "1" {
+		return true
+	}
+	if lower == "off" || lower == "false" || lower == "no" || lower == "0" {
+		return false
+	}
+	try types.ErrorFault(types.NewPgError("22023", "parameter \"{name}\" requires a Boolean value", "", "", 0))
+	return false
+}
+
+fn parseTimeoutGuc(val str, name str) !i64 {
+	mut s = twine.TrimSpace(val)
+	mut multiplier = i64(1)
+	if twine.HasSuffix(s, "ms") {
+		s = twine.TrimSpace(s[:len(s)-2])
+	} else if twine.HasSuffix(s, "s") {
+		multiplier = 1000
+		s = twine.TrimSpace(s[:len(s)-1])
+	} else if twine.HasSuffix(s, "min") {
+		multiplier = 60000
+		s = twine.TrimSpace(s[:len(s)-3])
+	} else if twine.HasSuffix(s, "h") {
+		multiplier = 3600000
+		s = twine.TrimSpace(s[:len(s)-1])
+	} else if twine.HasSuffix(s, "d") {
+		multiplier = 86400000
+		s = twine.TrimSpace(s[:len(s)-1])
+	}
+	let n = mint.Atoi(s) catch _ {
+		try types.ErrorFault(types.NewPgError("22023", "invalid value for parameter \"{name}\": \"{val}\"", "", "", 0))
+		0
+	}
+	if n < 0 {
+		try types.ErrorFault(types.NewPgError("22023", "{val} is outside the valid range for parameter \"{name}\"", "", "", 0))
+	}
+	return n * multiplier
+}
+
+fn validateMemoryGuc(val str, name str) ! {
+	mut s = twine.TrimSpace(val)
+	if twine.HasSuffix(s, "kB") || twine.HasSuffix(s, "kb") {
+		s = twine.TrimSpace(s[:len(s)-2])
+	} else if twine.HasSuffix(s, "MB") || twine.HasSuffix(s, "mb") {
+		s = twine.TrimSpace(s[:len(s)-2])
+	} else if twine.HasSuffix(s, "GB") || twine.HasSuffix(s, "gb") {
+		s = twine.TrimSpace(s[:len(s)-2])
+	} else if twine.HasSuffix(s, "TB") || twine.HasSuffix(s, "tb") {
+		s = twine.TrimSpace(s[:len(s)-2])
+	} else if twine.HasSuffix(s, "B") || twine.HasSuffix(s, "b") {
+		s = twine.TrimSpace(s[:len(s)-1])
+	}
+	let n = mint.Atoi(s) catch _ {
+		try types.ErrorFault(types.NewPgError("22023", "invalid value for parameter \"{name}\": \"{val}\"", "", "", 0))
+		0
+	}
+	if n < 0 {
+		try types.ErrorFault(types.NewPgError("22023", "{val} is outside the valid range for parameter \"{name}\"", "", "", 0))
+	}
+}
+
+fn validateDateStyle(val str) !str {
+	let lower = CanonicalGucName(val)
+	let parts = twine.Split(lower, ",")
+	mut hasFormat = false
+	mut hasOrder = false
+	mut fmtStr = "ISO"
+	mut ordStr = "MDY"
+
+	for p in parts {
+		let part = twine.TrimSpace(p)
+		if part == "iso" {
+			hasFormat = true
+			fmtStr = "ISO"
+		} else if part == "postgres" {
+			hasFormat = true
+			fmtStr = "Postgres"
+		} else if part == "sql" {
+			hasFormat = true
+			fmtStr = "SQL"
+		} else if part == "german" {
+			hasFormat = true
+			fmtStr = "German"
+		} else if part == "mdy" {
+			hasOrder = true
+			ordStr = "MDY"
+		} else if part == "dmy" {
+			hasOrder = true
+			ordStr = "DMY"
+		} else if part == "ymd" {
+			hasOrder = true
+			ordStr = "YMD"
+		} else {
+			try types.ErrorFault(types.NewPgError("22023", "invalid value for parameter \"DateStyle\": \"{val}\"", "", "", 0))
+		}
+	}
+	if !hasFormat && !hasOrder {
+		try types.ErrorFault(types.NewPgError("22023", "invalid value for parameter \"DateStyle\": \"{val}\"", "", "", 0))
+	}
+	return "{fmtStr}, {ordStr}"
+}
+
+fn toUpper(s str) str {
+	mut out = ""
+	for _, c in s {
+		if c >= 'a' && c <= 'z' {
+			out += str(c - 32)
+		} else {
+			out += str(c)
+		}
+	}
+	return out
+}

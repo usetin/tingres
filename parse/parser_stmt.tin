@@ -1,0 +1,803 @@
+package parse
+
+fn (p mut Parser) parseStatementDispatch() !Stmt {
+	mut withClause ?WithClause = nil
+	if p.eat("with") {
+		let wc = try p.parseWith(p.pos())
+		withClause = wc
+	}
+	let first = lowerAscii(p.text())
+	if first == "select" || first == "values" || first == "table" {
+		let value = try p.parseSelectAfterWith(withClause, p.pos())
+		return Stmt.Select(value)
+	} else if first == "insert" {
+		let value = try p.parseInsert(withClause)
+		return Stmt.Insert(value)
+	} else if first == "update" {
+		let value = try p.parseUpdate(withClause)
+		return Stmt.Update(value)
+	} else if first == "delete" {
+		let value = try p.parseDelete(withClause)
+		return Stmt.Delete(value)
+	} else if first == "create" {
+		return try p.parseCreate()
+	} else if first == "alter" {
+		return try p.parseAlter()
+	} else if first == "drop" {
+		return try p.parseDrop()
+	} else if first == "truncate" {
+		let value = try p.parseTruncate()
+		return Stmt.Truncate(value)
+	} else if first == "begin" || first == "start" || first == "commit" || first == "end" || first == "rollback" || first == "abort" || first == "savepoint" || first == "release" {
+		let value = try p.parseTransaction()
+		return Stmt.Transaction(value)
+	} else if first == "set" || first == "reset" || first == "show" {
+		if first == "set" && (p.At + 1 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "transaction") {
+			let value = try p.parseTransaction()
+			return Stmt.Transaction(value)
+		}
+		let value = try p.parseVariableSet()
+		return Stmt.VariableSet(value)
+	} else if first == "explain" {
+		let value = try p.parseExplain()
+		return Stmt.Explain(value)
+	} else if first == "copy" {
+		let value = try p.parseCopy()
+		return Stmt.Copy(value)
+	} else if first == "prepare" {
+		let value = try p.parsePrepare()
+		return Stmt.Prepare(value)
+	} else if first == "execute" {
+		let value = try p.parseExecute()
+		return Stmt.Execute(value)
+	} else if first == "deallocate" {
+		let value = try p.parseDeallocate()
+		return Stmt.Deallocate(value)
+	} else if first == "vacuum" {
+		let value = try p.parseVacuum()
+		return Stmt.Vacuum(value)
+	} else if first == "analyze" {
+		let value = try p.parseAnalyze()
+		return Stmt.Analyze(value)
+	} else if first == "discard" {
+		let value = try p.parseDiscard()
+		return Stmt.Discard(value)
+	} else if first == "comment" {
+		let value = try p.parseComment()
+		return Stmt.Comment(value)
+	} else if first == "grant" {
+		let value = try p.parseGrant()
+		return Stmt.Grant(value)
+	} else if first == "revoke" {
+		let value = try p.parseRevoke()
+		return Stmt.Revoke(value)
+	} else if first == "listen" {
+		let value = try p.parseListen()
+		return Stmt.Listen(value)
+	} else if first == "notify" {
+		let value = try p.parseNotify()
+		return Stmt.Notify(value)
+	} else if first == "unlisten" {
+		let value = try p.parseUnlisten()
+		return Stmt.Unlisten(value)
+	} else if first == "lock" {
+		let value = try p.parseLock()
+		return Stmt.Lock(value)
+	} else if first == "do" {
+		let value = try p.parseDo()
+		return Stmt.Do(value)
+	} else if first == "checkpoint" {
+		p.At += 1
+		return Stmt.Checkpoint(CheckpointStmt{Pos: p.pos()})
+	} else if first == "call" {
+		let value = try p.parseCall()
+		return Stmt.Call(value)
+	}
+	fail unsupportedMessage(p.Source, p.pos(), "statement " + first)
+}
+
+fn parseStatement(sql str, tokens []Token) !Stmt {
+	mut p = Parser{Source: sql, Tokens: tokens, At: 0, Depth: 0}
+	if p.done() {
+		fail syntaxMessage(sql, len(sql), "syntax error at end of input")
+	}
+	let statement = try p.parseStatementDispatch()
+	if !p.done() {
+		try p.errorHere()
+	}
+	return statement
+}
+
+fn (p mut Parser) parseWith(pos i64) !WithClause {
+	mut recursive = p.eat("recursive")
+	mut ctes = []CommonTableExpr{}
+	for {
+		let name = try p.parseIdentifier()
+		mut columns = []Identifier{}
+		if p.eat("(") {
+			columns = try p.parseIdentifierList(")")
+			try p.expect(")")
+		}
+		try p.expect("as")
+		mut materialized = "default"
+		if p.eat("materialized") { materialized = "materialized" } else if p.eat("not") {
+			try p.expect("materialized")
+			materialized = "not materialized"
+		}
+		try p.expect("(")
+		let query = try p.parseSelect()
+		try p.expect(")")
+		ctes = append(ctes, CommonTableExpr{Pos: name.Pos, Name: name, Columns: columns, Materialized: materialized, Query: query})
+		if !p.eat(",") { break }
+	}
+	return WithClause{Pos: pos, Recursive: recursive, Ctes: ctes}
+}
+
+fn (p mut Parser) parseSelect() !SelectStmt {
+	mut withClause ?WithClause = nil
+	mut pos = len(p.Source)
+	if !p.done() { pos = p.Tokens[p.At].Pos }
+	if p.eat("with") { withClause = try p.parseWith(pos) }
+	return try p.parseSelectAfterWith(withClause, pos)
+}
+
+fn (p mut Parser) parseSelectAfterWith(withClause ?WithClause, pos i64) !SelectStmt {
+	let body = try p.parseQueryBody(0)
+	mut orderBy = []SortBy{}
+	mut limitExpr ?Expr = nil
+	mut offset ?Expr = nil
+	mut fetch = ""
+	mut fetchCount ?Expr = nil
+	mut locking = []LockingClause{}
+	if p.eat("order") {
+		try p.expect("by")
+		orderBy = try p.parseSortList(";")
+	}
+	if p.eat("limit") {
+		if p.eat("all") { fetch = "limit all" } else { limitExpr = try p.parseExpression(0) }
+	}
+	if p.eat("offset") {
+		offset = try p.parseExpression(0)
+		p.eat("row")
+		p.eat("rows")
+	}
+	if p.eat("fetch") {
+		mut direction = "first"
+		if p.eat("next") { direction = "next" } else { p.eat("first") }
+		if p.text() != "row" && p.text() != "rows" { fetchCount = try p.parseExpression(0) }
+		p.eat("row")
+		p.eat("rows")
+		if p.eat("only") { fetch = direction + " only" } else if p.eat("with") {
+			try p.expect("ties")
+			fetch = direction + " with ties"
+		} else { try p.errorHere() }
+	}
+	for p.eat("for") {
+		let lockPos = p.Tokens[p.At - 1].Pos
+		mut strength = ""
+		if p.eat("update") { strength = "update" } else if p.eat("share") { strength = "share" } else if p.eat("no") {
+			try p.expect("key")
+			try p.expect("update")
+			strength = "no key update"
+		} else if p.eat("key") {
+			try p.expect("share")
+			strength = "key share"
+		} else { try p.errorHere() }
+		mut of = []QualifiedName{}
+		if p.eat("of") {
+			for {
+				let name = try p.parseQualifiedName()
+				of = append(of, name)
+				if !p.eat(",") { break }
+			}
+		}
+		mut wait = ""
+		if p.eat("nowait") { wait = "nowait" } else if p.eat("skip") {
+			try p.expect("locked")
+			wait = "skip locked"
+		}
+		locking = append(locking, LockingClause{Pos: lockPos, Strength: strength, Of: of, Wait: wait})
+	}
+	return SelectStmt{Pos: pos, With: withClause, Body: body, OrderBy: orderBy, Limit: limitExpr, Offset: offset, Fetch: fetch, FetchCount: fetchCount, Locking: locking}
+}
+
+fn (p mut Parser) parseQueryBody(minPrecedence i64) !QueryBody {
+	mut left = try p.parseQueryAtom()
+	for !p.done() {
+		let word = lowerAscii(p.text())
+		mut prec = 0
+		if word == "union" || word == "except" { prec = 1 } else if word == "intersect" { prec = 2 }
+		if prec == 0 || prec < minPrecedence { break }
+		let pos = p.Tokens[p.At].Pos
+		p.At += 1
+		let all = p.eat("all")
+		if !all { p.eat("distinct") }
+		let right = try p.parseQueryBody(prec + 1)
+		left = QueryBody.Set(SetOperation{Pos: pos, Left: left, Op: word, All: all, Right: right})
+	}
+	return left
+}
+
+fn (p mut Parser) parseQueryAtom() !QueryBody {
+	if p.eat("(") {
+		let body = try p.parseQueryBody(0)
+		try p.expect(")")
+		return body
+	}
+	if p.eat("select") {
+		let core = try p.parseSelectCore(p.Tokens[p.At - 1].Pos)
+		return QueryBody.Core(core)
+	}
+	if p.eat("values") {
+		let values = try p.parseValues(p.Tokens[p.At - 1].Pos)
+		return QueryBody.Values(values)
+	}
+	if p.eat("table") {
+		let pos = p.Tokens[p.At - 1].Pos
+		let name = try p.parseQualifiedName()
+		let target = TargetEntry{Pos: name.Pos, Value: Expr.ColumnRef(ColumnRefExpr{Pos: name.Pos, Star: true})}
+		let item = FromItem.Table(TableRef{Pos: name.Pos, Name: name})
+		return QueryBody.Core(SelectCore{Pos: pos, Targets: []TargetEntry{target}, From: []FromItem{item}})
+	}
+	try p.errorHere()
+	return QueryBody.Values(ValuesQuery{Pos: p.pos()})
+}
+
+fn (p mut Parser) parseSelectCore(pos i64) !SelectCore {
+	mut distinct = "all"
+	mut distinctOn = []Expr{}
+	if p.eat("distinct") {
+		distinct = "distinct"
+		if p.eat("on") {
+			try p.expect("(")
+			distinctOn = try p.parseExpressionList(")")
+			try p.expect(")")
+			distinct = "distinct on"
+		}
+	} else { p.eat("all") }
+	let targets = try p.parseTargetList()
+	mut from = []FromItem{}
+	mut where ?Expr = nil
+	mut groupBy = []GroupingElement{}
+	mut having ?Expr = nil
+	mut windows = []NamedWindow{}
+	if p.eat("from") { from = try p.parseFromList() }
+	if p.eat("where") { where = try p.parseExpression(0) }
+	if p.eat("group") {
+		try p.expect("by")
+		groupBy = try p.parseGroupingList()
+	}
+	if p.eat("having") { having = try p.parseExpression(0) }
+	if p.eat("window") {
+		for {
+			let name = try p.parseIdentifier()
+			try p.expect("as")
+			try p.expect("(")
+			let spec = try p.parseWindowSpec(name.Pos)
+			try p.expect(")")
+			windows = append(windows, NamedWindow{Pos: name.Pos, Name: name, Spec: spec})
+			if !p.eat(",") { break }
+		}
+	}
+	return SelectCore{Pos: pos, Distinct: distinct, DistinctOn: distinctOn, Targets: targets, From: from, Where: where, GroupBy: groupBy, Having: having, Windows: windows}
+}
+
+fn (p mut Parser) parseTargetList() ![]TargetEntry {
+	mut targets = []TargetEntry{}
+	for {
+		mut pos = len(p.Source)
+		if !p.done() { pos = p.Tokens[p.At].Pos }
+		let value = try p.parseExpression(0)
+		mut alias ?Identifier = nil
+		if p.eat("as") { alias = try p.parseLabelIdentifier() } else if p.canBeIdentifier() && !isSelectClause(p.text()) { alias = try p.parseIdentifier() }
+		targets = append(targets, TargetEntry{Pos: pos, Value: value, Alias: alias})
+		if !p.eat(",") { break }
+	}
+	return targets
+}
+
+fn isSelectClause(word str) bool {
+	return inWords(word, "from where group having window union intersect except order limit offset fetch for")
+}
+
+fn (p mut Parser) parseFromList() ![]FromItem {
+	mut items = []FromItem{}
+	for {
+		let item = try p.parseFromItem()
+		items = append(items, item)
+		if !p.eat(",") { break }
+	}
+	return items
+}
+
+fn (p mut Parser) parseFromItem() !FromItem {
+	let lateral = p.eat("lateral")
+	mut item = try p.parseFromAtom(lateral)
+	for {
+		let joinPos = ifPosition(p)
+		mut natural = p.eat("natural")
+		mut joinType = "inner"
+		if p.eat("left") {
+			joinType = "left"
+			p.eat("outer")
+		} else if p.eat("right") {
+			joinType = "right"
+			p.eat("outer")
+		} else if p.eat("full") {
+			joinType = "full"
+			p.eat("outer")
+		} else if p.eat("cross") { joinType = "cross" } else if p.eat("inner") { joinType = "inner" }
+		if !p.eat("join") {
+			if natural || joinType != "inner" { try p.errorHere() }
+			break
+		}
+		let right = try p.parseFromAtom(false)
+		mut condition ?JoinCondition = nil
+		if p.eat("on") {
+			let value = try p.parseExpression(0)
+			condition = JoinCondition.On(OnCondition{Pos: valuePos(value), Value: value})
+		} else if p.eat("using") {
+			let pos = ifPosition(p)
+			try p.expect("(")
+			let columns = try p.parseIdentifierList(")")
+			try p.expect(")")
+			condition = JoinCondition.Using(UsingCondition{Pos: pos, Columns: columns})
+		} else if joinType != "cross" && !natural { try p.errorHere() }
+		item = FromItem.Join(JoinExpr{Pos: joinPos, Left: item, Right: right, JoinType: joinType, Natural: natural, Condition: condition})
+	}
+	return item
+}
+
+fn ifPosition(p Parser) i64 {
+	if p.done() { return len(p.Source) }
+	return p.Tokens[p.At].Pos
+}
+
+fn (p mut Parser) parseFromAtom(lateral bool) !FromItem {
+	mut item = FromItem.Table(TableRef{Pos: 0, Name: QualifiedName{Pos: 0, Parts: []Identifier{Identifier{Pos: 0, Name: ""}}}})
+	if p.eat("(") {
+		if p.isQueryStart() {
+			let query = try p.parseSelect()
+			try p.expect(")")
+			item = FromItem.Subquery(SubqueryRef{Pos: query.Pos, Query: query, Lateral: lateral})
+		} else {
+			let inner = try p.parseFromItem()
+			try p.expect(")")
+			item = inner
+		}
+	} else if p.eat("values") {
+		let values = try p.parseValues(p.Tokens[p.At - 1].Pos)
+		item = FromItem.Values(ValuesRef{Pos: values.Pos, Values: values, Lateral: lateral})
+	} else {
+		let name = try p.parseQualifiedName()
+		if p.text() == "(" {
+			let function = try p.parseFunction(name.Pos, name)
+			item = FromItem.Function(FunctionRef{Pos: name.Pos, Function: function, Alias: nil, Lateral: lateral})
+		} else {
+			item = FromItem.Table(TableRef{Pos: name.Pos, Name: name})
+		}
+	}
+	return try p.parseAliasOnFrom(item)
+}
+
+fn (p mut Parser) parseAlias() !?AliasClause {
+	mut alias ?AliasClause = nil
+	if p.eat("as") {
+		let name = try p.parseLabelIdentifier()
+		let columns = try p.parseOptionalAliasColumns()
+		alias = AliasClause{Pos: name.Pos, Name: name, Columns: columns}
+	} else if p.canBeIdentifier() && !isFromClause(p.text()) {
+		let name = try p.parseLabelIdentifier()
+		let columns = try p.parseOptionalAliasColumns()
+		alias = AliasClause{Pos: name.Pos, Name: name, Columns: columns}
+	}
+	return alias
+}
+
+fn (p mut Parser) parseOptionalAliasColumns() ![]Identifier {
+	mut columns = []Identifier{}
+	if p.eat("(") {
+		columns = try p.parseIdentifierList(")")
+		try p.expect(")")
+	}
+	return columns
+}
+
+fn (p mut Parser) parseAliasOnFrom(item FromItem) !FromItem {
+	return match item {
+		Subquery(v) => {
+			mut alias = v.Alias
+			if alias == nil { alias = try p.parseAlias() }
+			FromItem.Subquery(SubqueryRef{Pos: v.Pos, Query: v.Query, Alias: alias, Lateral: v.Lateral})
+		}
+		Values(v) => {
+			mut alias = v.Alias
+			if alias == nil { alias = try p.parseAlias() }
+			FromItem.Values(ValuesRef{Pos: v.Pos, Values: v.Values, Alias: alias, Lateral: v.Lateral})
+		}
+		Function(v) => {
+			mut alias = v.Alias
+			if alias == nil { alias = try p.parseAlias() }
+			FromItem.Function(FunctionRef{Pos: v.Pos, Function: v.Function, Columns: v.Columns, Alias: alias, Lateral: v.Lateral, WithOrdinality: v.WithOrdinality})
+		}
+		Table(v) => {
+			mut alias = v.Alias
+			if alias == nil { alias = try p.parseAlias() }
+			FromItem.Table(TableRef{Pos: v.Pos, Name: v.Name, Alias: alias})
+		}
+		_ => item
+	}
+}
+
+fn isFromClause(word str) bool {
+	return inWords(word, "set returning where group having window order limit offset fetch union intersect except inner left right full cross natural join on using for")
+}
+
+fn (p mut Parser) parseValues(pos i64) !ValuesQuery {
+	mut rows = [][]Expr{}
+	for {
+		try p.expect("(")
+		mut row = []Expr{}
+		if p.text() != ")" { row = try p.parseExpressionList(")") }
+		try p.expect(")")
+		rows = append(rows, row)
+		if !p.eat(",") { break }
+		if p.text() != "(" { try p.errorHere() }
+	}
+	return ValuesQuery{Pos: pos, Rows: rows}
+}
+
+fn (p mut Parser) parseGroupingList() ![]GroupingElement {
+	mut groups = []GroupingElement{}
+	for {
+		let group = try p.parseGroupingElement()
+		groups = append(groups, group)
+		if !p.eat(",") { break }
+	}
+	return groups
+}
+
+fn (p mut Parser) parseGroupingElement() !GroupingElement {
+	let pos = ifPosition(p)
+	mut kind = "expression"
+	mut value ?Expr = nil
+	mut items = []GroupingElement{}
+	if p.eat("grouping") {
+		try p.expect("sets")
+		kind = "grouping sets"
+		try p.expect("(")
+		if p.text() != ")" { items = try p.parseGroupingList() }
+		try p.expect(")")
+	} else if p.eat("rollup") || p.eat("cube") {
+		kind = lowerAscii(p.Tokens[p.At - 1].Text)
+		try p.expect("(")
+		if p.text() != ")" { items = try p.parseGroupingList() }
+		try p.expect(")")
+	} else if p.eat("(") {
+		kind = "grouping set"
+		if p.text() != ")" {
+			for {
+				let value = try p.parseExpression(0)
+				items = append(items, GroupingElement{Pos: valuePos(value), Kind: "expression", Value: value})
+				if !p.eat(",") { break }
+			}
+		}
+		try p.expect(")")
+	} else { value = try p.parseExpression(0) }
+	return GroupingElement{Pos: pos, Kind: kind, Value: value, Items: items}
+}
+
+fn (p mut Parser) parseIdentifierList(end str) ![]Identifier {
+	mut values = []Identifier{}
+	if p.text() == end { return values }
+	for {
+		let value = try p.parseIdentifier()
+		values = append(values, value)
+		if !p.eat(",") { break }
+	}
+	return values
+}
+
+fn (p mut Parser) parseInsert(withClause ?WithClause) !InsertStmt {
+	let pos = p.Tokens[p.At].Pos
+	try p.expect("insert")
+	try p.expect("into")
+	let table = try p.parseQualifiedName()
+	mut columns = []Identifier{}
+	if p.eat("(") {
+		columns = try p.parseIdentifierList(")")
+		try p.expect(")")
+	}
+	mut overriding = ""
+	if p.eat("overriding") {
+		if p.eat("system") { overriding = "system value" } else {
+			try p.expect("user")
+			overriding = "user value"
+		}
+		try p.expect("value")
+	}
+	mut source = InsertSource.DefaultValues(DefaultValuesSource{Pos: pos})
+	if p.eat("default") {
+		try p.expect("values")
+		source = InsertSource.DefaultValues(DefaultValuesSource{Pos: pos})
+	} else if p.eat("values") {
+		let values = try p.parseValues(p.Tokens[p.At - 1].Pos)
+		source = InsertSource.Values(values)
+	} else {
+		let query = try p.parseSelect()
+		source = InsertSource.Query(query)
+	}
+	mut conflict ?OnConflictClause = nil
+	if p.eat("on") {
+		try p.expect("conflict")
+		let conflictPos = p.Tokens[p.At - 1].Pos
+		mut target ?ConflictTarget = nil
+		if p.eat("(") {
+			mut keys = []Expr{}
+			for {
+				let key = try p.parseExpression(0)
+				keys = append(keys, key)
+				if !p.eat(",") { break }
+			}
+			try p.expect(")")
+			mut targetWhere ?Expr = nil
+			if p.eat("where") { targetWhere = try p.parseExpression(0) }
+			target = ConflictTarget{Pos: conflictPos, Columns: keys, Where: targetWhere}
+		} else if p.eat("on") {
+			try p.expect("constraint")
+			let constraint = try p.parseIdentifier()
+			target = ConflictTarget{Pos: conflictPos, Constraint: constraint}
+		}
+		try p.expect("do")
+		mut action = ConflictAction{Pos: conflictPos, Kind: "nothing"}
+		if p.eat("update") {
+			try p.expect("set")
+			let assignments = try p.parseAssignments()
+			mut where ?Expr = nil
+			if p.eat("where") { where = try p.parseExpression(0) }
+			action = ConflictAction{Pos: conflictPos, Kind: "update", Assignments: assignments, Where: where}
+		} else { try p.expect("nothing") }
+		conflict = OnConflictClause{Pos: conflictPos, Target: target, Action: action}
+	}
+	mut returning = []TargetEntry{}
+	if p.eat("returning") { returning = try p.parseTargetList() }
+	return InsertStmt{Pos: pos, With: withClause, Table: table, Columns: columns, Overriding: overriding, Source: source, Conflict: conflict, Returning: returning}
+}
+
+fn (p mut Parser) parseAssignments() ![]Assignment {
+	mut assignments = []Assignment{}
+	for {
+		let pos = ifPosition(p)
+		mut columns = []Identifier{}
+		if p.eat("(") {
+			columns = try p.parseIdentifierList(")")
+			try p.expect(")")
+		} else {
+			let column = try p.parseIdentifier()
+			columns = []Identifier{column}
+		}
+		try p.expect("=")
+		let value = try p.parseExpression(0)
+		assignments = append(assignments, Assignment{Pos: pos, Columns: columns, Value: value})
+		if !p.eat(",") { break }
+	}
+	return assignments
+}
+
+fn (p mut Parser) parseUpdate(withClause ?WithClause) !UpdateStmt {
+	let pos = p.Tokens[p.At].Pos
+	try p.expect("update")
+	let table = try p.parseQualifiedName()
+	let alias = try p.parseAlias()
+	try p.expect("set")
+	let assignments = try p.parseAssignments()
+	mut from = []FromItem{}
+	mut where ?Expr = nil
+	mut whereCurrentOf ?Identifier = nil
+	mut returning = []TargetEntry{}
+	if p.eat("from") { from = try p.parseFromList() }
+	if p.eat("where") {
+		if p.eat("current") {
+			try p.expect("of")
+			whereCurrentOf = try p.parseIdentifier()
+		} else { where = try p.parseExpression(0) }
+	}
+	if p.eat("returning") { returning = try p.parseTargetList() }
+	return UpdateStmt{Pos: pos, With: withClause, Table: table, Alias: alias, Assignments: assignments, From: from, Where: where, WhereCurrentOf: whereCurrentOf, Returning: returning}
+}
+
+fn (p mut Parser) parseDelete(withClause ?WithClause) !DeleteStmt {
+	let pos = p.Tokens[p.At].Pos
+	try p.expect("delete")
+	try p.expect("from")
+	let table = try p.parseQualifiedName()
+	let alias = try p.parseAlias()
+	mut using = []FromItem{}
+	mut where ?Expr = nil
+	mut whereCurrentOf ?Identifier = nil
+	mut returning = []TargetEntry{}
+	if p.eat("using") { using = try p.parseFromList() }
+	if p.eat("where") {
+		if p.eat("current") {
+			try p.expect("of")
+			whereCurrentOf = try p.parseIdentifier()
+		} else { where = try p.parseExpression(0) }
+	}
+	if p.eat("returning") { returning = try p.parseTargetList() }
+	return DeleteStmt{Pos: pos, With: withClause, Table: table, Alias: alias, Using: using, Where: where, WhereCurrentOf: whereCurrentOf, Returning: returning}
+}
+
+fn (p mut Parser) parseCreate() !Stmt {
+	return try p.parseCreateStatement()
+}
+
+fn (p mut Parser) parseColumnDef() !ColumnDef {
+	let name = try p.parseIdentifier()
+	let typeName = try p.parseTypeName()
+	mut defaultExpr ?Expr = nil
+	mut nullability = "default"
+	mut collation ?QualifiedName = nil
+	mut constraints = []TableConstraint{}
+	mut generated = ""
+	mut generatedExpr ?Expr = nil
+	mut identity = ""
+	for !p.done() {
+		if p.eat("collate") {
+			let c = try p.parseQualifiedName()
+			collation = c
+		} else if p.eat("default") {
+			let expr = try p.parseExpression(0)
+			defaultExpr = expr
+		} else if p.eat("not") {
+			try p.expect("null")
+			nullability = "not null"
+		} else if p.eat("null") {
+			nullability = "null"
+		} else if p.eat("primary") {
+			try p.expect("key")
+			constraints = append(constraints, TableConstraint{Pos: name.Pos, Kind: "primary key", Columns: []Identifier{name}})
+		} else if p.eat("unique") {
+			constraints = append(constraints, TableConstraint{Pos: name.Pos, Kind: "unique", Columns: []Identifier{name}})
+		} else if p.eat("check") {
+			try p.expect("(")
+			let expr = try p.parseExpression(0)
+			try p.expect(")")
+			constraints = append(constraints, TableConstraint{Pos: name.Pos, Kind: "check", Expressions: []Expr{expr}})
+		} else if p.eat("references") {
+			let refTable = try p.parseQualifiedName()
+			mut refCols = []Identifier{}
+			if p.eat("(") {
+				refCols = try p.parseIdentifierList(")")
+				try p.expect(")")
+			}
+			constraints = append(constraints, TableConstraint{Pos: name.Pos, Kind: "foreign key", Columns: []Identifier{name}, References: refTable, ReferenceColumns: refCols})
+		} else if p.eat("generated") {
+			mut idKind = ""
+			if p.eat("always") {
+				idKind = "always"
+			} else if p.eat("by") {
+				try p.expect("default")
+				idKind = "by default"
+			}
+			try p.expect("as")
+			if p.eat("identity") {
+				generated = "identity"
+				identity = idKind
+				if p.eat("(") {
+					let _ = try p.parseSequenceOptions()
+					try p.expect(")")
+				}
+			} else if p.eat("(") {
+				let expr = try p.parseExpression(0)
+				generatedExpr = expr
+				try p.expect(")")
+				try p.expect("stored")
+				generated = "stored"
+			} else {
+				try p.errorHere()
+			}
+		} else {
+			break
+		}
+	}
+	return ColumnDef{Pos: name.Pos, Name: name, TypeName: typeName, Default: defaultExpr, Nullability: nullability, Collation: collation, Constraints: constraints, Generated: generated, GeneratedExpr: generatedExpr, Identity: identity}
+}
+
+fn (p mut Parser) parseTableConstraint(pos i64, name ?Identifier) !TableConstraint {
+	mut kind = ""
+	mut columns = []Identifier{}
+	mut expressions = []Expr{}
+	if p.eat("primary") {
+		try p.expect("key")
+		kind = "primary key"
+	} else if p.eat("unique") { kind = "unique" } else if p.eat("check") {
+		kind = "check"
+		try p.expect("(")
+		let expression = try p.parseExpression(0)
+		expressions = []Expr{expression}
+		try p.expect(")")
+	} else if p.eat("foreign") {
+		try p.expect("key")
+		kind = "foreign key"
+	} else { try p.errorHere() }
+	if kind != "check" {
+		try p.expect("(")
+		columns = try p.parseIdentifierList(")")
+		try p.expect(")")
+	}
+	mut references ?QualifiedName = nil
+	mut referenceColumns = []Identifier{}
+	if p.eat("references") {
+		references = try p.parseQualifiedName()
+		if p.eat("(") {
+			referenceColumns = try p.parseIdentifierList(")")
+			try p.expect(")")
+		}
+	}
+	return TableConstraint{Pos: pos, Name: name, Kind: kind, Columns: columns, Expressions: expressions, References: references, ReferenceColumns: referenceColumns}
+}
+
+fn (p mut Parser) parseTransaction() !TransactionStmt {
+	let pos = p.Tokens[p.At].Pos
+	let command = lowerAscii(p.take().Text)
+	mut kind = command
+	mut name ?Identifier = nil
+	mut chain = false
+	mut modes = []TransactionMode{}
+	if command == "start" {
+		try p.expect("transaction")
+		kind = "begin"
+	} else if command == "end" { kind = "commit" } else if command == "abort" { kind = "rollback" }
+	if kind == "savepoint" { name = try p.parseIdentifier() }
+	if kind == "release" {
+		p.eat("savepoint")
+		name = try p.parseIdentifier()
+	}
+	if kind == "rollback" && p.eat("to") {
+		p.eat("savepoint")
+		name = try p.parseIdentifier()
+		kind = "rollback to"
+	}
+	if kind == "begin" && p.eat("transaction") { }
+	if kind == "begin" || kind == "start" {
+		for {
+			let modePos = p.pos()
+			if p.eat("isolation") {
+				try p.expect("level")
+				mut level = ""
+				if p.eat("serializable") {
+					level = "serializable"
+				} else if p.eat("repeatable") {
+					try p.expect("read")
+					level = "repeatable read"
+				} else if p.eat("read") {
+					if p.eat("committed") { level = "read committed" } else {
+						try p.expect("uncommitted")
+						level = "read uncommitted"
+					}
+				} else { try p.errorHere() }
+				modes = append(modes, TransactionMode{Pos: modePos, Kind: "isolation level", Value: level})
+			} else if p.eat("read") {
+				mut access = "write"
+				if p.eat("only") { access = "only" } else { try p.expect("write") }
+				modes = append(modes, TransactionMode{Pos: modePos, Kind: "read", Value: access})
+			} else if p.eat("deferrable") {
+				modes = append(modes, TransactionMode{Pos: modePos, Kind: "deferrable", Value: "true"})
+			} else if p.eat("not") {
+				try p.expect("deferrable")
+				modes = append(modes, TransactionMode{Pos: modePos, Kind: "deferrable", Value: "false"})
+			} else { break }
+			if !p.eat(",") { break }
+		}
+	}
+	if p.eat("and") {
+		if p.eat("no") {
+			try p.expect("chain")
+			chain = false
+		} else {
+			try p.expect("chain")
+			chain = true
+		}
+	} else if p.eat("chain") { chain = true }
+	return TransactionStmt{Pos: pos, Kind: kind, Name: name, Chain: chain, Modes: modes}
+}
