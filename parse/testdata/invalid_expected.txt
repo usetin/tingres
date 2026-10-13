@@ -1,218 +1,228 @@
-8|42601|trailing junk after numeric literal at or near "1a"
-8|42601|trailing junk after numeric literal at or near "1b"
-8|42601|trailing junk after numeric literal at or near "1c"
-8|42601|trailing junk after numeric literal at or near "1d"
-8|42601|trailing junk after numeric literal at or near "1e"
-8|42601|trailing junk after numeric literal at or near "1f"
-8|42601|trailing junk after numeric literal at or near "1g"
-8|42601|trailing junk after numeric literal at or near "1h"
-8|42601|trailing junk after numeric literal at or near "1i"
-8|42601|trailing junk after numeric literal at or near "1j"
-8|42601|trailing junk after numeric literal at or near "1k"
-8|42601|trailing junk after numeric literal at or near "1l"
-8|42601|trailing junk after numeric literal at or near "1m"
-8|42601|trailing junk after numeric literal at or near "1n"
-8|42601|trailing junk after numeric literal at or near "1o"
-8|42601|unterminated quoted string at or near "'unterminated_string_0"
-8|42601|unterminated quoted string at or near "'unterminated_string_1"
-8|42601|unterminated quoted string at or near "'unterminated_string_2"
-8|42601|unterminated quoted string at or near "'unterminated_string_3"
-8|42601|unterminated quoted string at or near "'unterminated_string_4"
-8|42601|unterminated quoted string at or near "'unterminated_string_5"
-8|42601|unterminated quoted string at or near "'unterminated_string_6"
-8|42601|unterminated quoted string at or near "'unterminated_string_7"
-8|42601|unterminated quoted string at or near "'unterminated_string_8"
-8|42601|unterminated quoted string at or near "'unterminated_string_9"
-8|42601|unterminated quoted string at or near "'unterminated_string_10"
-8|42601|unterminated quoted string at or near "'unterminated_string_11"
-8|42601|unterminated quoted string at or near "'unterminated_string_12"
-8|42601|unterminated quoted string at or near "'unterminated_string_13"
-8|42601|unterminated quoted string at or near "'unterminated_string_14"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_0"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_1"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_2"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_3"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_4"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_5"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_6"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_7"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_8"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_9"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_10"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_11"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_12"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_13"
-8|42601|unterminated quoted identifier at or near ""unterminated_ident_14"
-10|42601|unterminated /* comment at or near "/* unclosed comment 0"
-10|42601|unterminated /* comment at or near "/* unclosed comment 1"
-10|42601|unterminated /* comment at or near "/* unclosed comment 2"
-10|42601|unterminated /* comment at or near "/* unclosed comment 3"
-10|42601|unterminated /* comment at or near "/* unclosed comment 4"
-10|42601|unterminated /* comment at or near "/* unclosed comment 5"
-10|42601|unterminated /* comment at or near "/* unclosed comment 6"
-10|42601|unterminated /* comment at or near "/* unclosed comment 7"
-10|42601|unterminated /* comment at or near "/* unclosed comment 8"
-10|42601|unterminated /* comment at or near "/* unclosed comment 9"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_0"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_1"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_2"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_3"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_4"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_5"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_6"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_7"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_8"
-8|42601|unterminated dollar-quoted string at or near "$tag$body_without_closing_9"
-0|42601|syntax error
-11|42601|syntax error at end of input
-11|42601|syntax error at end of input
-11|42601|syntax error at end of input
-11|42601|syntax error at end of input
-11|42601|syntax error at end of input
-0|42601|syntax error
-0|42601|syntax error
-11|42601|syntax error at end of input
-12|42601|syntax error at end of input
-11|42601|syntax error at end of input
-11|42601|syntax error at end of input
-12|42601|syntax error at end of input
-12|42601|syntax error at end of input
-0|42601|syntax error
-16|42601|syntax error at end of input
-0|42601|syntax error
-0|42601|syntax error
-0|42601|syntax error
-0|42601|syntax error
-14|42601|syntax error at end of input
-15|42601|syntax error at end of input
-18|42601|syntax error at end of input
-18|42601|syntax error at end of input
-16|42601|syntax error at end of input
-15|42601|syntax error at end of input
-16|42601|syntax error at end of input
-15|42601|syntax error at end of input
-19|42601|syntax error at end of input
-16|42601|syntax error at end of input
-12|42601|syntax error at end of input
-21|42601|syntax error at end of input
-13|42601|syntax error at end of input
-12|42601|syntax error at end of input
-13|42601|syntax error at end of input
-12|42601|syntax error at end of input
-11|42601|syntax error at end of input
-13|42601|syntax error at end of input
-12|42601|syntax error at end of input
-9|42601|syntax error at end of input
-12|42601|syntax error at end of input
-13|42601|syntax error at end of input
-13|42601|syntax error at end of input
-13|42601|syntax error at end of input
-14|42601|syntax error at end of input
-13|42601|syntax error at end of input
-14|42601|syntax error at end of input
-8|42601|syntax error at or near ","
-10|42601|syntax error at end of input
-8|42601|syntax error at or near ","
-10|42601|syntax error at or near ","
-10|42601|syntax error at or near "2"
-11|42601|syntax error at or near ")"
-8|42601|syntax error at or near ")"
-9|42601|syntax error at or near ")"
-12|42601|syntax error at or near "*"
-12|42601|syntax error at or near "/"
-14|42601|syntax error at or near "OR"
-13|42601|syntax error at or near "AND"
-14|42601|syntax error at or near "NOT"
-21|42601|syntax error at end of input
-18|42601|syntax error at or near "AND"
-14|42601|syntax error at or near ")"
-15|42703|column "escape" does not exist
-11|42601|syntax error at end of input
-0|42601|syntax error
-17|42601|syntax error at end of input
-18|42601|syntax error at or near "THEN"
-25|42601|syntax error at or near "ELSE"
-13|42601|syntax error at or near "END"
-13|42601|syntax error at or near ")"
-14|42601|syntax error at or near ")"
-17|42601|syntax error at or near ")"
-16|42601|syntax error at or near ")"
-20|42601|syntax error at or near ")"
-8|42883|function substring() does not exist
-17|42601|syntax error at or near ")"
-13|42601|syntax error at or near ")"
-8|42883|function overlay() does not exist
-21|42601|syntax error at end of input
-17|42601|syntax error at or near "ON"
-17|42601|syntax error at or near "USING"
-0|42601|syntax error
-22|42601|syntax error at end of input
-25|42601|syntax error at end of input
-23|42601|syntax error at end of input
-25|42601|syntax error at end of input
-21|42601|syntax error at or near "1"
-18|42601|syntax error at or near ")"
-25|42601|syntax error at or near ")"
-22|42601|syntax error at end of input
-14|42601|syntax error at or near "="
-12|42601|syntax error at or near "="
-17|42601|syntax error at end of input
-25|42601|syntax error at end of input
-8|42601|syntax error at or near "WHERE"
-20|42601|syntax error at end of input
-14|42601|syntax error at or near "("
-0|42P07|relation "t" already exists
-20|42601|syntax error at end of input
-24|42601|syntax error at or near ")"
-31|42601|syntax error at or near ")"
-34|42601|syntax error at or near ")"
-34|42601|syntax error at or near ")"
-33|42601|syntax error at or near ")"
-40|42601|syntax error at or near ")"
-17|42601|syntax error at or near "COLUMN"
-18|42601|syntax error at end of input
-19|42601|syntax error at end of input
-20|42601|syntax error at end of input
-21|42601|syntax error at end of input
-12|42601|syntax error at or near ","
-11|42601|syntax error at end of input
-12|42601|syntax error at or near ","
-10|42601|syntax error at end of input
-14|42601|syntax error at end of input
-0|REATE INDEX|syntax error
-21|42601|syntax error at or near "("
-24|42601|syntax error at or near ")"
-13|42601|syntax error at or near "AS"
-15|42601|syntax error at or near "SELECT"
-0|REATE SEQUENCE|syntax error
-24|42601|syntax error at end of input
-28|42601|syntax error at end of input
-13|42601|syntax error at or near "AS"
-0|42P13|no language specified
-15|42601|syntax error at end of input
-18|42601|syntax error at end of input
-16|42601|syntax error at end of input
-28|42601|syntax error at end of input
-5|42601|syntax error at or near "="
-13|42601|syntax error at end of input
-6|42601|syntax error at end of input
-5|42601|syntax error at end of input
-17|42601|syntax error at end of input
-6|42601|syntax error at or near "FROM"
-12|42601|syntax error at end of input
-9|42601|syntax error at or near "AS"
-11|42601|syntax error at or near "SELECT"
-8|42601|syntax error at end of input
-0|26000|prepared statement "prepare" does not exist
-9|42601|syntax error at end of input
-10|42601|syntax error at end of input
-8|42601|syntax error at end of input
-11|42601|syntax error at end of input
-17|42601|syntax error at end of input
-7|42601|syntax error at or near "ON"
-8|42601|syntax error at or near "ON"
-7|42601|syntax error at end of input
-7|42601|syntax error at end of input
-5|42601|syntax error at end of input
-11|42601|syntax error at end of input
-5|42601|syntax error at end of input
+8	42601	trailing junk after numeric literal at or near "1a"
+8	42601	trailing junk after numeric literal at or near "1b"
+8	42601	trailing junk after numeric literal at or near "1c"
+8	42601	trailing junk after numeric literal at or near "1d"
+8	42601	trailing junk after numeric literal at or near "1e"
+8	42601	trailing junk after numeric literal at or near "1f"
+8	42601	trailing junk after numeric literal at or near "1g"
+8	42601	trailing junk after numeric literal at or near "1h"
+8	42601	trailing junk after numeric literal at or near "1i"
+8	42601	trailing junk after numeric literal at or near "1j"
+8	42601	trailing junk after numeric literal at or near "1k"
+8	42601	trailing junk after numeric literal at or near "1l"
+8	42601	trailing junk after numeric literal at or near "1m"
+8	42601	trailing junk after numeric literal at or near "1n"
+8	42601	trailing junk after numeric literal at or near "1o"
+8	42601	unterminated quoted string at or near "'unterminated_string_0"
+8	42601	unterminated quoted string at or near "'unterminated_string_1"
+8	42601	unterminated quoted string at or near "'unterminated_string_2"
+8	42601	unterminated quoted string at or near "'unterminated_string_3"
+8	42601	unterminated quoted string at or near "'unterminated_string_4"
+8	42601	unterminated quoted string at or near "'unterminated_string_5"
+8	42601	unterminated quoted string at or near "'unterminated_string_6"
+8	42601	unterminated quoted string at or near "'unterminated_string_7"
+8	42601	unterminated quoted string at or near "'unterminated_string_8"
+8	42601	unterminated quoted string at or near "'unterminated_string_9"
+8	42601	unterminated quoted string at or near "'unterminated_string_10"
+8	42601	unterminated quoted string at or near "'unterminated_string_11"
+8	42601	unterminated quoted string at or near "'unterminated_string_12"
+8	42601	unterminated quoted string at or near "'unterminated_string_13"
+8	42601	unterminated quoted string at or near "'unterminated_string_14"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_0"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_1"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_2"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_3"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_4"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_5"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_6"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_7"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_8"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_9"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_10"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_11"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_12"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_13"
+8	42601	unterminated quoted identifier at or near ""unterminated_ident_14"
+10	42601	unterminated /* comment at or near "/* unclosed comment 0"
+10	42601	unterminated /* comment at or near "/* unclosed comment 1"
+10	42601	unterminated /* comment at or near "/* unclosed comment 2"
+10	42601	unterminated /* comment at or near "/* unclosed comment 3"
+10	42601	unterminated /* comment at or near "/* unclosed comment 4"
+10	42601	unterminated /* comment at or near "/* unclosed comment 5"
+10	42601	unterminated /* comment at or near "/* unclosed comment 6"
+10	42601	unterminated /* comment at or near "/* unclosed comment 7"
+10	42601	unterminated /* comment at or near "/* unclosed comment 8"
+10	42601	unterminated /* comment at or near "/* unclosed comment 9"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_0"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_1"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_2"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_3"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_4"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_5"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_6"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_7"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_8"
+8	42601	unterminated dollar-quoted string at or near "$tag$body_without_closing_9"
+11	42601	syntax error at end of input
+11	42601	syntax error at end of input
+11	42601	syntax error at end of input
+11	42601	syntax error at end of input
+11	42601	syntax error at end of input
+11	42601	syntax error at end of input
+12	42601	syntax error at end of input
+11	42601	syntax error at end of input
+11	42601	syntax error at end of input
+12	42601	syntax error at end of input
+12	42601	syntax error at end of input
+16	42601	syntax error at end of input
+14	42601	syntax error at end of input
+15	42601	syntax error at end of input
+18	42601	syntax error at end of input
+18	42601	syntax error at end of input
+16	42601	syntax error at end of input
+15	42601	syntax error at end of input
+16	42601	syntax error at end of input
+15	42601	syntax error at end of input
+19	42601	syntax error at end of input
+16	42601	syntax error at end of input
+12	42601	syntax error at end of input
+21	42601	syntax error at end of input
+13	42601	syntax error at end of input
+12	42601	syntax error at end of input
+13	42601	syntax error at end of input
+12	42601	syntax error at end of input
+11	42601	syntax error at end of input
+13	42601	syntax error at end of input
+12	42601	syntax error at end of input
+9	42601	syntax error at end of input
+12	42601	syntax error at end of input
+13	42601	syntax error at end of input
+13	42601	syntax error at end of input
+13	42601	syntax error at end of input
+14	42601	syntax error at end of input
+13	42601	syntax error at end of input
+14	42601	syntax error at end of input
+8	42601	syntax error at or near ","
+10	42601	syntax error at end of input
+8	42601	syntax error at or near ","
+10	42601	syntax error at or near ","
+10	42601	syntax error at or near "2"
+11	42601	syntax error at or near ")"
+8	42601	syntax error at or near ")"
+9	42601	syntax error at or near ")"
+12	42601	syntax error at or near "*"
+12	42601	syntax error at or near "/"
+14	42601	syntax error at or near "OR"
+13	42601	syntax error at or near "AND"
+21	42601	syntax error at end of input
+18	42601	syntax error at or near "AND"
+14	42601	syntax error at or near ")"
+11	42601	syntax error at end of input
+17	42601	syntax error at end of input
+18	42601	syntax error at or near "THEN"
+25	42601	syntax error at or near "ELSE"
+13	42601	syntax error at or near "END"
+13	42601	syntax error at or near ")"
+14	42601	syntax error at or near ")"
+17	42601	syntax error at or near ")"
+16	42601	syntax error at or near ")"
+20	42601	syntax error at or near ")"
+17	42601	syntax error at or near ")"
+13	42601	syntax error at or near ")"
+21	42601	syntax error at end of input
+17	42601	syntax error at or near "ON"
+17	42601	syntax error at or near "USING"
+22	42601	syntax error at end of input
+25	42601	syntax error at end of input
+23	42601	syntax error at end of input
+25	42601	syntax error at end of input
+21	42601	syntax error at or near "1"
+18	42601	syntax error at or near ")"
+25	42601	syntax error at or near ")"
+22	42601	syntax error at end of input
+14	42601	syntax error at or near "="
+12	42601	syntax error at or near "="
+17	42601	syntax error at end of input
+25	42601	syntax error at end of input
+8	42601	syntax error at or near "WHERE"
+20	42601	syntax error at end of input
+14	42601	syntax error at or near "("
+24	42601	syntax error at or near ")"
+31	42601	syntax error at or near ")"
+34	42601	syntax error at or near ")"
+34	42601	syntax error at or near ")"
+33	42601	syntax error at or near ")"
+40	42601	syntax error at or near ")"
+17	42601	syntax error at or near "COLUMN"
+18	42601	syntax error at end of input
+19	42601	syntax error at end of input
+20	42601	syntax error at end of input
+21	42601	syntax error at end of input
+12	42601	syntax error at or near ","
+11	42601	syntax error at end of input
+12	42601	syntax error at or near ","
+10	42601	syntax error at end of input
+14	42601	syntax error at end of input
+21	42601	syntax error at or near "("
+24	42601	syntax error at or near ")"
+13	42601	syntax error at or near "AS"
+15	42601	syntax error at or near "SELECT"
+24	42601	syntax error at end of input
+28	42601	syntax error at end of input
+13	42601	syntax error at or near "AS"
+15	42601	syntax error at end of input
+18	42601	syntax error at end of input
+16	42601	syntax error at end of input
+28	42601	syntax error at end of input
+5	42601	syntax error at or near "="
+13	42601	syntax error at end of input
+6	42601	syntax error at end of input
+5	42601	syntax error at end of input
+17	42601	syntax error at end of input
+6	42601	syntax error at or near "FROM"
+12	42601	syntax error at end of input
+9	42601	syntax error at or near "AS"
+11	42601	syntax error at or near "SELECT"
+8	42601	syntax error at end of input
+9	42601	syntax error at end of input
+10	42601	syntax error at end of input
+8	42601	syntax error at end of input
+11	42601	syntax error at end of input
+17	42601	syntax error at end of input
+7	42601	syntax error at or near "ON"
+8	42601	syntax error at or near "ON"
+7	42601	syntax error at end of input
+7	42601	syntax error at end of input
+5	42601	syntax error at end of input
+11	42601	syntax error at end of input
+5	42601	syntax error at end of input
+14	42601	syntax error at or near "FROM"
+12	42601	syntax error at end of input
+15	42601	syntax error at end of input
+21	42601	syntax error at end of input
+17	42601	syntax error at end of input
+13	42601	syntax error at end of input
+17	42601	syntax error at end of input
+17	42601	syntax error at or near "OR"
+12	42601	syntax error at or near "1"
+16	42601	syntax error at or near "FROM"
+8	42601	unterminated quoted string at or near "'é"
+8	42601	unterminated quoted identifier at or near ""café"
+18	42601	syntax error at or near "2"
+19	42601	syntax error at end of input
+21	42601	syntax error at or near "1"
+15	42601	syntax error at or near "1"
+25	42601	syntax error at or near "FROM"
+26	42601	syntax error at end of input
+10	42601	unterminated dollar-quoted string at or near "$tag$"
+14	42601	syntax error at or near "*"
+29	42601	syntax error at or near ")"
+13	42601	syntax error at end of input
+21	42601	syntax error at end of input
+25	42601	syntax error at end of input
+29	42601	syntax error at or near "END"
+17	42601	syntax error at or near ")"
+16	42601	syntax error at or near "$x$b$x$"
+12	42601	syntax error at end of input
+37	42601	syntax error at end of input
+29	42601	syntax error at end of input
