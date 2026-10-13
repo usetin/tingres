@@ -18,6 +18,232 @@ type Numeric value struct {
 	special i64
 }
 
+// A numeric Datum has two forms. When its canonical decimal text is stored in
+// s it is the slow, arbitrary-precision form (parse_numeric_value). When s is
+// empty the value is "fast": i holds a signed mantissa and offset the number of
+// decimal places, so the value is i * 10^-offset. The fast form covers values
+// with at most 18 significant digits and a scale of at most maxFastScale, and
+// add/sub/mul/compare/round stay in i64 without allocating or formatting text.
+
+const maxFastScale i64 = 30
+const fastMaxI64 i64 = 9223372036854775807
+
+fn fast_numeric_datum(mantissa i64, scale i64) Datum {
+	return Datum{oid: NumericOid, null: false, i: mantissa, f: 0.0, b: false, s: "", bytes: []u8{}, months: 0, days: 0, offset: scale}
+}
+
+// numeric_fast_pair returns the fast mantissa and scale of d, or ok=false when
+// d uses the canonical text representation.
+fn numeric_fast_pair(d Datum) (i64, i64, bool) {
+	if d.oid == NumericOid && d.s == "" && !d.null { return d.i, d.offset, true }
+	return 0, 0, false
+}
+
+fn fast_numeric_text(m i64, scale i64) str {
+	let magnitude = fast_abs_u64(m)
+	let digits = mint.FormatUint(magnitude, 10)
+	mut out = ""
+	if scale <= 0 {
+		out = digits
+	} else if len(digits) <= scale {
+		out = "0."+zeroes(scale-len(digits))+digits
+	} else {
+		let cut = len(digits)-scale
+		out = digits[:cut]+"."+digits[cut:]
+	}
+	if m < 0 { out = "-"+out }
+	return out
+}
+
+// fast_parse_text decodes canonical decimal text into a fast mantissa/scale
+// when it has at most 18 significant digits and a scale of at most maxFastScale.
+fn fast_parse_text(t str) (i64, i64, bool) {
+	if len(t) == 0 { return 0, 0, false }
+	mut s = t
+	mut negative = false
+	if s[0] == '-' {
+		negative = true
+		s = s[1:]
+	} else if s[0] == '+' {
+		s = s[1:]
+	}
+	mut dot = -1
+	for i in 0..len(s) {
+		if s[i] == '.' {
+			dot = i
+			break
+		}
+	}
+	mut intPart = s
+	mut fracPart = ""
+	if dot >= 0 {
+		intPart = s[:dot]
+		fracPart = s[dot+1:]
+	}
+	mut all = intPart+fracPart
+	mut start = i64(0)
+	for start < len(all) && all[start] == '0' { start += 1 }
+	all = all[start:]
+	if len(all) > 18 { return 0, 0, false }
+	if len(fracPart) > maxFastScale { return 0, 0, false }
+	mut m = i64(0)
+	if len(all) > 0 {
+		m = mint.ParseInt(all, 10) catch _ { return 0, 0, false }
+	}
+	if negative { m = 0-m }
+	return m, len(fracPart), true
+}
+
+fn fast_abs_u64(v i64) u64 {
+	if v < 0 { return u64(0-%v) }
+	return u64(v)
+}
+
+fn fast_pow10_u64(k i64) u64 {
+	mut p = u64(1)
+	for i in 0..k {
+		p = p*10
+		_ = i
+	}
+	return p
+}
+
+fn fast_scale_up(m i64, k i64) (i64, bool) {
+	if m == 0 { return 0, true }
+	if k < 0 { return 0, false }
+	if k == 0 { return m, true }
+	if k > 18 { return 0, false }
+	let p = fast_pow10_u64(k)
+	if fast_abs_u64(m) > u64(fastMaxI64)/p { return 0, false }
+	return m*i64(p), true
+}
+
+fn fast_checked_add(a i64, b i64) (i64, bool) {
+	if b > 0 && a > fastMaxI64-b { return 0, false }
+	if b < 0 && a < (-fastMaxI64-1)-b { return 0, false }
+	return a+b, true
+}
+
+fn fast_checked_sub(a i64, b i64) (i64, bool) {
+	if b < 0 && a > fastMaxI64+b { return 0, false }
+	if b > 0 && a < (-fastMaxI64-1)+b { return 0, false }
+	return a-b, true
+}
+
+fn fast_u64_digits(u u64) i64 {
+	mut n = i64(1)
+	mut v = u
+	for v >= 10 {
+		v = v/10
+		n += 1
+	}
+	return n
+}
+
+// fast_scaled_digit returns the digit at position pos (0 = most significant) of
+// the number u*10^k, which has total digits.
+fn fast_scaled_digit(u u64, total i64, pos i64) i64 {
+	let ulen = fast_u64_digits(u)
+	if pos >= ulen { return 0 }
+	return i64(u/fast_pow10_u64(ulen-1-pos)%10)
+}
+
+// fast_cmp_mag_scaled compares u1*10^k1 with u2*10^k2 exactly, without
+// allocating, by comparing digit strings.
+fn fast_cmp_mag_scaled(u1 u64, k1 i64, u2 u64, k2 i64) i64 {
+	if u1 == 0 {
+		if u2 == 0 { return 0 }
+		return -1
+	}
+	if u2 == 0 { return 1 }
+	let l1 = fast_u64_digits(u1)+k1
+	let l2 = fast_u64_digits(u2)+k2
+	if l1 < l2 { return -1 }
+	if l1 > l2 { return 1 }
+	mut pos = i64(0)
+	for pos < l1 {
+		let d1 = fast_scaled_digit(u1, l1, pos)
+		let d2 = fast_scaled_digit(u2, l2, pos)
+		if d1 < d2 { return -1 }
+		if d1 > d2 { return 1 }
+		pos += 1
+	}
+	return 0
+}
+
+fn fast_compare_pair(m1 i64, s1 i64, m2 i64, s2 i64) i64 {
+	if m1 == 0 && m2 == 0 { return 0 }
+	if m1 < 0 && m2 >= 0 { return -1 }
+	if m1 >= 0 && m2 < 0 { return 1 }
+	// Compare |m1|/10^s1 with |m2|/10^s2 as |m1|*10^s2 vs |m2|*10^s1.
+	let c = fast_cmp_mag_scaled(fast_abs_u64(m1), s2, fast_abs_u64(m2), s1)
+	if m1 < 0 { return 0-c }
+	return c
+}
+
+fn fast_add_sub(a Datum, b Datum, sign i64) (Datum, bool) {
+	let (m1, s1, ok1) = numeric_fast_pair(a)
+	let (m2, s2, ok2) = numeric_fast_pair(b)
+	if !ok1 || !ok2 { return Null(), false }
+	let scale = max(s1, s2)
+	let (x, okx) = fast_scale_up(m1, scale-s1)
+	let (y, oky) = fast_scale_up(m2, scale-s2)
+	if !okx || !oky { return Null(), false }
+	if sign > 0 {
+		let (v, ok) = fast_checked_add(x, y)
+		if !ok { return Null(), false }
+		return fast_numeric_datum(v, scale), true
+	}
+	let (v, ok) = fast_checked_sub(x, y)
+	if !ok { return Null(), false }
+	return fast_numeric_datum(v, scale), true
+}
+
+fn fast_mul(a Datum, b Datum) (Datum, bool) {
+	let (m1, s1, ok1) = numeric_fast_pair(a)
+	let (m2, s2, ok2) = numeric_fast_pair(b)
+	if !ok1 || !ok2 { return Null(), false }
+	let scale = s1+s2
+	if scale > maxFastScale { return Null(), false }
+	if m1 == 0 || m2 == 0 { return fast_numeric_datum(0, scale), true }
+	if fast_abs_u64(m1) > u64(fastMaxI64)/fast_abs_u64(m2) { return Null(), false }
+	return fast_numeric_datum(m1*m2, scale), true
+}
+
+fn fast_round(m i64, s i64, rscale i64) (Datum, bool) {
+	if rscale < 0 { return Null(), false }
+	if rscale >= s {
+		let (v, ok) = fast_scale_up(m, rscale-s)
+		if !ok { return Null(), false }
+		return fast_numeric_datum(v, rscale), true
+	}
+	let k = s-rscale
+	if k > 18 { return Null(), false }
+	let p = i64(fast_pow10_u64(k))
+	let q = m/p
+	let rem = m%p
+	mut absrem = rem
+	if absrem < 0 { absrem = 0-absrem }
+	mut result = q
+	if absrem*2 >= p {
+		if m >= 0 { result = q+1 } else { result = q-1 }
+	}
+	return fast_numeric_datum(result, rscale), true
+}
+
+fn fast_trunc(m i64, s i64, rscale i64) (Datum, bool) {
+	if rscale < 0 { return Null(), false }
+	if rscale >= s {
+		let (v, ok) = fast_scale_up(m, rscale-s)
+		if !ok { return Null(), false }
+		return fast_numeric_datum(v, rscale), true
+	}
+	let k = s-rscale
+	if k > 18 { return Null(), false }
+	return fast_numeric_datum(m/i64(fast_pow10_u64(k)), rscale), true
+}
+
+
 fn float_text(d Datum) str {
 	if d.f != d.f { return "NaN" }
 	if d.f == 0.0 && gauge.Signbit(d.f) { return "-0" }
@@ -114,10 +340,20 @@ fn compare_float(a f64, b f64) i64 {
 	return 0
 }
 
+// numeric_datum_from_value picks the fast form when the value has at most 18
+// significant digits and a small scale, and the canonical text form otherwise.
+fn numeric_datum_from_value(n Numeric) Datum {
+	if n.special != 0 { return FromStr(NumericOid, format_numeric(n)) }
+	let text = format_numeric(n)
+	let (m, scale, ok) = fast_parse_text(text)
+	if ok { return fast_numeric_datum(m, scale) }
+	return FromStr(NumericOid, text)
+}
+
 // ParseNumeric parses PostgreSQL decimal syntax into a numeric Datum.
 fn ParseNumeric(text str) !Datum {
 	let n = try parse_numeric_value(text)
-	return FromStr(NumericOid, format_numeric(n))
+	return numeric_datum_from_value(n)
 }
 
 // ParseNumericTypmod parses and applies PostgreSQL numeric precision and scale.
@@ -137,11 +373,12 @@ fn ParseNumericTypmod(text str, precision i64, scale i64) !Datum {
 	if rounded.sign != 0 && integerDigits > precision-scale {
 		fail ErrorFault(NewError("22003", "numeric field overflow"))
 	}
-	return FromStr(NumericOid, format_numeric(rounded))
+	return numeric_datum_from_value(rounded)
 }
 
 // NumericText returns the exact PostgreSQL text representation of a numeric Datum.
 fn NumericText(d Datum) str {
+	if d.oid == NumericOid && d.s == "" && !d.null { return fast_numeric_text(d.i, d.offset) }
 	let n = parse_numeric_value(d.s) catch _ { return d.s }
 	return format_numeric(n)
 }
@@ -330,11 +567,19 @@ fn numeric_group_text(v i64) str {
 	return zeroes(4-len(s))+s
 }
 
-// NumericAdd adds two numeric Datums without converting through floating point.
-fn NumericAdd(a Datum, b Datum) !Datum { return try numeric_binary(a, b, 0) }
+// NumericAdd adds two numeric Datums, using the i64 fast path when possible.
+fn NumericAdd(a Datum, b Datum) !Datum {
+	let (fast, ok) = fast_add_sub(a, b, 1)
+	if ok { return fast }
+	return try numeric_binary(a, b, 0)
+}
 
-// NumericSub subtracts b from a without converting through floating point.
-fn NumericSub(a Datum, b Datum) !Datum { return try numeric_binary(a, b, 1) }
+// NumericSub subtracts b from a, using the i64 fast path when possible.
+fn NumericSub(a Datum, b Datum) !Datum {
+	let (fast, ok) = fast_add_sub(a, b, -1)
+	if ok { return fast }
+	return try numeric_binary(a, b, 1)
+}
 
 fn numeric_binary(a Datum, b Datum, op i64) !Datum {
 	let x = try parse_numeric_value(NumericText(a))
@@ -343,8 +588,8 @@ fn numeric_binary(a Datum, b Datum, op i64) !Datum {
 	mut y = y0
 	if op == 1 { y = numeric_neg_value(y0) }
 	if x.sign == 0 && y.sign == 0 { return FromStr(NumericOid, zero_with_scale(max(x.dscale, y.dscale))) }
-	if x.sign == 0 { return FromStr(NumericOid, format_numeric(with_scale(y, max(x.dscale, y.dscale)))) }
-	if y.sign == 0 { return FromStr(NumericOid, format_numeric(with_scale(x, max(x.dscale, y.dscale)))) }
+	if x.sign == 0 { return numeric_datum_from_value(with_scale(y, max(x.dscale, y.dscale))) }
+	if y.sign == 0 { return numeric_datum_from_value(with_scale(x, max(x.dscale, y.dscale))) }
 	mut high = max(x.weight, y.weight)
 	let low = min(numeric_low_exp(x), numeric_low_exp(y))
 	let n = high-low+1
@@ -398,11 +643,13 @@ fn numeric_binary(a Datum, b Datum, op i64) !Datum {
 		}
 	}
 	let mutN = numeric_from_dense(sign, high, max(x.dscale, y.dscale), digits)
-	return FromStr(NumericOid, format_numeric(mutN))
+	return numeric_datum_from_value(mutN)
 }
 
-// NumericMul multiplies two numeric Datums with base-10000 arithmetic.
+// NumericMul multiplies two numeric Datums, using the i64 fast path when possible.
 fn NumericMul(a Datum, b Datum) !Datum {
+	let (fast, ok) = fast_mul(a, b)
+	if ok { return fast }
 	let x = try parse_numeric_value(NumericText(a))
 	let y = try parse_numeric_value(NumericText(b))
 	if x.special != 0 || y.special != 0 { return FromStr(NumericOid, numeric_special_mul(x, y)) }
@@ -434,7 +681,7 @@ fn NumericMul(a Datum, b Datum) !Datum {
 	let digits = reverse_i64(out)
 	let productWeight = numeric_low_exp(x)+numeric_low_exp(y)+len(digits)-1
 	let n = numeric_from_dense(x.sign*y.sign, productWeight, x.dscale+y.dscale, digits)
-	return FromStr(NumericOid, format_numeric(n))
+	return numeric_datum_from_value(n)
 }
 
 // NumericDiv divides a numeric Datum using PostgreSQL's select_div_scale result scale.
@@ -511,29 +758,46 @@ fn NumericMod(a Datum, b Datum) !Datum {
 
 // NumericNeg returns the additive inverse of a numeric Datum.
 fn NumericNeg(a Datum) !Datum {
+	let (m, s, ok) = numeric_fast_pair(a)
+	if ok { return fast_numeric_datum(0-m, s) }
 	let n = try parse_numeric_value(NumericText(a))
-	return FromStr(NumericOid, format_numeric(numeric_neg_value(n)))
+	return numeric_datum_from_value(numeric_neg_value(n))
 }
 
 // NumericAbs returns the absolute value of a numeric Datum.
 fn NumericAbs(a Datum) !Datum {
+	let (m, s, ok) = numeric_fast_pair(a)
+	if ok {
+		if m < 0 { return fast_numeric_datum(0-m, s) }
+		return a
+	}
 	let n = try parse_numeric_value(NumericText(a))
 	mut copy = n
 	if copy.sign < 0 { copy.sign = 1 }
 	if copy.special < 0 { copy.special = 1 }
-	return FromStr(NumericOid, format_numeric(copy))
+	return numeric_datum_from_value(copy)
 }
 
 // NumericRound rounds at scale decimal places, ties away from zero.
 fn NumericRound(a Datum, scale i64) !Datum {
+	let (m, s, ok) = numeric_fast_pair(a)
+	if ok {
+		let (fast, fastOk) = fast_round(m, s, scale)
+		if fastOk { return fast }
+	}
 	let n = try parse_numeric_value(NumericText(a))
-	return FromStr(NumericOid, format_numeric(numeric_round_value(n, scale)))
+	return numeric_datum_from_value(numeric_round_value(n, scale))
 }
 
 // NumericTrunc truncates at scale decimal places toward zero.
 fn NumericTrunc(a Datum, scale i64) Datum {
+	let (m, s, ok) = numeric_fast_pair(a)
+	if ok {
+		let (fast, fastOk) = fast_trunc(m, s, scale)
+		if fastOk { return fast }
+	}
 	let n = parse_numeric_value(NumericText(a)) catch _ { return a }
-	return FromStr(NumericOid, format_numeric(numeric_trunc_value(n, scale)))
+	return numeric_datum_from_value(numeric_trunc_value(n, scale))
 }
 
 // NumericFloor returns the greatest integer not greater than a.
@@ -603,19 +867,19 @@ fn nv_cmp(a Numeric, b Numeric) i64 { return CompareNumeric(FromStr(NumericOid, 
 
 fn nv_add(a Numeric, b Numeric, rscale i64) Numeric {
 	let sum = NumericAdd(FromStr(NumericOid, format_numeric(a)), FromStr(NumericOid, format_numeric(b))) catch _ { return a }
-	let v = parse_numeric_value(sum.s) catch _ { return a }
+	let v = parse_numeric_value(NumericText(sum)) catch _ { return a }
 	return numeric_round_value(v, rscale)
 }
 
 fn nv_sub(a Numeric, b Numeric, rscale i64) Numeric {
 	let diff = NumericSub(FromStr(NumericOid, format_numeric(a)), FromStr(NumericOid, format_numeric(b))) catch _ { return a }
-	let v = parse_numeric_value(diff.s) catch _ { return a }
+	let v = parse_numeric_value(NumericText(diff)) catch _ { return a }
 	return numeric_round_value(v, rscale)
 }
 
 fn nv_mul(a Numeric, b Numeric, rscale i64) Numeric {
 	let product = NumericMul(FromStr(NumericOid, format_numeric(a)), FromStr(NumericOid, format_numeric(b))) catch _ { return a }
-	let v = parse_numeric_value(product.s) catch _ { return a }
+	let v = parse_numeric_value(NumericText(product)) catch _ { return a }
 	return numeric_round_value(v, rscale)
 }
 
@@ -888,6 +1152,9 @@ fn NumericDivInt(a Datum, b Datum) !Datum {
 
 // CompareNumeric compares numeric values exactly, including PostgreSQL NaN ordering.
 fn CompareNumeric(a Datum, b Datum) i64 {
+	let (m1, s1, ok1) = numeric_fast_pair(a)
+	let (m2, s2, ok2) = numeric_fast_pair(b)
+	if ok1 && ok2 { return fast_compare_pair(m1, s1, m2, s2) }
 	let x = parse_numeric_value(NumericText(a)) catch _ { return 0 }
 	let y = parse_numeric_value(NumericText(b)) catch _ { return 0 }
 	if x.special == 2 {
@@ -1099,7 +1366,7 @@ fn numeric_add_one(n Numeric, sign i64, scale i64) Numeric {
 	if sign < 0 { step = NumericNeg(unit) catch _ { unit } }
 	let current = FromStr(NumericOid, format_numeric(n))
 	let sum = NumericAdd(current, step) catch _ { return n }
-	return parse_numeric_value(sum.s) catch _ { n }
+	return parse_numeric_value(NumericText(sum)) catch _ { n }
 }
 
 fn zero_with_scale(scale i64) str {
