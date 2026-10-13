@@ -1,6 +1,7 @@
 package types
 
 import "gauge"
+import "say"
 
 const UnknownLiteralOid Oid = 705
 
@@ -30,6 +31,14 @@ fn pgFault(code str, message str) PgError {
 }
 
 fn pgRaise(code str, message str) ! { try PgFault(code, message) }
+
+// pgRaiseHint raises a PostgreSQL error with a hint. It builds the fault payload
+// itself and passes it as a say.Fault argument so a percent sign in the message
+// or hint is not read as a format verb.
+fn pgRaiseHint(code str, message str, hint str) ! {
+	let payload = "@PGERR1@"+pg_field(code)+pg_field("ERROR")+pg_field(message)+pg_field("")+pg_field(hint)+pg_field("0")
+	fail say.Fault("%s", payload)
+}
 
 fn function(name str, args []Oid, ret Oid, strict bool, volatile bool, call fn([]Datum) !Datum) Func {
 	return Func{
