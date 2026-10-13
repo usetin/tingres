@@ -1,9 +1,50 @@
 package server
 
+import "../exec"
 import "crucible"
 
+// conformanceFails runs one statement on a fresh conformance session and reports whether
+// it ended in an error instead of an answer. This is the statement boundary the old
+// hand-written M1 handler used to draw; the conformance engine draws it now.
+fn conformanceFails(sql str) bool {
+	mut s = NewFakeSession("postgres", "postgres", 100)
+	mut sink = exec.NewRecordSink()
+	mut broken = false
+	s.Simple(sql, mut sink) catch _ { broken = true }
+	return broken
+}
+
+// conformanceTags runs one statement and returns its command tags.
+fn conformanceTags(sql str) []str {
+	mut s = NewFakeSession("postgres", "postgres", 100)
+	mut sink = exec.NewRecordSink()
+	s.Simple(sql, mut sink) catch _ {
+	}
+	return sink.Tags
+}
+
 fn TestM1QueryBoundary(t mut crucible.T) {
-	t.True("SELECT 1 is supported", supported_query(" SELECT 1; "))
-	t.True("SELECT 1 AS answer is supported", supported_query("select 1 as answer"))
-	t.True("other SQL stays unsupported", !supported_query("select 2"))
+	t.True("SELECT 1 is supported", !conformanceFails(" SELECT 1; "))
+	t.True("SELECT 1 AS answer is supported", !conformanceFails("select 1 as answer"))
+	let tags = conformanceTags("select 1 as answer")
+	t.True("SELECT 1 reports its tag", len(tags) == 1 && tags[0] == "SELECT 1")
+	t.True("a scan stays unsupported", conformanceFails("select 2 from t"))
+	t.True("DML stays unsupported", conformanceFails("insert into t values (1)"))
+}
+
+fn TestServerHelpers(t mut crucible.T) {
+	crucible.Equal(mut t, "default limit", Limit(0), defaultMaxConnections)
+	crucible.Equal(mut t, "custom limit", Limit(250), 250)
+	t.True("empty query spaces", is_empty_query("   ;   ;  "))
+	t.True("not empty query", !is_empty_query("SELECT 1;"))
+}
+
+fn TestFakeSessionBasics(t mut crucible.T) {
+	mut s = NewFakeSession("postgres", "postgres", 100)
+	crucible.Equal(mut t, "status char idle", s.StatusChar(), u8('I'))
+	t.True("cancel not set", !s.IsCanceled())
+	s.Cancel()
+	t.True("cancel set", s.IsCanceled())
+	s.ResetCancel()
+	t.True("cancel reset", !s.IsCanceled())
 }

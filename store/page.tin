@@ -2,7 +2,7 @@ package store
 
 type RelId = u32
 type PageNo = u32
-
+type Lsn = u64
 
 const PageSize = 8192
 const pageHeaderSize = 32
@@ -396,6 +396,38 @@ fn (p mut Page) PruneSlots(deadSlots []u16) {
 		}
 	}
 	p.Compact()
+}
+
+// SlotStatus returns the line pointer status: 0 unused, 1 live, 2 reserved.
+fn (p Page) SlotStatus(slot u16) u32 {
+	let h = p.Header()
+	if slot == 0 || slot > h.Slots {
+		return 0
+	}
+	return readU32(p.Data, pageHeaderSize+i64(slot-1)*linePointerSize+4)
+}
+
+// ItemLen returns the byte length of a live line pointer.
+fn (p Page) ItemLen(slot u16) i64 {
+	if p.SlotStatus(slot) != 1 {
+		return 0
+	}
+	return i64(readU16(p.Data, pageHeaderSize+i64(slot-1)*linePointerSize+2))
+}
+
+// SetItemPrefix overwrites the first bytes of a live item in place, keeping its length.
+fn (p mut Page) SetItemPrefix(slot u16, prefix []u8) ! {
+	if p.SlotStatus(slot) != 1 {
+		fail "store: invalid tuple id"
+	}
+	let lp = pageHeaderSize + i64(slot-1)*linePointerSize
+	let off = i64(readU16(p.Data, lp))
+	let n = i64(readU16(p.Data, lp+2))
+	if len(prefix) > n || off < pageHeaderSize || off+n > PageSize {
+		fail "store: invalid item prefix"
+	}
+	copy(p.Data[off:off+len(prefix)], prefix)
+	p.Seal()
 }
 
 fn writeU16(b mut []u8, off i64, v u16) {

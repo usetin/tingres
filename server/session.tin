@@ -1,0 +1,345 @@
+// Session is the server's view of one connection's execution state: either the real
+// executor session (store -> txn -> catalog -> exec) or the built-in conformance session
+// used while exec.Session does not run SQL end to end. SessionSink translates executor
+// events into protocol messages, buffered in the connection until ReadyForQuery.
+package server
+
+import "../exec"
+import "../proto"
+import "../types"
+import "fault"
+import "say"
+import "twine"
+
+// ParamStatus is one name/value pair reported in ParameterStatus.
+type ParamStatus struct {
+	Name str
+	Value str
+}
+
+// Session wraps the two session implementations behind one API. Exactly one is set.
+type Session struct {
+	Real ?exec.Session
+	Fake ?FakeSession
+}
+
+// RealSession wraps an exec session.
+fn RealSession(s exec.Session) Session {
+	return Session{Real: s, Fake: nil}
+}
+
+// FakeSessionOf wraps the conformance session.
+fn FakeSessionOf(s FakeSession) Session {
+	return Session{Real: nil, Fake: s}
+}
+
+// Simple runs every statement in a simple-query string.
+fn (s mut Session) Simple(sql str, out mut dyn exec.Sink) ! {
+	if let r = s.Real {
+		try r.Simple(sql, mut out)
+		return
+	}
+	if let f = s.Fake {
+		try f.Simple(sql, mut out)
+		return
+	}
+}
+
+// Parse prepares an extended-protocol statement.
+fn (s mut Session) Parse(name str, sql str, paramOids []u32) ! {
+	if let r = s.Real {
+		try r.Parse(name, sql, paramOids)
+		return
+	}
+	if let f = s.Fake {
+		try f.Parse(name, sql, paramOids)
+		return
+	}
+}
+
+// BindBytes binds raw parameter bytes to a prepared statement. The decoding lives here
+// rather than in exec.Session.BindBytes because exec's copy trips the compiler's
+// mut-parameter aliasing rule (see BUGS.md); this also keeps a NULL apart from an empty
+// parameter value, which exec's version cannot.
+fn (s mut Session) BindBytes(portalName str, prepName str, paramFormats mut []i16, paramValues mut [][]u8, resultFormats mut []i16) ! {
+	if let r = s.Real {
+		mut oids = []u32{}
+		let prepared = r.GetPreparedStatement(prepName)
+		if let p = prepared { oids = p.ParamTypes }
+		mut params = try decode_params(oids, mut paramFormats, mut paramValues)
+		mut formats = []i16{}
+		for f in resultFormats { formats = append(formats, f) }
+		try r.Bind(portalName, prepName, mut params, mut formats)
+		return
+	}
+	if let f = s.Fake {
+		try f.BindBytes(portalName, prepName, mut paramFormats, mut paramValues, mut resultFormats)
+		return
+	}
+}
+
+// decode_params turns the extended protocol's parameter bytes into datums: a truly empty
+// value is a NULL (PostgreSQL marks a NULL with length -1, which the frontend reader keeps
+// as an empty slice), and a binary parameter is decoded with the type's binary input.
+fn decode_params(oids []u32, paramFormats mut []i16, paramValues mut [][]u8) ![]types.Datum {
+	mut params = []types.Datum{}
+	for i, value in paramValues {
+		if len(value) == 0 {
+			params = append(params, types.Null())
+			continue
+		}
+		mut oid = types.TextOid
+		if i < len(oids) && oids[i] != 0 { oid = oids[i] }
+		mut binary = false
+		if len(paramFormats) == 1 { binary = paramFormats[0] == 1 }
+		if i < len(paramFormats) && paramFormats[i] == 1 { binary = true }
+		if binary {
+			let decoded = try types.DecodeBinary(oid, value)
+			params = append(params, decoded)
+		} else {
+			let parsed = try types.Parse(oid, str(value))
+			params = append(params, parsed)
+		}
+	}
+	return params
+}
+
+// Execute runs a portal, stopping after maxRows rows (0 means all of them).
+fn (s mut Session) Execute(portalName str, maxRows i64, out mut dyn exec.Sink) ! {
+	if let r = s.Real {
+		try r.Execute(portalName, maxRows, mut out)
+		return
+	}
+	if let f = s.Fake {
+		try f.Execute(portalName, maxRows, mut out)
+		return
+	}
+}
+
+// Describe describes a statement or portal.
+fn (s Session) Describe(kind u8, name str) !exec.Description {
+	if let r = s.Real {
+		return try r.Describe(kind, name)
+	}
+	if let f = s.Fake {
+		return try f.Describe(kind, name)
+	}
+	return exec.Description{Cols: []exec.ColDesc{}, ParamOids: []u32{}}
+}
+
+// Close drops a prepared statement or portal.
+fn (s mut Session) Close(kind u8, name str) ! {
+	if let r = s.Real {
+		try r.Close(kind, name)
+		return
+	}
+	if let f = s.Fake {
+		try f.Close(kind, name)
+		return
+	}
+}
+
+// Sync ends the extended-query cycle.
+fn (s mut Session) Sync(out mut dyn exec.Sink) ! {
+	if let r = s.Real {
+		try r.Sync(mut out)
+		return
+	}
+	if let f = s.Fake {
+		try f.Sync(mut out)
+		return
+	}
+}
+
+// Cancel flags the session for cancellation; safe from the accept loop's task.
+fn (s Session) Cancel() {
+	if let r = s.Real {
+		r.Cancel()
+		return
+	}
+	if let f = s.Fake {
+		f.Cancel()
+		return
+	}
+}
+
+// ResetCancel clears a previous cancel request.
+fn (s Session) ResetCancel() {
+	if let r = s.Real {
+		r.ResetCancel()
+		return
+	}
+	if let f = s.Fake {
+		f.ResetCancel()
+		return
+	}
+}
+
+// IsCanceled reports whether Cancel was requested.
+fn (s Session) IsCanceled() bool {
+	if let r = s.Real { return r.IsCanceled() }
+	if let f = s.Fake { return f.IsCanceled() }
+	return false
+}
+
+// StatusChar is the ReadyForQuery transaction status: I, T or E.
+fn (s Session) StatusChar() u8 {
+	if let r = s.Real { return r.StatusChar() }
+	if let f = s.Fake { return f.StatusChar() }
+	return 'I'
+}
+
+// Parameters lists the GUCs reported to the client, in PostgreSQL's ParameterStatus order.
+fn (s Session) Parameters() []ParamStatus {
+	mut out = []ParamStatus{}
+	for name in parameter_order() {
+		if let v = s.GetGuc(twine.ToLower(name)) {
+			out = append(out, ParamStatus{Name: name, Value: v})
+		}
+	}
+	return out
+}
+
+// parameter_order is PostgreSQL's startup ParameterStatus order (17.3).
+fn parameter_order() []str {
+	return []str{"server_version", "server_encoding", "client_encoding", "application_name", "DateStyle", "IntervalStyle", "TimeZone", "integer_datetimes", "standard_conforming_strings", "scram_iterations", "in_hot_standby", "is_superuser", "session_authorization", "default_transaction_read_only", "default_transaction_deferrable"}
+}
+
+// GetGuc reads one GUC value.
+fn (s Session) GetGuc(name str) ?str {
+	if let r = s.Real { return r.GetGuc(name) }
+	if let f = s.Fake { return f.GetGuc(name) }
+	return nil
+}
+
+// pg_type typlen values RowDescription carries (negative means variable length).
+fn type_size(oid u32) i16 {
+	if oid == 16 { return 1 }
+	if oid == 17 || oid == 25 || oid == 114 || oid == 1042 || oid == 1043 || oid == 3802 || oid == 1700 { return -1 }
+	if oid == 18 || oid == 19 { return 64 }
+	if oid == 20 || oid == 701 || oid == 1114 || oid == 1184 || oid == 1083 || oid == 1266 { return 8 }
+	if oid == 21 { return 2 }
+	if oid == 23 || oid == 26 || oid == 700 || oid == 1082 { return 4 }
+	if oid == 1186 || oid == 2950 { return 16 }
+	if oid == 705 { return -2 }
+	return -1
+}
+
+// SessionSink writes executor events straight into a connection's output buffer.
+type SessionSink struct {
+	Conn proto.Conn
+	Formats []i16
+	SawTag bool
+	LastTag str
+	PendingTag str
+	InCopyIn bool
+	InCopyOut bool
+	CopyRows i64
+	BytesCopied i64
+	Failed bool
+	FailMessage str
+	FlushAt i64
+}
+
+// NewSessionSink creates a sink that reports to one connection.
+fn NewSessionSink(c proto.Conn) SessionSink {
+	return SessionSink{Conn: c, Formats: []i16{}, SawTag: false, LastTag: "", PendingTag: "", InCopyIn: false, InCopyOut: false, CopyRows: 0, BytesCopied: 0, Failed: false, FailMessage: "", FlushAt: copyFlushBytes}
+}
+
+// note records a write failure; a sink method cannot fail, so the session loop checks.
+fn (s mut SessionSink) note(err fault) {
+	s.Failed = true
+	s.FailMessage = fault.Message(err)
+}
+
+fn (s mut SessionSink) RowDescription(cols []exec.ColDesc, formats []i16) {
+	s.Formats = formats
+	s.Conn.SendRowDescription(columns_of(cols, formats)) catch err { s.note(err) }
+}
+
+fn (s mut SessionSink) DataRow(r types.Row) {
+	mut cells = make([]proto.Cell, 0, len(r))
+	for i, d in r {
+		if types.IsNull(d) {
+			cells = append(cells, proto.Cell{Null: true})
+			continue
+		}
+		mut format = i16(0)
+		if i < len(s.Formats) { format = s.Formats[i] }
+		if format == 1 {
+			mut buf = []u8{}
+			types.EncodeBinary(d, mut buf)
+			cells = append(cells, proto.Cell{Binary: true, Bytes: buf})
+		} else {
+			cells = append(cells, proto.Cell{Value: d.Text()})
+		}
+	}
+	s.Conn.SendDataRow(cells) catch err { s.note(err) }
+}
+
+fn (s mut SessionSink) CommandComplete(tag str) {
+	s.SawTag = true
+	s.LastTag = tag
+	if s.InCopyIn && !s.InCopyOut {
+		// The client is still sending copy data: defer the tag until CopyDone.
+		s.PendingTag = tag
+		return
+	}
+	s.Conn.SendCommandComplete(tag) catch err { s.note(err) }
+}
+
+fn (s mut SessionSink) Notice(n exec.Notice) {
+	s.Conn.SendNotice(proto.ErrorFields{Severity: "NOTICE", Code: n.Code, Message: n.Message, Detail: n.Detail, Hint: n.Hint}) catch err { s.note(err) }
+}
+
+// CopyIn starts a COPY FROM STDIN exchange; the session loop reads the client's data.
+fn (s mut SessionSink) CopyIn(format i8, columnFormats []i16) {
+	s.InCopyIn = true
+	s.Conn.SendCopyInResponse(format, columnFormats) catch err { s.note(err) }
+}
+
+// CopyOut starts a COPY TO STDOUT exchange.
+fn (s mut SessionSink) CopyOut(format i8, columnFormats []i16) {
+	s.InCopyOut = true
+	s.Conn.SendCopyOutResponse(format, columnFormats) catch err { s.note(err) }
+}
+
+// CopyData streams one COPY block, flushing so the client's backpressure reaches us.
+fn (s mut SessionSink) CopyData(d []u8) {
+	s.BytesCopied += i64(len(d))
+	s.Conn.SendCopyData(d) catch err { s.note(err) }
+	if s.Conn.Pending() >= s.FlushAt {
+		s.Conn.Flush() catch err2 { s.note(err2) }
+	}
+}
+
+// CopyDone ends a COPY stream (a COPY FROM STDIN end comes from the client instead).
+fn (s mut SessionSink) CopyDone() {
+	if s.InCopyIn && !s.InCopyOut { return }
+	s.Conn.SendCopyDone() catch err { s.note(err) }
+}
+
+// logStatement logs a statement whose execution exceeded log_min_duration_statement.
+fn logStatement(sql str, durationNs i64, enableMs i64) {
+	if enableMs < 0 { return }
+	if durationNs < enableMs*1000000 { return }
+	let ms = f64(durationNs) / 1000000.0
+	say.Line("LOG: duration: {ms:.3} ms  statement: {one_line(sql)}")
+}
+
+// one_line collapses whitespace so a logged statement stays on one line.
+fn one_line(sql str) str {
+	mut out = []u8{}
+	mut lastSpace = true
+	for i in 0..len(sql) {
+		let c = sql[i]
+		if c == '\n' || c == '\r' || c == '\t' || c == ' ' {
+			if !lastSpace { out = append(out, ' ') }
+			lastSpace = true
+			continue
+		}
+		out = append(out, c)
+		lastSpace = false
+	}
+	return str(out)
+}

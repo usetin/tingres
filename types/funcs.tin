@@ -626,6 +626,7 @@ fn builtinFuncs() []Func {
 	registerByteaUuidFuncs(mut funcs)
 	registerLikeFuncs(mut funcs)
 	registerRegexFuncs(mut funcs)
+	registerArrayFuncs(mut funcs)
 	return funcs
 }
 

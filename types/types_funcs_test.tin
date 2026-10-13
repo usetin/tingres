@@ -402,3 +402,59 @@ fn TestTypeRegistryIsUnified(t mut crucible.T) {
 		crucible.Equal(mut t, "numeric / value", got.Text(), "3.7500000000000000")
 	}
 }
+
+// TestTypeLookupPathsAgree guards that the registry LookupFunc/LookupOperator use
+// and typereg.tin's view hold the same numeric/date-time/interval entries, and
+// that those entries expose the arity-specific fast paths.
+fn TestTypeLookupPathsAgree(t mut crucible.T) {
+	let cases = [][]Oid{
+		{NumericOid, NumericOid},
+		{NumericOid},
+		{DateOid, DateOid},
+		{IntervalOid, IntervalOid},
+		{TimestampOid, IntervalOid},
+		{TextOid, TimestampOid},
+	}
+	let names = []str{"+", "=", "<", "abs", "round", "trunc", "date_part", "date_trunc", "to_char"}
+	for name in names {
+		for args in cases {
+			let direct = LookupFunc(name, args) != nil
+			let typed = LookupTypeFunc(name, args) != nil
+			if direct != typed {
+				t.Error("{name}/{args}: LookupFunc {direct} but LookupTypeFunc {typed}")
+			}
+		}
+	}
+	if let f = LookupOperator("+", NumericOid, NumericOid) {
+		let generic = f.Call([]Datum{FromStr(NumericOid, "1.5"), FromStr(NumericOid, "2")}) catch _ {
+			t.Error("numeric + generic failed")
+			return
+		}
+		let fast = f.Call2(FromStr(NumericOid, "1.5"), FromStr(NumericOid, "2")) catch err {
+			t.Error("numeric + Call2 fast path failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "numeric + fast path agrees", fast.Text(), generic.Text())
+	}
+	if let f = LookupOperator("=", DateOid, DateOid) {
+		let fast = f.Call2(date("2024-01-02"), date("2024-01-02")) catch err {
+			t.Error("date = Call2 fast path failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "date = fast path", fast.Text(), "true")
+	}
+	if let f = LookupFunc("make_date", []Oid{Int4Oid, Int4Oid, Int4Oid}) {
+		let fast = f.Call3(FromI64(Int4Oid, 2024), FromI64(Int4Oid, 1), FromI64(Int4Oid, 2)) catch err {
+			t.Error("make_date Call3 fast path failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "make_date fast path", fast.Text(), "2024-01-02")
+	}
+	if let f = LookupFunc("abs", []Oid{NumericOid}) {
+		let fast = f.Call1(FromStr(NumericOid, "-1.5")) catch err {
+			t.Error("abs(numeric) Call1 fast path failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "abs(numeric) fast path", fast.Text(), "1.5")
+	}
+}

@@ -1,24 +1,37 @@
-// Package proto implements the PostgreSQL v3 server wire protocol.
+// Package proto implements the PostgreSQL v3 server wire protocol: framing, startup and
+// TLS negotiation, authentication, the simple and extended query protocols, the COPY
+// sub-protocol, cancel requests and error/notice messages. It knows nothing about SQL.
 package proto
 
+import "fault"
+import "say"
 import "mint"
 import "seal"
+import "tls"
+import "twine"
 import "wire"
 
 const maxMessage = 16777216
+const maxStartupPacket = 10000
 const protocol30 = 196608
 const protocol32 = 196610
 const sslRequest = 80877103
 const cancelRequest = 80877102
 const gssRequest = 80877104
 
-// Config controls startup and authentication.
+// Config controls startup negotiation and authentication.
 type Config struct {
 	User str
 	Database str
-	Auth str // trust or scram-sha-256
+	Auth str // trust, password (cleartext), md5, scram-sha-256
 	Password str
 	MaxConnections i64 // 0 selects the server default
+	Hba []HbaLine // rule list; when non-empty it decides the method, not Auth
+	TlsCert str // PEM certificate chain; empty disables TLS
+	TlsKey str // PEM private key
+	PeerAddress str // the client address used for pg_hba matching
+	ServerVersion str
+	Pid u32 // BackendKeyData pid to use; 0 picks one at random
 }
 
 // Startup contains the negotiated protocol and startup parameters.
@@ -33,7 +46,7 @@ type Startup struct {
 type Message enum {
 	Query(sql str)
 	Parse(name str, sql str, paramOids []u32)
-	Bind(portal str, statement str, params [][]u8, paramFormats []i16, resultFormats []i16)
+	Bind(portal str, statement str, paramFormats []i16, params [][]u8, resultFormats []i16)
 	Describe(kind u8, name str)
 	Execute(portal str, maxRows i64)
 	Close(kind u8, name str)
@@ -72,27 +85,82 @@ type Column struct {
 	Format i16
 }
 
-// Cell is one text-format DataRow value.
+// Cell is one DataRow value: NULL, text in Value, or binary in Bytes when Binary is set.
 type Cell struct {
 	Null bool
 	Value str
-}
-
-// Conn is an authenticated PostgreSQL frontend connection.
-type Conn struct {
-	sock wire.Conn
-	startup Startup
-	pid u32
-	secretKey u32
-	closed bool
-	out []u8
+	Binary bool
+	Bytes []u8
 }
 
 type Cursor struct { at i64 }
 
+// Accepted is the outcome of a startup negotiation: a ready connection, a cancel request
+// (which the server routes to the session named by pid and key), or nothing.
+type Accepted enum {
+	Ready(Conn)
+	Canceled(pid u32, secretKey u32)
+}
+
+// stream is the byte transport of one connection: plain TCP or TLS over it. The write
+// methods return the byte count because a Tin shape member with a fault-only result is
+// only accepted as the last member of the shape (see BUGS.md).
+shape stream {
+	mut ReadFull(n i64) !str
+	mut Write(s str) !i64
+	mut WriteBytes(b []u8) !i64
+	mut SetTimeout(ns i64)
+	mut Close()
+}
+
+type plainStream struct { conn wire.Conn }
+
+fn (s mut plainStream) ReadFull(n i64) !str { return try s.conn.ReadFull(n) }
+fn (s mut plainStream) Write(text str) !i64 { try s.conn.Write(text)
+	return i64(len(text)) }
+fn (s mut plainStream) WriteBytes(b []u8) !i64 { try s.conn.WriteBytes(b)
+	return i64(len(b)) }
+fn (s mut plainStream) SetTimeout(ns i64) { s.conn.SetTimeout(ns) }
+fn (s mut plainStream) Close() { s.conn.Close() }
+
+type tlsStream struct { conn tls.Conn }
+
+fn (s mut tlsStream) ReadFull(n i64) !str { return try s.conn.ReadFull(n) }
+fn (s mut tlsStream) Write(text str) !i64 { try s.conn.Write(text)
+	return i64(len(text)) }
+fn (s mut tlsStream) WriteBytes(b []u8) !i64 { try s.conn.WriteBytes(b)
+	return i64(len(b)) }
+fn (s mut tlsStream) SetTimeout(ns i64) { s.conn.SetTimeout(ns) }
+fn (s mut tlsStream) Close() { s.conn.Close() }
+
+// Conn is an authenticated PostgreSQL frontend connection.
+type Conn struct {
+	sock dyn stream
+	startup Startup
+	pid u32
+	secretKey u32
+	closed bool
+	secure bool
+	out []u8
+}
+
+// IsProtocolError reports whether a fault is a frontend protocol violation, which the
+// server answers with 08P01 and a closed connection, as PostgreSQL does.
+fn IsProtocolError(err fault) bool {
+	return twine.HasPrefix(fault.Message(err), "proto:")
+}
+
 fn be(b []u8, at i64, n i64) i64 {
 	mut v = i64(0)
 	for i in 0..n { v = (v << 8) | i64(b[at+i]) }
+	return v
+}
+
+// be32 reads a signed big-endian 32-bit length.
+fn be32(b []u8, at i64) i64 {
+	mut v = i64(0)
+	for i in 0..4 { v = (v << 8) | i64(b[at+i]) }
+	if v >= 2147483648 { v -= 4294967296 }
 	return v
 }
 
@@ -154,7 +222,7 @@ fn (c mut Conn) send(kind u8, payload []u8) ! {
 
 fn (c mut Conn) flush() ! {
 	if len(c.out) == 0 { return }
-	try c.sock.WriteBytes(c.out)
+	_ = try c.sock.WriteBytes(c.out)
 	c.out = c.out[:0]
 }
 
@@ -170,11 +238,16 @@ fn (c mut Conn) auth_ok() ! {
 	try c.auth_message(0, []u8{})
 }
 
-fn (c mut Conn) parameter(name str, value str) ! {
-	let start = begin_frame(mut c.out, 'S')
-	cstr(mut c.out, name)
-	cstr(mut c.out, value)
-	end_frame(mut c.out, start)
+// SendParameter sends one ParameterStatus message; buffered until ReadyForQuery.
+fn (c mut Conn) SendParameter(name str, value str) ! {
+	try c.send('S', cstr_payload(name, value))
+}
+
+fn cstr_payload(a str, b str) []u8 {
+	mut out = []u8{}
+	cstr(mut out, a)
+	cstr(mut out, b)
+	return out
 }
 
 fn (c mut Conn) ready(status u8) ! {
@@ -185,9 +258,15 @@ fn (c mut Conn) ready(status u8) ! {
 }
 
 fn (c mut Conn) error(fields ErrorFields) ! {
+	try c.send_error_fields(fields)
+}
+
+fn (c mut Conn) send_error_fields(fields ErrorFields) ! {
 	let start = begin_frame(mut c.out, 'E')
-	error_field(mut c.out, 'S', fields.Severity)
-	error_field(mut c.out, 'V', fields.Severity)
+	mut severity = fields.Severity
+	if severity == "" { severity = "ERROR" }
+	error_field(mut c.out, 'S', severity)
+	error_field(mut c.out, 'V', severity)
 	error_field(mut c.out, 'C', fields.Code)
 	error_field(mut c.out, 'M', fields.Message)
 	if fields.Detail != "" { error_field(mut c.out, 'D', fields.Detail) }
@@ -202,15 +281,15 @@ fn (c mut Conn) error(fields ErrorFields) ! {
 }
 
 fn bad_request(c mut Conn, code str, message str) ! {
-	try c.error(ErrorFields{Severity: "FATAL", Code: code, Message: message})
+	try c.send_error_fields(ErrorFields{Severity: "FATAL", Code: code, Message: message})
 	try c.flush()
 }
 
-fn startup_packet(sock wire.Conn) !(i64, []u8) {
+fn startup_packet(sock mut dyn stream) !(i64, []u8) {
 	let head = try sock.ReadFull(4)
 	let hb = []u8(head)
 	let n = be(hb, 0, 4)
-	if n < 8 || n > maxMessage { fail "proto: invalid startup packet length" }
+	if n < 8 || n > maxStartupPacket { fail "proto: invalid startup packet length" }
 	let raw = try sock.ReadFull(n-4)
 	let body = []u8(raw)
 	if len(body) < 4 { fail "proto: truncated startup packet" }
@@ -240,6 +319,33 @@ fn parse_startup(version i64, body []u8) !Startup {
 // ParseStartup decodes startup protocol fields while retaining unknown options.
 fn ParseStartup(version i64, body []u8) !Startup {
 	return try parse_startup(version, body)
+}
+
+// protocol_minor is the minor version a 3.x startup request carries.
+fn protocol_minor(version i64) i64 {
+	return version & 0xffff
+}
+
+// unsupported_startup_options lists the `_pq_.` options tingres does not implement; they
+// are reported back in NegotiateProtocolVersion, as PostgreSQL does for its own.
+fn unsupported_startup_options(params map[str]str) []str {
+	let known = map[str]bool{"_pq_.protocol_version": true}
+	mut out = []str{}
+	for key, _ in params {
+		if !twine.HasPrefix(key, "_pq_.") { continue }
+		if known[key] { continue }
+		out = append(out, key)
+	}
+	return out
+}
+
+fn (c mut Conn) send_negotiate(newestMinor i64, options []str) ! {
+	let start = begin_frame(mut c.out, 'v')
+	putbe(mut c.out, newestMinor, 4)
+	putbe(mut c.out, len(options), 4)
+	for option in options { cstr(mut c.out, option) }
+	end_frame(mut c.out, start)
+	try c.flush()
 }
 
 fn scram_attrs(s str) !map[u8]str {
@@ -293,6 +399,7 @@ fn (c mut Conn) scram(password str) ! {
 				Password(response) => {
 					let attrs2 = try scram_attrs(response)
 					if attrs2['r'] != serverNonce || attrs2['c'] != "biws" || attrs2['p'] == "" { fail "proto: invalid SCRAM client-final message" }
+					say.Line("SCRAM: got response: {response}")
 					let proof = try seal.B64Decode(attrs2['p'])
 					if len(proof) != 32 { fail "proto: invalid SCRAM proof length" }
 					let finalNoProof = "c=biws,r={serverNonce}"
@@ -303,7 +410,12 @@ fn (c mut Conn) scram(password str) ! {
 					let clientSignature = seal.HmacSha256(str(storedKey), authMessage)
 					mut recovered = make([]u8, 32)
 					for i in 0..32 { recovered[i] = proof[i]^clientSignature[i] }
-					if !seal.ConstantTimeEq(seal.Sha256(str(recovered)), storedKey) { fail "proto: SCRAM authentication failed" }
+					say.Line("SCRAM: checking proof")
+					if !seal.ConstantTimeEq(seal.Sha256(str(recovered)), storedKey) {
+						say.Line("SCRAM: PROOF MISMATCH!")
+						fail "proto: SCRAM authentication failed"
+					}
+					say.Line("SCRAM: PROOF MATCHED!")
 					let serverKey = seal.HmacSha256(str(salted), "Server Key")
 					let signature = seal.HmacSha256(str(serverKey), authMessage)
 					let sf2 = []u8("v={seal.B64(signature)}")
@@ -316,80 +428,210 @@ fn (c mut Conn) scram(password str) ! {
 	}
 }
 
-// Accept performs startup negotiation and authentication on an accepted socket.
-fn Accept(sock wire.Conn, cfg Config) !Conn {
+// (c mut Conn) cleartext asks for a plain password and compares it in constant time.
+fn (c mut Conn) cleartext(password str) ! {
+	try c.auth_message(3, []u8{})
+	let response = try c.read_frontend()
+	match response {
+		Password(data) => {
+			mut text = data
+			if len(text) > 0 && text[len(text)-1] == 0 { text = text[:len(text)-1] }
+			if !seal.ConstantTimeEq([]u8(text), []u8(password)) { fail "proto: password authentication failed" }
+		}
+		_ => { fail "proto: expected a password message" }
+	}
+}
+
+// (c mut Conn) md5 asks for the PostgreSQL md5 challenge: md5(md5(password+user) + salt).
+fn (c mut Conn) md5(password str, user str) ! {
+	let salt = seal.RandomBytes(4)
+	let body = []u8{}
+	let start = begin_frame(mut c.out, 'R')
+	putbe(mut c.out, 5, 4)
+	c.out = append(c.out, salt...)
+	end_frame(mut c.out, start)
+	try c.flush()
+	let response = try c.read_frontend()
+	match response {
+		Password(data) => {
+			mut text = data
+			if len(text) > 0 && text[len(text)-1] == 0 { text = text[:len(text)-1] }
+			let inner = Md5Hex(pad2([]u8(password), []u8(user)))
+			mut salted = []u8(inner)
+			salted = append(salted, salt...)
+			let expected = "md5" + Md5Hex(salted)
+			if !seal.ConstantTimeEq([]u8(text), []u8(expected)) { fail "proto: password authentication failed" }
+		}
+		_ => { fail "proto: expected a password message" }
+	}
+}
+
+// pad2 concatenates two byte slices.
+fn pad2(a []u8, b []u8) []u8 {
+	mut out = make([]u8, 0, len(a)+len(b))
+	out = append(out, a...)
+	out = append(out, b...)
+	return out
+}
+
+// AuthMethod is the method a pg_hba.conf rule or --auth flag selects.
+fn resolve_auth_method(cfg Config, database str, user str, secure bool) !str {
+	if len(cfg.Hba) > 0 {
+		mut method = ""
+		let matched = MatchHba(cfg.Hba, database, user, cfg.PeerAddress, secure)
+		if let rule = matched {
+			method = rule.Method
+		}
+		if method == "" {
+			mut encryption = "no encryption"
+			if secure { encryption = "SSL encryption" }
+			fail "proto: no pg_hba.conf entry for host \"{cfg.PeerAddress}\", user \"{user}\", database \"{database}\", {encryption}"
+		}
+		if method == "reject" {
+			fail "proto: pg_hba.conf rejects connection for host \"{cfg.PeerAddress}\", user \"{user}\", database \"{database}\""
+		}
+		return method
+	}
+	if cfg.Auth == "" { return "trust" }
+	return cfg.Auth
+}
+
+// Accept performs startup negotiation (including TLS when configured) and authentication.
+// A CancelRequest is returned as Accepted.Canceled for the server to route.
+fn Accept(sock mut wire.Conn, cfg Config) !Accepted {
+	mut transport = plainStream{conn: sock}
+	mut secure = false
 	let token = seal.RandomBytes(8)
-	let c = Conn{sock: sock, startup: Startup{Parameters: make(map[str]str)}, pid: u32(be(token, 0, 4)), secretKey: u32(be(token, 4, 4)), out: make([]u8, 0, 4096)}
+	mut pid = u32(be(token, 0, 4))
+	if cfg.Pid != 0 { pid = cfg.Pid }
+	mut conn = Conn{sock: transport, startup: Startup{Parameters: make(map[str]str)}, pid: pid, secretKey: u32(be(token, 4, 4)), out: make([]u8, 0, 4096)}
 	mut version = i64(0)
 	mut body = []u8{}
 	for {
-		let (v, b) = try startup_packet(sock)
-		if v == sslRequest || v == gssRequest {
-			try sock.Write("N")
+		let (v, b) = try startup_packet(mut conn.sock)
+		if v == sslRequest {
+			if cfg.TlsCert == "" {
+				_ = try conn.sock.Write("N")
+				continue
+			}
+			_ = try conn.sock.Write("S")
+			let serverCfg = try tls.LoadServerConfig(cfg.TlsCert, cfg.TlsKey)
+			let secured = tls.Server(sock, serverCfg) catch err {
+				fail "proto: TLS handshake failed: {err}"
+			}
+			conn.sock = tlsStream{conn: secured}
+			secure = true
 			continue
 		}
-		if v == cancelRequest { fail "proto: cancel request" }
+		if v == gssRequest {
+			_ = try conn.sock.Write("N")
+			continue
+		}
+		if v == cancelRequest {
+			if len(b) < 8 { fail "proto: malformed cancel request" }
+			let pid = u32(be(b, 0, 4))
+			let key = u32(be(b, 4, 4))
+			conn.sock.Close()
+			return Accepted.Canceled(pid, key)
+		}
 		version = v
 		body = b
 		break
 	}
+	let major = version >> 16
+	if major != 3 {
+		try bad_request(mut conn, "0A000", "unsupported frontend protocol {version >> 16}.{version & 0xffff}: server supports 3.0 to 3.0")
+		fail "proto: unsupported protocol version {version}"
+	}
 	let startup = try parse_startup(version, body)
-	mut conn = c
 	conn.startup = startup
+	conn.secure = secure
+	let minor = protocol_minor(version)
+	let unsupported = unsupported_startup_options(startup.Parameters)
+	if minor > 0 || len(unsupported) > 0 {
+		try conn.send_negotiate(0, unsupported)
+	}
+	mut database = startup.Database
+	if database == "" { database = startup.User }
 	if cfg.User != "" && startup.User != cfg.User {
 		try bad_request(mut conn, "28000", "role \"{startup.User}\" does not exist")
 		fail "proto: configured role mismatch"
 	}
-	if cfg.Database != "" && startup.Database != "" && startup.Database != cfg.Database {
-		try bad_request(mut conn, "3D000", "database \"{startup.Database}\" does not exist")
+	if cfg.Database != "" && database != cfg.Database {
+		try bad_request(mut conn, "3D000", "database \"{database}\" does not exist")
 		fail "proto: configured database mismatch"
 	}
-	let auth = cfg.Auth
-	if auth == "trust" || auth == "" {
+	let method = resolve_auth_method(cfg, database, startup.User, secure) catch err {
+		bad_request(mut conn, "28000", fault.Message(err)) catch _ { }
+		fail err
+	}
+	if method == "trust" {
 		try conn.auth_ok()
-	} else if auth == "scram-sha-256" {
+	} else if method == "password" || method == "cleartext" {
+		conn.cleartext(cfg.Password) catch err {
+			bad_request(mut conn, "28P01", "password authentication failed for user \"{startup.User}\"") catch _ { }
+			fail err
+		}
+		try conn.auth_ok()
+	} else if method == "md5" {
+		conn.md5(cfg.Password, startup.User) catch err {
+			bad_request(mut conn, "28P01", "password authentication failed for user \"{startup.User}\"") catch _ { }
+			fail err
+		}
+		try conn.auth_ok()
+	} else if method == "scram-sha-256" {
 		conn.scram(cfg.Password) catch err {
-			bad_request(mut conn, "28P01", "password authentication failed") catch _ {
-			}
+			bad_request(mut conn, "28P01", "password authentication failed: " + fault.Message(err)) catch _ { }
 			fail err
 		}
 		try conn.auth_ok()
 	} else {
-		try bad_request(mut conn, "0A000", "authentication method is not supported")
+		try bad_request(mut conn, "0A000", "authentication method \"{method}\" is not supported")
 		fail "proto: unsupported authentication method"
 	}
-	try conn.parameter("server_version", "17.0-tingres")
-	try conn.parameter("server_encoding", "UTF8")
-	try conn.parameter("client_encoding", "UTF8")
-	try conn.parameter("DateStyle", "ISO, MDY")
-	try conn.parameter("integer_datetimes", "on")
-	try conn.parameter("standard_conforming_strings", "on")
-	mut key = []u8{}
-	putbe(mut key, i64(conn.pid), 4)
-	putbe(mut key, i64(conn.secretKey), 4)
-	try conn.send('K', key)
+	mut version_text = "17.3"
+	if cfg.ServerVersion != "" { version_text = cfg.ServerVersion }
+	try conn.SendParameter("server_version", version_text)
+	try conn.SendParameter("server_encoding", "UTF8")
+	try conn.SendParameter("client_encoding", "UTF8")
+	try conn.SendParameter("DateStyle", "ISO, MDY")
+	try conn.SendParameter("integer_datetimes", "on")
+	try conn.SendParameter("standard_conforming_strings", "on")
+	try conn.send_backend_key()
 	try conn.ready('I')
-	return conn
+	return Accepted.Ready(conn)
+}
+
+fn (c mut Conn) send_backend_key() ! {
+	mut key = []u8{}
+	putbe(mut key, i64(c.pid), 4)
+	putbe(mut key, i64(c.secretKey), 4)
+	try c.send('K', key)
 }
 
 // RejectStartup reads through SSL/GSS negotiation and sends a fatal startup error.
-fn RejectStartup(sock wire.Conn, code str, message str) ! {
+fn RejectStartup(sock mut wire.Conn, code str, message str) ! {
+	mut transport = plainStream{conn: sock}
 	for {
-		let (version, _) = try startup_packet(sock)
+		let (version, _) = try startup_packet(mut transport)
 		if version == sslRequest || version == gssRequest {
-			try sock.Write("N")
+			_ = try transport.Write("N")
 			continue
 		}
 		if version == cancelRequest {
+			transport.Close()
 			return
 		}
-		mut c = Conn{sock: sock, startup: Startup{Parameters: make(map[str]str)}, pid: 0, secretKey: 0, out: make([]u8, 0, 256)}
+		mut c = Conn{sock: transport, startup: Startup{Parameters: make(map[str]str)}, pid: 0, secretKey: 0, out: make([]u8, 0, 256)}
 		try bad_request(mut c, code, message)
+		mut closed = c
+		closed.sock.Close()
+		closed.closed = true
 		return
 	}
 }
 
-fn (c Conn) read_frontend() !Message {
+fn (c mut Conn) read_frontend() !Message {
 	let rawHead = try c.sock.ReadFull(5)
 	let head = []u8(rawHead)
 	let kind = head[0]
@@ -399,26 +641,119 @@ fn (c Conn) read_frontend() !Message {
 	let body = []u8(rawBody)
 	mut k = Cursor{at: 0}
 	match kind {
-		'Q' => { let sql = try readc(body, mut k)
+		'Q' => {
+			let sql = try readc(body, mut k)
 			if k.at != len(body) { fail "proto: trailing Query bytes" }
-			return Message.Query(sql) }
-		'X' => { if len(body) != 0 { fail "proto: malformed Terminate" }
-			return Message.Terminate }
-		'S' => { if len(body) != 0 { fail "proto: malformed Sync" }
-			return Message.Sync }
-		'H' => { if len(body) != 0 { fail "proto: malformed Flush" }
-			return Message.Flush }
-		'p' => { return Message.Password(str(body)) }
-		'd' => { return Message.CopyData(body) }
-		'c' => { return Message.CopyDone }
-		'f' => { let message = try readc(body, mut k)
-			return Message.CopyFail(message) }
-		_ => { return Message.Unknown(kind) }
+			return Message.Query(sql)
+		}
+		'P' => {
+			let name = try readc(body, mut k)
+			let sql = try readc(body, mut k)
+			let count = be(body, k.at, 2)
+			k.at += 2
+			if count < 0 || k.at+count*4 > len(body) { fail "proto: invalid Parse parameter count" }
+			mut oids = []u32{}
+			for i in 0..count {
+				oids = append(oids, u32(be(body, k.at, 4)))
+				k.at += 4
+			}
+			if k.at != len(body) { fail "proto: trailing Parse bytes" }
+			return Message.Parse(name, sql, oids)
+		}
+		'B' => {
+			let portal = try readc(body, mut k)
+			let statement = try readc(body, mut k)
+			let formatCount = be(body, k.at, 2)
+			k.at += 2
+			if formatCount < 0 || k.at+formatCount*2 > len(body) { fail "proto: invalid Bind format count" }
+			mut paramFormats = []i16{}
+			for i in 0..formatCount {
+				paramFormats = append(paramFormats, i16(be(body, k.at, 2)))
+				k.at += 2
+			}
+			let valueCount = be(body, k.at, 2)
+			k.at += 2
+			if valueCount < 0 || k.at+valueCount*4 > len(body) { fail "proto: invalid Bind value count" }
+			mut params = [][]u8{}
+			for i in 0..valueCount {
+				let size = be32(body, k.at)
+				k.at += 4
+				if size == -1 {
+					params = append(params, []u8{})
+					continue
+				}
+				if size < 0 || k.at+size > len(body) { fail "proto: invalid Bind value length" }
+				params = append(params, body[k.at:k.at+size])
+				k.at += size
+			}
+			let resultCount = be(body, k.at, 2)
+			k.at += 2
+			if resultCount < 0 || k.at+resultCount*2 > len(body) { fail "proto: invalid Bind result format count" }
+			mut resultFormats = []i16{}
+			for i in 0..resultCount {
+				resultFormats = append(resultFormats, i16(be(body, k.at, 2)))
+				k.at += 2
+			}
+			if k.at != len(body) { fail "proto: trailing Bind bytes" }
+			return Message.Bind(portal, statement, paramFormats, params, resultFormats)
+		}
+		'D' => {
+			if len(body) < 1 { fail "proto: empty Describe" }
+			let kindByte = body[0]
+			k.at = 1
+			let name = try readc(body, mut k)
+			if k.at != len(body) { fail "proto: trailing Describe bytes" }
+			return Message.Describe(kindByte, name)
+		}
+		'E' => {
+			let portal = try readc(body, mut k)
+			let maxRows = be(body, k.at, 4)
+			k.at += 4
+			if k.at != len(body) { fail "proto: trailing Execute bytes" }
+			return Message.Execute(portal, maxRows)
+		}
+		'C' => {
+			if len(body) < 1 { fail "proto: empty Close" }
+			let kindByte = body[0]
+			k.at = 1
+			let name = try readc(body, mut k)
+			if k.at != len(body) { fail "proto: trailing Close bytes" }
+			return Message.Close(kindByte, name)
+		}
+		'X' => {
+			if len(body) != 0 { fail "proto: malformed Terminate" }
+			return Message.Terminate
+		}
+		'S' => {
+			if len(body) != 0 { fail "proto: malformed Sync" }
+			return Message.Sync
+		}
+		'H' => {
+			if len(body) != 0 { fail "proto: malformed Flush" }
+			return Message.Flush
+		}
+		'p' => {
+			return Message.Password(str(body))
+		}
+		'd' => {
+			return Message.CopyData(body)
+		}
+		'c' => {
+			if len(body) != 0 { fail "proto: malformed CopyDone" }
+			return Message.CopyDone
+		}
+		'f' => {
+			let message = try readc(body, mut k)
+			return Message.CopyFail(message)
+		}
+		_ => {
+			return Message.Unknown(kind)
+		}
 	}
 }
 
 // Next reads and validates the next frontend message.
-fn (c Conn) Next() !Message {
+fn (c mut Conn) Next() !Message {
 	return try c.read_frontend()
 }
 
@@ -426,6 +761,15 @@ fn (c Conn) Next() !Message {
 fn (c Conn) Startup() Startup {
 	return c.startup
 }
+
+// Pid returns the BackendKeyData process id of this connection.
+fn (c Conn) Pid() u32 { return c.pid }
+
+// SecretKey returns the BackendKeyData secret a CancelRequest must present.
+fn (c Conn) SecretKey() u32 { return c.secretKey }
+
+// Secure reports whether this connection negotiated TLS.
+fn (c Conn) Secure() bool { return c.secure }
 
 // SetTimeout sets the read and write wait limit for this connection.
 fn (c mut Conn) SetTimeout(ns i64) {
@@ -437,6 +781,21 @@ fn (c mut Conn) SendError(fields ErrorFields) ! {
 	try c.error(fields)
 }
 
+// SendNotice sends a PostgreSQL NoticeResponse.
+fn (c mut Conn) SendNotice(fields ErrorFields) ! {
+	let start = begin_frame(mut c.out, 'N')
+	mut severity = fields.Severity
+	if severity == "" { severity = "NOTICE" }
+	error_field(mut c.out, 'S', severity)
+	error_field(mut c.out, 'V', severity)
+	error_field(mut c.out, 'C', fields.Code)
+	error_field(mut c.out, 'M', fields.Message)
+	if fields.Detail != "" { error_field(mut c.out, 'D', fields.Detail) }
+	if fields.Hint != "" { error_field(mut c.out, 'H', fields.Hint) }
+	c.out = append(c.out, 0)
+	end_frame(mut c.out, start)
+}
+
 // SendReadyForQuery sends ReadyForQuery with transaction status I, T or E.
 fn (c mut Conn) SendReadyForQuery(status u8) ! {
 	if status != 'I' && status != 'T' && status != 'E' { fail "proto: invalid transaction status" }
@@ -445,9 +804,13 @@ fn (c mut Conn) SendReadyForQuery(status u8) ! {
 
 // SendCommandComplete sends CommandComplete.
 fn (c mut Conn) SendCommandComplete(tag str) ! {
-	let start = begin_frame(mut c.out, 'C')
-	cstr(mut c.out, tag)
-	end_frame(mut c.out, start)
+	try c.send('C', cbyte_payload(tag))
+}
+
+fn cbyte_payload(tag str) []u8 {
+	mut out = []u8{}
+	cstr(mut out, tag)
+	return out
 }
 
 fn encode_row_description(out mut []u8, cols []Column) {
@@ -471,10 +834,15 @@ fn encode_data_row(out mut []u8, cells []Cell) {
 	for cell in cells {
 		if cell.Null {
 			putbe(mut out, -1, 4)
-		} else {
-			putbe(mut out, len(cell.Value), 4)
-			for i in 0..len(cell.Value) { out = append(out, u8(cell.Value[i])) }
+			continue
 		}
+		if cell.Binary {
+			putbe(mut out, len(cell.Bytes), 4)
+			out = append(out, cell.Bytes...)
+			continue
+		}
+		putbe(mut out, len(cell.Value), 4)
+		for i in 0..len(cell.Value) { out = append(out, u8(cell.Value[i])) }
 	}
 	end_frame(mut out, start)
 }
@@ -484,7 +852,7 @@ fn (c mut Conn) SendRowDescription(cols []Column) ! {
 	encode_row_description(mut c.out, cols)
 }
 
-// SendDataRow sends one row in text format; NULL cells use length -1.
+// SendDataRow sends one row; NULL cells use length -1 and binary cells use Bytes.
 fn (c mut Conn) SendDataRow(cells []Cell) ! {
 	encode_data_row(mut c.out, cells)
 }
@@ -502,14 +870,68 @@ fn (c mut Conn) SendBindComplete() ! { try c.send('2', []u8{}) }
 fn (c mut Conn) SendCloseComplete() ! { try c.send('3', []u8{}) }
 // SendNoData sends NoData.
 fn (c mut Conn) SendNoData() ! { try c.send('n', []u8{}) }
+// SendPortalSuspended sends PortalSuspended.
+fn (c mut Conn) SendPortalSuspended() ! { try c.send('s', []u8{}) }
+
+// SendParameterDescription sends ParameterDescription.
+fn (c mut Conn) SendParameterDescription(oids []u32) ! {
+	let start = begin_frame(mut c.out, 't')
+	putbe(mut c.out, len(oids), 2)
+	for oid in oids { putbe(mut c.out, i64(oid), 4) }
+	end_frame(mut c.out, start)
+}
+
+// SendCopyInResponse sends CopyInResponse; format 0 is text and 1 is binary per column.
+fn (c mut Conn) SendCopyInResponse(format i8, columnFormats []i16) ! {
+	try c.send_copy_response('G', format, columnFormats)
+}
+
+// SendCopyOutResponse sends CopyOutResponse.
+fn (c mut Conn) SendCopyOutResponse(format i8, columnFormats []i16) ! {
+	try c.send_copy_response('H', format, columnFormats)
+}
+
+// SendCopyBothResponse sends CopyBothResponse (replication is not implemented yet).
+fn (c mut Conn) SendCopyBothResponse(format i8, columnFormats []i16) ! {
+	try c.send_copy_response('W', format, columnFormats)
+}
+
+fn (c mut Conn) send_copy_response(kind u8, format i8, columnFormats []i16) ! {
+	let start = begin_frame(mut c.out, kind)
+	c.out = append(c.out, u8(format))
+	putbe(mut c.out, len(columnFormats), 2)
+	for f in columnFormats { putbe(mut c.out, i64(f), 2) }
+	end_frame(mut c.out, start)
+}
+
+// SendCopyData sends one CopyData payload.
+fn (c mut Conn) SendCopyData(data []u8) ! {
+	try c.send('d', data)
+}
+
+// SendCopyDone sends CopyDone.
+fn (c mut Conn) SendCopyDone() ! {
+	try c.send('c', []u8{})
+}
 
 // Flush writes backend messages buffered since the last ReadyForQuery.
 fn (c mut Conn) Flush() ! {
 	try c.flush()
 }
 
+// Pending reports how many buffered output bytes have not been written yet.
+fn (c Conn) Pending() i64 { return len(c.out) }
+
 // Close closes the network connection.
 fn (c mut Conn) Close() {
+	if c.closed { return }
+	c.sock.Close()
+	c.closed = true
+}
+
+// CloseIfClosedOnWire closes the socket without sending anything more.
+fn (c mut Conn) Abort() {
+	if c.closed { return }
 	c.sock.Close()
 	c.closed = true
 }
