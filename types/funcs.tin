@@ -468,10 +468,6 @@ fn integerRangeMessage(oid Oid) str {
 	return "bigint out of range"
 }
 
-fn arithmeticFunc(op str, args []Datum) !Datum {
-	return try arithmeticValues(op, args[0], args[1])
-}
-
 fn arithmeticValues(op str, left Datum, right Datum) !Datum {
 	let oid = left.Oid()
 	if oid == NumericOid { return try numericArithmetic(op, left, right) }
@@ -627,7 +623,7 @@ let builtinFuncRegistry = builtinFuncs()
 fn registerBasicFuncs(funcs mut []Func) {
 	registerOperators(mut funcs)
 	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, OidOid, Float4Oid, Float8Oid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid, NumericOid, DateOid, TimeOid, TimestampOid, TimestamptzOid, IntervalOid, UnknownLiteralOid} {
-		registerFunc(mut funcs, function("pg_typeof", []Oid{oid}, TextOid, true, false, fn(args []Datum) !Datum { return try pgTypeName(args[0].Oid()) }))
+		registerFunc(mut funcs, function1("pg_typeof", []Oid{oid}, TextOid, true, false, fn(p1 Datum) !Datum { return try pgTypeName(p1.Oid()) }))
 	}
 }
 

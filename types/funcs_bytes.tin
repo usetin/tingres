@@ -5,17 +5,17 @@ import "seal"
 
 fn registerByteaUuidFuncs(funcs mut []Func) {
 	for _, name in []str{"length", "octet_length"} {
-		registerFunc(mut funcs, function(name, []Oid{ByteaOid}, Int4Oid, true, false, fn(args []Datum) !Datum { return FromI64(Int4Oid, len(args[0].bytes)) }))
+		registerFunc(mut funcs, function1(name, []Oid{ByteaOid}, Int4Oid, true, false, fn(p1 Datum) !Datum { return FromI64(Int4Oid, len(p1.bytes)) }))
 	}
-	registerFunc(mut funcs, function("||", []Oid{ByteaOid, ByteaOid}, ByteaOid, true, false, fn(args []Datum) !Datum {
-		mut out = make([]u8, 0, len(args[0].bytes)+len(args[1].bytes))
-		out = append(out, args[0].bytes...)
-		out = append(out, args[1].bytes...)
+	registerFunc(mut funcs, function2("||", []Oid{ByteaOid, ByteaOid}, ByteaOid, true, false, fn(p1 Datum, p2 Datum) !Datum {
+		mut out = make([]u8, 0, len(p1.bytes)+len(p2.bytes))
+		out = append(out, p1.bytes...)
+		out = append(out, p2.bytes...)
 		return FromBytes(ByteaOid, out)
 	}))
-	registerFunc(mut funcs, function("substring", []Oid{ByteaOid, Int4Oid}, ByteaOid, true, false, fn(args []Datum) !Datum { return try byteaSubstring(args[0], args[1].i, -1) }))
-	registerFunc(mut funcs, function("substring", []Oid{ByteaOid, Int4Oid, Int4Oid}, ByteaOid, true, false, fn(args []Datum) !Datum { return try byteaSubstring(args[0], args[1].i, args[2].i) }))
-	registerFunc(mut funcs, function("get_byte", []Oid{ByteaOid, Int4Oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try byteaGetByte(args[0], args[1].i) }))
+	registerFunc(mut funcs, function2("substring", []Oid{ByteaOid, Int4Oid}, ByteaOid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try byteaSubstring(p1, p2.i, -1) }))
+	registerFunc(mut funcs, function3("substring", []Oid{ByteaOid, Int4Oid, Int4Oid}, ByteaOid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try byteaSubstring(p1, p2.i, p3.i) }))
+	registerFunc(mut funcs, function2("get_byte", []Oid{ByteaOid, Int4Oid}, Int4Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try byteaGetByte(p1, p2.i) }))
 	registerFunc(mut funcs, function("gen_random_uuid", []Oid{}, UuidOid, false, true, fn(args []Datum) !Datum { return try randomUuid() }))
 }
 

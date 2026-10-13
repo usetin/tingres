@@ -242,3 +242,48 @@ fn goldenCheck(t mut crucible.T, expression str, want str) {
 	let text = got.Text()
 	if text != want { t.Error("{expression}: got {text}, want {want}") }
 }
+
+// TestFixedArityFastPaths checks that the arity-specific entry points agree with
+// the generic slice call, so exec can resolve once at plan time.
+fn TestFixedArityFastPaths(t mut crucible.T) {
+	if let g = LookupFunc("substr", []Oid{TextOid, Int4Oid, Int4Oid}) {
+		let generic = g.Call([]Datum{FromStr(TextOid, "abcdef"), FromI64(Int4Oid, 2), FromI64(Int4Oid, 3)}) catch _ {
+			t.Error("generic substr failed")
+			return
+		}
+		let fast = g.Call3(FromStr(TextOid, "abcdef"), FromI64(Int4Oid, 2), FromI64(Int4Oid, 3)) catch _ {
+			t.Error("fast substr failed")
+			return
+		}
+		crucible.Equal(mut t, "substr Call3 matches Call", fast.Text(), generic.Text())
+		crucible.Equal(mut t, "substr value", fast.Text(), "bcd")
+	}
+	if let g = LookupFunc("strpos", []Oid{TextOid, TextOid}) {
+		let fast = g.Call2(FromStr(TextOid, "abc"), FromStr(TextOid, "b")) catch _ {
+			t.Error("fast strpos failed")
+			return
+		}
+		crucible.Equal(mut t, "strpos Call2", fast.Text(), "2")
+	}
+	if let g = LookupFunc("lower", []Oid{TextOid}) {
+		let fast = g.Call1(FromStr(TextOid, "ABC")) catch _ {
+			t.Error("fast lower failed")
+			return
+		}
+		crucible.Equal(mut t, "lower Call1", fast.Text(), "abc")
+	}
+	if let g = LookupOperator("LIKE", TextOid, TextOid) {
+		let fast = g.Call2(FromStr(TextOid, "abc"), FromStr(TextOid, "a%")) catch _ {
+			t.Error("fast LIKE failed")
+			return
+		}
+		crucible.Equal(mut t, "LIKE Call2", fast.Text(), "true")
+	}
+	if let g = LookupOperator("+", Int4Oid, Int4Oid) {
+		let fast = g.Call2(FromI64(Int4Oid, 2), FromI64(Int4Oid, 3)) catch _ {
+			t.Error("fast + failed")
+			return
+		}
+		crucible.Equal(mut t, "int4 + Call2", fast.Text(), "5")
+	}
+}
