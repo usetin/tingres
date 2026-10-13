@@ -20,11 +20,11 @@ type LikeToken value struct {
 fn registerLikeFuncs(funcs mut []Func) {
 	for _, oid in []Oid{TextOid, VarcharOid, BpcharOid, NameOid} {
 		for _, name in []str{"LIKE", "ILIKE", "NOT LIKE", "NOT ILIKE", "~~", "~~*", "!~~", "!~~*"} {
-			registerFunc(mut funcs, function(name, []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try likeOperator(name, args[0].Text(), args[1].Text(), "\\") }))
-			registerFunc(mut funcs, function(name, []Oid{oid, oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try likeOperator(name, args[0].Text(), args[1].Text(), args[2].Text()) }))
+			registerFunc(mut funcs, function2(name, []Oid{oid, oid}, BoolOid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try likeOperator(name, p1.Text(), p2.Text(), "\\") }))
+			registerFunc(mut funcs, function3(name, []Oid{oid, oid, oid}, BoolOid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try likeOperator(name, p1.Text(), p2.Text(), p3.Text()) }))
 		}
-		registerFunc(mut funcs, function("SIMILAR TO", []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try similarTo(args[0].Text(), args[1].Text(), "\\") }))
-		registerFunc(mut funcs, function("SIMILAR TO", []Oid{oid, oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try similarTo(args[0].Text(), args[1].Text(), args[2].Text()) }))
+		registerFunc(mut funcs, function2("SIMILAR TO", []Oid{oid, oid}, BoolOid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try similarTo(p1.Text(), p2.Text(), "\\") }))
+		registerFunc(mut funcs, function3("SIMILAR TO", []Oid{oid, oid, oid}, BoolOid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try similarTo(p1.Text(), p2.Text(), p3.Text()) }))
 	}
 	for _, name in []str{"~", "~*", "!~", "!~*"} {
 		for _, oid in []Oid{TextOid, VarcharOid, BpcharOid, NameOid} {

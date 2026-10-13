@@ -1,17 +1,18 @@
 package types
 
 import "twine"
+import "gauge"
 
 // registerOperators installs comparison, boolean, arithmetic and bit operators.
 fn registerOperators(funcs mut []Func) {
-	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid} {
+	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, NumericOid, DateOid, TimeOid, TimetzOid, TimestampOid, TimestamptzOid, IntervalOid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid} {
 		for _, op in []str{"=", "<>", "<", "<=", ">", ">="} {
 			registerFunc(mut funcs, comparisonOperator(op, oid))
 		}
 	}
 	for _, op in []str{"+", "-", "*", "/", "%", "^"} {
-		for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
-			if op == "^" && isInteger(oid) { continue }
+		for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, NumericOid} {
+			if op == "^" && (isInteger(oid) || oid == NumericOid) { continue }
 			registerFunc(mut funcs, arithmeticOperator(op, oid))
 		}
 	}
@@ -20,9 +21,10 @@ fn registerOperators(funcs mut []Func) {
 			registerFunc(mut funcs, arithmeticOperator(op, oid))
 		}
 	}
-	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
+	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, NumericOid} {
 		registerFunc(mut funcs, function1("+", []Oid{oid}, oid, true, false, fn(a Datum) !Datum { return try callUnary("+", a) }))
 		registerFunc(mut funcs, function1("-", []Oid{oid}, oid, true, false, fn(a Datum) !Datum { return try callUnary("-", a) }))
+		registerFunc(mut funcs, function1("@", []Oid{oid}, oid, true, false, fn(a Datum) !Datum { return try callUnary("@", a) }))
 	}
 	registerFunc(mut funcs, function1("NOT", []Oid{BoolOid}, BoolOid, true, false, fn(a Datum) !Datum { return try booleanNot(a) }))
 	registerFunc(mut funcs, function2("AND", []Oid{BoolOid, BoolOid}, BoolOid, false, false, fn(a Datum, b Datum) !Datum { return try booleanValues("AND", a, b) }))
@@ -128,10 +130,20 @@ fn comparisonFunc(op str, args []Datum) !Datum {
 
 fn callUnary(op str, arg Datum) !Datum {
 	if op == "+" { return arg }
+	if arg.Oid() == NumericOid {
+		if op == "@" { return try NumericAbs(arg) }
+		return try NumericNeg(arg)
+	}
 	if isInteger(arg.Oid()) {
+		if op == "@" {
+			if arg.i == minInt(arg.Oid()) { try pgRaise("22003", integerRangeMessage(arg.Oid())) }
+			if arg.i < 0 { return FromI64(arg.Oid(), 0-arg.i) }
+			return arg
+		}
 		if arg.i == minInt(arg.Oid()) { try pgRaise("22003", integerRangeMessage(arg.Oid())) }
 		return FromI64(arg.Oid(), 0-arg.i)
 	}
+	if op == "@" { return numericFromFloat(arg.Oid(), gauge.Abs(arg.f)) }
 	return numericFromFloat(arg.Oid(), -arg.f)
 }
 

@@ -8,28 +8,50 @@ const VoidOid Oid = 2278
 
 fn registerMathFuncs(funcs mut []Func) {
 	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
-		registerFunc(mut funcs, function("abs", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try mathUnary("abs", args[0]) }))
-		registerFunc(mut funcs, function("sign", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try mathUnary("sign", args[0]) }))
+		registerFunc(mut funcs, function1("abs", []Oid{oid}, oid, true, false, fn(p1 Datum) !Datum { return try mathUnary("abs", p1) }))
 	}
+	registerFunc(mut funcs, function1("sign", []Oid{Float8Oid}, Float8Oid, true, false, fn(p1 Datum) !Datum { return try mathUnary("sign", p1) }))
 	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid} {
-		registerFunc(mut funcs, function("mod", []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc("%", args) }))
-		registerFunc(mut funcs, function("div", []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc("/", args) }))
-		registerFunc(mut funcs, function("to_hex", []Oid{oid}, TextOid, true, false, fn(args []Datum) !Datum { return try toHex(args[0].i) }))
+		registerFunc(mut funcs, function2("mod", []Oid{oid, oid}, oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try arithmeticValues("%", p1, p2) }))
 	}
-	for _, oid in []Oid{Float4Oid, Float8Oid} {
-		registerFunc(mut funcs, function("mod", []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc("%", args) }))
+	for _, oid in []Oid{Int4Oid, Int8Oid} {
+		registerFunc(mut funcs, function1("to_hex", []Oid{oid}, TextOid, true, false, fn(p1 Datum) !Datum { return try toHex(oid, p1.i) }))
 	}
+	registerFunc(mut funcs, function2("mod", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try arithmeticValues("%", p1, p2) }))
 	for _, name in []str{"sqrt", "cbrt", "exp", "ln", "log", "ceil", "ceiling", "floor", "round", "trunc", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "degrees", "radians"} {
 		if name == "log" { continue }
-		registerFunc(mut funcs, function(name, []Oid{Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathUnary(name, args[0]) }))
+		registerFunc(mut funcs, function1(name, []Oid{Float8Oid}, Float8Oid, true, false, fn(p1 Datum) !Datum { return try mathUnary(name, p1) }))
 	}
-	registerFunc(mut funcs, function("log", []Oid{Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathUnary("log10", args[0]) }))
-	registerFunc(mut funcs, function("log", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathBinary("log", args[0], args[1]) }))
-	registerFunc(mut funcs, function("power", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathBinary("power", args[0], args[1]) }))
-	registerFunc(mut funcs, function("atan2", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathBinary("atan2", args[0], args[1]) }))
+	registerFunc(mut funcs, function1("log", []Oid{Float8Oid}, Float8Oid, true, false, fn(p1 Datum) !Datum { return try mathUnary("log10", p1) }))
+	registerFunc(mut funcs, function2("log", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try mathBinary("log", p1, p2) }))
+	registerFunc(mut funcs, function2("power", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try mathBinary("power", p1, p2) }))
+	registerFunc(mut funcs, function2("atan2", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try mathBinary("atan2", p1, p2) }))
 	registerFunc(mut funcs, function("pi", []Oid{}, Float8Oid, false, false, fn(args []Datum) !Datum { return try mathConstant("pi") }))
 	registerFunc(mut funcs, function("random", []Oid{}, Float8Oid, false, true, fn(args []Datum) !Datum { return try mathConstant("random") }))
-	registerFunc(mut funcs, function("setseed", []Oid{Float8Oid}, VoidOid, true, true, fn(args []Datum) !Datum { return try mathSeed(args[0]) }))
+	registerFunc(mut funcs, function1("setseed", []Oid{Float8Oid}, VoidOid, true, true, fn(p1 Datum) !Datum { return try mathSeed(p1) }))
+	registerNumericMathFuncs(mut funcs)
+}
+
+fn registerNumericMathFuncs(funcs mut []Func) {
+	for _, name in []str{"abs", "@"} {
+		registerFunc(mut funcs, function1(name, []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericAbs(a) }))
+	}
+	registerFunc(mut funcs, function1("sign", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericSign(a) }))
+	registerFunc(mut funcs, function2("mod", []Oid{NumericOid, NumericOid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try NumericModulo(a, b) }))
+	registerFunc(mut funcs, function2("div", []Oid{NumericOid, NumericOid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try numericDiv(a, b) }))
+	for _, name in []str{"ceil", "ceiling"} {
+		registerFunc(mut funcs, function1(name, []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericCeil(a) }))
+	}
+	registerFunc(mut funcs, function1("floor", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericFloor(a) }))
+	registerFunc(mut funcs, function1("round", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericRound(a, 0) }))
+	registerFunc(mut funcs, function1("trunc", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericTrunc(a, 0) }))
+	registerFunc(mut funcs, function2("round", []Oid{NumericOid, Int4Oid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try NumericRound(a, b.i) }))
+	registerFunc(mut funcs, function2("trunc", []Oid{NumericOid, Int4Oid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return NumericTrunc(a, b.i) }))
+}
+
+fn numericDiv(a Datum, b Datum) !Datum {
+	let quotient = try NumericDivide(a, b)
+	return NumericTrunc(quotient, 0)
 }
 
 fn mathUnary(name str, arg Datum) !Datum {
@@ -65,7 +87,7 @@ fn mathUnary(name str, arg Datum) !Datum {
 		"log10" => gauge.Log10(x)
 		"ceil", "ceiling" => gauge.Ceil(x)
 		"floor" => gauge.Floor(x)
-		"round" => gauge.Round(x)
+		"round" => roundEven(x)
 		"trunc" => gauge.Trunc(x)
 		"sin" => gauge.Sin(x)
 		"cos" => gauge.Cos(x)
@@ -107,10 +129,27 @@ fn mathSeed(seed Datum) !Datum {
 	return Null()
 }
 
-fn toHex(v i64) !Datum {
+// roundEven is PostgreSQL's round(double precision): the nearest integer,
+// halves to even (C rint), so round(2.5) is 2 and round(-0.5) is -0.
+fn roundEven(x f64) f64 {
+	let whole = gauge.Trunc(x)
+	let fraction = x-whole
+	if fraction > 0.5 { return whole+1.0 }
+	if fraction < -0.5 { return whole-1.0 }
+	if fraction == 0.5 || fraction == -0.5 {
+		let half = whole/2.0
+		if gauge.Trunc(half) == half { return whole }
+		if fraction > 0.0 { return whole+1.0 }
+		return whole-1.0
+	}
+	return whole
+}
+
+fn toHex(oid Oid, v i64) !Datum {
 	let digits = "0123456789abcdef"
-	if v == 0 { return FromStr(TextOid, "0") }
 	mut x = u64(v)
+	if oid == Int4Oid { x = u64(u32(v)) } else if oid == Int2Oid { x = u64(u16(v)) }
+	if x == 0 { return FromStr(TextOid, "0") }
 	mut out = ""
 	for x > 0 {
 		out = str(digits[i64(x&15)]) + out
