@@ -3,6 +3,15 @@ package types
 import "glyph"
 import "twine"
 
+// LikeMatcher owns a LIKE pattern compiled once for a planned expression.
+type LikeMatcher value struct {
+	Tokens []LikeToken
+	Insensitive bool
+	Negated bool
+	FastKind u8
+	Needle str
+}
+
 type LikeToken value struct {
 	Kind u8
 	Rune i32
@@ -19,7 +28,7 @@ fn registerLikeFuncs(funcs mut []Func) {
 	}
 	for _, name in []str{"~", "~*", "!~", "!~*"} {
 		for _, oid in []Oid{TextOid, VarcharOid, BpcharOid, NameOid} {
-			registerFunc(mut funcs, function(name, []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { fail "regular expression operators are not supported" }))
+			registerFunc(mut funcs, function2(name, []Oid{oid, oid}, BoolOid, true, false, fn(a Datum, b Datum) !Datum { return try regexOperator(name, a.Text(), b.Text()) }))
 		}
 	}
 }
@@ -27,9 +36,87 @@ fn registerLikeFuncs(funcs mut []Func) {
 fn likeOperator(name str, text str, pattern str, escape str) !Datum {
 	let insensitive = name == "ILIKE" || name == "NOT ILIKE" || name == "~~*" || name == "!~~*"
 	let negated = name == "NOT LIKE" || name == "NOT ILIKE" || name == "!~~" || name == "!~~*"
-	mut matches = try likeMatch(text, pattern, escape, insensitive)
-	if negated { matches = !matches }
+	let matcher = try CompileLike(pattern, escape, insensitive, negated)
+	let matches = matcher.Matches(text)
 	return FromBool(matches)
+}
+
+// CompileLike prepares a pattern for repeated matching in the executor.
+fn CompileLike(pattern str, escape str, insensitive bool, negated bool) !LikeMatcher {
+	mut sourcePattern = pattern
+	mut sourceEscape = escape
+	if insensitive {
+		sourcePattern = twine.ToLower(pattern)
+		sourceEscape = twine.ToLower(escape)
+	}
+	let tokens = try parseLike(sourcePattern, sourceEscape)
+	mut matcher = LikeMatcher{Tokens: tokens, Insensitive: insensitive, Negated: negated, FastKind: 0, Needle: ""}
+	let n = len(tokens)
+	mut literal = ""
+	mut allLiteral = true
+	for token in tokens {
+		if token.Kind != 0 { allLiteral = false } else { literal += glyph.RuneStr(token.Rune) }
+	}
+	if allLiteral {
+		matcher.FastKind = 1
+		matcher.Needle = literal
+		return matcher
+	}
+	if n >= 1 && tokens[n-1].Kind == 2 {
+		mut prefix = ""
+		mut plain = true
+		for i in 0..n-1 {
+			if tokens[i].Kind != 0 { plain = false } else { prefix += glyph.RuneStr(tokens[i].Rune) }
+		}
+		if plain {
+			matcher.FastKind = 2
+			matcher.Needle = prefix
+			return matcher
+		}
+	}
+	if n >= 1 && tokens[0].Kind == 2 {
+		mut suffix = ""
+		mut plain = true
+		for i in 1..n {
+			if tokens[i].Kind != 0 { plain = false } else { suffix += glyph.RuneStr(tokens[i].Rune) }
+		}
+		if plain {
+			matcher.FastKind = 3
+			matcher.Needle = suffix
+			return matcher
+		}
+	}
+	if n >= 2 && tokens[0].Kind == 2 && tokens[n-1].Kind == 2 {
+		mut contains = ""
+		mut plain = true
+		for i in 1..n-1 {
+			if tokens[i].Kind != 0 { plain = false } else { contains += glyph.RuneStr(tokens[i].Rune) }
+		}
+		if plain {
+			matcher.FastKind = 4
+			matcher.Needle = contains
+			return matcher
+		}
+	}
+	return matcher
+}
+
+// Matches tests a string with the prepared LIKE pattern and its escape rules.
+fn (matcher LikeMatcher) Matches(text str) bool {
+	mut value = text
+	mut needle = matcher.Needle
+	if matcher.Insensitive {
+		value = twine.ToLower(value)
+		needle = twine.ToLower(needle)
+	}
+	mut matches = false
+	if matcher.FastKind == 1 { matches = value == needle
+	} else if matcher.FastKind == 2 { matches = twine.HasPrefix(value, needle)
+	} else if matcher.FastKind == 3 { matches = twine.HasSuffix(value, needle)
+	} else if matcher.FastKind == 4 { matches = twine.Contains(value, needle)
+	} else { matches = likeMatchTokens(value, matcher.Tokens) }
+	if matcher.Negated { matches = !matches }
+	return matches
 }
 
 fn textRunes(s str) []i32 {
@@ -45,7 +132,7 @@ fn textRunes(s str) []i32 {
 
 fn parseLike(pattern str, escape str) ![]LikeToken {
 	let esc = textRunes(escape)
-	if len(esc) > 1 { fail "LIKE escape must be a single character" }
+	if len(esc) > 1 { try pgRaise("22025", "LIKE escape must be a single character") }
 	let chars = textRunes(pattern)
 	mut out = make([]LikeToken, 0, len(chars))
 	mut i = i64(0)
@@ -53,7 +140,7 @@ fn parseLike(pattern str, escape str) ![]LikeToken {
 		let c = chars[i]
 		if len(esc) == 1 && c == esc[0] {
 			i += 1
-			if i >= len(chars) { fail "LIKE pattern must not end with escape character" }
+			if i >= len(chars) { try pgRaise("22025", "LIKE pattern must not end with escape character") }
 			out = append(out, LikeToken{Kind: 0, Rune: chars[i]})
 		} else if c == '%' {
 			if len(out) == 0 || out[len(out)-1].Kind != 2 { out = append(out, LikeToken{Kind: 2, Rune: 0}) }
@@ -64,13 +151,19 @@ fn parseLike(pattern str, escape str) ![]LikeToken {
 }
 
 fn likeMatch(text str, pattern str, escape str, insensitive bool) !bool {
+	mut sourcePattern = pattern
+	mut sourceEscape = escape
 	if insensitive {
 		text = twine.ToLower(text)
-		pattern = twine.ToLower(pattern)
-		escape = twine.ToLower(escape)
+		sourcePattern = twine.ToLower(pattern)
+		sourceEscape = twine.ToLower(escape)
 	}
+	let tokens = try parseLike(sourcePattern, sourceEscape)
+	return likeMatchTokens(text, tokens)
+}
+
+fn likeMatchTokens(text str, tokens []LikeToken) bool {
 	let chars = textRunes(text)
-	let tokens = try parseLike(pattern, escape)
 	mut prev = make([]bool, len(chars)+1)
 	prev[0] = true
 	for token in tokens {
@@ -89,32 +182,5 @@ fn likeMatch(text str, pattern str, escape str, insensitive bool) !bool {
 }
 
 fn similarTo(text str, pattern str, escape str) !Datum {
-	let chars = textRunes(pattern)
-	for c in chars {
-		if c == '|' || c == '(' || c == ')' || c == '[' || c == ']' || c == '*' || c == '+' || c == '?' || c == '{' || c == '}' || c == '^' || c == '$' {
-			fail "SIMILAR TO pattern syntax is not supported"
-		}
-	}
-	let tokens = try similarLikePattern(chars, escape)
-	let matches = try likeMatch(text, tokens, "\\", false)
-	return FromBool(matches)
-}
-
-fn similarLikePattern(chars []i32, escape str) !str {
-	let esc = textRunes(escape)
-	if len(esc) > 1 { fail "SIMILAR TO escape must be a single character" }
-	mut out = ""
-	mut i = i64(0)
-	for i < len(chars) {
-		let c = chars[i]
-		if len(esc) == 1 && c == esc[0] {
-			i += 1
-			if i >= len(chars) { fail "LIKE pattern must not end with escape character" }
-			let escaped = chars[i]
-			if escaped == '%' || escaped == '_' || escaped == '\\' { out += "\\" }
-			out += glyph.RuneStr(escaped)
-		} else if c == '\\' { out += "\\\\" } else { out += glyph.RuneStr(c) }
-		i += 1
-	}
-	return out
+	return try similarRegexMatch(text, pattern, escape)
 }
