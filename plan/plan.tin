@@ -45,6 +45,34 @@ fn ExplainPlan(p Plan, analyze bool) []str {
 	return lines
 }
 
+
+// ExplainJson formats an execution plan tree as a JSON string matching PostgreSQL EXPLAIN (FORMAT JSON).
+fn ExplainJson(p Prepared) str {
+	return "[{{\"Plan\": " + planToJson(p.Plan) + "}}]"
+}
+
+fn planToJson(p Plan) str {
+	let title = nodeTitle(p)
+	let cost = p.Cost()
+	mut s = "{{\"Node Type\": \"" + title + "\", "
+	s += "\"Startup Cost\": " + say.Fmt("%.2f", cost.Startup) + ", "
+	s += "\"Total Cost\": " + say.Fmt("%.2f", cost.Total) + ", "
+	s += "\"Plan Rows\": " + say.Fmt("%d", i64(cost.Rows)) + ", "
+	s += "\"Plan Width\": " + say.Fmt("%d", cost.Width)
+
+	let children = p.Children()
+	if len(children) > 0 {
+		s += ", \"Plans\": ["
+		for i, child in children {
+			if i > 0 { s += ", " }
+			s += planToJson(child)
+		}
+		s += "]"
+	}
+	s += "}}"
+	return s
+}
+
 fn writeExplain(p Plan, depth i64, analyze bool, lines mut []str) {
 	mut indent = ""
 	for i in 0..depth {
@@ -156,21 +184,13 @@ fn prepareSelect(c catalog.Catalog, t txn.Txn, sel parse.SelectStmt, paramTypes 
 	for pt in paramTypes {
 		params = append(params, pt)
 	}
-	let analyzed = try AnalyzeStatement(c, t, parse.Stmt.Select(sel), mut params)
-	mut resultCols = []ColDesc{}
-	for target in analyzed.Targets {
-		resultCols = append(resultCols, target.Col)
-	}
+	mut analyzed = try AnalyzeStatement(c, t, parse.Stmt.Select(sel), mut params)
+	let planTree = try PlanQuery(c, t, mut analyzed)
 	return Prepared{
 		Stmt: parse.Stmt.Select(sel),
 		ParamTypes: params,
-		ResultCols: resultCols,
-		Plan: Plan.Result(ResultNode{
-			Exprs: []Expr{},
-			Filter: nil,
-			Cols: resultCols,
-			Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0},
-		}),
+		ResultCols: planTree.Cols(),
+		Plan: planTree,
 		CatalogVersion: c.Version(),
 	}
 }
@@ -180,12 +200,13 @@ fn prepareInsert(c catalog.Catalog, t txn.Txn, ins parse.InsertStmt, paramTypes 
 	for pt in paramTypes {
 		params = append(params, pt)
 	}
-	let _ = try AnalyzeStatement(c, t, parse.Stmt.Insert(ins), mut params)
+	mut analyzed = try AnalyzeStatement(c, t, parse.Stmt.Insert(ins), mut params)
+	let planTree = try PlanQuery(c, t, mut analyzed)
 	return Prepared{
 		Stmt: parse.Stmt.Insert(ins),
 		ParamTypes: params,
-		ResultCols: []ColDesc{},
-		Plan: Plan.Utility(UtilityNode{Stmt: parse.Stmt.Insert(ins), Cols: []ColDesc{}}),
+		ResultCols: planTree.Cols(),
+		Plan: planTree,
 		CatalogVersion: c.Version(),
 	}
 }
@@ -195,12 +216,13 @@ fn prepareUpdate(c catalog.Catalog, t txn.Txn, upd parse.UpdateStmt, paramTypes 
 	for pt in paramTypes {
 		params = append(params, pt)
 	}
-	let _ = try AnalyzeStatement(c, t, parse.Stmt.Update(upd), mut params)
+	mut analyzed = try AnalyzeStatement(c, t, parse.Stmt.Update(upd), mut params)
+	let planTree = try PlanQuery(c, t, mut analyzed)
 	return Prepared{
 		Stmt: parse.Stmt.Update(upd),
 		ParamTypes: params,
-		ResultCols: []ColDesc{},
-		Plan: Plan.Utility(UtilityNode{Stmt: parse.Stmt.Update(upd), Cols: []ColDesc{}}),
+		ResultCols: planTree.Cols(),
+		Plan: planTree,
 		CatalogVersion: c.Version(),
 	}
 }
@@ -210,12 +232,13 @@ fn prepareDelete(c catalog.Catalog, t txn.Txn, del parse.DeleteStmt, paramTypes 
 	for pt in paramTypes {
 		params = append(params, pt)
 	}
-	let _ = try AnalyzeStatement(c, t, parse.Stmt.Delete(del), mut params)
+	mut analyzed = try AnalyzeStatement(c, t, parse.Stmt.Delete(del), mut params)
+	let planTree = try PlanQuery(c, t, mut analyzed)
 	return Prepared{
 		Stmt: parse.Stmt.Delete(del),
 		ParamTypes: params,
-		ResultCols: []ColDesc{},
-		Plan: Plan.Utility(UtilityNode{Stmt: parse.Stmt.Delete(del), Cols: []ColDesc{}}),
+		ResultCols: planTree.Cols(),
+		Plan: planTree,
 		CatalogVersion: c.Version(),
 	}
 }

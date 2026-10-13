@@ -1,0 +1,370 @@
+package plan
+
+import "crucible"
+import "../catalog"
+import "../txn"
+import "../types"
+import "../parse"
+
+fn TestPlannerConstantFolding(t mut crucible.T) {
+	let addFunc = types.LookupFunc("+", []types.Oid{types.Int4Oid, types.Int4Oid})
+	t.True("add func found", addFunc != nil)
+	if let fnVal = addFunc {
+		let opExpr = Expr.OpCall(OpCallExpr{
+			Op: "+",
+			Func: fnVal,
+			Args: []Expr{
+				Expr.Const(ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: u32(types.Int4Oid)}),
+				Expr.Const(ConstExpr{Value: types.FromI64(types.Int4Oid, 2), Type: u32(types.Int4Oid)}),
+			},
+			Type: u32(types.Int4Oid),
+		})
+		let foldedOp = foldExpr(opExpr)
+		match foldedOp {
+			Const(c) => {
+				crucible.Equal(mut t, "1 + 2 is 3", c.Value.Text(), "3")
+			}
+			_ => {
+				t.Error("expected folded const")
+			}
+		}
+	}
+
+	// Boolean AND: true AND false -> false
+	let andExpr = Expr.BoolExpr(BoolExpr{
+		Op: BoolOp.And,
+		Args: []Expr{
+			Expr.Const(ConstExpr{Value: types.FromBool(true), Type: u32(types.BoolOid)}),
+			Expr.Const(ConstExpr{Value: types.FromBool(false), Type: u32(types.BoolOid)}),
+		},
+		Type: u32(types.BoolOid),
+	})
+	let foldedAnd = foldExpr(andExpr)
+	match foldedAnd {
+		Const(c) => {
+			crucible.Equal(mut t, "true AND false is false", c.Value.Text(), "false")
+		}
+		_ => {
+			t.Error("expected folded const for AND")
+		}
+	}
+
+	// Boolean OR: false OR true -> true
+	let orExpr = Expr.BoolExpr(BoolExpr{
+		Op: BoolOp.Or,
+		Args: []Expr{
+			Expr.Const(ConstExpr{Value: types.FromBool(false), Type: u32(types.BoolOid)}),
+			Expr.Const(ConstExpr{Value: types.FromBool(true), Type: u32(types.BoolOid)}),
+		},
+		Type: u32(types.BoolOid),
+	})
+	let foldedOr = foldExpr(orExpr)
+	match foldedOr {
+		Const(c) => {
+			crucible.Equal(mut t, "false OR true is true", c.Value.Text(), "true")
+		}
+		_ => {
+			t.Error("expected folded const for OR")
+		}
+	}
+
+	// Boolean NOT: NOT false -> true
+	let notExpr = Expr.BoolExpr(BoolExpr{
+		Op: BoolOp.Not,
+		Args: []Expr{
+			Expr.Const(ConstExpr{Value: types.FromBool(false), Type: u32(types.BoolOid)}),
+		},
+		Type: u32(types.BoolOid),
+	})
+	let foldedNot = foldExpr(notExpr)
+	match foldedNot {
+		Const(c) => {
+			crucible.Equal(mut t, "NOT false is true", c.Value.Text(), "true")
+		}
+		_ => {
+			t.Error("expected folded const for NOT")
+		}
+	}
+
+	// IS NULL on non-null -> false
+	let nullTest = Expr.NullTest(NullTestExpr{
+		Arg: Expr.Const(ConstExpr{Value: types.FromStr(types.TextOid, "hello"), Type: u32(types.TextOid)}),
+		Test: NullTestType.IsNull,
+		Type: u32(types.BoolOid),
+	})
+	let foldedNullTest = foldExpr(nullTest)
+	match foldedNullTest {
+		Const(c) => {
+			crucible.Equal(mut t, "'hello' IS NULL is false", c.Value.Text(), "false")
+		}
+		_ => {
+			t.Error("expected folded const for IS NULL")
+		}
+	}
+}
+
+fn TestPlannerPhysicalPlans(t mut crucible.T) {
+
+	let envOpt = setupTestEnv(mut t, "planner_physical")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	if let tbl = env.Cat.LookupTable(env.Txn, "public", "users") {
+		let idxDef = catalog.IndexDef{Table: tbl, Name: "users_pkey", Unique: true}
+		_ = env.Cat.CreateIndex(env.Txn, idxDef) catch _ { return }
+		env.Txn.CommandCounterIncrement()
+	}
+
+	// 1. SeqScan with pushed down filter
+	let stmtSeq = parseSql("SELECT * FROM users WHERE age > 21") catch err {
+		t.Error("parse seq: " + types.ErrorMessage(err))
+		return
+	}
+	let prepSeq = Prepare(env.Cat, env.Txn, stmtSeq, []u32{}) catch err {
+		t.Error("prepare seq: " + types.ErrorMessage(err))
+		return
+	}
+	match prepSeq.Plan {
+		Project(p) => {
+			match p.Input {
+				SeqScan(ss) => {
+					t.True("seq scan has pushed down filter", ss.Filter != nil)
+				}
+				_ => {
+					t.Error("expected SeqScan input to Project")
+				}
+			}
+		}
+		SeqScan(ss) => {
+			t.True("seq scan has filter", ss.Filter != nil)
+		}
+		_ => {
+			t.Error("expected Project or SeqScan")
+		}
+	}
+
+	// 2. HashAgg for query with aggregates
+	let stmtAgg = parseSql("SELECT count(*) FROM users") catch err {
+		t.Error("parse agg: " + types.ErrorMessage(err))
+		return
+	}
+	let prepAgg = Prepare(env.Cat, env.Txn, stmtAgg, []u32{}) catch err {
+		t.Error("prepare agg: " + types.ErrorMessage(err))
+		return
+	}
+	match prepAgg.Plan {
+		Project(p) => {
+			match p.Input {
+				HashAgg(_) => {
+					// Expected HashAgg!
+				}
+				_ => {
+					t.Error("expected HashAgg for count(*)")
+				}
+			}
+		}
+		_ => {
+			t.Error("expected Project wrapping HashAgg")
+		}
+	}
+
+	// 3. Sort for ORDER BY
+	let stmtSort = parseSql("SELECT id, name FROM users ORDER BY name") catch err {
+		t.Error("parse sort: " + types.ErrorMessage(err))
+		return
+	}
+	let prepSort = Prepare(env.Cat, env.Txn, stmtSort, []u32{}) catch err {
+		t.Error("prepare sort: " + types.ErrorMessage(err))
+		return
+	}
+	match prepSort.Plan {
+		Sort(s) => {
+			crucible.Equal(mut t, "sort has 1 key", len(s.Keys), 1)
+		}
+		_ => {
+			t.Error("expected Sort node")
+		}
+	}
+
+	// 4. Limit for LIMIT / OFFSET
+	let stmtLimit = parseSql("SELECT * FROM users LIMIT 10 OFFSET 5") catch err {
+		t.Error("parse limit: " + types.ErrorMessage(err))
+		return
+	}
+	let prepLimit = Prepare(env.Cat, env.Txn, stmtLimit, []u32{}) catch err {
+		t.Error("prepare limit: " + types.ErrorMessage(err))
+		return
+	}
+	match prepLimit.Plan {
+		Limit(l) => {
+			t.True("limit has count", l.Count != nil)
+			t.True("limit has offset", l.Offset != nil)
+		}
+		_ => {
+			t.Error("expected Limit node")
+		}
+	}
+
+	// 5. Join planning: Equijoin produces HashJoin
+	let stmtJoin = parseSql("SELECT * FROM users JOIN orders ON users.id = orders.user_id") catch err {
+		t.Error("parse join: " + types.ErrorMessage(err))
+		return
+	}
+	let prepJoin = Prepare(env.Cat, env.Txn, stmtJoin, []u32{}) catch err {
+		t.Error("prepare join: " + types.ErrorMessage(err))
+		return
+	}
+	match prepJoin.Plan {
+		Project(p) => {
+			match p.Input {
+				HashJoin(hj) => {
+					crucible.Equal(mut t, "hash join has 1 left key", len(hj.LeftKeys), 1)
+				}
+				_ => {
+					t.Error("expected HashJoin for equijoin")
+				}
+			}
+		}
+		_ => {
+			t.Error("expected Project over HashJoin")
+		}
+	}
+
+
+	// 6. DML: INSERT, UPDATE, DELETE produce ModifyTable
+	let stmtIns = parseSql("INSERT INTO users (id, name, age) VALUES (10, 'alice', 30)") catch err {
+		t.Error("parse insert: " + types.ErrorMessage(err))
+		return
+	}
+	let prepIns = Prepare(env.Cat, env.Txn, stmtIns, []u32{}) catch err {
+		t.Error("prepare insert: " + types.ErrorMessage(err))
+		return
+	}
+	match prepIns.Plan {
+		ModifyTable(m) => {
+			crucible.Equal(mut t, "insert table name", m.Table.Name, "users")
+		}
+		_ => {
+			t.Error("expected ModifyTable for INSERT")
+		}
+	}
+
+	let stmtUpd = parseSql("UPDATE users SET age = 22 WHERE id = 1") catch err {
+		t.Error("parse update: " + types.ErrorMessage(err))
+		return
+	}
+	let prepUpd = Prepare(env.Cat, env.Txn, stmtUpd, []u32{}) catch err {
+		t.Error("prepare update: " + types.ErrorMessage(err))
+		return
+	}
+	match prepUpd.Plan {
+		ModifyTable(m) => {
+			crucible.Equal(mut t, "update table name", m.Table.Name, "users")
+		}
+		_ => {
+			t.Error("expected ModifyTable for UPDATE")
+		}
+	}
+
+	let stmtDel = parseSql("DELETE FROM users WHERE id = 1") catch err {
+		t.Error("parse delete: " + types.ErrorMessage(err))
+		return
+	}
+	let prepDel = Prepare(env.Cat, env.Txn, stmtDel, []u32{}) catch err {
+		t.Error("prepare delete: " + types.ErrorMessage(err))
+		return
+	}
+	match prepDel.Plan {
+		ModifyTable(m) => {
+			crucible.Equal(mut t, "delete table name", m.Table.Name, "users")
+		}
+		_ => {
+			t.Error("expected ModifyTable for DELETE")
+		}
+	}
+
+	// 7. EXPLAIN JSON
+	let jsonStr = ExplainJson(prepSeq)
+	t.True("json has Node Type", len(jsonStr) > 0)
+
+	cleanupTestEnv(env)
+}
+
+fn TestPlannerAdditionalQueryShapes(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "planner_shapes")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	if let tbl = env.Cat.LookupTable(env.Txn, "public", "users") {
+		let idxDef = catalog.IndexDef{Table: tbl, Name: "users_pkey", Unique: true}
+		_ = env.Cat.CreateIndex(env.Txn, idxDef) catch _ { return }
+		env.Txn.CommandCounterIncrement()
+	}
+
+	// 1. Parameterized point lookup
+	let stmtParam = parseSql("SELECT id, name FROM users WHERE id = $1") catch err {
+		t.Error("parse param: " + types.ErrorMessage(err))
+		return
+	}
+	let prepParam = Prepare(env.Cat, env.Txn, stmtParam, []u32{u32(types.Int4Oid)}) catch err {
+		t.Error("prepare param: " + types.ErrorMessage(err))
+		return
+	}
+	match prepParam.Plan {
+		Project(p) => {
+			match p.Input {
+				IndexScan(idx) => {
+					crucible.Equal(mut t, "index scan on users_pkey", idx.Index.Name, "users_pkey")
+				}
+				_ => {
+					t.Error("expected IndexScan for point lookup on id")
+				}
+			}
+		}
+		IndexScan(idx) => {
+			crucible.Equal(mut t, "index scan on users_pkey", idx.Index.Name, "users_pkey")
+		}
+		_ => {
+			t.Error("expected IndexScan or Project wrapping IndexScan")
+		}
+	}
+
+	// 2. Multi-column GROUP BY with aggregate
+	let stmtGrp = parseSql("SELECT age, count(*) FROM users GROUP BY age") catch err {
+		t.Error("parse grp: " + types.ErrorMessage(err))
+		return
+	}
+	let prepGrp = Prepare(env.Cat, env.Txn, stmtGrp, []u32{}) catch err {
+		t.Error("prepare grp: " + types.ErrorMessage(err))
+		return
+	}
+	match prepGrp.Plan {
+		Project(p) => {
+			match p.Input {
+				HashAgg(ha) => {
+					crucible.Equal(mut t, "group by has 1 key", len(ha.GroupKeys), 1)
+					crucible.Equal(mut t, "hash agg has 1 agg ref", len(ha.Aggs), 1)
+				}
+				_ => {
+					t.Error("expected HashAgg")
+				}
+			}
+		}
+		_ => {
+			t.Error("expected Project over HashAgg")
+		}
+	}
+
+	// 3. Subquery in FROM
+	let stmtSub = parseSql("SELECT sub.id FROM (SELECT id, name FROM users) AS sub") catch err {
+		t.Error("parse sub: " + types.ErrorMessage(err))
+		return
+	}
+	let prepSub = Prepare(env.Cat, env.Txn, stmtSub, []u32{}) catch err {
+		t.Error("prepare sub: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "subquery result cols", len(prepSub.ResultCols), 1)
+
+	cleanupTestEnv(env)
+}

@@ -539,7 +539,7 @@ fn analyzeSelectCore(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes [
 		GroupBy: groupByExprs,
 		Having: havingExpr,
 		Windows: []AnalyzedWindow{},
-		Distinct: core.Distinct != "",
+		Distinct: core.Distinct == "distinct" || core.Distinct == "distinct on",
 		OrderBy: orderKeys,
 		Limit: limitExpr,
 		Offset: offsetExpr,
