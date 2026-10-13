@@ -8,6 +8,9 @@ import "gauge"
 // `implicit` is true for expression/operator resolution and false for an explicit cast.
 fn CanCast(from Oid, to Oid, implicit bool) bool {
 	if from == to { return true }
+	if isArrayOid(from) && isArrayOid(to) { return from == to || false }
+	if isArrayOid(to) && is_string_oid(from) { return true }
+	if is_string_oid(to) && isArrayOid(from) { return true }
 	if is_string_oid(from) || is_string_oid(to) { return !implicit || (is_string_oid(from) && is_string_oid(to)) }
 	if from == Int2Oid && (to == Int4Oid || to == Int8Oid || to == Float4Oid || to == Float8Oid || to == NumericOid) { return true }
 	if from == Int4Oid && (to == Int8Oid || to == Float4Oid || to == Float8Oid || to == NumericOid) { return true }
@@ -29,6 +32,8 @@ fn CanCast(from Oid, to Oid, implicit bool) bool {
 // Cast applies an explicit PostgreSQL cast between supported scalar types.
 fn Cast(d Datum, to Oid) !Datum {
 	if d.null { return Null() }
+	if isArrayOid(d.oid) && is_string_oid(to) { return FromStr(to, d.Text()) }
+	if is_string_oid(d.oid) && isArrayOid(to) { return try Parse(to, d.Text()) }
 	if d.oid == to { return d }
 	if !CanCast(d.oid, to, false) { fail ErrorFault(NewError("42846", "cannot cast type {sql_type_name(d.oid)} to {sql_type_name(to)}")) }
 	if is_string_oid(to) { return FromStr(to, d.Text()) }
