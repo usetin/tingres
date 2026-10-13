@@ -4,8 +4,8 @@ import "../types"
 import "../plan"
 import "crucible"
 
-fn evalOk(t mut crucible.T, e plan.Expr, ctx mut ExprContext) types.Datum {
-	let res = EvalExpr(e, mut ctx) catch err {
+fn evalOk(t mut crucible.T, e mut plan.Expr, ctx mut ExprContext) types.Datum {
+	let res = EvalExpr(mut e, mut ctx) catch err {
 		t.Error("eval failed: {err}")
 		return types.Null()
 	}
@@ -19,22 +19,22 @@ fn TestEvalConstAndColRef(t mut crucible.T) {
 	)
 
 	// Const
-	let c = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 42), Type: types.Int4Oid})
-	let cVal = evalOk(mut t, c, mut ctx)
+	mut c = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 42), Type: types.Int4Oid})
+	let cVal = evalOk(mut t, mut c, mut ctx)
 	t.True("const int", cVal.Text() == "42")
 
 	// ColRef valid
-	let col0 = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.Int4Oid})
-	let col0Val = evalOk(mut t, col0, mut ctx)
+	mut col0 = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.Int4Oid})
+	let col0Val = evalOk(mut t, mut col0, mut ctx)
 	t.True("colref 0", col0Val.Text() == "100")
 
-	let col1 = plan.Expr.ColRef(plan.ColRefExpr{Slot: 1, RangeIndex: 1, AttNo: 2, Type: types.TextOid})
-	let col1Val = evalOk(mut t, col1, mut ctx)
+	mut col1 = plan.Expr.ColRef(plan.ColRefExpr{Slot: 1, RangeIndex: 1, AttNo: 2, Type: types.TextOid})
+	let col1Val = evalOk(mut t, mut col1, mut ctx)
 	t.True("colref 1", col1Val.Text() == "hello")
 
 	// ColRef out of range yields null
-	let colOOB = plan.Expr.ColRef(plan.ColRefExpr{Slot: 99, RangeIndex: 1, AttNo: 99, Type: types.Int4Oid})
-	let colOOBVal = evalOk(mut t, colOOB, mut ctx)
+	mut colOOB = plan.Expr.ColRef(plan.ColRefExpr{Slot: 99, RangeIndex: 1, AttNo: 99, Type: types.Int4Oid})
+	let colOOBVal = evalOk(mut t, mut colOOB, mut ctx)
 	t.True("colref OOB is null", types.IsNull(colOOBVal))
 }
 
@@ -44,18 +44,19 @@ fn TestEvalParam(t mut crucible.T) {
 		[]types.Datum{types.FromI64(types.Int4Oid, 10), types.FromStr(types.TextOid, "param2")},
 	)
 
-	let p1 = plan.Expr.Param(plan.ParamExpr{N: 1, Type: types.Int4Oid})
-	let p1Val = evalOk(mut t, p1, mut ctx)
+	mut p1 = plan.Expr.Param(plan.ParamExpr{N: 1, Type: types.Int4Oid})
+	let p1Val = evalOk(mut t, mut p1, mut ctx)
 	t.True("param $1", p1Val.Text() == "10")
 
-	let p2 = plan.Expr.Param(plan.ParamExpr{N: 2, Type: types.TextOid})
-	let p2Val = evalOk(mut t, p2, mut ctx)
+	mut p2 = plan.Expr.Param(plan.ParamExpr{N: 2, Type: types.TextOid})
+	let p2Val = evalOk(mut t, mut p2, mut ctx)
 	t.True("param $2", p2Val.Text() == "param2")
 
 	// Missing parameter fails with 42P02
 	mut failed = false
-	let p3 = plan.Expr.Param(plan.ParamExpr{N: 3, Type: types.Int4Oid})
-	EvalExpr(p3, mut ctx) catch err {
+	mut p3 = plan.Expr.Param(plan.ParamExpr{N: 3, Type: types.Int4Oid})
+	mut p3Mut = p3
+	EvalExpr(mut p3Mut, mut ctx) catch err {
 		failed = true
 		let pgErr = types.ErrorFromFault(err)
 		t.True("code is 42P02", pgErr.Code == "42P02")
@@ -66,62 +67,62 @@ fn TestEvalParam(t mut crucible.T) {
 fn TestEvalBool3VLAndShortCircuit(t mut crucible.T) {
 	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
 
-	let trueExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromBool(true), Type: types.BoolOid})
-	let falseExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromBool(false), Type: types.BoolOid})
-	let nullExpr = plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.BoolOid})
+	mut trueExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromBool(true), Type: types.BoolOid})
+	mut falseExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromBool(false), Type: types.BoolOid})
+	mut nullExpr = plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.BoolOid})
 
 	// FALSE AND NULL must be FALSE (short-circuit / 3VL)
-	let falseAndNull = plan.Expr.BoolExpr(plan.BoolExpr{
+	mut falseAndNull = plan.Expr.BoolExpr(plan.BoolExpr{
 		Op: plan.BoolOp.And,
 		Args: []plan.Expr{falseExpr, nullExpr},
 		Type: types.BoolOid,
 	})
-	let r1 = evalOk(mut t, falseAndNull, mut ctx)
+	let r1 = evalOk(mut t, mut falseAndNull, mut ctx)
 	t.True("FALSE AND NULL is FALSE", !types.IsNull(r1) && r1.Text() == "false")
 
 	// NULL AND FALSE must be FALSE (3VL)
-	let nullAndFalse = plan.Expr.BoolExpr(plan.BoolExpr{
+	mut nullAndFalse = plan.Expr.BoolExpr(plan.BoolExpr{
 		Op: plan.BoolOp.And,
 		Args: []plan.Expr{nullExpr, falseExpr},
 		Type: types.BoolOid,
 	})
-	let r2 = evalOk(mut t, nullAndFalse, mut ctx)
+	let r2 = evalOk(mut t, mut nullAndFalse, mut ctx)
 	t.True("NULL AND FALSE is FALSE", !types.IsNull(r2) && r2.Text() == "false")
 
 	// NULL AND TRUE must be NULL (3VL)
-	let nullAndTrue = plan.Expr.BoolExpr(plan.BoolExpr{
+	mut nullAndTrue = plan.Expr.BoolExpr(plan.BoolExpr{
 		Op: plan.BoolOp.And,
 		Args: []plan.Expr{nullExpr, trueExpr},
 		Type: types.BoolOid,
 	})
-	let r3 = evalOk(mut t, nullAndTrue, mut ctx)
+	let r3 = evalOk(mut t, mut nullAndTrue, mut ctx)
 	t.True("NULL AND TRUE is NULL", types.IsNull(r3))
 
 	// TRUE OR NULL must be TRUE (short-circuit / 3VL)
-	let trueOrNull = plan.Expr.BoolExpr(plan.BoolExpr{
+	mut trueOrNull = plan.Expr.BoolExpr(plan.BoolExpr{
 		Op: plan.BoolOp.Or,
 		Args: []plan.Expr{trueExpr, nullExpr},
 		Type: types.BoolOid,
 	})
-	let r4 = evalOk(mut t, trueOrNull, mut ctx)
+	let r4 = evalOk(mut t, mut trueOrNull, mut ctx)
 	t.True("TRUE OR NULL is TRUE", !types.IsNull(r4) && r4.Text() == "true")
 
 	// NULL OR FALSE must be NULL (3VL)
-	let nullOrFalse = plan.Expr.BoolExpr(plan.BoolExpr{
+	mut nullOrFalse = plan.Expr.BoolExpr(plan.BoolExpr{
 		Op: plan.BoolOp.Or,
 		Args: []plan.Expr{nullExpr, falseExpr},
 		Type: types.BoolOid,
 	})
-	let r5 = evalOk(mut t, nullOrFalse, mut ctx)
+	let r5 = evalOk(mut t, mut nullOrFalse, mut ctx)
 	t.True("NULL OR FALSE is NULL", types.IsNull(r5))
 
 	// NOT NULL must be NULL
-	let notNull = plan.Expr.BoolExpr(plan.BoolExpr{
+	mut notNull = plan.Expr.BoolExpr(plan.BoolExpr{
 		Op: plan.BoolOp.Not,
 		Args: []plan.Expr{nullExpr},
 		Type: types.BoolOid,
 	})
-	let r6 = evalOk(mut t, notNull, mut ctx)
+	let r6 = evalOk(mut t, mut notNull, mut ctx)
 	t.True("NOT NULL is NULL", types.IsNull(r6))
 }
 
@@ -129,31 +130,31 @@ fn TestEvalStrictFunctionsAndNullTest(t mut crucible.T) {
 	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
 
 	// IS NULL and IS NOT NULL
-	let nullExpr = plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.Int4Oid})
-	let notNullExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 5), Type: types.Int4Oid})
+	mut nullExpr = plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.Int4Oid})
+	mut notNullExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 5), Type: types.Int4Oid})
 
-	let isNullTest = plan.Expr.NullTest(plan.NullTestExpr{Arg: nullExpr, Test: plan.NullTestType.IsNull, Type: types.BoolOid})
-	let r1 = evalOk(mut t, isNullTest, mut ctx)
+	mut isNullTest = plan.Expr.NullTest(plan.NullTestExpr{Arg: nullExpr, Test: plan.NullTestType.IsNull, Type: types.BoolOid})
+	let r1 = evalOk(mut t, mut isNullTest, mut ctx)
 	t.True("null is null", !types.IsNull(r1) && r1.Text() == "true")
 
-	let isNotNullTest = plan.Expr.NullTest(plan.NullTestExpr{Arg: nullExpr, Test: plan.NullTestType.IsNotNull, Type: types.BoolOid})
-	let r2 = evalOk(mut t, isNotNullTest, mut ctx)
+	mut isNotNullTest = plan.Expr.NullTest(plan.NullTestExpr{Arg: nullExpr, Test: plan.NullTestType.IsNotNull, Type: types.BoolOid})
+	let r2 = evalOk(mut t, mut isNotNullTest, mut ctx)
 	t.True("null is not not-null", !types.IsNull(r2) && r2.Text() == "false")
 
-	let notNullTest = plan.Expr.NullTest(plan.NullTestExpr{Arg: notNullExpr, Test: plan.NullTestType.IsNotNull, Type: types.BoolOid})
-	let r3 = evalOk(mut t, notNullTest, mut ctx)
+	mut notNullTest = plan.Expr.NullTest(plan.NullTestExpr{Arg: notNullExpr, Test: plan.NullTestType.IsNotNull, Type: types.BoolOid})
+	let r3 = evalOk(mut t, mut notNullTest, mut ctx)
 	t.True("5 is not null", !types.IsNull(r3) && r3.Text() == "true")
 
 	// Strict function call with NULL argument must propagate NULL without invoking function
 	let absFn = types.LookupFunc("abs", []u32{types.Int4Oid})
 	if let f = absFn {
 		t.True("abs is strict", f.Strict)
-		let call = plan.Expr.FuncCall(plan.FuncCallExpr{Func: f, Args: []plan.Expr{nullExpr}, Type: types.Int4Oid})
-		let res = evalOk(mut t, call, mut ctx)
+		mut call = plan.Expr.FuncCall(plan.FuncCallExpr{Func: f, Args: []plan.Expr{nullExpr}, Type: types.Int4Oid})
+		let res = evalOk(mut t, mut call, mut ctx)
 		t.True("strict abs(NULL) returns NULL", types.IsNull(res))
 
-		let call5 = plan.Expr.FuncCall(plan.FuncCallExpr{Func: f, Args: []plan.Expr{notNullExpr}, Type: types.Int4Oid})
-		let res5 = evalOk(mut t, call5, mut ctx)
+		mut call5 = plan.Expr.FuncCall(plan.FuncCallExpr{Func: f, Args: []plan.Expr{notNullExpr}, Type: types.Int4Oid})
+		let res5 = evalOk(mut t, mut call5, mut ctx)
 		t.True("abs(5) returns 5", res5.Text() == "5")
 	}
 }
@@ -161,15 +162,15 @@ fn TestEvalStrictFunctionsAndNullTest(t mut crucible.T) {
 fn TestEvalCaseAndCoalesce(t mut crucible.T) {
 	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
 
-	let trueExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromBool(true), Type: types.BoolOid})
-	let falseExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromBool(false), Type: types.BoolOid})
-	let val10 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 10), Type: types.Int4Oid})
-	let val20 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 20), Type: types.Int4Oid})
-	let val30 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 30), Type: types.Int4Oid})
-	let nullExpr = plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.Int4Oid})
+	mut trueExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromBool(true), Type: types.BoolOid})
+	mut falseExpr = plan.Expr.Const(plan.ConstExpr{Value: types.FromBool(false), Type: types.BoolOid})
+	mut val10 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 10), Type: types.Int4Oid})
+	mut val20 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 20), Type: types.Int4Oid})
+	mut val30 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 30), Type: types.Int4Oid})
+	mut nullExpr = plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.Int4Oid})
 
 	// CASE WHEN false THEN 10 WHEN true THEN 20 ELSE 30 END -> 20
-	let caseExpr = plan.Expr.Case(plan.CaseExpr{
+	mut caseExpr = plan.Expr.Case(plan.CaseExpr{
 		Whens: []plan.CaseWhen{
 			plan.CaseWhen{When: falseExpr, Then: val10},
 			plan.CaseWhen{When: trueExpr, Then: val20},
@@ -177,15 +178,15 @@ fn TestEvalCaseAndCoalesce(t mut crucible.T) {
 		Else: val30,
 		Type: types.Int4Oid,
 	})
-	let r1 = evalOk(mut t, caseExpr, mut ctx)
+	let r1 = evalOk(mut t, mut caseExpr, mut ctx)
 	t.True("case selects matching branch", r1.Text() == "20")
 
 	// COALESCE(NULL, NULL, 30) -> 30
-	let coal = plan.Expr.Coalesce(plan.CoalesceExpr{
+	mut coal = plan.Expr.Coalesce(plan.CoalesceExpr{
 		Args: []plan.Expr{nullExpr, nullExpr, val30},
 		Type: types.Int4Oid,
 	})
-	let r2 = evalOk(mut t, coal, mut ctx)
+	let r2 = evalOk(mut t, mut coal, mut ctx)
 	t.True("coalesce returns first non-null", r2.Text() == "30")
 }
 
@@ -202,49 +203,49 @@ fn TestEvalSubLink(t mut crucible.T) {
 	})
 
 	// EXISTS(Values) -> TRUE
-	let existsLink = plan.Expr.SubLink(plan.SubLinkExpr{
+	mut existsLink = plan.Expr.SubLink(plan.SubLinkExpr{
 		LinkType: plan.SubLinkType.Exists,
 		SubPlan: valPlan,
 		TestExpr: nil,
 		OuterRefs: []plan.ColRefExpr{},
 		Type: types.BoolOid,
 	})
-	let r1 = evalOk(mut t, existsLink, mut ctx)
+	let r1 = evalOk(mut t, mut existsLink, mut ctx)
 	t.True("exists is true", !types.IsNull(r1) && r1.Text() == "true")
 
 	// Scalar(Values) -> 1
-	let scalarLink = plan.Expr.SubLink(plan.SubLinkExpr{
+	mut scalarLink = plan.Expr.SubLink(plan.SubLinkExpr{
 		LinkType: plan.SubLinkType.Scalar,
 		SubPlan: valPlan,
 		TestExpr: nil,
 		OuterRefs: []plan.ColRefExpr{},
 		Type: types.Int4Oid,
 	})
-	let r2 = evalOk(mut t, scalarLink, mut ctx)
+	let r2 = evalOk(mut t, mut scalarLink, mut ctx)
 	t.True("scalar returns first row", r2.Text() == "1")
 
 	// 2 IN Values -> TRUE
-	let testVal2 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 2), Type: types.Int4Oid})
-	let inLink = plan.Expr.SubLink(plan.SubLinkExpr{
+	mut testVal2 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 2), Type: types.Int4Oid})
+	mut inLink = plan.Expr.SubLink(plan.SubLinkExpr{
 		LinkType: plan.SubLinkType.In,
 		SubPlan: valPlan,
 		TestExpr: testVal2,
 		OuterRefs: []plan.ColRefExpr{},
 		Type: types.BoolOid,
 	})
-	let r3 = evalOk(mut t, inLink, mut ctx)
+	let r3 = evalOk(mut t, mut inLink, mut ctx)
 	t.True("2 in values is true", !types.IsNull(r3) && r3.Text() == "true")
 
 	// 5 IN Values -> FALSE
-	let testVal5 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 5), Type: types.Int4Oid})
-	let inLink5 = plan.Expr.SubLink(plan.SubLinkExpr{
+	mut testVal5 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 5), Type: types.Int4Oid})
+	mut inLink5 = plan.Expr.SubLink(plan.SubLinkExpr{
 		LinkType: plan.SubLinkType.In,
 		SubPlan: valPlan,
 		TestExpr: testVal5,
 		OuterRefs: []plan.ColRefExpr{},
 		Type: types.BoolOid,
 	})
-	let r4 = evalOk(mut t, inLink5, mut ctx)
+	let r4 = evalOk(mut t, mut inLink5, mut ctx)
 	t.True("5 in values is false", !types.IsNull(r4) && r4.Text() == "false")
 }
 
@@ -252,36 +253,36 @@ fn TestEvalCastOpRowArray(t mut crucible.T) {
 	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
 
 	// Cast: integer 42 to text
-	let c42 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 42), Type: types.Int4Oid})
-	let castText = plan.Expr.Cast(plan.CastExpr{Arg: c42, Type: types.TextOid, Typmod: -1})
-	let castVal = evalOk(mut t, castText, mut ctx)
+	mut c42 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 42), Type: types.Int4Oid})
+	mut castText = plan.Expr.Cast(plan.CastExpr{Arg: c42, Type: types.TextOid, Typmod: -1})
+	let castVal = evalOk(mut t, mut castText, mut ctx)
 	t.True("cast int to text", castVal.Text() == "42")
 
 	// Cast: text to int
-	let cText = plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "123"), Type: types.TextOid})
-	let castInt = plan.Expr.Cast(plan.CastExpr{Arg: cText, Type: types.Int4Oid, Typmod: -1})
-	let castIntVal = evalOk(mut t, castInt, mut ctx)
+	mut cText = plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "123"), Type: types.TextOid})
+	mut castInt = plan.Expr.Cast(plan.CastExpr{Arg: cText, Type: types.Int4Oid, Typmod: -1})
+	let castIntVal = evalOk(mut t, mut castInt, mut ctx)
 	t.True("cast text to int", castIntVal.Text() == "123")
 
 	// OpCall: + operator
 	let plusFn = types.LookupOperator("+", types.Int4Oid, types.Int4Oid)
 	if let op = plusFn {
-		let c1 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 15), Type: types.Int4Oid})
-		let c2 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 27), Type: types.Int4Oid})
-		let opCall = plan.Expr.OpCall(plan.OpCallExpr{Op: "+", Func: op, Args: []plan.Expr{c1, c2}, Type: types.Int4Oid})
-		let sumVal = evalOk(mut t, opCall, mut ctx)
+		mut c1 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 15), Type: types.Int4Oid})
+		mut c2 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 27), Type: types.Int4Oid})
+		mut opCall = plan.Expr.OpCall(plan.OpCallExpr{Op: "+", Func: op, Args: []plan.Expr{c1, c2}, Type: types.Int4Oid})
+		let sumVal = evalOk(mut t, mut opCall, mut ctx)
 		t.True("15 + 27 = 42", sumVal.Text() == "42")
 	}
 
 	// RowExpr: (42, 'hello')
-	let hello = plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "hello"), Type: types.TextOid})
-	let rowExpr = plan.Expr.RowExpr(plan.RowExpr{Elements: []plan.Expr{c42, hello}, Type: types.TextOid})
-	let rowVal = evalOk(mut t, rowExpr, mut ctx)
+	mut hello = plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "hello"), Type: types.TextOid})
+	mut rowExpr = plan.Expr.RowExpr(plan.RowExpr{Elements: []plan.Expr{c42, hello}, Type: types.TextOid})
+	let rowVal = evalOk(mut t, mut rowExpr, mut ctx)
 	t.True("row text representation", rowVal.Text() == "(42,hello)")
 
 	// ArrayExpr: {42, NULL}
-	let nullInt = plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.Int4Oid})
-	let arrExpr = plan.Expr.ArrayExpr(plan.ArrayExpr{Elements: []plan.Expr{c42, nullInt}, ElemType: types.Int4Oid, Type: types.TextOid})
-	let arrVal = evalOk(mut t, arrExpr, mut ctx)
+	mut nullInt = plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.Int4Oid})
+	mut arrExpr = plan.Expr.ArrayExpr(plan.ArrayExpr{Elements: []plan.Expr{c42, nullInt}, ElemType: types.Int4Oid, Type: types.TextOid})
+	let arrVal = evalOk(mut t, mut arrExpr, mut ctx)
 	t.True("array text representation", arrVal.Text() == "{{42,NULL}}")
 }

@@ -619,7 +619,7 @@ fn (s mut Session) Parse(name str, sql str, paramOids []u32) ! {
 }
 
 // Bind binds parameters to a prepared portal skeleton.
-fn (s mut Session) Bind(portalName str, prepName str, params mut []types.Datum, resultFormats []i16) ! {
+fn (s mut Session) Bind(portalName str, prepName str, params mut []types.Datum, resultFormats mut []i16) ! {
 	let prepOpt = s.GetPreparedStatement(prepName)
 	if let prep = prepOpt {
 		mut ctx = ExprContext{
@@ -669,7 +669,8 @@ fn (s mut Session) BindBytes(portalName str, prepName str, paramFormats []i16, p
 				}
 			}
 		}
-		try s.Bind(portalName, prepName, mut decodedParams, resultFormats)
+		mut resFormats = resultFormats
+		try s.Bind(portalName, prepName, mut decodedParams, mut resFormats)
 		return
 	}
 	try types.ErrorFault(types.NewPgError("26000", "prepared statement \"" + prepName + "\" does not exist", "", "", 0))

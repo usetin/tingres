@@ -125,7 +125,8 @@ fn TestDifferentialExtendedProtocolSuite(t mut crucible.T) {
 
 	// Bind with parameter value 32
 	mut bindParams = []types.Datum{types.FromI64(types.Int4Oid, 32)}
-	s.Bind("portal_calc", "prep_calc", mut bindParams, []i16{0}) catch err {
+	mut rf = []i16{0}
+	s.Bind("portal_calc", "prep_calc", mut bindParams, mut rf) catch err {
 		t.Error("Bind portal_calc failed: {err}")
 		return
 	}

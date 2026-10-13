@@ -122,7 +122,8 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 							retCtx.Row = targetRow
 							mut retRow = []types.Datum{}
 							for expr in node.Returning {
-								let retVal = try EvalExpr(expr, mut retCtx)
+								mut eMut = expr
+								let retVal = try EvalExpr(mut eMut, mut retCtx)
 								retRow = append(retRow, retVal)
 							}
 							out.DataRow(retRow)
@@ -167,7 +168,8 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 								retCtx.Row = sourceRow
 								mut retRow = []types.Datum{}
 								for expr in node.Returning {
-									let retVal = try EvalExpr(expr, mut retCtx)
+									mut eMut = expr
+									let retVal = try EvalExpr(mut eMut, mut retCtx)
 									retRow = append(retRow, retVal)
 								}
 								out.DataRow(retRow)
@@ -226,7 +228,8 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 								retCtx.Row = updatedRow
 								mut retRow = []types.Datum{}
 								for expr in node.Returning {
-									let retVal = try EvalExpr(expr, mut retCtx)
+									mut eMut = expr
+									let retVal = try EvalExpr(mut eMut, mut retCtx)
 									retRow = append(retRow, retVal)
 								}
 								out.DataRow(retRow)
