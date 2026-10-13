@@ -109,4 +109,27 @@ fn TestPrepareAndCatalogVersion(t mut crucible.T) {
 		return
 	}
 	t.True("plan valid immediately", prep.Valid(c))
+
+	// A catalog change invalidates the prepared statement.
+	let def = catalog.TableDef{Schema: "public", Name: "t", Columns: []catalog.ColumnDef{catalog.ColumnDef{Name: "a", Type: types.Int4Oid, Typmod: -1, Nullable: true}}}
+	_ = c.CreateTable(currentTxn, def) catch err {
+		t.Error("create table: " + types.ErrorMessage(err))
+		return
+	}
+	currentTxn.CommandCounterIncrement()
+	t.True("plan invalid after catalog change", !prep.Valid(c))
+
+	quarry.RemoveAll(dir) catch _ { }
+}
+
+fn TestPlanCacheNormalization(t mut crucible.T) {
+	// Literals collapse to '?'; parameters and whitespace/comments normalize away.
+	crucible.Equal(mut t, "int literal", NormalizeStatement("SELECT * FROM users WHERE id = 1"), "SELECT * FROM users WHERE id = ?")
+	crucible.Equal(mut t, "literal equality", NormalizeStatement("SELECT * FROM users WHERE id = 42"), "SELECT * FROM users WHERE id = ?")
+	crucible.Equal(mut t, "string literal", NormalizeStatement("SELECT name FROM users WHERE name = 'alice'"), "SELECT name FROM users WHERE name = ?")
+	crucible.Equal(mut t, "parameters preserved", NormalizeStatement("SELECT * FROM users WHERE id = $1"), "SELECT * FROM users WHERE id = $1")
+	crucible.Equal(mut t, "whitespace collapses", NormalizeStatement("SELECT   *\n  FROM\tusers"), "SELECT * FROM users")
+	crucible.Equal(mut t, "comments removed", NormalizeStatement("SELECT 1 -- trailing\nFROM users"), "SELECT ? FROM users")
+	crucible.Equal(mut t, "block comment removed", NormalizeStatement("SELECT /* c */ 1 FROM users"), "SELECT ? FROM users")
+	crucible.Equal(mut t, "quoted identifier kept", NormalizeStatement("SELECT \"myCol\" FROM t"), "SELECT \"myCol\" FROM t")
 }

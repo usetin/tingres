@@ -426,13 +426,13 @@ fn PlanQuery(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
 			return try planSelect(c, tx, mut query)
 		}
 		"INSERT" => {
-			return try planInsert(c, tx, query)
+			return try planInsert(c, tx, mut query)
 		}
 		"UPDATE" => {
-			return try planUpdate(c, tx, query)
+			return try planUpdate(c, tx, mut query)
 		}
 		"DELETE" => {
-			return try planDelete(c, tx, query)
+			return try planDelete(c, tx, mut query)
 		}
 		_ => {
 			return Plan.Result(ResultNode{
@@ -1249,86 +1249,126 @@ fn planTableScan(c catalog.Catalog, tx txn.Txn, tbl FromTable, allQuals []Expr) 
 	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tbl.Name + "\" does not exist"))
 }
 
-fn planInsert(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery) !Plan {
+// dmlTargetTable returns the single target relation of a DML query.
+fn dmlTargetTable(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery, verb str) !catalog.Table {
 	if len(query.From) == 0 {
-		fail types.ErrorFault(types.NewError("42P01", "missing target table for INSERT"))
+		fail types.ErrorFault(types.NewError("42P01", "missing target table for " + verb))
 	}
-	let tbl = query.From[0]
-	match tbl {
+	match query.From[0] {
 		Table(t) => {
 			if let catTable = c.LookupTable(tx, t.Schema, t.Name) {
-				return Plan.ModifyTable(ModifyTableNode{
-					Kind: ModifyKind.Insert,
-					Table: catTable,
-					Source: Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}}),
-					TargetCols: []i16{},
-					OnConflict: nil,
-					Returning: []Expr{},
-					Cols: []ColDesc{},
-					Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
-				})
+				return catTable
 			}
-			fail types.ErrorFault(types.NewError("42P01", "relation \"" + t.Name + "\" does not exist"))
 		}
-		_ => {
-			fail types.ErrorFault(types.NewError("42P01", "invalid target table for INSERT"))
-		}
+		_ => {}
 	}
-	fail types.ErrorFault(types.NewError("42P01", "invalid target table for INSERT"))
+	fail types.ErrorFault(types.NewError("42P01", "invalid target table for " + verb))
 }
 
-fn planUpdate(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery) !Plan {
-	if len(query.From) == 0 {
-		fail types.ErrorFault(types.NewError("42P01", "missing target table for UPDATE"))
-	}
-	let tbl = query.From[0]
-	match tbl {
-		Table(t) => {
-			if let catTable = c.LookupTable(tx, t.Schema, t.Name) {
-				return Plan.ModifyTable(ModifyTableNode{
-					Kind: ModifyKind.Update,
-					Table: catTable,
-					Source: Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}}),
-					TargetCols: []i16{},
-					OnConflict: nil,
-					Returning: []Expr{},
-					Cols: []ColDesc{},
-					Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
-				})
+fn planInsert(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
+	let catTable = try dmlTargetTable(c, tx, query, "INSERT")
+
+	mut source = Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}})
+	if len(query.InsertRows) > 0 {
+		mut rowsCols = []ColDesc{}
+		for j, attno in query.InsertCols {
+			mut cd = ColDesc{Name: "column", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: i16(j + 1), RangeIndex: 0, SourceName: ""}
+			for col in catTable.Cols {
+				if col.Number == attno {
+					cd = ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: catTable.Oid, Attno: col.Number, RangeIndex: 0, SourceName: catTable.Name}
+				}
 			}
-			fail types.ErrorFault(types.NewError("42P01", "relation \"" + t.Name + "\" does not exist"))
+			rowsCols = append(rowsCols, cd)
 		}
-		_ => {
-			fail types.ErrorFault(types.NewError("42P01", "invalid target table for UPDATE"))
+		source = Plan.Values(ValuesNode{
+			Rows: query.InsertRows,
+			Cols: rowsCols,
+			Cost: Cost{Startup: 0.0, Total: f64(len(query.InsertRows)) * CpuTupleCost, Rows: f64(len(query.InsertRows)), Width: i64(len(rowsCols) * 8)},
+		})
+	} else if query.HasInsertQuery {
+		if let sq = query.InsertQuery {
+			mut q = sq
+			source = try PlanQuery(c, tx, mut q)
 		}
 	}
-	fail types.ErrorFault(types.NewError("42P01", "invalid target table for UPDATE"))
+
+	return Plan.ModifyTable(ModifyTableNode{
+		Kind: ModifyKind.Insert,
+		Table: catTable,
+		Source: source,
+		TargetCols: query.InsertCols,
+		OnConflict: query.OnConflict,
+		Returning: query.Returning,
+		Cols: query.ReturningCols,
+		Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
+	})
 }
 
-fn planDelete(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery) !Plan {
-	if len(query.From) == 0 {
-		fail types.ErrorFault(types.NewError("42P01", "missing target table for DELETE"))
+fn planUpdate(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
+	let catTable = try dmlTargetTable(c, tx, query, "UPDATE")
+
+	mut foldedWhere ?Expr = nil
+	if let w = query.Where {
+		foldedWhere = foldExpr(w)
 	}
-	let tbl = query.From[0]
-	match tbl {
-		Table(t) => {
-			if let catTable = c.LookupTable(tx, t.Schema, t.Name) {
-				return Plan.ModifyTable(ModifyTableNode{
-					Kind: ModifyKind.Delete,
-					Table: catTable,
-					Source: Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}}),
-					TargetCols: []i16{},
-					OnConflict: nil,
-					Returning: []Expr{},
-					Cols: []ColDesc{},
-					Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
-				})
+	let allQuals = splitConjunction(foldedWhere)
+	mut item = query.From[0]
+	let scan = try planFromItem(c, tx, mut item, allQuals)
+
+	// The update source emits one full table row per matched row: SET expressions
+	// replace their columns, all other columns pass through.
+	mut exprs = []Expr{}
+	for i, col in catTable.Cols {
+		mut replaced = false
+		for j, attno in query.SetCols {
+			if i64(attno) == i64(col.Number) && j < len(query.SetExprs) {
+				exprs = append(exprs, query.SetExprs[j])
+				replaced = true
+				break
 			}
-			fail types.ErrorFault(types.NewError("42P01", "relation \"" + t.Name + "\" does not exist"))
 		}
-		_ => {
-			fail types.ErrorFault(types.NewError("42P01", "invalid target table for DELETE"))
+		if !replaced {
+			exprs = append(exprs, Expr.ColRef(ColRefExpr{Slot: i64(i), RangeIndex: 1, AttNo: col.Number, Type: col.Type}))
 		}
 	}
-	fail types.ErrorFault(types.NewError("42P01", "invalid target table for DELETE"))
+	let source = Plan.Project(ProjectNode{
+		Input: scan,
+		Exprs: exprs,
+		Cols: scan.Cols(),
+		Cost: scan.Cost(),
+	})
+
+	return Plan.ModifyTable(ModifyTableNode{
+		Kind: ModifyKind.Update,
+		Table: catTable,
+		Source: source,
+		TargetCols: query.SetCols,
+		OnConflict: nil,
+		Returning: query.Returning,
+		Cols: query.ReturningCols,
+		Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
+	})
+}
+
+fn planDelete(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
+	let catTable = try dmlTargetTable(c, tx, query, "DELETE")
+
+	mut foldedWhere ?Expr = nil
+	if let w = query.Where {
+		foldedWhere = foldExpr(w)
+	}
+	let allQuals = splitConjunction(foldedWhere)
+	mut item = query.From[0]
+	let scan = try planFromItem(c, tx, mut item, allQuals)
+
+	return Plan.ModifyTable(ModifyTableNode{
+		Kind: ModifyKind.Delete,
+		Table: catTable,
+		Source: scan,
+		TargetCols: []i16{},
+		OnConflict: nil,
+		Returning: query.Returning,
+		Cols: query.ReturningCols,
+		Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
+	})
 }

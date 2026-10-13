@@ -341,6 +341,52 @@ fn TestAnalyzeJoinScopes(t mut crucible.T) {
 	cleanupTestEnv(env)
 }
 
+fn TestAnalyzeLiteralTyping(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "literal_typing")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	let stmt = parseSql("SELECT 1, true, 1.5, 2147483648, 'hello'") catch err {
+		t.Error("parse literals: " + types.ErrorMessage(err))
+		return
+	}
+	mut params = []u32{}
+	let q = AnalyzeStatement(env.Cat, env.Txn, stmt, mut params) catch err {
+		t.Error("analyze literals: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "small int is int4", q.Targets[0].Col.Oid, u32(types.Int4Oid))
+	crucible.Equal(mut t, "true is boolean", q.Targets[1].Col.Oid, u32(types.BoolOid))
+	crucible.Equal(mut t, "decimal is numeric", q.Targets[2].Col.Oid, u32(types.NumericOid))
+	crucible.Equal(mut t, "large int is int8", q.Targets[3].Col.Oid, u32(types.Int8Oid))
+	crucible.Equal(mut t, "untyped string is text", q.Targets[4].Col.Oid, u32(types.TextOid))
+
+	cleanupTestEnv(env)
+}
+
+fn TestAnalyzeDmlErrors(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "dml_errors")
+	if envOpt == nil { return }
+	let env = envOpt
+	if let tbl = env.Cat.LookupTable(env.Txn, "public", "users") {
+		_ = env.Cat.CreateIndex(env.Txn, catalog.IndexDef{Table: tbl, Name: "users_pkey", Unique: true}) catch _ { return }
+		env.Txn.CommandCounterIncrement()
+	}
+
+	// Exact PostgreSQL messages and SQLSTATEs for DML binding failures.
+	assertSqlError(mut t, env, "INSERT INTO users (nope) VALUES (1)", "42703", "column \"nope\" of relation \"users\" does not exist")
+	assertSqlError(mut t, env, "INSERT INTO users (id, id) VALUES (1, 2)", "42701", "column \"id\" specified more than once")
+	assertSqlError(mut t, env, "INSERT INTO users (age) VALUES (true)", "42804", "column \"age\" is of type integer but expression is of type boolean")
+	assertSqlError(mut t, env, "INSERT INTO users (id, name) VALUES (1)", "42601", "INSERT has more target columns than expressions")
+	assertSqlError(mut t, env, "INSERT INTO users (id) VALUES (1, 2)", "42601", "INSERT has more expressions than target columns")
+	assertSqlError(mut t, env, "UPDATE users SET nope = 1", "42703", "column \"nope\" of relation \"users\" does not exist")
+	assertSqlError(mut t, env, "UPDATE users SET age = true", "42804", "column \"age\" is of type integer but expression is of type boolean")
+	assertSqlError(mut t, env, "INSERT INTO users (name) VALUES ('x') ON CONFLICT (name) DO NOTHING", "42P10", "there is no unique or exclusion constraint matching the ON CONFLICT specification")
+	assertSqlError(mut t, env, "INSERT INTO users (name) VALUES ('x') ON CONFLICT DO UPDATE SET name = 'y'", "42601", "ON CONFLICT DO UPDATE requires inference specification or constraint name")
+
+	cleanupTestEnv(env)
+}
+
 fn TestAnalyzeDmlAndParams(t mut crucible.T) {
 	let envOpt = setupTestEnv(mut t, "dml_params")
 	if envOpt == nil { return }
@@ -357,7 +403,8 @@ fn TestAnalyzeDmlAndParams(t mut crucible.T) {
 		return
 	}
 	crucible.Equal(mut t, "insert command", qIns.Command, "INSERT")
-	crucible.Equal(mut t, "insert targets count", len(qIns.Targets), 3)
+	crucible.Equal(mut t, "insert target cols", len(qIns.InsertCols), 3)
+	crucible.Equal(mut t, "insert rows", len(qIns.InsertRows), 1)
 
 	// UPDATE analysis
 	let stmtUpd = parseSql("UPDATE users SET age = 30 WHERE id = 1") catch err {

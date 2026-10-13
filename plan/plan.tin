@@ -6,6 +6,145 @@ import "../txn"
 import "../parse"
 import "say"
 
+// NormalizeStatement builds a plan-cache key from raw SQL text: comments are
+// removed, whitespace is collapsed, and literal constants are replaced by '?'
+// while $n parameters and quoted identifiers are preserved. Two statements that
+// differ only in literal values share a key, so exec can reuse a Prepared plan
+// (guarded by Prepared.Valid).
+fn NormalizeStatement(sql str) str {
+	mut out = ""
+	mut i = 0
+	let n = len(sql)
+	for i < n {
+		let c = sql[i]
+		// -- line comment
+		if c == 45 && i+1 < n && sql[i+1] == 45 {
+			for i < n && sql[i] != 10 {
+				i += 1
+			}
+			continue
+		}
+		// /* block comment */
+		if c == 47 && i+1 < n && sql[i+1] == 42 {
+			i += 2
+			for i+1 < n && !(sql[i] == 42 && sql[i+1] == 47) {
+				i += 1
+			}
+			i += 2
+			continue
+		}
+		// 'string literal' -> ?
+		if c == 39 {
+			i += 1
+			for i < n {
+				if sql[i] == 39 {
+					if i+1 < n && sql[i+1] == 39 {
+						i += 2
+						continue
+					}
+					i += 1
+					break
+				}
+				i += 1
+			}
+			out += "?"
+			continue
+		}
+		// "quoted identifier" kept verbatim
+		if c == 34 {
+			out += "\""
+			i += 1
+			for i < n {
+				if sql[i] == 34 {
+					if i+1 < n && sql[i+1] == 34 {
+						out += "\"\""
+						i += 2
+						continue
+					}
+					out += "\""
+					i += 1
+					break
+				}
+				out += sql[i:i+1]
+				i += 1
+			}
+			continue
+		}
+		// numeric literal -> ? (only at a token boundary)
+		if isDigitByte(c) && !prevIsWordChar(out) {
+			i += 1
+			for i < n && isNumberTail(sql[i]) {
+				i += 1
+			}
+			out += "?"
+			continue
+		}
+		// whitespace run -> single space
+		if c == 32 || c == 9 || c == 10 || c == 13 {
+			out += " "
+			for i < n && (sql[i] == 32 || sql[i] == 9 || sql[i] == 10 || sql[i] == 13) {
+				i += 1
+			}
+			continue
+		}
+		out += sql[i:i+1]
+		i += 1
+	}
+	return collapseSpaces(out)
+}
+
+fn isDigitByte(c u8) bool {
+	return c >= 48 && c <= 57
+}
+
+fn isNumberTail(c u8) bool {
+	if isDigitByte(c) { return true }
+	if c == 46 || c == 101 || c == 69 { return true }
+	if c == 43 || c == 45 { return true }
+	return false
+}
+
+fn prevIsWordChar(out str) bool {
+	if len(out) == 0 { return false }
+	let c = out[len(out)-1]
+	if isDigitByte(c) { return true }
+	if c >= 97 && c <= 122 { return true }
+	if c >= 65 && c <= 90 { return true }
+	if c == 95 || c == 46 { return true }
+	if c == 36 { return true }
+	return false
+}
+
+// collapseSpaces replaces runs of spaces with one and trims the ends.
+fn collapseSpaces(s str) str {
+	mut out = ""
+	mut prevSpace = false
+	for _, ch in s {
+		if ch == 32 {
+			if !prevSpace {
+				out += " "
+			}
+			prevSpace = true
+		} else {
+			out += str(ch)
+			prevSpace = false
+		}
+	}
+	return trimSpace(out)
+}
+
+fn trimSpace(s str) str {
+	mut start = 0
+	mut end = len(s)
+	for start < end && s[start] == 32 {
+		start += 1
+	}
+	for end > start && s[end-1] == 32 {
+		end -= 1
+	}
+	return s[start:end]
+}
+
 // Prepare analyzes and optimizes an AST statement into an executable Prepared plan.
 fn Prepare(c catalog.Catalog, t txn.Txn, s parse.Stmt, paramTypes []u32) !Prepared {
 	match s {

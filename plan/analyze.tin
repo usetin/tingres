@@ -114,6 +114,16 @@ type AnalyzedQuery struct {
 	Ctes []AnalyzedCte
 	HasAggs bool
 	HasWindowFuncs bool
+	// DML payload (zero for SELECT and UTILITY).
+	InsertCols []i16
+	InsertRows [][]Expr
+	InsertQuery ?AnalyzedQuery
+	HasInsertQuery bool
+	OnConflict ?OnConflictPlan
+	Returning []Expr
+	ReturningCols []ColDesc
+	SetCols []i16
+	SetExprs []Expr
 }
 
 // TargetCol describes an evaluated output column expression and its result descriptor.
@@ -982,20 +992,59 @@ fn analyzeExpr(c catalog.Catalog, tx txn.Txn, scopes []Scope, ctes []CteInfo, fl
 	}
 }
 
+// isFloatText reports whether a numeric literal contains a fraction or exponent.
+fn isFloatText(text str) bool {
+	for _, ch in text {
+		if ch == 46 || ch == 101 || ch == 69 {
+			return true
+		}
+	}
+	return false
+}
+
+// analyzeIntLiteralNoTarget types an untyped integer literal: int4 when it fits,
+// int8 when it does not, numeric beyond that (PostgreSQL's rule).
+fn analyzeIntLiteralNoTarget(text str) !Expr {
+	let n = mint.Atoi(text) catch _ {
+		let d = types.Parse(types.NumericOid, text) catch err {
+			fail err
+		}
+		return mkConstExpr(d, u32(types.NumericOid))
+	}
+	if n >= -2147483648 && n <= 2147483647 {
+		return mkInt4Const(types.Int4Oid, n)
+	}
+	return mkInt4Const(types.Int8Oid, n)
+}
+
 fn analyzeLiteral(lit parse.LiteralExpr, targetType u32) !Expr {
 	match lit.Kind {
-		"int" => {
-			let val = mint.Atoi(lit.Value) catch _ {
-				fail types.ErrorFault(types.NewError("22003", "integer out of range"))
+		"number" => {
+			if isFloatText(lit.Value) {
+				if targetType != 0 && targetType != u32(types.UnknownLiteralOid) {
+					let d = types.Parse(types.Oid(targetType), lit.Value) catch err {
+						fail err
+					}
+					return mkConstExpr(d, targetType)
+				}
+				let d = types.Parse(types.NumericOid, lit.Value) catch err {
+					fail err
+				}
+				return mkConstExpr(d, u32(types.NumericOid))
 			}
-			return mkInt4Const(types.Int4Oid, val)
+			if targetType != 0 && targetType != u32(types.UnknownLiteralOid) {
+				let d = types.Parse(types.Oid(targetType), lit.Value) catch err {
+					fail err
+				}
+				return mkConstExpr(d, targetType)
+			}
+			return try analyzeIntLiteralNoTarget(lit.Value)
 		}
-		"float" => {
-			return mkStrConst(types.Float8Oid, lit.Value)
+		"true" => {
+			return mkBoolConst(true)
 		}
-		"bool" => {
-			let bVal = lit.Value == "true" || lit.Value == "t"
-			return mkBoolConst(bVal)
+		"false" => {
+			return mkBoolConst(false)
 		}
 		"null" => {
 			mut typ = u32(types.UnknownLiteralOid)
@@ -1004,12 +1053,28 @@ fn analyzeLiteral(lit parse.LiteralExpr, targetType u32) !Expr {
 			}
 			return mkNullConst(typ)
 		}
+		"typed_date", "typed_time", "typed_timestamp", "typed_interval" => {
+			mut oid = u32(types.TimestampOid)
+			match lit.Kind {
+				"typed_date" => { oid = u32(types.DateOid) }
+				"typed_time" => { oid = u32(types.TimeOid) }
+				"typed_timestamp" => { oid = u32(types.TimestampOid) }
+				"typed_interval" => { oid = u32(types.IntervalOid) }
+				_ => {}
+			}
+			let d = types.Parse(types.Oid(oid), lit.Value) catch err {
+				fail err
+			}
+			return mkConstExpr(d, oid)
+		}
 		_ => {
+			// 'string', bit strings and unknown literals are all untyped until
+			// a target type coerces them.
 			if targetType != 0 && targetType != u32(types.UnknownLiteralOid) {
-				let parsed = types.Parse(types.Oid(targetType), lit.Value) catch _ {
+				let d = types.Parse(types.Oid(targetType), lit.Value) catch _ {
 					fail types.ErrorFault(types.NewError("22P02", "invalid input syntax for type " + typeName(targetType) + ": \"" + lit.Value + "\""))
 				}
-				return mkConstExpr(parsed, targetType)
+				return mkConstExpr(d, targetType)
 			}
 			let textD = types.FromStr(types.TextOid, lit.Value)
 			return mkConstExpr(textD, u32(types.UnknownLiteralOid))
@@ -1354,152 +1419,415 @@ fn deriveColumnName(expr parse.Expr) str {
 	return "?column?"
 }
 
+// findColumnIndex returns the position and match of a named table column.
+fn findColumnIndex(tbl catalog.Table, name str) (i64, bool) {
+	for i, col in tbl.Cols {
+		if col.Name == name {
+			return i64(i), true
+		}
+	}
+	return -1, false
+}
+
+// coerceForColumn applies PostgreSQL assignment-cast rules to a value being
+// stored into a column, or fails with 42804 for an impossible coercion.
+fn coerceForColumn(expr Expr, col catalog.Column) !Expr {
+	if expr.Type() == col.Type {
+		return expr
+	}
+	if expr.Type() == u32(types.UnknownLiteralOid) {
+		match expr {
+			Const(c) => {
+				let parsed = types.Parse(types.Oid(col.Type), c.Value.Text()) catch err {
+					fail err
+				}
+				return mkConstExpr(parsed, col.Type)
+			}
+			_ => {}
+		}
+	}
+	if types.CanCast(types.Oid(expr.Type()), types.Oid(col.Type), true) {
+		return Expr.Cast(CastExpr{Arg: expr, Type: col.Type, Typmod: col.Typmod})
+	}
+	fail types.ErrorFault(types.NewError("42804", "column \"" + col.Name + "\" is of type " + typeName(col.Type) + " but expression is of type " + typeName(expr.Type())))
+}
+
+// uniqueIndexOn reports whether the table has a unique index whose columns match
+// the given attribute numbers (used for ON CONFLICT arbiter inference).
+fn uniqueIndexOn(tbl catalog.Table, arbiter []i16) bool {
+	for idx in tbl.Indexes {
+		if !idx.Unique { continue }
+		let idxCols = inferIndexColumns(idx, tbl)
+		if len(idxCols) != len(arbiter) { continue }
+		mut allMatch = true
+		for name in idxCols {
+			let (pos, ok) = findColumnIndex(tbl, name)
+			if !ok {
+				allMatch = false
+				break
+			}
+			let attno = tbl.Cols[pos].Number
+			mut found = false
+			for a in arbiter {
+				if a == attno {
+					found = true
+					break
+				}
+			}
+			if !found {
+				allMatch = false
+				break
+			}
+		}
+		if allMatch { return true }
+	}
+	return false
+}
+
+// tableScopeCols builds the scope columns for a named base table at rangeIndex.
+fn tableScopeCols(tbl catalog.Table, rangeIndex i64) []ScopeCol {
+	mut scopeCols = []ScopeCol{}
+	for i, col in tbl.Cols {
+		scopeCols = append(scopeCols, ScopeCol{
+			Name: col.Name,
+			Oid: col.Type,
+			Typmod: col.Typmod,
+			TableOid: tbl.Oid,
+			Attno: col.Number,
+			Slot: i64(i),
+			RangeIndex: rangeIndex,
+			Hidden: false,
+		})
+	}
+	return scopeCols
+}
+
+// tableScope builds a single-table scope.
+fn tableScope(tbl catalog.Table, name str, rangeIndex i64) []Scope {
+	return []Scope{Scope{Tables: []ScopeTable{ScopeTable{Name: name, Alias: name, TableOid: tbl.Oid, RangeIndex: rangeIndex, Cols: tableScopeCols(tbl, rangeIndex)}}}}
+}
+
+// dmlTableCols returns the output column descriptors for a base table.
+fn dmlTableCols(tbl catalog.Table) []ColDesc {
+	mut cols = []ColDesc{}
+	for col in tbl.Cols {
+		cols = append(cols, ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number, RangeIndex: 1, SourceName: tbl.Name})
+	}
+	return cols
+}
+
+// analyzeReturning binds a RETURNING list against the given scopes.
+fn analyzeReturning(c catalog.Catalog, tx txn.Txn, scopes []Scope, params mut []u32, entries []parse.TargetEntry) !([]Expr, []ColDesc) {
+	mut exprs = []Expr{}
+	mut cols = []ColDesc{}
+	let flags = ExprFlags{InWhere: false, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+	mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+	mut idx = i64(1)
+	for te in entries {
+		let e = try analyzeExpr(c, tx, scopes, []CteInfo{}, flags, []Expr{}, mut stats, mut params, te.Value, 0)
+		mut cName = "?column?"
+		if let a = te.Alias {
+			cName = a.Name
+		} else {
+			cName = deriveColumnName(te.Value)
+		}
+		mut oid = e.Type()
+		if oid == u32(types.UnknownLiteralOid) {
+			oid = u32(types.TextOid)
+		}
+		exprs = append(exprs, e)
+		cols = append(cols, ColDesc{Name: cName, Oid: oid, Typmod: -1, TableOid: 0, Attno: i16(idx), RangeIndex: 0, SourceName: ""})
+		idx += 1
+	}
+	return exprs, cols
+}
+
+// resolveDmlTable resolves the target relation of a DML statement by name.
+fn resolveDmlTable(c catalog.Catalog, tx txn.Txn, name parse.QualifiedName) !(catalog.Table, str, str) {
+	mut tblName = name.Parts[0].Name
+	if len(name.Parts) == 2 {
+		tblName = name.Parts[1].Name
+	}
+	mut schema = ""
+	if len(name.Parts) == 2 {
+		schema = name.Parts[0].Name
+	}
+	if let tbl = c.LookupTable(tx, schema, tblName) {
+		return tbl, tblName, schema
+	}
+	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tblName + "\" does not exist"))
+}
+
+// analyzeInsert binds an INSERT, its source rows, ON CONFLICT and RETURNING.
 fn analyzeInsert(c catalog.Catalog, tx txn.Txn, params mut []u32, ins parse.InsertStmt) !AnalyzedQuery {
-	mut tblName = ins.Table.Parts[0].Name
-	if len(ins.Table.Parts) == 2 {
-		tblName = ins.Table.Parts[1].Name
-	}
-	mut schema = ""
-	if len(ins.Table.Parts) == 2 {
-		schema = ins.Table.Parts[0].Name
-	}
-	if let tbl = c.LookupTable(tx, schema, tblName) {
-		mut targets = []TargetCol{}
-		mut cols = []ColDesc{}
-		for i, col in tbl.Cols {
-			let colDesc = ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number, RangeIndex: 1, SourceName: tblName}
-			cols = append(cols, colDesc)
-			targets = append(targets, TargetCol{
-				Expr: Expr.ColRef(ColRefExpr{Slot: i64(i), RangeIndex: 1, AttNo: col.Number, Type: col.Type}),
-				Name: col.Name,
-				Col: colDesc,
-			})
-		}
+	let (tbl, tblName, _) = try resolveDmlTable(c, tx, ins.Table)
 
-		return AnalyzedQuery{
-			Command: "INSERT",
-			Targets: targets,
-			From: []FromClauseItem{FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: tblName, RangeIndex: 1, Cols: cols})},
-			Where: nil,
-			GroupBy: []Expr{},
-			Having: nil,
-			Windows: []AnalyzedWindow{},
-			Distinct: false,
-			OrderBy: []AnalyzedSortKey{},
-			Limit: nil,
-			Offset: nil,
-			Ctes: []AnalyzedCte{},
-			HasAggs: false,
-			HasWindowFuncs: false,
+	// Target column list: explicit list or every column in order.
+	mut colIdx = []i64{}
+	if len(ins.Columns) == 0 {
+		for i in 0..len(tbl.Cols) {
+			colIdx = append(colIdx, i64(i))
+		}
+	} else {
+		mut seen = []str{}
+		for ident in ins.Columns {
+			let (idx, ok) = findColumnIndex(tbl, ident.Name)
+			if !ok {
+				fail types.ErrorFault(types.NewError("42703", "column \"" + ident.Name + "\" of relation \"" + tblName + "\" does not exist"))
+			}
+			for seenName in seen {
+				if seenName == ident.Name {
+					fail types.ErrorFault(types.NewError("42701", "column \"" + ident.Name + "\" specified more than once"))
+				}
+			}
+			seen = append(seen, ident.Name)
+			colIdx = append(colIdx, idx)
 		}
 	}
-	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tblName + "\" does not exist"))
+
+	mut targetCols = []i16{}
+	for ci in colIdx {
+		targetCols = append(targetCols, tbl.Cols[ci].Number)
+	}
+
+	mut insertRows = [][]Expr{}
+	mut insertQuery ?AnalyzedQuery = nil
+	mut hasInsertQuery = false
+	let flags = ExprFlags{InWhere: false, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+
+	match ins.Source {
+		Values(vq) => {
+			for row in vq.Rows {
+				if len(row) > len(colIdx) {
+					fail types.ErrorFault(types.NewError("42601", "INSERT has more expressions than target columns"))
+				}
+				if len(row) < len(colIdx) {
+					fail types.ErrorFault(types.NewError("42601", "INSERT has more target columns than expressions"))
+				}
+				mut aRow = []Expr{}
+				mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+				for j, e in row {
+					let col = tbl.Cols[colIdx[j]]
+					let a = try analyzeExpr(c, tx, []Scope{}, []CteInfo{}, flags, []Expr{}, mut stats, mut params, e, col.Type)
+					let ce = try coerceForColumn(a, col)
+					aRow = append(aRow, ce)
+				}
+				insertRows = append(insertRows, aRow)
+			}
+		}
+		DefaultValues(_) => {}
+		Query(sel) => {
+			mut sq = try analyzeSelect(c, tx, []Scope{}, []CteInfo{}, mut params, sel)
+			if len(sq.Targets) > len(colIdx) {
+				fail types.ErrorFault(types.NewError("42601", "INSERT has more expressions than target columns"))
+			}
+			if len(sq.Targets) < len(colIdx) {
+				fail types.ErrorFault(types.NewError("42601", "INSERT has more target columns than expressions"))
+			}
+			mut newTargets = []TargetCol{}
+			for j, t in sq.Targets {
+				let col = tbl.Cols[colIdx[j]]
+				let ce = try coerceForColumn(t.Expr, col)
+				newTargets = append(newTargets, TargetCol{Expr: ce, Name: t.Name, Col: t.Col})
+			}
+			sq.Targets = newTargets
+			insertQuery = sq
+			hasInsertQuery = true
+		}
+	}
+
+	// ON CONFLICT
+	mut onConflict ?OnConflictPlan = nil
+	if let oc = ins.Conflict {
+		mut arbiter = []i16{}
+		if let tgt = oc.Target {
+			for e in tgt.Columns {
+				match e {
+					ColumnRef(cr) => {
+						mut cname = ""
+						if len(cr.Parts) > 0 {
+							cname = cr.Parts[len(cr.Parts)-1].Name
+						}
+						let (pos, ok) = findColumnIndex(tbl, cname)
+						if !ok {
+							fail types.ErrorFault(types.NewError("42703", "column \"" + cname + "\" does not exist"))
+						}
+						arbiter = append(arbiter, tbl.Cols[pos].Number)
+					}
+					_ => {
+						fail types.ErrorFault(types.NewError("42P10", "there is no unique or exclusion constraint matching the ON CONFLICT specification"))
+					}
+				}
+			}
+		}
+		if oc.Action.Kind == "update" {
+			if len(arbiter) == 0 {
+				fail types.ErrorFault(types.NewError("42601", "ON CONFLICT DO UPDATE requires inference specification or constraint name"))
+			}
+			if !uniqueIndexOn(tbl, arbiter) {
+				fail types.ErrorFault(types.NewError("42P10", "there is no unique or exclusion constraint matching the ON CONFLICT specification"))
+			}
+			// SET targets may reference the table row and the proposed "excluded" row.
+			mut conflictTables = []ScopeTable{}
+			for st in tableScope(tbl, tblName, 1)[0].Tables {
+				conflictTables = append(conflictTables, st)
+			}
+			for st in tableScope(tbl, "excluded", 2)[0].Tables {
+				conflictTables = append(conflictTables, st)
+			}
+			let scopes = []Scope{Scope{Tables: conflictTables}}
+			mut upExprs = []Expr{}
+			for asg in oc.Action.Assignments {
+				if len(asg.Columns) == 0 { continue }
+				let cname = asg.Columns[0].Name
+				let (pos, ok) = findColumnIndex(tbl, cname)
+				if !ok {
+					fail types.ErrorFault(types.NewError("42703", "column \"" + cname + "\" of relation \"" + tblName + "\" does not exist"))
+				}
+				let col = tbl.Cols[pos]
+				mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+				let a = try analyzeExpr(c, tx, scopes, []CteInfo{}, flags, []Expr{}, mut stats, mut params, asg.Value, col.Type)
+				let ce = try coerceForColumn(a, col)
+				upExprs = append(upExprs, ce)
+			}
+			mut whereExpr ?Expr = nil
+			if let w = oc.Action.Where {
+				mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+				whereExpr = try analyzeExpr(c, tx, scopes, []CteInfo{}, flags, []Expr{}, mut stats, mut params, w, u32(types.BoolOid))
+			}
+			onConflict = OnConflictPlan{ArbiterCols: arbiter, Action: ModifyKind.Update, UpdateExprs: upExprs, Where: whereExpr}
+		} else {
+			if len(arbiter) > 0 && !uniqueIndexOn(tbl, arbiter) {
+				fail types.ErrorFault(types.NewError("42P10", "there is no unique or exclusion constraint matching the ON CONFLICT specification"))
+			}
+			onConflict = OnConflictPlan{ArbiterCols: arbiter, Action: ModifyKind.Insert, UpdateExprs: []Expr{}, Where: nil}
+		}
+	}
+
+	let (returning, returningCols) = try analyzeReturning(c, tx, tableScope(tbl, tblName, 1), mut params, ins.Returning)
+
+	return AnalyzedQuery{
+		Command: "INSERT",
+		Targets: []TargetCol{},
+		From: []FromClauseItem{FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: tblName, RangeIndex: 1, Cols: dmlTableCols(tbl)})},
+		Where: nil,
+		GroupBy: []Expr{},
+		Having: nil,
+		Windows: []AnalyzedWindow{},
+		Distinct: false,
+		OrderBy: []AnalyzedSortKey{},
+		Limit: nil,
+		Offset: nil,
+		Ctes: []AnalyzedCte{},
+		HasAggs: false,
+		HasWindowFuncs: false,
+		InsertCols: targetCols,
+		InsertRows: insertRows,
+		InsertQuery: insertQuery,
+		HasInsertQuery: hasInsertQuery,
+		OnConflict: onConflict,
+		Returning: returning,
+		ReturningCols: returningCols,
+		SetCols: []i16{},
+		SetExprs: []Expr{},
+	}
 }
 
+// analyzeUpdate binds an UPDATE's SET list, WHERE and RETURNING.
 fn analyzeUpdate(c catalog.Catalog, tx txn.Txn, params mut []u32, upd parse.UpdateStmt) !AnalyzedQuery {
-	mut tblName = upd.Table.Parts[0].Name
-	if len(upd.Table.Parts) == 2 {
-		tblName = upd.Table.Parts[1].Name
-	}
-	mut schema = ""
-	if len(upd.Table.Parts) == 2 {
-		schema = upd.Table.Parts[0].Name
-	}
-	if let tbl = c.LookupTable(tx, schema, tblName) {
-		mut scopeCols = []ScopeCol{}
-		mut cols = []ColDesc{}
-		for i, col in tbl.Cols {
-			scopeCols = append(scopeCols, ScopeCol{
-				Name: col.Name,
-				Oid: col.Type,
-				Typmod: col.Typmod,
-				TableOid: tbl.Oid,
-				Attno: col.Number,
-				Slot: i64(i),
-				RangeIndex: 1,
-				Hidden: false,
-			})
-			cols = append(cols, ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number, RangeIndex: 1, SourceName: tblName})
-		}
-		let scopes = []Scope{Scope{Tables: []ScopeTable{ScopeTable{Name: tblName, Alias: tblName, TableOid: tbl.Oid, RangeIndex: 1, Cols: scopeCols}}}}
+	let (tbl, tblName, _) = try resolveDmlTable(c, tx, upd.Table)
+	let scopes = tableScope(tbl, tblName, 1)
 
-		mut whereExpr ?Expr = nil
-		mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
-		if let w = upd.Where {
-			let flags = ExprFlags{InWhere: true, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
-			whereExpr = try analyzeExpr(c, tx, scopes, []CteInfo{}, flags, []Expr{}, mut stats, mut params, w, u32(types.BoolOid))
-		}
-
-		return AnalyzedQuery{
-			Command: "UPDATE",
-			Targets: []TargetCol{},
-			From: []FromClauseItem{FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: tblName, RangeIndex: 1, Cols: cols})},
-			Where: whereExpr,
-			GroupBy: []Expr{},
-			Having: nil,
-			Windows: []AnalyzedWindow{},
-			Distinct: false,
-			OrderBy: []AnalyzedSortKey{},
-			Limit: nil,
-			Offset: nil,
-			Ctes: []AnalyzedCte{},
-			HasAggs: false,
-			HasWindowFuncs: false,
-		}
+	mut whereExpr ?Expr = nil
+	mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+	let flags = ExprFlags{InWhere: true, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+	if let w = upd.Where {
+		whereExpr = try analyzeExpr(c, tx, scopes, []CteInfo{}, flags, []Expr{}, mut stats, mut params, w, u32(types.BoolOid))
 	}
-	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tblName + "\" does not exist"))
+
+	mut setCols = []i16{}
+	mut setExprs = []Expr{}
+	let setFlags = ExprFlags{InWhere: false, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+	for asg in upd.Assignments {
+		if len(asg.Columns) == 0 { continue }
+		let cname = asg.Columns[0].Name
+		let (pos, ok) = findColumnIndex(tbl, cname)
+		if !ok {
+			fail types.ErrorFault(types.NewError("42703", "column \"" + cname + "\" of relation \"" + tblName + "\" does not exist"))
+		}
+		let col = tbl.Cols[pos]
+		let a = try analyzeExpr(c, tx, scopes, []CteInfo{}, setFlags, []Expr{}, mut stats, mut params, asg.Value, col.Type)
+		let ce = try coerceForColumn(a, col)
+		setExprs = append(setExprs, ce)
+		setCols = append(setCols, col.Number)
+	}
+
+	let (returning, returningCols) = try analyzeReturning(c, tx, scopes, mut params, upd.Returning)
+
+	return AnalyzedQuery{
+		Command: "UPDATE",
+		Targets: []TargetCol{},
+		From: []FromClauseItem{FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: tblName, RangeIndex: 1, Cols: dmlTableCols(tbl)})},
+		Where: whereExpr,
+		GroupBy: []Expr{},
+		Having: nil,
+		Windows: []AnalyzedWindow{},
+		Distinct: false,
+		OrderBy: []AnalyzedSortKey{},
+		Limit: nil,
+		Offset: nil,
+		Ctes: []AnalyzedCte{},
+		HasAggs: false,
+		HasWindowFuncs: false,
+		InsertCols: []i16{},
+		InsertRows: [][]Expr{},
+		InsertQuery: nil,
+		HasInsertQuery: false,
+		OnConflict: nil,
+		Returning: returning,
+		ReturningCols: returningCols,
+		SetCols: setCols,
+		SetExprs: setExprs,
+	}
 }
 
+// analyzeDelete binds a DELETE's WHERE and RETURNING.
 fn analyzeDelete(c catalog.Catalog, tx txn.Txn, params mut []u32, del parse.DeleteStmt) !AnalyzedQuery {
-	mut tblName = del.Table.Parts[0].Name
-	if len(del.Table.Parts) == 2 {
-		tblName = del.Table.Parts[1].Name
-	}
-	mut schema = ""
-	if len(del.Table.Parts) == 2 {
-		schema = del.Table.Parts[0].Name
-	}
-	if let tbl = c.LookupTable(tx, schema, tblName) {
-		mut scopeCols = []ScopeCol{}
-		mut cols = []ColDesc{}
-		for i, col in tbl.Cols {
-			scopeCols = append(scopeCols, ScopeCol{
-				Name: col.Name,
-				Oid: col.Type,
-				Typmod: col.Typmod,
-				TableOid: tbl.Oid,
-				Attno: col.Number,
-				Slot: i64(i),
-				RangeIndex: 1,
-				Hidden: false,
-			})
-			cols = append(cols, ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number, RangeIndex: 1, SourceName: tblName})
-		}
-		let scopes = []Scope{Scope{Tables: []ScopeTable{ScopeTable{Name: tblName, Alias: tblName, TableOid: tbl.Oid, RangeIndex: 1, Cols: scopeCols}}}}
+	let (tbl, tblName, _) = try resolveDmlTable(c, tx, del.Table)
+	let scopes = tableScope(tbl, tblName, 1)
 
-		mut whereExpr ?Expr = nil
-		mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
-		if let w = del.Where {
-			let flags = ExprFlags{InWhere: true, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
-			whereExpr = try analyzeExpr(c, tx, scopes, []CteInfo{}, flags, []Expr{}, mut stats, mut params, w, u32(types.BoolOid))
-		}
-
-		return AnalyzedQuery{
-			Command: "DELETE",
-			Targets: []TargetCol{},
-			From: []FromClauseItem{FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: tblName, RangeIndex: 1, Cols: cols})},
-			Where: whereExpr,
-			GroupBy: []Expr{},
-			Having: nil,
-			Windows: []AnalyzedWindow{},
-			Distinct: false,
-			OrderBy: []AnalyzedSortKey{},
-			Limit: nil,
-			Offset: nil,
-			Ctes: []AnalyzedCte{},
-			HasAggs: false,
-			HasWindowFuncs: false,
-		}
+	mut whereExpr ?Expr = nil
+	mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+	let flags = ExprFlags{InWhere: true, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+	if let w = del.Where {
+		whereExpr = try analyzeExpr(c, tx, scopes, []CteInfo{}, flags, []Expr{}, mut stats, mut params, w, u32(types.BoolOid))
 	}
-	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tblName + "\" does not exist"))
+
+	let (returning, returningCols) = try analyzeReturning(c, tx, scopes, mut params, del.Returning)
+
+	return AnalyzedQuery{
+		Command: "DELETE",
+		Targets: []TargetCol{},
+		From: []FromClauseItem{FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: tblName, RangeIndex: 1, Cols: dmlTableCols(tbl)})},
+		Where: whereExpr,
+		GroupBy: []Expr{},
+		Having: nil,
+		Windows: []AnalyzedWindow{},
+		Distinct: false,
+		OrderBy: []AnalyzedSortKey{},
+		Limit: nil,
+		Offset: nil,
+		Ctes: []AnalyzedCte{},
+		HasAggs: false,
+		HasWindowFuncs: false,
+		InsertCols: []i16{},
+		InsertRows: [][]Expr{},
+		InsertQuery: nil,
+		HasInsertQuery: false,
+		OnConflict: nil,
+		Returning: returning,
+		ReturningCols: returningCols,
+		SetCols: []i16{},
+		SetExprs: []Expr{},
+	}
 }
