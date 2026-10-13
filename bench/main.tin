@@ -1,0 +1,93 @@
+// Package main is a small extended-protocol PostgreSQL load generator.
+package main
+
+import "atomic"
+import "lever"
+import "postgres"
+import "quarry"
+import "say"
+import "tide"
+
+shared let completed = atomic.NewInt(0)
+shared let failures = atomic.NewInt(0)
+
+fn main() ! {
+	let addr = lever.Str("addr", "127.0.0.1:5432", "PostgreSQL server address")
+	let user = lever.Str("user", "postgres", "database user")
+	let password = lever.Str("password", quarry.Getenv("PGPASSWORD"), "database password")
+	let database = lever.Str("database", "postgres", "database name")
+	let clients = lever.Int("clients", 10, "number of concurrent database connections")
+	let seconds = lever.Int("duration", 10, "benchmark duration in seconds")
+	let mode = lever.Str("mode", "select", "workload: select or tpcb")
+	let scale = lever.Int("scale", 1, "TPC-B account scale")
+	try lever.Parse(quarry.Args()[1:])
+	if clients.Val() < 1 || clients.Val() > 1024 { fail "--clients must be between 1 and 1024" }
+	if seconds.Val() < 1 { fail "--duration must be at least one second" }
+	if mode.Val() != "select" && mode.Val() != "tpcb" { fail "--mode must be select or tpcb" }
+	if scale.Val() < 1 { fail "--scale must be positive" }
+	completed.Store(0)
+	failures.Store(0)
+	let start = tide.Now()
+	let until = start + seconds.Val()*tide.Second
+	scope workers {
+		for i in 0..clients.Val() {
+			let worker = i
+			workers.spawn(fn() ! {
+				worker_loop(addr.Val(), user.Val(), password.Val(), database.Val(), mode.Val(), until, worker, scale.Val()) catch err {
+					failures.Add(1)
+					say.Line("worker {worker} stopped: {err}")
+				}
+			})
+		}
+	}
+	let elapsed = tide.Since(start)
+	let count = completed.Load()
+	say.Line("mode: {mode.Val()}")
+	say.Line("clients: {clients.Val()}")
+	say.Line("transactions: {count}")
+	say.Line("errors: {failures.Load()}")
+	say.Line("elapsed_seconds: {tide.Seconds(elapsed):.3}")
+	if elapsed > 0 { say.Line("transactions_per_second: {f64(count)*1.0e9/f64(elapsed):.2}") }
+	if failures.Load() != 0 { fail "one or more benchmark workers failed" }
+}
+
+fn worker_loop(addr str, user str, password str, database str, mode str, until i64, worker i64, scale i64) ! {
+	let db = postgres.Open(postgres.Options{Addr: addr, User: user, Password: password, Database: database, Pool: 1, MaxTotal: 1, Timeout: 10*tide.Second, SSLMode: "disable"})
+	mut sequence = 0
+	for tide.Now() < until {
+		if mode == "select" {
+			let value = (sequence + worker) % 100000
+			let rows = try db.Query("SELECT {value}::int4")
+			if len(rows.Rows) != 1 || rows.Rows[0][0].Int() != value { fail "select workload returned an unexpected result" }
+		} else {
+			try tpcb_transaction(db, sequence, worker, scale)
+		}
+		completed.Add(1)
+		sequence += 1
+	}
+}
+
+fn tpcb_transaction(db postgres.Client, sequence i64, worker i64, scale i64) ! {
+	let accountCount = scale*100000
+	let aid = (sequence*7919 + worker*104729) % accountCount + 1
+	let bid = (sequence + worker) % (scale*10) + 1
+	let tid = (sequence*7 + worker) % (scale*100) + 1
+	let delta = (sequence%200)-100
+	mut tx = try db.Begin()
+	let (_, readErr) = tx.Query("SELECT abalance FROM pgbench_accounts WHERE aid = {aid}")
+	if readErr != nil { tx.Rollback() catch _ {}
+		fail readErr }
+	let (_, accountErr) = tx.Exec("UPDATE pgbench_accounts SET abalance = abalance + {delta} WHERE aid = {aid}")
+	if accountErr != nil { tx.Rollback() catch _ {}
+		fail accountErr }
+	let (_, tellerErr) = tx.Exec("UPDATE pgbench_tellers SET tbalance = tbalance + {delta} WHERE tid = {tid}")
+	if tellerErr != nil { tx.Rollback() catch _ {}
+		fail tellerErr }
+	let (_, branchErr) = tx.Exec("UPDATE pgbench_branches SET bbalance = bbalance + {delta} WHERE bid = {bid}")
+	if branchErr != nil { tx.Rollback() catch _ {}
+		fail branchErr }
+	let (_, historyErr) = tx.Exec("INSERT INTO pgbench_history(tid, bid, aid, delta) VALUES ({tid}, {bid}, {aid}, {delta})")
+	if historyErr != nil { tx.Rollback() catch _ {}
+		fail historyErr }
+	try tx.Commit()
+}
