@@ -1,6 +1,7 @@
 package catalog
 
 import "../txn"
+import "../store"
 
 // Oid is a PostgreSQL object identifier.
 type Oid = u32
@@ -62,6 +63,7 @@ type IndexDef struct {
 // Catalog stores transactional relation metadata. M1 keeps catalog rows in memory until
 // the store heap tuple encoding and type Datum APIs are present in this worktree.
 type Catalog struct {
+	Store store.Store
 	Manager txn.Manager
 	tables map[Oid]Table
 	names map[str][]Oid
@@ -72,8 +74,8 @@ type Catalog struct {
 }
 
 // Open creates the catalog metadata and the M1 pg_catalog relation descriptors.
-fn Open(m txn.Manager) !Catalog {
-	mut c = Catalog{Manager: m, tables: make(map[Oid]Table), names: make(map[str][]Oid), searchPaths: make(map[u32][]str), nextOid: 16384, nextRel: 16384, version: 1}
+fn Open(s mut store.Store, m txn.Manager) !Catalog {
+	mut c = Catalog{Store: s, Manager: m, tables: make(map[Oid]Table), names: make(map[str][]Oid), searchPaths: make(map[u32][]str), nextOid: 16384, nextRel: 16384, version: 1}
 	c.addNamespace("pg_catalog", 11)
 	c.addNamespace("public", 2200)
 	c.addSystemTable(1259, "pg_class", 2615, "relname", 25, "relnamespace", 26, "relkind", 18)

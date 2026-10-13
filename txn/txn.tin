@@ -1,7 +1,17 @@
 package txn
 
-// Transaction state is owned by one manager. The M1 implementation is in-memory until
-// the store WAL record registration API is available in this worktree.
+import "../store"
+
+const xactRel store.RelId = 4294967294
+const xidBlockSize u32 = 256
+const walXidReserve u8 = 16
+const walXidCommit u8 = 17
+const walXidAbort u8 = 18
+const walClogPage u8 = 19
+const clogPageXids u32 = 256
+const clogPageBytes i64 = 64
+
+// Manager owns the durable xid horizon, two-bit commit log, snapshots, and locks.
 
 // Isolation selects when a statement takes its visibility snapshot.
 type Isolation enum {
@@ -92,26 +102,52 @@ type TupleHeader struct {
 
 // Manager owns transaction ids, outcomes, active snapshots and relation locks.
 type Manager struct {
+	store store.Store
 	nextXid u32
-	states map[u32]XidState
+	reservedUntil u32
+	clog map[u32][]u8
 	active map[u32]bool
 	locks map[LockKey][]LockHolder
 	tupleLocks map[TupleLockKey][]TupleLockHolder
 	version u64
 }
 
-// NewManager creates an empty in-memory transaction manager.
-fn NewManager() !Manager {
-	return Manager{nextXid: 3, states: make(map[u32]XidState), active: make(map[u32]bool), locks: make(map[LockKey][]LockHolder), tupleLocks: make(map[TupleLockKey][]TupleLockHolder), version: 1}
+// NewManager recovers the durable xid horizon and commit log from the store.
+fn NewManager(s mut store.Store) !Manager {
+	try s.RegisterRecordKind(walXidReserve, "txn xid reserve")
+	try s.RegisterRecordKind(walXidCommit, "txn commit")
+	try s.RegisterRecordKind(walXidAbort, "txn abort")
+	try s.RegisterRecordKind(walClogPage, "txn clog page")
+	s.CreateHeap(xactRel) catch _ { }
+	mut m = Manager{store: s, nextXid: 3, reservedUntil: 3, clog: make(map[u32][]u8), active: make(map[u32]bool), locks: make(map[LockKey][]LockHolder), tupleLocks: make(map[TupleLockKey][]TupleLockHolder), version: 1}
+	mut scan = s.HeapScan(xactRel)
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok { break }
+		if len(tuple.Payload) == 5 && tuple.Payload[0] == 1 {
+			let watermark = readU32(tuple.Payload, 1)
+			if watermark > m.nextXid { m.nextXid = watermark }
+		} else if len(tuple.Payload) == clogPageBytes+5 && tuple.Payload[0] == 2 {
+			let page = readU32(tuple.Payload, 1)
+			m.clog[page] = cloneBytes(tuple.Payload[5:])
+		}
+	}
+	if m.nextXid < 3 { m.nextXid = 3 }
+	m.reservedUntil = m.nextXid
+	try m.recoverInflight()
+	try m.reserveXids()
+	return m
 }
 
 // Begin starts a transaction at the current xid horizon.
-fn (m mut Manager) Begin(iso Isolation) Txn {
+fn (m mut Manager) Begin(iso Isolation) !Txn {
+	if m.nextXid >= m.reservedUntil {
+		try m.reserveXids()
+	}
 	let xid = m.nextXid
 	m.nextXid += 1
 	let activeXids = m.activeXids()
 	let xmin = m.minimumActive(xid)
-	m.states[xid] = XidState.InProgress
 	m.active[xid] = true
 	m.version += 1
 	return Txn{xid: xid, iso: iso, cid: 0, startXmin: xmin, startXmax: xid, startXip: activeXids, active: true}
@@ -146,7 +182,8 @@ fn (m mut Manager) Commit(t mut Txn) ! {
 	if !t.active {
 		fail "25000 transaction is not active"
 	}
-	m.states[t.xid] = XidState.Committed
+	let lsn = try m.persistState(t.xid, XidState.Committed, walXidCommit)
+	try m.store.Sync(lsn)
 	delete(m.active, t.xid)
 	t.active = false
 	m.version += 1
@@ -155,11 +192,11 @@ fn (m mut Manager) Commit(t mut Txn) ! {
 }
 
 // Abort records an aborted outcome and releases transaction locks.
-fn (m mut Manager) Abort(t mut Txn) {
+fn (m mut Manager) Abort(t mut Txn) ! {
 	if !t.active {
 		return
 	}
-	m.states[t.xid] = XidState.Aborted
+	_ = try m.persistState(t.xid, XidState.Aborted, walXidAbort)
 	delete(m.active, t.xid)
 	t.active = false
 	m.version += 1
@@ -168,14 +205,125 @@ fn (m mut Manager) Abort(t mut Txn) {
 
 // State returns the known outcome of xid, treating an unknown id as aborted.
 fn (m Manager) State(xid u32) XidState {
-	let (state, ok) = m.states[xid]
-	if !ok {
-		if xid < 3 {
-			return XidState.Committed
+	if xid < 3 { return XidState.Committed }
+	let (isActive, active) = m.active[xid]
+	if active && isActive { return XidState.InProgress }
+	return m.clogState(xid)
+}
+
+fn (m mut Manager) reserveXids() ! {
+	let base = max(m.nextXid, m.reservedUntil)
+	let watermark = base + xidBlockSize
+	let payload = []u8{1}
+	appendU32(mut payload, watermark)
+	_ = try m.store.HeapInsert(store.NewXidCtx(2, 0), xactRel, payload)
+	let lsn = try m.store.LogRecord(walXidReserve, u32Bytes(watermark))
+	try m.store.Sync(lsn)
+	m.reservedUntil = watermark
+}
+
+fn (m mut Manager) persistState(xid u32, state XidState, outcomeKind u8) !store.Lsn {
+	let pageNo = xid / clogPageXids
+	mut page = m.clogPage(pageNo)
+	setClogBits(mut page, xid % clogPageXids, state)
+	let payload = clogPayload(pageNo, page)
+	_ = try m.store.HeapInsert(store.NewXidCtx(2, 0), xactRel, payload)
+	_ = try m.store.LogRecord(walClogPage, payload)
+	let outcomeLsn = try m.store.LogRecord(outcomeKind, u32Bytes(xid))
+	m.clog[pageNo] = page
+	return outcomeLsn
+}
+
+fn (m mut Manager) recoverInflight() ! {
+	mut changed = make(map[u32]bool)
+	mut xid = u32(3)
+	for xid < m.nextXid {
+		let state = m.clogState(xid)
+		if state == XidState.InProgress || state == XidState.SubCommitted {
+			let pageNo = xid / clogPageXids
+			mut page = m.clogPage(pageNo)
+			setClogBits(mut page, xid % clogPageXids, XidState.Aborted)
+			m.clog[pageNo] = page
+			changed[pageNo] = true
 		}
+		xid += 1
+	}
+	for pageNo, hasChanges in changed {
+		if hasChanges {
+			let page = m.clog[pageNo]
+			let payload = clogPayload(pageNo, page)
+			_ = try m.store.HeapInsert(store.NewXidCtx(2, 0), xactRel, payload)
+			_ = try m.store.LogRecord(walClogPage, payload)
+		}
+	}
+}
+
+fn (m Manager) clogState(xid u32) XidState {
+	let pageNo = xid / clogPageXids
+	let (page, ok) = m.clog[pageNo]
+	if !ok {
+		if xid < m.reservedUntil { return XidState.InProgress }
 		return XidState.Aborted
 	}
-	return state
+	let offset = xid % clogPageXids
+	let byteAt = i64(offset / 4)
+	let shift = u16((offset % 4) * 2)
+	let state = (page[byteAt] >> shift) & 3
+	match state {
+		0 => return XidState.InProgress
+		1 => return XidState.SubCommitted
+		2 => return XidState.Committed
+		_ => return XidState.Aborted
+	}
+}
+
+fn (m Manager) clogPage(pageNo u32) []u8 {
+	let (page, ok) = m.clog[pageNo]
+	if ok { return cloneBytes(page) }
+	return make([]u8, clogPageBytes)
+}
+
+fn setClogBits(page mut []u8, offset u32, state XidState) {
+	let byteAt = i64(offset / 4)
+	let shift = u16((offset % 4) * 2)
+	let bits = stateBits(state)
+	page[byteAt] = (page[byteAt] & ~(u8(3) << shift)) | (bits << shift)
+}
+
+fn stateBits(state XidState) u8 {
+	match state {
+		InProgress => return 0
+		SubCommitted => return 1
+		Committed => return 2
+		Aborted => return 3
+	}
+}
+
+fn clogPayload(pageNo u32, page []u8) []u8 {
+	mut payload = []u8{2}
+	appendU32(mut payload, pageNo)
+	payload = append(payload, page...)
+	return payload
+}
+
+fn u32Bytes(value u32) []u8 {
+	mut bytes = []u8{}
+	appendU32(mut bytes, value)
+	return bytes
+}
+
+fn appendU32(out mut []u8, value u32) {
+	out = append(out, u8(value >> 24), u8(value >> 16), u8(value >> 8), u8(value))
+}
+
+fn readU32(bytes []u8, at i64) u32 {
+	return u32(bytes[at]) << 24 | u32(bytes[at+1]) << 16 | u32(bytes[at+2]) << 8 | u32(bytes[at+3])
+}
+
+fn cloneBytes(src []u8) []u8 {
+	let dst = make([]u8, len(src))
+	copy(dst, src)
+	return dst
 }
 
 // Visible applies snapshot visibility to one tuple header.
