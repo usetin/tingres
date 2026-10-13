@@ -1,0 +1,1430 @@
+package plan
+
+import "../types"
+import "../catalog"
+import "../txn"
+import "../parse"
+import "mint"
+
+fn checkUnaggregatedColumn(expr Expr, groupByExprs []Expr, scopes []Scope) ! {
+	match expr {
+		ColRef(col) => {
+			mut found = false
+			for g in groupByExprs {
+				match g {
+					ColRef(gc) => {
+						if gc.Slot == col.Slot && gc.RangeIndex == col.RangeIndex {
+							found = true
+							break
+						}
+					}
+					_ => {}
+				}
+			}
+			if !found {
+				mut colName = "column"
+				for s in scopes {
+					for t in s.Tables {
+						if t.RangeIndex == col.RangeIndex {
+							for c in t.Cols {
+								if c.Slot == col.Slot {
+									colName = c.Name
+									break
+								}
+							}
+						}
+					}
+				}
+				fail types.ErrorFault(types.NewError("42803", "column \"" + colName + "\" must appear in the GROUP BY clause or be used in an aggregate function"))
+			}
+		}
+		AggRef(_) => { return }
+		WindowFuncRef(_) => { return }
+		OpCall(op) => {
+			for a in op.Args {
+				try checkUnaggregatedColumn(a, groupByExprs, scopes)
+			}
+		}
+		FuncCall(fc) => {
+			for a in fc.Args {
+				try checkUnaggregatedColumn(a, groupByExprs, scopes)
+			}
+		}
+		BoolExpr(be) => {
+			for a in be.Args {
+				try checkUnaggregatedColumn(a, groupByExprs, scopes)
+			}
+		}
+		Cast(ce) => {
+			try checkUnaggregatedColumn(ce.Arg, groupByExprs, scopes)
+		}
+		Case(cs) => {
+			for w in cs.Whens {
+				try checkUnaggregatedColumn(w.When, groupByExprs, scopes)
+				try checkUnaggregatedColumn(w.Then, groupByExprs, scopes)
+			}
+			if let e = cs.Else {
+				try checkUnaggregatedColumn(e, groupByExprs, scopes)
+			}
+		}
+		_ => {}
+	}
+}
+
+fn isNumericType(oid u32) bool {
+	match oid {
+		types.Int2Oid, types.Int4Oid, types.Int8Oid, types.Float4Oid, types.Float8Oid, types.NumericOid => { return true }
+		_ => { return false }
+	}
+	return false
+}
+
+fn isStringType(oid u32) bool {
+	match oid {
+		types.TextOid, types.VarcharOid, types.BpcharOid => { return true }
+		_ => { return false }
+	}
+	return false
+}
+
+fn isKnownAggName(name str) bool {
+	match name {
+		"count", "sum", "avg", "min", "max", "array_agg", "string_agg", "bool_and", "every", "bool_or", "bit_and", "bit_or" => {
+			return true
+		}
+		_ => { return false }
+	}
+	return false
+}
+
+
+// AnalyzedQuery represents a semantically validated and typed query AST.
+type AnalyzedQuery struct {
+	Command str
+	Targets []TargetCol
+	From []FromClauseItem
+	Where ?Expr
+	GroupBy []Expr
+	Having ?Expr
+	Windows []AnalyzedWindow
+	Distinct bool
+	OrderBy []AnalyzedSortKey
+	Limit ?Expr
+	Offset ?Expr
+	Ctes []AnalyzedCte
+	HasAggs bool
+	HasWindowFuncs bool
+}
+
+// TargetCol describes an evaluated output column expression and its result descriptor.
+type TargetCol struct {
+	Expr Expr
+	Name str
+	Col ColDesc
+}
+
+// FromClauseItem is a typed relational source in the FROM clause.
+type FromClauseItem enum {
+	Table(FromTable)
+	Subquery(FromSubquery)
+	Join(FromJoin)
+	Values(FromValues)
+	Function(FromFunction)
+}
+
+type FromTable struct {
+	TableOid u32
+	Schema str
+	Name str
+	Alias str
+	RangeIndex i64
+	Cols []ColDesc
+}
+
+type FromSubquery struct {
+	Query AnalyzedQuery
+	Alias str
+	RangeIndex i64
+	Cols []ColDesc
+}
+
+type FromValues struct {
+	Rows [][]Expr
+	Alias str
+	RangeIndex i64
+	Cols []ColDesc
+}
+
+type FromFunction struct {
+	Expr Expr
+	Alias str
+	RangeIndex i64
+	Cols []ColDesc
+}
+
+type FromJoin struct {
+	Left FromClauseItem
+	Right FromClauseItem
+	JoinType JoinType
+	Quals []Expr
+	Cols []ColDesc
+}
+
+type AnalyzedWindow struct {
+	Name str
+	Partitions []Expr
+	OrderKeys []SortKey
+	Frame WindowFrame
+}
+
+type AnalyzedSortKey struct {
+	Expr Expr
+	Descending bool
+	NullsFirst bool
+}
+
+type AnalyzedCte struct {
+	Name str
+	Query AnalyzedQuery
+	Recursive bool
+	Cols []ColDesc
+}
+
+// Scope tracks table and column visibility within a query nesting level.
+type Scope struct {
+	Tables []ScopeTable
+}
+
+type ScopeTable struct {
+	Name str
+	Alias str
+	TableOid u32
+	RangeIndex i64
+	Cols []ScopeCol
+}
+
+type ScopeCol struct {
+	Name str
+	Oid u32
+	Typmod i32
+	TableOid u32
+	Attno i16
+	Slot i64
+	RangeIndex i64
+	Hidden bool
+}
+
+// CteInfo stores CTE metadata for recursion and cycle checking.
+type CteInfo struct {
+	Name str
+	Recursive bool
+	Cols []ColDesc
+	InResolution bool
+}
+
+type QueryStats struct {
+	HasAggs bool
+	HasWindowFuncs bool
+}
+
+type ExprFlags value struct {
+	InWhere bool
+	InHaving bool
+	InGroupBy bool
+	InAggregate bool
+	InWindow bool
+}
+
+fn typeName(oid u32) str {
+	match oid {
+		types.BoolOid => { return "boolean" }
+		types.ByteaOid => { return "bytea" }
+		types.Int2Oid => { return "smallint" }
+		types.Int4Oid => { return "integer" }
+		types.Int8Oid => { return "bigint" }
+		types.OidOid => { return "oid" }
+		types.Float4Oid => { return "real" }
+		types.Float8Oid => { return "double precision" }
+		types.TextOid => { return "text" }
+		types.VarcharOid => { return "character varying" }
+		types.BpcharOid => { return "character" }
+		types.NumericOid => { return "numeric" }
+		types.DateOid => { return "date" }
+		types.TimeOid => { return "time without time zone" }
+		types.TimestampOid => { return "timestamp without time zone" }
+		types.TimestamptzOid => { return "timestamp with time zone" }
+		types.IntervalOid => { return "interval" }
+		types.UuidOid => { return "uuid" }
+		types.UnknownLiteralOid => { return "unknown" }
+		_ => { return "unknown" }
+	}
+	return "unknown"
+}
+
+// AnalyzeStatement analyzes any supported AST statement.
+fn AnalyzeStatement(c catalog.Catalog, tx txn.Txn, stmt parse.Stmt, paramTypes mut []u32) !AnalyzedQuery {
+	match stmt {
+		Select(sel) => {
+			return try analyzeSelect(c, tx, []Scope{}, []CteInfo{}, mut paramTypes, sel)
+		}
+		Insert(ins) => {
+			return try analyzeInsert(c, tx, mut paramTypes, ins)
+		}
+		Update(upd) => {
+			return try analyzeUpdate(c, tx, mut paramTypes, upd)
+		}
+		Delete(del) => {
+			return try analyzeDelete(c, tx, mut paramTypes, del)
+		}
+		_ => {
+			return AnalyzedQuery{
+				Command: "UTILITY",
+				Targets: []TargetCol{},
+				From: []FromClauseItem{},
+				Where: nil,
+				GroupBy: []Expr{},
+				Having: nil,
+				Windows: []AnalyzedWindow{},
+				Distinct: false,
+				OrderBy: []AnalyzedSortKey{},
+				Limit: nil,
+				Offset: nil,
+				Ctes: []AnalyzedCte{},
+				HasAggs: false,
+				HasWindowFuncs: false,
+			}
+		}
+	}
+}
+
+fn findCte(ctes []CteInfo, name str) ?CteInfo {
+	for cte in ctes {
+		if cte.Name == name {
+			return cte
+		}
+	}
+	return nil
+}
+
+fn setCte(ctes mut []CteInfo, info CteInfo) {
+	for i in 0..len(ctes) {
+		if ctes[i].Name == info.Name {
+			ctes[i] = info
+			return
+		}
+	}
+	ctes = append(ctes, info)
+}
+
+fn analyzeSelect(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, parentCtes []CteInfo, params mut []u32, sel parse.SelectStmt) !AnalyzedQuery {
+	mut ctes = []AnalyzedCte{}
+	mut currentCtes = []CteInfo{}
+	for pcte in parentCtes {
+		currentCtes = append(currentCtes, pcte)
+	}
+
+	if let withClause = sel.With {
+		for cte in withClause.Ctes {
+			let name = cte.Name.Name
+			if let existing = findCte(currentCtes, name) {
+				if existing.InResolution {
+					fail types.ErrorFault(types.NewError("42P19", "circular reference in CTE \"" + name + "\""))
+				}
+			}
+			setCte(mut currentCtes, CteInfo{Name: name, Recursive: withClause.Recursive, Cols: []ColDesc{}, InResolution: true})
+			let subQuery = try analyzeSelect(c, tx, parentScopes, currentCtes, mut params, cte.Query)
+			mut cols = []ColDesc{}
+			for i, target in subQuery.Targets {
+				mut colName = target.Name
+				if i < len(cte.Columns) {
+					colName = cte.Columns[i].Name
+				}
+				cols = append(cols, ColDesc{
+					Name: colName,
+					Oid: target.Col.Oid,
+					Typmod: target.Col.Typmod,
+					TableOid: 0,
+					Attno: i16(i + 1),
+				})
+			}
+			setCte(mut currentCtes, CteInfo{Name: name, Recursive: withClause.Recursive, Cols: cols, InResolution: false})
+			ctes = append(ctes, AnalyzedCte{
+				Name: name,
+				Query: subQuery,
+				Recursive: withClause.Recursive,
+				Cols: cols,
+			})
+		}
+	}
+
+	match sel.Body {
+		Core(core) => {
+			return try analyzeSelectCore(c, tx, parentScopes, currentCtes, mut params, core, sel, ctes)
+		}
+		Values(vq) => {
+			return try analyzeValuesQuery(c, tx, mut params, vq, sel, ctes)
+		}
+		Set(setOp) => {
+			return try analyzeSetOperation(c, tx, parentScopes, currentCtes, mut params, setOp, sel, ctes)
+		}
+	}
+}
+
+fn analyzeSelectCore(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []CteInfo, params mut []u32, core parse.SelectCore, sel parse.SelectStmt, analyzedCtes []AnalyzedCte) !AnalyzedQuery {
+	mut currentScope = Scope{Tables: []ScopeTable{}}
+	mut fromItems = []FromClauseItem{}
+	mut rangeIndex = i64(1)
+
+	for fromItem in core.From {
+		let (item, scopeTable) = try analyzeFromItem(c, tx, parentScopes, ctes, mut params, fromItem, rangeIndex)
+		for existingTbl in currentScope.Tables {
+			if existingTbl.Alias == scopeTable.Alias {
+				fail types.ErrorFault(types.NewError("42712", "table name \"" + scopeTable.Alias + "\" specified more than once"))
+			}
+		}
+		currentScope.Tables = append(currentScope.Tables, scopeTable)
+		fromItems = append(fromItems, item)
+		rangeIndex += 1
+	}
+
+	mut allScopes = []Scope{}
+	for ps in parentScopes {
+		allScopes = append(allScopes, ps)
+	}
+	allScopes = append(allScopes, currentScope)
+
+	mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+
+	// WHERE
+	mut whereExpr ?Expr = nil
+	if let w = core.Where {
+		let flags = ExprFlags{InWhere: true, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+		let resolvedWhere = try analyzeExpr(c, tx, allScopes, ctes, flags, []Expr{}, mut stats, mut params, w, u32(types.BoolOid))
+		if resolvedWhere.Type() != u32(types.BoolOid) && resolvedWhere.Type() != u32(types.UnknownLiteralOid) {
+			fail types.ErrorFault(types.NewError("42804", "argument of WHERE must be type boolean, not type " + typeName(resolvedWhere.Type())))
+		}
+		whereExpr = resolvedWhere
+	}
+
+	// GROUP BY
+	mut groupByExprs = []Expr{}
+	for g in core.GroupBy {
+		if let val = g.Value {
+			let flags = ExprFlags{InWhere: false, InHaving: false, InGroupBy: true, InAggregate: false, InWindow: false}
+			let grpExpr = try analyzeExpr(c, tx, allScopes, ctes, flags, []Expr{}, mut stats, mut params, val, 0)
+			groupByExprs = append(groupByExprs, grpExpr)
+		}
+	}
+
+	// Targets
+	mut targets = []TargetCol{}
+	mut targetIndex = i64(1)
+	let targetFlags = ExprFlags{InWhere: false, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+	for target in core.Targets {
+		match target.Value {
+			ColumnRef(colRef) => {
+				if colRef.Star {
+					if len(colRef.Parts) == 0 {
+						for tbl in currentScope.Tables {
+							for col in tbl.Cols {
+								if col.Hidden { continue }
+								let colExpr = Expr.ColRef(ColRefExpr{
+									Slot: col.Slot,
+									RangeIndex: col.RangeIndex,
+									AttNo: col.Attno,
+									Type: col.Oid,
+								})
+								targets = append(targets, TargetCol{
+									Expr: colExpr,
+									Name: col.Name,
+									Col: ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: i16(targetIndex)},
+								})
+								targetIndex += 1
+							}
+						}
+						continue
+					} else if len(colRef.Parts) == 1 {
+						let tblName = colRef.Parts[0].Name
+						mut found = false
+						for tbl in currentScope.Tables {
+							if tbl.Alias == tblName || tbl.Name == tblName {
+								found = true
+								for col in tbl.Cols {
+									if col.Hidden { continue }
+									let colExpr = Expr.ColRef(ColRefExpr{
+										Slot: col.Slot,
+										RangeIndex: col.RangeIndex,
+										AttNo: col.Attno,
+										Type: col.Oid,
+									})
+									targets = append(targets, TargetCol{
+										Expr: colExpr,
+										Name: col.Name,
+										Col: ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: i16(targetIndex)},
+									})
+									targetIndex += 1
+								}
+								break
+							}
+						}
+						if !found {
+							fail types.ErrorFault(types.NewError("42P01", "missing FROM-clause entry for table \"" + tblName + "\""))
+						}
+						continue
+					}
+				}
+			}
+			_ => {}
+		}
+
+		let expr = try analyzeExpr(c, tx, allScopes, ctes, targetFlags, groupByExprs, mut stats, mut params, target.Value, 0)
+		mut colName = "?column?"
+		if let alias = target.Alias {
+			colName = alias.Name
+		} else {
+			colName = deriveColumnName(target.Value)
+		}
+		mut colType = expr.Type()
+		if colType == u32(types.UnknownLiteralOid) {
+			colType = u32(types.TextOid)
+		}
+		targets = append(targets, TargetCol{
+			Expr: expr,
+			Name: colName,
+			Col: ColDesc{Name: colName, Oid: colType, Typmod: -1, TableOid: 0, Attno: i16(targetIndex)},
+		})
+		targetIndex += 1
+	}
+
+	if stats.HasAggs || len(groupByExprs) > 0 {
+		for target in targets {
+			try checkUnaggregatedColumn(target.Expr, groupByExprs, allScopes)
+		}
+	}
+
+	// HAVING
+	mut havingExpr ?Expr = nil
+	if let h = core.Having {
+		let flags = ExprFlags{InWhere: false, InHaving: true, InGroupBy: false, InAggregate: false, InWindow: false}
+		let resolvedHaving = try analyzeExpr(c, tx, allScopes, ctes, flags, groupByExprs, mut stats, mut params, h, u32(types.BoolOid))
+		havingExpr = resolvedHaving
+	}
+
+	// ORDER BY
+	mut orderKeys = []AnalyzedSortKey{}
+	for sb in sel.OrderBy {
+		let sortExpr = try analyzeExpr(c, tx, allScopes, ctes, targetFlags, groupByExprs, mut stats, mut params, sb.Value, 0)
+		orderKeys = append(orderKeys, AnalyzedSortKey{
+			Expr: sortExpr,
+			Descending: sb.Direction == "DESC",
+			NullsFirst: sb.Nulls == "FIRST",
+		})
+	}
+
+	// LIMIT / OFFSET
+	mut limitExpr ?Expr = nil
+	if let l = sel.Limit {
+		limitExpr = try analyzeExpr(c, tx, allScopes, ctes, targetFlags, groupByExprs, mut stats, mut params, l, u32(types.Int8Oid))
+	}
+	mut offsetExpr ?Expr = nil
+	if let o = sel.Offset {
+		offsetExpr = try analyzeExpr(c, tx, allScopes, ctes, targetFlags, groupByExprs, mut stats, mut params, o, u32(types.Int8Oid))
+	}
+
+	return AnalyzedQuery{
+		Command: "SELECT",
+		Targets: targets,
+		From: fromItems,
+		Where: whereExpr,
+		GroupBy: groupByExprs,
+		Having: havingExpr,
+		Windows: []AnalyzedWindow{},
+		Distinct: core.Distinct != "",
+		OrderBy: orderKeys,
+		Limit: limitExpr,
+		Offset: offsetExpr,
+		Ctes: analyzedCtes,
+		HasAggs: stats.HasAggs,
+		HasWindowFuncs: stats.HasWindowFuncs,
+	}
+}
+
+fn analyzeValuesQuery(c catalog.Catalog, tx txn.Txn, params mut []u32, vq parse.ValuesQuery, sel parse.SelectStmt, ctes []AnalyzedCte) !AnalyzedQuery {
+	mut analyzedRows = [][]Expr{}
+	mut firstRowTypes = []u32{}
+	let flags = ExprFlags{InWhere: false, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+	mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+
+	for rIdx, row in vq.Rows {
+		mut analyzedRow = []Expr{}
+		for cIdx, expr in row {
+			mut targetType = u32(0)
+			if rIdx > 0 && cIdx < len(firstRowTypes) {
+				targetType = firstRowTypes[cIdx]
+			}
+			let analyzed = try analyzeExpr(c, tx, []Scope{}, []CteInfo{}, flags, []Expr{}, mut stats, mut params, expr, targetType)
+			analyzedRow = append(analyzedRow, analyzed)
+			if rIdx == 0 {
+				firstRowTypes = append(firstRowTypes, analyzed.Type())
+			}
+		}
+		analyzedRows = append(analyzedRows, analyzedRow)
+	}
+
+	mut targets = []TargetCol{}
+	if len(analyzedRows) > 0 {
+		for i, cell in analyzedRows[0] {
+			let name = "column" + mint.Itoa(i + 1)
+			mut typ = cell.Type()
+			if typ == u32(types.UnknownLiteralOid) {
+				typ = u32(types.TextOid)
+			}
+			targets = append(targets, TargetCol{
+				Expr: cell,
+				Name: name,
+				Col: ColDesc{Name: name, Oid: typ, Typmod: -1, TableOid: 0, Attno: i16(i + 1)},
+			})
+		}
+	}
+
+	return AnalyzedQuery{
+		Command: "SELECT",
+		Targets: targets,
+		From: []FromClauseItem{FromClauseItem.Values(FromValues{Rows: analyzedRows, Alias: "", RangeIndex: 1, Cols: []ColDesc{}})},
+		Where: nil,
+		GroupBy: []Expr{},
+		Having: nil,
+		Windows: []AnalyzedWindow{},
+		Distinct: false,
+		OrderBy: []AnalyzedSortKey{},
+		Limit: nil,
+		Offset: nil,
+		Ctes: ctes,
+		HasAggs: false,
+		HasWindowFuncs: false,
+	}
+}
+
+fn analyzeSetOperation(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, parentCtes []CteInfo, params mut []u32, setOp parse.SetOperation, sel parse.SelectStmt, ctes []AnalyzedCte) !AnalyzedQuery {
+	let leftQuery = try analyzeSelect(c, tx, parentScopes, parentCtes, mut params, parse.SelectStmt{Pos: sel.Pos, With: nil, Body: setOp.Left, OrderBy: []parse.SortBy{}, Limit: nil, Offset: nil, Fetch: "", FetchCount: nil, Locking: []parse.LockingClause{}})
+	let rightQuery = try analyzeSelect(c, tx, parentScopes, parentCtes, mut params, parse.SelectStmt{Pos: sel.Pos, With: nil, Body: setOp.Right, OrderBy: []parse.SortBy{}, Limit: nil, Offset: nil, Fetch: "", FetchCount: nil, Locking: []parse.LockingClause{}})
+
+	if len(leftQuery.Targets) != len(rightQuery.Targets) {
+		fail types.ErrorFault(types.NewError("42601", "each " + setOp.Op + " query must have the same number of columns"))
+	}
+
+	mut targets = []TargetCol{}
+	for i in 0..len(leftQuery.Targets) {
+		let lTyp = leftQuery.Targets[i].Col.Oid
+		let rTyp = rightQuery.Targets[i].Col.Oid
+		let unifiedTyp = try unifyTypes(lTyp, rTyp, "UNION")
+		targets = append(targets, TargetCol{
+			Expr: leftQuery.Targets[i].Expr,
+			Name: leftQuery.Targets[i].Name,
+			Col: ColDesc{Name: leftQuery.Targets[i].Name, Oid: unifiedTyp, Typmod: -1, TableOid: 0, Attno: i16(i + 1)},
+		})
+	}
+
+	return AnalyzedQuery{
+		Command: "SELECT",
+		Targets: targets,
+		From: []FromClauseItem{},
+		Where: nil,
+		GroupBy: []Expr{},
+		Having: nil,
+		Windows: []AnalyzedWindow{},
+		Distinct: !setOp.All,
+		OrderBy: []AnalyzedSortKey{},
+		Limit: nil,
+		Offset: nil,
+		Ctes: ctes,
+		HasAggs: false,
+		HasWindowFuncs: false,
+	}
+}
+
+fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []CteInfo, params mut []u32, item parse.FromItem, rangeIndex i64) !(FromClauseItem, ScopeTable) {
+	match item {
+		Table(tblRef) => {
+			mut name = tblRef.Name.Parts[0].Name
+			if len(tblRef.Name.Parts) == 2 {
+				name = tblRef.Name.Parts[1].Name
+			}
+			mut schema = ""
+			if len(tblRef.Name.Parts) == 2 {
+				schema = tblRef.Name.Parts[0].Name
+			}
+			mut aliasName = name
+			if let a = tblRef.Alias {
+				aliasName = a.Name.Name
+			}
+
+			// Check CTEs first
+			if schema == "" {
+				if let cte = findCte(ctes, name) {
+					if cte.InResolution {
+						fail types.ErrorFault(types.NewError("42P19", "circular reference in CTE \"" + name + "\""))
+					}
+					mut scopeCols = []ScopeCol{}
+					mut colDescs = []ColDesc{}
+					for i, col in cte.Cols {
+						mut cName = col.Name
+						if let a = tblRef.Alias {
+							if i < len(a.Columns) {
+								cName = a.Columns[i].Name
+							}
+						}
+						scopeCols = append(scopeCols, ScopeCol{
+							Name: cName,
+							Oid: col.Oid,
+							Typmod: col.Typmod,
+							TableOid: 0,
+							Attno: i16(i + 1),
+							Slot: i64(i),
+							RangeIndex: rangeIndex,
+							Hidden: false,
+						})
+						colDescs = append(colDescs, ColDesc{Name: cName, Oid: col.Oid, Typmod: col.Typmod, TableOid: 0, Attno: i16(i + 1)})
+					}
+					let st = ScopeTable{Name: name, Alias: aliasName, TableOid: 0, RangeIndex: rangeIndex, Cols: scopeCols}
+					return FromClauseItem.Table(FromTable{
+						TableOid: 0,
+						Schema: "",
+						Name: name,
+						Alias: aliasName,
+						RangeIndex: rangeIndex,
+						Cols: colDescs,
+					}), st
+				}
+			}
+
+			// Catalog table lookup
+			if let tbl = c.LookupTable(tx, schema, name) {
+				mut scopeCols = []ScopeCol{}
+				mut colDescs = []ColDesc{}
+				for i, col in tbl.Cols {
+					mut cName = col.Name
+					if let a = tblRef.Alias {
+						if i < len(a.Columns) {
+							cName = a.Columns[i].Name
+						}
+					}
+					scopeCols = append(scopeCols, ScopeCol{
+						Name: cName,
+						Oid: col.Type,
+						Typmod: col.Typmod,
+						TableOid: tbl.Oid,
+						Attno: col.Number,
+						Slot: i64(i),
+						RangeIndex: rangeIndex,
+						Hidden: false,
+					})
+					colDescs = append(colDescs, ColDesc{Name: cName, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number})
+				}
+				let st = ScopeTable{Name: name, Alias: aliasName, TableOid: tbl.Oid, RangeIndex: rangeIndex, Cols: scopeCols}
+				return FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: aliasName, RangeIndex: rangeIndex, Cols: colDescs}), st
+			}
+			fail types.ErrorFault(types.NewError("42P01", "relation \"" + name + "\" does not exist"))
+		}
+		Subquery(subRef) => {
+			mut aliasName = "subquery"
+			if let a = subRef.Alias {
+				aliasName = a.Name.Name
+			}
+			let subQuery = try analyzeSelect(c, tx, parentScopes, ctes, mut params, subRef.Query)
+			mut scopeCols = []ScopeCol{}
+			mut colDescs = []ColDesc{}
+			for i, target in subQuery.Targets {
+				mut cName = target.Name
+				if let a = subRef.Alias {
+					if i < len(a.Columns) {
+						cName = a.Columns[i].Name
+					}
+				}
+				scopeCols = append(scopeCols, ScopeCol{
+					Name: cName,
+					Oid: target.Col.Oid,
+					Typmod: target.Col.Typmod,
+					TableOid: 0,
+					Attno: i16(i + 1),
+					Slot: i64(i),
+					RangeIndex: rangeIndex,
+					Hidden: false,
+				})
+				colDescs = append(colDescs, ColDesc{Name: cName, Oid: target.Col.Oid, Typmod: target.Col.Typmod, TableOid: 0, Attno: i16(i + 1)})
+			}
+			let st = ScopeTable{Name: aliasName, Alias: aliasName, TableOid: 0, RangeIndex: rangeIndex, Cols: scopeCols}
+			return FromClauseItem.Subquery(FromSubquery{Query: subQuery, Alias: aliasName, RangeIndex: rangeIndex, Cols: colDescs}), st
+		}
+		Join(jExpr) => {
+			let (leftItem, leftTable) = try analyzeFromItem(c, tx, parentScopes, ctes, mut params, jExpr.Left, rangeIndex)
+			let (rightItem, rightTable) = try analyzeFromItem(c, tx, parentScopes, ctes, mut params, jExpr.Right, rangeIndex + 1)
+			let joinType = match jExpr.JoinType {
+				"LEFT" => JoinType.Left
+				"RIGHT" => JoinType.Right
+				"FULL" => JoinType.Full
+				_ => JoinType.Inner
+			}
+
+			mut mergedCols = []ScopeCol{}
+			mut mergedDescs = []ColDesc{}
+			for col in leftTable.Cols {
+				mergedCols = append(mergedCols, col)
+				mergedDescs = append(mergedDescs, ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: col.Attno})
+			}
+			for col in rightTable.Cols {
+				mergedCols = append(mergedCols, col)
+				mergedDescs = append(mergedDescs, ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: col.Attno})
+			}
+
+			mut quals = []Expr{}
+			if let cond = jExpr.Condition {
+				match cond {
+					On(onCond) => {
+						mut joinScopes = []Scope{}
+						for ps in parentScopes {
+							joinScopes = append(joinScopes, ps)
+						}
+						joinScopes = append(joinScopes, Scope{Tables: []ScopeTable{leftTable, rightTable}})
+						let onFlags = ExprFlags{InWhere: true, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+						mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+						let onExpr = try analyzeExpr(c, tx, joinScopes, ctes, onFlags, []Expr{}, mut stats, mut params, onCond.Value, u32(types.BoolOid))
+						quals = append(quals, onExpr)
+					}
+					Using(uCond) => {
+						for colIdent in uCond.Columns {
+							let cName = colIdent.Name
+							mut lCol ?ScopeCol = nil
+							for col in leftTable.Cols {
+								if col.Name == cName {
+									lCol = col
+									break
+								}
+							}
+							mut rCol ?ScopeCol = nil
+							for col in rightTable.Cols {
+								if col.Name == cName {
+									rCol = col
+									break
+								}
+							}
+							if let lc = lCol {
+								if let rc = rCol {
+									let lExpr = Expr.ColRef(ColRefExpr{Slot: lc.Slot, RangeIndex: lc.RangeIndex, AttNo: lc.Attno, Type: lc.Oid})
+									let rExpr = Expr.ColRef(ColRefExpr{Slot: rc.Slot, RangeIndex: rc.RangeIndex, AttNo: rc.Attno, Type: rc.Oid})
+									if let eqFunc = types.LookupFunc("=", []types.Oid{lc.Oid, rc.Oid}) {
+										quals = append(quals, Expr.OpCall(OpCallExpr{Op: "=", Func: eqFunc, Args: []Expr{lExpr, rExpr}, Type: u32(types.BoolOid)}))
+									}
+								} else {
+									fail types.ErrorFault(types.NewError("42703", "column \"" + cName + "\" does not exist"))
+								}
+							} else {
+								fail types.ErrorFault(types.NewError("42703", "column \"" + cName + "\" does not exist"))
+							}
+						}
+					}
+				}
+			}
+
+			let joinTable = ScopeTable{Name: "", Alias: leftTable.Alias + "_" + rightTable.Alias, TableOid: 0, RangeIndex: rangeIndex, Cols: mergedCols}
+			return FromClauseItem.Join(FromJoin{Left: leftItem, Right: rightItem, JoinType: joinType, Quals: quals, Cols: mergedDescs}), joinTable
+		}
+		_ => {
+			let emptyTable = ScopeTable{Name: "", Alias: "anon", TableOid: 0, RangeIndex: rangeIndex, Cols: []ScopeCol{}}
+			return FromClauseItem.Values(FromValues{Rows: [][]Expr{}, Alias: "anon", RangeIndex: rangeIndex, Cols: []ColDesc{}}), emptyTable
+		}
+	}
+	let fallbackTable = ScopeTable{Name: "", Alias: "anon", TableOid: 0, RangeIndex: rangeIndex, Cols: []ScopeCol{}}
+	return FromClauseItem.Values(FromValues{Rows: [][]Expr{}, Alias: "anon", RangeIndex: rangeIndex, Cols: []ColDesc{}}), fallbackTable
+}
+
+fn analyzeExpr(c catalog.Catalog, tx txn.Txn, scopes []Scope, ctes []CteInfo, flags ExprFlags, groupByExprs []Expr, stats mut QueryStats, params mut []u32, expr parse.Expr, targetType u32) !Expr {
+	match expr {
+		Literal(lit) => {
+			return try analyzeLiteral(lit, targetType)
+		}
+		ColumnRef(colRef) => {
+			return try analyzeColumnRef(scopes, flags, groupByExprs, stats.HasAggs, colRef)
+		}
+		Param(param) => {
+			let n = param.N
+			if n <= 0 {
+				fail types.ErrorFault(types.NewError("42P02", "there is no parameter $" + mint.Itoa(n)))
+			}
+			for len(params) < i64(n) {
+				params = append(params, u32(0))
+			}
+			mut inferredType = params[n - 1]
+			if inferredType == 0 {
+				inferredType = u32(types.TextOid)
+				if targetType != 0 {
+					inferredType = targetType
+				}
+				params[n - 1] = inferredType
+			}
+			return Expr.Param(ParamExpr{N: n, Type: inferredType})
+		}
+		Binary(bin) => {
+			return try analyzeBinary(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, bin, targetType)
+		}
+		Boolean(b) => {
+			return try analyzeBoolean(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, b)
+		}
+		Is(isExpr) => {
+			let arg = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, isExpr.Operand, 0)
+			mut testKind = NullTestType.IsNull
+			if isExpr.Negated {
+				testKind = NullTestType.IsNotNull
+			}
+			return Expr.NullTest(NullTestExpr{Arg: arg, Test: testKind, Type: u32(types.BoolOid)})
+		}
+		Case(caseExpr) => {
+			return try analyzeCase(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, caseExpr, targetType)
+		}
+		Call(call) => {
+			return try analyzeCall(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, call, targetType)
+		}
+		Cast(castExpr) => {
+			let typeNameStr = castExpr.TypeName.Name.Parts[0].Name
+			let targetOid = resolveTypeName(typeNameStr)
+			let arg = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, castExpr.Value, targetOid)
+			if !types.CanCast(types.Oid(arg.Type()), types.Oid(targetOid), false) {
+				fail types.ErrorFault(types.NewError("42846", "cannot cast type " + typeName(arg.Type()) + " to " + typeName(targetOid)))
+			}
+			return Expr.Cast(CastExpr{Arg: arg, Type: targetOid, Typmod: -1})
+		}
+		Subquery(sub) => {
+			let subQuery = try analyzeSelect(c, tx, scopes, ctes, mut params, sub.Query)
+			return Expr.SubLink(SubLinkExpr{LinkType: SubLinkType.Scalar, SubPlan: Plan.Utility(UtilityNode{Stmt: parse.Stmt.Select(sub.Query), Cols: []ColDesc{}}), TestExpr: nil, OuterRefs: []ColRefExpr{}, Type: subQuery.Targets[0].Col.Oid})
+		}
+		Exists(exists) => {
+			let subQuery = try analyzeSelect(c, tx, scopes, ctes, mut params, exists.Query)
+			_ = subQuery
+			return Expr.SubLink(SubLinkExpr{LinkType: SubLinkType.Exists, SubPlan: Plan.Utility(UtilityNode{Stmt: parse.Stmt.Select(exists.Query), Cols: []ColDesc{}}), TestExpr: nil, OuterRefs: []ColRefExpr{}, Type: u32(types.BoolOid)})
+		}
+		_ => {
+			return Expr.Const(ConstExpr{Value: types.Null(), Type: u32(types.UnknownLiteralOid)})
+		}
+	}
+}
+
+fn analyzeLiteral(lit parse.LiteralExpr, targetType u32) !Expr {
+	match lit.Kind {
+		"int" => {
+			let val = mint.Atoi(lit.Value) catch _ {
+				fail types.ErrorFault(types.NewError("22003", "integer out of range"))
+			}
+			return Expr.Const(ConstExpr{Value: types.FromI64(types.Int4Oid, val), Type: u32(types.Int4Oid)})
+		}
+		"float" => {
+			return Expr.Const(ConstExpr{Value: types.FromStr(types.Float8Oid, lit.Value), Type: u32(types.Float8Oid)})
+		}
+		"bool" => {
+			let bVal = lit.Value == "true" || lit.Value == "t"
+			return Expr.Const(ConstExpr{Value: types.FromBool(bVal), Type: u32(types.BoolOid)})
+		}
+		"null" => {
+			mut typ = u32(types.UnknownLiteralOid)
+			if targetType != 0 {
+				typ = targetType
+			}
+			return Expr.Const(ConstExpr{Value: types.Null(), Type: typ})
+		}
+		_ => {
+			if targetType != 0 && targetType != u32(types.UnknownLiteralOid) {
+				let parsed = types.Parse(types.Oid(targetType), lit.Value) catch _ {
+					fail types.ErrorFault(types.NewError("22P02", "invalid input syntax for type " + typeName(targetType) + ": \"" + lit.Value + "\""))
+				}
+				return Expr.Const(ConstExpr{Value: parsed, Type: targetType})
+			}
+			return Expr.Const(ConstExpr{Value: types.FromStr(types.TextOid, lit.Value), Type: u32(types.UnknownLiteralOid)})
+		}
+	}
+}
+
+fn analyzeColumnRef(scopes []Scope, flags ExprFlags, groupByExprs []Expr, hasAggs bool, colRef parse.ColumnRefExpr) !Expr {
+	if len(colRef.Parts) == 0 {
+		fail types.ErrorFault(types.NewError("42601", "empty column reference"))
+	}
+
+	if len(colRef.Parts) == 1 {
+		let colName = colRef.Parts[0].Name
+		mut matchedCol ?ScopeCol = nil
+		mut matches = 0
+
+		mut sIdx = len(scopes) - 1
+		for sIdx >= 0 {
+			let scope = scopes[sIdx]
+			for tbl in scope.Tables {
+				for col in tbl.Cols {
+					if col.Name == colName {
+						matches += 1
+						matchedCol = col
+					}
+				}
+			}
+			if matches > 1 {
+				fail types.ErrorFault(types.NewError("42702", "column reference \"" + colName + "\" is ambiguous"))
+			}
+			if matches == 1 {
+				break
+			}
+			sIdx -= 1
+		}
+
+		if let col = matchedCol {
+			if (len(groupByExprs) > 0 || hasAggs) && !flags.InAggregate && !flags.InGroupBy {
+				mut grouped = false
+				for g in groupByExprs {
+					match g {
+						ColRef(c) => {
+							if c.Slot == col.Slot && c.RangeIndex == col.RangeIndex {
+								grouped = true
+								break
+							}
+						}
+						_ => {}
+					}
+				}
+				if !grouped {
+					fail types.ErrorFault(types.NewError("42803", "column \"" + colName + "\" must appear in the GROUP BY clause or be used in an aggregate function"))
+				}
+			}
+			return Expr.ColRef(ColRefExpr{Slot: col.Slot, RangeIndex: col.RangeIndex, AttNo: col.Attno, Type: col.Oid})
+		}
+		fail types.ErrorFault(types.NewError("42703", "column \"" + colName + "\" does not exist"))
+	}
+
+	if len(colRef.Parts) == 2 {
+		let tblName = colRef.Parts[0].Name
+		let colName = colRef.Parts[1].Name
+
+		mut matchedTable ?ScopeTable = nil
+		mut sIdx = len(scopes) - 1
+		for sIdx >= 0 {
+			let scope = scopes[sIdx]
+			for tbl in scope.Tables {
+				if tbl.Alias == tblName || tbl.Name == tblName {
+					matchedTable = tbl
+					break
+				}
+			}
+			if matchedTable != nil { break }
+			sIdx -= 1
+		}
+
+		if let tbl = matchedTable {
+			mut matchedCol ?ScopeCol = nil
+			for col in tbl.Cols {
+				if col.Name == colName {
+					matchedCol = col
+					break
+				}
+			}
+			if let col = matchedCol {
+				if (len(groupByExprs) > 0 || hasAggs) && !flags.InAggregate && !flags.InGroupBy {
+					mut grouped = false
+					for g in groupByExprs {
+						match g {
+							ColRef(c) => {
+								if c.Slot == col.Slot && c.RangeIndex == col.RangeIndex {
+									grouped = true
+									break
+								}
+							}
+							_ => {}
+						}
+					}
+					if !grouped {
+						fail types.ErrorFault(types.NewError("42803", "column \"" + tblName + "." + colName + "\" must appear in the GROUP BY clause or be used in an aggregate function"))
+					}
+				}
+				return Expr.ColRef(ColRefExpr{Slot: col.Slot, RangeIndex: col.RangeIndex, AttNo: col.Attno, Type: col.Oid})
+			}
+			fail types.ErrorFault(types.NewError("42703", "column " + tblName + "." + colName + " does not exist"))
+		}
+		fail types.ErrorFault(types.NewError("42P01", "missing FROM-clause entry for table \"" + tblName + "\""))
+	}
+
+	fail types.ErrorFault(types.NewError("42601", "unsupported column reference form"))
+}
+
+fn analyzeBinary(c catalog.Catalog, tx txn.Txn, scopes []Scope, ctes []CteInfo, flags ExprFlags, groupByExprs []Expr, stats mut QueryStats, params mut []u32, bin parse.BinaryExpr, targetType u32) !Expr {
+	mut left = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, bin.Left, 0)
+	mut rightTarget = u32(0)
+	if left.Type() != 0 && left.Type() != u32(types.UnknownLiteralOid) {
+		rightTarget = left.Type()
+	}
+	mut right = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, bin.Right, rightTarget)
+
+	if left.Type() == u32(types.UnknownLiteralOid) && right.Type() != u32(types.UnknownLiteralOid) {
+		left = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, bin.Left, right.Type())
+	} else if right.Type() == u32(types.UnknownLiteralOid) && left.Type() != u32(types.UnknownLiteralOid) {
+		right = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, bin.Right, left.Type())
+	}
+
+	let op = bin.Op
+	if let f = types.LookupFunc(op, []types.Oid{types.Oid(left.Type()), types.Oid(right.Type())}) {
+		if left.Type() != f.Args[0] {
+			left = Expr.Cast(CastExpr{Arg: left, Type: f.Args[0], Typmod: -1})
+		}
+		if right.Type() != f.Args[1] {
+			right = Expr.Cast(CastExpr{Arg: right, Type: f.Args[1], Typmod: -1})
+		}
+		return Expr.OpCall(OpCallExpr{Op: op, Func: f, Args: []Expr{left, right}, Type: f.Ret})
+	}
+	fail types.ErrorFault(types.NewError("42883", "operator does not exist: " + typeName(left.Type()) + " " + op + " " + typeName(right.Type())))
+}
+
+fn analyzeBoolean(c catalog.Catalog, tx txn.Txn, scopes []Scope, ctes []CteInfo, flags ExprFlags, groupByExprs []Expr, stats mut QueryStats, params mut []u32, b parse.BooleanExpr) !Expr {
+	let op = match b.Op {
+		"AND" => BoolOp.And
+		"OR" => BoolOp.Or
+		"NOT" => BoolOp.Not
+		_ => BoolOp.And
+	}
+	mut args = []Expr{}
+	for arg in b.Args {
+		let analyzed = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, arg, u32(types.BoolOid))
+		args = append(args, analyzed)
+	}
+	return Expr.BoolExpr(BoolExpr{Op: op, Args: args, Type: u32(types.BoolOid)})
+}
+
+fn analyzeCase(c catalog.Catalog, tx txn.Txn, scopes []Scope, ctes []CteInfo, flags ExprFlags, groupByExprs []Expr, stats mut QueryStats, params mut []u32, caseExpr parse.CaseExpr, targetType u32) !Expr {
+	mut whens = []CaseWhen{}
+	mut resultType = targetType
+
+	for w in caseExpr.Whens {
+		let cond = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, w.Condition, u32(types.BoolOid))
+		let res = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, w.Result, resultType)
+		if resultType == 0 || resultType == u32(types.UnknownLiteralOid) {
+			resultType = res.Type()
+		} else {
+			resultType = try unifyTypes(resultType, res.Type(), "CASE")
+		}
+		whens = append(whens, CaseWhen{When: cond, Then: res})
+	}
+
+	mut elseExpr ?Expr = nil
+	if let e = caseExpr.ElseExpr {
+		let res = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, e, resultType)
+		resultType = try unifyTypes(resultType, res.Type(), "CASE")
+		elseExpr = res
+	}
+
+	return Expr.Case(CaseExpr{Whens: whens, Else: elseExpr, Type: resultType})
+}
+
+fn analyzeCall(c catalog.Catalog, tx txn.Txn, scopes []Scope, ctes []CteInfo, flags ExprFlags, groupByExprs []Expr, stats mut QueryStats, params mut []u32, call parse.FunctionCallExpr, targetType u32) !Expr {
+	let funcName = call.Name.Parts[len(call.Name.Parts) - 1].Name
+
+	if call.Over != nil || isKnownWindowFunc(funcName) {
+		if flags.InWhere {
+			fail types.ErrorFault(types.NewError("42P20", "window functions are not allowed in WHERE"))
+		}
+		if flags.InHaving {
+			fail types.ErrorFault(types.NewError("42P20", "window functions are not allowed in HAVING"))
+		}
+		if flags.InAggregate {
+			fail types.ErrorFault(types.NewError("42803", "aggregate function calls cannot contain window function calls"))
+		}
+		if flags.InWindow {
+			fail types.ErrorFault(types.NewError("42P20", "window functions are not allowed in window definitions"))
+		}
+		stats.HasWindowFuncs = true
+		mut args = []Expr{}
+		let childFlags = ExprFlags{InWhere: flags.InWhere, InHaving: flags.InHaving, InGroupBy: flags.InGroupBy, InAggregate: flags.InAggregate, InWindow: true}
+		for a in call.Args {
+			let analyzed = try analyzeExpr(c, tx, scopes, ctes, childFlags, groupByExprs, mut stats, mut params, a.Value, 0)
+			args = append(args, analyzed)
+		}
+		return Expr.WindowFuncRef(WindowFuncRefExpr{Slot: 0, Name: funcName, Args: args, WindowIndex: 0, Type: u32(types.Int8Oid)})
+	}
+
+	if isKnownAggName(funcName) {
+		if flags.InWhere {
+			fail types.ErrorFault(types.NewError("42803", "aggregate functions are not allowed in WHERE"))
+		}
+		if flags.InGroupBy {
+			fail types.ErrorFault(types.NewError("42803", "aggregate functions are not allowed in GROUP BY"))
+		}
+		if flags.InAggregate {
+			fail types.ErrorFault(types.NewError("42803", "aggregate function calls cannot be nested"))
+		}
+		stats.HasAggs = true
+
+		// Check for count(*)
+		mut isStar = false
+		if funcName == "count" && len(call.Args) == 1 {
+			match call.Args[0].Value {
+				ColumnRef(cr) => {
+					if cr.Star {
+						isStar = true
+					}
+				}
+				_ => {}
+			}
+		}
+
+		if isStar {
+			let agg = types.LookupAgg("count", []types.Oid{})
+			if let a = agg {
+				return Expr.AggRef(AggRefExpr{Slot: 0, Agg: a, Args: []Expr{}, Distinct: call.Distinct, Type: a.Ret})
+			}
+		}
+
+		mut argTypes = []types.Oid{}
+		mut args = []Expr{}
+		let childFlags = ExprFlags{InWhere: flags.InWhere, InHaving: flags.InHaving, InGroupBy: flags.InGroupBy, InAggregate: true, InWindow: flags.InWindow}
+		for a in call.Args {
+			let analyzed = try analyzeExpr(c, tx, scopes, ctes, childFlags, groupByExprs, mut stats, mut params, a.Value, 0)
+			args = append(args, analyzed)
+			argTypes = append(argTypes, types.Oid(analyzed.Type()))
+		}
+
+		if let agg = types.LookupAgg(funcName, argTypes) {
+			return Expr.AggRef(AggRefExpr{Slot: 0, Agg: agg, Args: args, Distinct: call.Distinct, Type: agg.Ret})
+		}
+		mut typesStr = ""
+		for i, argType in argTypes {
+			if i > 0 { typesStr += ", " }
+			typesStr += typeName(u32(argType))
+		}
+		fail types.ErrorFault(types.NewError("42883", "function " + funcName + "(" + typesStr + ") does not exist"))
+	}
+
+	mut argTypes = []types.Oid{}
+	mut args = []Expr{}
+	for a in call.Args {
+		let analyzed = try analyzeExpr(c, tx, scopes, ctes, flags, groupByExprs, mut stats, mut params, a.Value, 0)
+		args = append(args, analyzed)
+		argTypes = append(argTypes, types.Oid(analyzed.Type()))
+	}
+
+	if let f = types.LookupFunc(funcName, argTypes) {
+		return Expr.FuncCall(FuncCallExpr{Func: f, Args: args, Type: f.Ret})
+	}
+	mut typesStr = ""
+	for i, argType in argTypes {
+		if i > 0 { typesStr += ", " }
+		typesStr += typeName(u32(argType))
+	}
+	fail types.ErrorFault(types.NewError("42883", "function " + funcName + "(" + typesStr + ") does not exist"))
+}
+
+fn unifyTypes(t1 u32, t2 u32, contextName str) !u32 {
+	if t1 == t2 { return t1 }
+	if t1 == u32(types.UnknownLiteralOid) { return t2 }
+	if t2 == u32(types.UnknownLiteralOid) { return t1 }
+	if isNumericType(t1) && isNumericType(t2) {
+		if t1 == u32(types.Float8Oid) || t2 == u32(types.Float8Oid) { return u32(types.Float8Oid) }
+		if t1 == u32(types.Float4Oid) || t2 == u32(types.Float4Oid) { return u32(types.Float4Oid) }
+		if t1 == u32(types.NumericOid) || t2 == u32(types.NumericOid) { return u32(types.NumericOid) }
+		if t1 == u32(types.Int8Oid) || t2 == u32(types.Int8Oid) { return u32(types.Int8Oid) }
+		if t1 == u32(types.Int4Oid) || t2 == u32(types.Int4Oid) { return u32(types.Int4Oid) }
+		return u32(types.Int2Oid)
+	}
+	if isStringType(t1) && isStringType(t2) {
+		return u32(types.TextOid)
+	}
+	fail types.ErrorFault(types.NewError("42804", contextName + " types " + typeName(t1) + " and " + typeName(t2) + " cannot be matched"))
+}
+
+fn resolveTypeName(name str) u32 {
+	match name {
+		"int", "integer", "int4" => { return u32(types.Int4Oid) }
+		"bigint", "int8" => { return u32(types.Int8Oid) }
+		"smallint", "int2" => { return u32(types.Int2Oid) }
+		"text" => { return u32(types.TextOid) }
+		"varchar" => { return u32(types.VarcharOid) }
+		"bool", "boolean" => { return u32(types.BoolOid) }
+		"float", "float8", "double precision" => { return u32(types.Float8Oid) }
+		"float4", "real" => { return u32(types.Float4Oid) }
+		"date" => { return u32(types.DateOid) }
+		"timestamp" => { return u32(types.TimestampOid) }
+		"timestamptz" => { return u32(types.TimestamptzOid) }
+		"bytea" => { return u32(types.ByteaOid) }
+		"numeric" => { return u32(types.NumericOid) }
+		"uuid" => { return u32(types.UuidOid) }
+		_ => { return u32(types.TextOid) }
+	}
+	return u32(types.TextOid)
+}
+
+fn isKnownWindowFunc(name str) bool {
+	match name {
+		"row_number", "rank", "dense_rank", "lead", "lag", "first_value", "last_value", "nth_value" => { return true }
+		_ => { return false }
+	}
+	return false
+}
+
+fn deriveColumnName(expr parse.Expr) str {
+	match expr {
+		ColumnRef(c) => {
+			if len(c.Parts) > 0 {
+				return c.Parts[len(c.Parts) - 1].Name
+			}
+			return "?column?"
+		}
+		Call(c) => {
+			if len(c.Name.Parts) > 0 {
+				return c.Name.Parts[len(c.Name.Parts) - 1].Name
+			}
+			return "?column?"
+		}
+		_ => { return "?column?" }
+	}
+	return "?column?"
+}
+
+fn analyzeInsert(c catalog.Catalog, tx txn.Txn, params mut []u32, ins parse.InsertStmt) !AnalyzedQuery {
+	mut tblName = ins.Table.Parts[0].Name
+	if len(ins.Table.Parts) == 2 {
+		tblName = ins.Table.Parts[1].Name
+	}
+	mut schema = ""
+	if len(ins.Table.Parts) == 2 {
+		schema = ins.Table.Parts[0].Name
+	}
+	if let tbl = c.LookupTable(tx, schema, tblName) {
+		mut targets = []TargetCol{}
+		mut cols = []ColDesc{}
+		for i, col in tbl.Cols {
+			let colDesc = ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number}
+			cols = append(cols, colDesc)
+			targets = append(targets, TargetCol{
+				Expr: Expr.ColRef(ColRefExpr{Slot: i64(i), RangeIndex: 1, AttNo: col.Number, Type: col.Type}),
+				Name: col.Name,
+				Col: colDesc,
+			})
+		}
+
+		return AnalyzedQuery{
+			Command: "INSERT",
+			Targets: targets,
+			From: []FromClauseItem{FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: tblName, RangeIndex: 1, Cols: cols})},
+			Where: nil,
+			GroupBy: []Expr{},
+			Having: nil,
+			Windows: []AnalyzedWindow{},
+			Distinct: false,
+			OrderBy: []AnalyzedSortKey{},
+			Limit: nil,
+			Offset: nil,
+			Ctes: []AnalyzedCte{},
+			HasAggs: false,
+			HasWindowFuncs: false,
+		}
+	}
+	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tblName + "\" does not exist"))
+}
+
+fn analyzeUpdate(c catalog.Catalog, tx txn.Txn, params mut []u32, upd parse.UpdateStmt) !AnalyzedQuery {
+	mut tblName = upd.Table.Parts[0].Name
+	if len(upd.Table.Parts) == 2 {
+		tblName = upd.Table.Parts[1].Name
+	}
+	mut schema = ""
+	if len(upd.Table.Parts) == 2 {
+		schema = upd.Table.Parts[0].Name
+	}
+	if let tbl = c.LookupTable(tx, schema, tblName) {
+		mut scopeCols = []ScopeCol{}
+		mut cols = []ColDesc{}
+		for i, col in tbl.Cols {
+			scopeCols = append(scopeCols, ScopeCol{
+				Name: col.Name,
+				Oid: col.Type,
+				Typmod: col.Typmod,
+				TableOid: tbl.Oid,
+				Attno: col.Number,
+				Slot: i64(i),
+				RangeIndex: 1,
+				Hidden: false,
+			})
+			cols = append(cols, ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number})
+		}
+		let scopes = []Scope{Scope{Tables: []ScopeTable{ScopeTable{Name: tblName, Alias: tblName, TableOid: tbl.Oid, RangeIndex: 1, Cols: scopeCols}}}}
+
+		mut whereExpr ?Expr = nil
+		mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+		if let w = upd.Where {
+			let flags = ExprFlags{InWhere: true, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+			whereExpr = try analyzeExpr(c, tx, scopes, []CteInfo{}, flags, []Expr{}, mut stats, mut params, w, u32(types.BoolOid))
+		}
+
+		return AnalyzedQuery{
+			Command: "UPDATE",
+			Targets: []TargetCol{},
+			From: []FromClauseItem{FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: tblName, RangeIndex: 1, Cols: cols})},
+			Where: whereExpr,
+			GroupBy: []Expr{},
+			Having: nil,
+			Windows: []AnalyzedWindow{},
+			Distinct: false,
+			OrderBy: []AnalyzedSortKey{},
+			Limit: nil,
+			Offset: nil,
+			Ctes: []AnalyzedCte{},
+			HasAggs: false,
+			HasWindowFuncs: false,
+		}
+	}
+	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tblName + "\" does not exist"))
+}
+
+fn analyzeDelete(c catalog.Catalog, tx txn.Txn, params mut []u32, del parse.DeleteStmt) !AnalyzedQuery {
+	mut tblName = del.Table.Parts[0].Name
+	if len(del.Table.Parts) == 2 {
+		tblName = del.Table.Parts[1].Name
+	}
+	mut schema = ""
+	if len(del.Table.Parts) == 2 {
+		schema = del.Table.Parts[0].Name
+	}
+	if let tbl = c.LookupTable(tx, schema, tblName) {
+		mut scopeCols = []ScopeCol{}
+		mut cols = []ColDesc{}
+		for i, col in tbl.Cols {
+			scopeCols = append(scopeCols, ScopeCol{
+				Name: col.Name,
+				Oid: col.Type,
+				Typmod: col.Typmod,
+				TableOid: tbl.Oid,
+				Attno: col.Number,
+				Slot: i64(i),
+				RangeIndex: 1,
+				Hidden: false,
+			})
+			cols = append(cols, ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number})
+		}
+		let scopes = []Scope{Scope{Tables: []ScopeTable{ScopeTable{Name: tblName, Alias: tblName, TableOid: tbl.Oid, RangeIndex: 1, Cols: scopeCols}}}}
+
+		mut whereExpr ?Expr = nil
+		mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
+		if let w = del.Where {
+			let flags = ExprFlags{InWhere: true, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
+			whereExpr = try analyzeExpr(c, tx, scopes, []CteInfo{}, flags, []Expr{}, mut stats, mut params, w, u32(types.BoolOid))
+		}
+
+		return AnalyzedQuery{
+			Command: "DELETE",
+			Targets: []TargetCol{},
+			From: []FromClauseItem{FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: tblName, RangeIndex: 1, Cols: cols})},
+			Where: whereExpr,
+			GroupBy: []Expr{},
+			Having: nil,
+			Windows: []AnalyzedWindow{},
+			Distinct: false,
+			OrderBy: []AnalyzedSortKey{},
+			Limit: nil,
+			Offset: nil,
+			Ctes: []AnalyzedCte{},
+			HasAggs: false,
+			HasWindowFuncs: false,
+		}
+	}
+	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tblName + "\" does not exist"))
+}
