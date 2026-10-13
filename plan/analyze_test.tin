@@ -267,6 +267,80 @@ fn TestAnalyzeMoreErrors(t mut crucible.T) {
 	cleanupTestEnv(env)
 }
 
+fn TestAnalyzeJoinScopes(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "join_scopes")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	// Qualified references resolve to the right relation and to a global row slot.
+	let stmtA = parseSql("SELECT users.id, orders.user_id FROM users JOIN orders ON users.id = orders.user_id") catch err {
+		t.Error("parse join refs: " + types.ErrorMessage(err))
+		return
+	}
+	mut paramsA = []u32{}
+	let qA = AnalyzeStatement(env.Cat, env.Txn, stmtA, mut paramsA) catch err {
+		t.Error("analyze join refs: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "join targets", len(qA.Targets), 2)
+	match qA.Targets[0].Expr {
+		ColRef(c) => {
+			crucible.Equal(mut t, "users.id range", c.RangeIndex, 1)
+			crucible.Equal(mut t, "users.id slot", c.Slot, 0)
+		}
+		_ => { t.Error("expected ColRef for users.id") }
+	}
+	match qA.Targets[1].Expr {
+		ColRef(c) => {
+			crucible.Equal(mut t, "orders.user_id range", c.RangeIndex, 2)
+			crucible.Equal(mut t, "orders.user_id global slot", c.Slot, 4)
+		}
+		_ => { t.Error("expected ColRef for orders.user_id") }
+	}
+
+	// USING merges the join column: unqualified id is not ambiguous and star lists it once.
+	let stmtB = parseSql("SELECT * FROM users JOIN orders USING (id)") catch err {
+		t.Error("parse using: " + types.ErrorMessage(err))
+		return
+	}
+	mut paramsB = []u32{}
+	let qB = AnalyzeStatement(env.Cat, env.Txn, stmtB, mut paramsB) catch err {
+		t.Error("analyze using: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "using star columns", len(qB.Targets), 5)
+	crucible.Equal(mut t, "using merged id once", qB.Targets[0].Name, "id")
+
+	// Qualified access to the hidden side still works.
+	let stmtC = parseSql("SELECT orders.id FROM users JOIN orders USING (id)") catch err {
+		t.Error("parse using qualified: " + types.ErrorMessage(err))
+		return
+	}
+	mut paramsC = []u32{}
+	let qC = AnalyzeStatement(env.Cat, env.Txn, stmtC, mut paramsC) catch err {
+		t.Error("analyze using qualified: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "qualified hidden col count", len(qC.Targets), 1)
+
+	// NATURAL JOIN on the shared id column behaves like USING (id).
+	let stmtD = parseSql("SELECT * FROM users NATURAL JOIN orders") catch err {
+		t.Error("parse natural: " + types.ErrorMessage(err))
+		return
+	}
+	mut paramsD = []u32{}
+	let qD = AnalyzeStatement(env.Cat, env.Txn, stmtD, mut paramsD) catch err {
+		t.Error("analyze natural: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "natural star columns", len(qD.Targets), 5)
+
+	// USING on a missing column names the side it is missing from.
+	assertSqlError(mut t, env, "SELECT * FROM users JOIN orders USING (age)", "42703", "does not exist in right table")
+
+	cleanupTestEnv(env)
+}
+
 fn TestAnalyzeDmlAndParams(t mut crucible.T) {
 	let envOpt = setupTestEnv(mut t, "dml_params")
 	if envOpt == nil { return }

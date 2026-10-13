@@ -374,17 +374,21 @@ fn analyzeSelectCore(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes [
 	mut currentScope = Scope{Tables: []ScopeTable{}}
 	mut fromItems = []FromClauseItem{}
 	mut rangeIndex = i64(1)
+	mut slotBase = i64(0)
 
 	for fromItem in core.From {
-		let (item, scopeTable) = try analyzeFromItem(c, tx, parentScopes, ctes, mut params, fromItem, rangeIndex)
-		for existingTbl in currentScope.Tables {
-			if existingTbl.Alias == scopeTable.Alias {
-				fail types.ErrorFault(types.NewError("42712", "table name \"" + scopeTable.Alias + "\" specified more than once"))
+		let (item, scopeTables) = try analyzeFromItem(c, tx, parentScopes, ctes, mut params, fromItem, rangeIndex, slotBase)
+		for scopeTable in scopeTables {
+			for existingTbl in currentScope.Tables {
+				if existingTbl.Alias == scopeTable.Alias {
+					fail types.ErrorFault(types.NewError("42712", "table name \"" + scopeTable.Alias + "\" specified more than once"))
+				}
 			}
+			currentScope.Tables = append(currentScope.Tables, scopeTable)
+			slotBase += i64(len(scopeTable.Cols))
+			rangeIndex += 1
 		}
-		currentScope.Tables = append(currentScope.Tables, scopeTable)
 		fromItems = append(fromItems, item)
-		rangeIndex += 1
 	}
 
 	mut allScopes = []Scope{}
@@ -643,7 +647,78 @@ fn analyzeSetOperation(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, pare
 	}
 }
 
-fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []CteInfo, params mut []u32, item parse.FromItem, rangeIndex i64) !(FromClauseItem, ScopeTable) {
+// fromItemCols returns the output column descriptors of a typed FROM item.
+fn fromItemCols(item FromClauseItem) []ColDesc {
+	match item {
+		Table(t) => { return t.Cols }
+		Subquery(s) => { return s.Cols }
+		Values(v) => { return v.Cols }
+		Function(f) => { return f.Cols }
+		Join(j) => { return j.Cols }
+	}
+	return []ColDesc{}
+}
+
+// scopeColCount counts the visible output columns across a list of scope tables.
+fn scopeColCount(tables []ScopeTable) i64 {
+	mut n = i64(0)
+	for st in tables {
+		for col in st.Cols {
+			if col.Hidden { continue }
+			n += 1
+		}
+	}
+	return n
+}
+
+// concatScopeTables copies two scope-table lists into one list.
+fn concatScopeTables(a []ScopeTable, b []ScopeTable) []ScopeTable {
+	mut out = []ScopeTable{}
+	for st in a { out = append(out, st) }
+	for st in b { out = append(out, st) }
+	return out
+}
+
+// findVisibleScopeCol returns the first non-hidden column named name, if any.
+fn findVisibleScopeCol(tables []ScopeTable, name str) ?ScopeCol {
+	for st in tables {
+		for col in st.Cols {
+			if !col.Hidden && col.Name == name {
+				return col
+			}
+		}
+	}
+	return nil
+}
+
+// hideScopeCol marks the first non-hidden column named name in tables hidden.
+fn hideScopeCol(tables mut []ScopeTable, name str) bool {
+	for st in tables {
+		for i in 0..len(st.Cols) {
+			if !st.Cols[i].Hidden && st.Cols[i].Name == name {
+				st.Cols[i].Hidden = true
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// joinColumnQual builds the equality predicate used by JOIN ... USING / NATURAL.
+fn joinColumnQual(lc ScopeCol, rc ScopeCol) !Expr {
+	let eqFunc = types.LookupFunc("=", []types.Oid{types.Oid(lc.Oid), types.Oid(rc.Oid)})
+	if let f = eqFunc {
+		let lExpr = Expr.ColRef(ColRefExpr{Slot: lc.Slot, RangeIndex: lc.RangeIndex, AttNo: lc.Attno, Type: lc.Oid})
+		let rExpr = Expr.ColRef(ColRefExpr{Slot: rc.Slot, RangeIndex: rc.RangeIndex, AttNo: rc.Attno, Type: rc.Oid})
+		return Expr.OpCall(OpCallExpr{Op: "=", Func: f, Args: []Expr{lExpr, rExpr}, Type: u32(types.BoolOid)})
+	}
+	fail types.ErrorFault(types.NewError("42883", "operator does not exist: " + typeName(lc.Oid) + " = " + typeName(rc.Oid)))
+}
+
+// analyzeFromItem binds one FROM item, assigning executor row slots from slotBase
+// and range-table indices from rangeIndex. It returns the typed item plus the base
+// scope tables it exposes (a join exposes both sides, left to right).
+fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []CteInfo, params mut []u32, item parse.FromItem, rangeIndex i64, slotBase i64) !(FromClauseItem, []ScopeTable) {
 	match item {
 		Table(tblRef) => {
 			mut name = tblRef.Name.Parts[0].Name
@@ -680,7 +755,7 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 							Typmod: col.Typmod,
 							TableOid: 0,
 							Attno: i16(i + 1),
-							Slot: i64(i),
+							Slot: slotBase + i64(i),
 							RangeIndex: rangeIndex,
 							Hidden: false,
 						})
@@ -694,7 +769,7 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 						Alias: aliasName,
 						RangeIndex: rangeIndex,
 						Cols: colDescs,
-					}), st
+					}), []ScopeTable{st}
 				}
 			}
 
@@ -715,14 +790,14 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 						Typmod: col.Typmod,
 						TableOid: tbl.Oid,
 						Attno: col.Number,
-						Slot: i64(i),
+						Slot: slotBase + i64(i),
 						RangeIndex: rangeIndex,
 						Hidden: false,
 					})
 					colDescs = append(colDescs, ColDesc{Name: cName, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number})
 				}
 				let st = ScopeTable{Name: name, Alias: aliasName, TableOid: tbl.Oid, RangeIndex: rangeIndex, Cols: scopeCols}
-				return FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: aliasName, RangeIndex: rangeIndex, Cols: colDescs}), st
+				return FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: aliasName, RangeIndex: rangeIndex, Cols: colDescs}), []ScopeTable{st}
 			}
 			fail types.ErrorFault(types.NewError("42P01", "relation \"" + name + "\" does not exist"))
 		}
@@ -747,33 +822,32 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 					Typmod: target.Col.Typmod,
 					TableOid: 0,
 					Attno: i16(i + 1),
-					Slot: i64(i),
+					Slot: slotBase + i64(i),
 					RangeIndex: rangeIndex,
 					Hidden: false,
 				})
 				colDescs = append(colDescs, ColDesc{Name: cName, Oid: target.Col.Oid, Typmod: target.Col.Typmod, TableOid: 0, Attno: i16(i + 1)})
 			}
 			let st = ScopeTable{Name: aliasName, Alias: aliasName, TableOid: 0, RangeIndex: rangeIndex, Cols: scopeCols}
-			return FromClauseItem.Subquery(FromSubquery{Query: subQuery, Alias: aliasName, RangeIndex: rangeIndex, Cols: colDescs}), st
+			return FromClauseItem.Subquery(FromSubquery{Query: subQuery, Alias: aliasName, RangeIndex: rangeIndex, Cols: colDescs}), []ScopeTable{st}
 		}
 		Join(jExpr) => {
-			let (leftItem, leftTable) = try analyzeFromItem(c, tx, parentScopes, ctes, mut params, jExpr.Left, rangeIndex)
-			let (rightItem, rightTable) = try analyzeFromItem(c, tx, parentScopes, ctes, mut params, jExpr.Right, rangeIndex + 1)
+			let (leftItem, leftScopes) = try analyzeFromItem(c, tx, parentScopes, ctes, mut params, jExpr.Left, rangeIndex, slotBase)
+			let leftCount = scopeColCount(leftScopes)
+			let rightStart = rangeIndex + i64(len(leftScopes))
+			let (rightItem, rightScopes) = try analyzeFromItem(c, tx, parentScopes, ctes, mut params, jExpr.Right, rightStart, slotBase + leftCount)
 			let joinType = match jExpr.JoinType {
-				"LEFT" => JoinType.Left
-				"RIGHT" => JoinType.Right
-				"FULL" => JoinType.Full
+				"left" => JoinType.Left
+				"right" => JoinType.Right
+				"full" => JoinType.Full
 				_ => JoinType.Inner
 			}
 
-			mut mergedCols = []ScopeCol{}
 			mut mergedDescs = []ColDesc{}
-			for col in leftTable.Cols {
-				mergedCols = append(mergedCols, col)
+			for col in fromItemCols(leftItem) {
 				mergedDescs = append(mergedDescs, ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: col.Attno})
 			}
-			for col in rightTable.Cols {
-				mergedCols = append(mergedCols, col)
+			for col in fromItemCols(rightItem) {
 				mergedDescs = append(mergedDescs, ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: col.Attno})
 			}
 
@@ -781,11 +855,12 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 			if let cond = jExpr.Condition {
 				match cond {
 					On(onCond) => {
+						mut joinTables = concatScopeTables(leftScopes, rightScopes)
 						mut joinScopes = []Scope{}
 						for ps in parentScopes {
 							joinScopes = append(joinScopes, ps)
 						}
-						joinScopes = append(joinScopes, Scope{Tables: []ScopeTable{leftTable, rightTable}})
+						joinScopes = append(joinScopes, Scope{Tables: joinTables})
 						let onFlags = ExprFlags{InWhere: true, InHaving: false, InGroupBy: false, InAggregate: false, InWindow: false}
 						mut stats = QueryStats{HasAggs: false, HasWindowFuncs: false}
 						let onExpr = try analyzeExpr(c, tx, joinScopes, ctes, onFlags, []Expr{}, mut stats, mut params, onCond.Value, u32(types.BoolOid))
@@ -794,48 +869,47 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 					Using(uCond) => {
 						for colIdent in uCond.Columns {
 							let cName = colIdent.Name
-							mut lCol ?ScopeCol = nil
-							for col in leftTable.Cols {
-								if col.Name == cName {
-									lCol = col
-									break
-								}
-							}
-							mut rCol ?ScopeCol = nil
-							for col in rightTable.Cols {
-								if col.Name == cName {
-									rCol = col
-									break
-								}
-							}
-							if let lc = lCol {
-								if let rc = rCol {
-									let lExpr = Expr.ColRef(ColRefExpr{Slot: lc.Slot, RangeIndex: lc.RangeIndex, AttNo: lc.Attno, Type: lc.Oid})
-									let rExpr = Expr.ColRef(ColRefExpr{Slot: rc.Slot, RangeIndex: rc.RangeIndex, AttNo: rc.Attno, Type: rc.Oid})
-									if let eqFunc = types.LookupFunc("=", []types.Oid{lc.Oid, rc.Oid}) {
-										quals = append(quals, Expr.OpCall(OpCallExpr{Op: "=", Func: eqFunc, Args: []Expr{lExpr, rExpr}, Type: u32(types.BoolOid)}))
-									}
+							let lcOpt = findVisibleScopeCol(leftScopes, cName)
+							let rcOpt = findVisibleScopeCol(rightScopes, cName)
+							if let lc = lcOpt {
+								if let rc = rcOpt {
+									let jq = try joinColumnQual(lc, rc)
+									quals = append(quals, jq)
 								} else {
-									fail types.ErrorFault(types.NewError("42703", "column \"" + cName + "\" does not exist"))
+									fail types.ErrorFault(types.NewError("42703", "column \"" + cName + "\" specified in USING clause does not exist in right table"))
 								}
 							} else {
-								fail types.ErrorFault(types.NewError("42703", "column \"" + cName + "\" does not exist"))
+								fail types.ErrorFault(types.NewError("42703", "column \"" + cName + "\" specified in USING clause does not exist in left table"))
 							}
+							_ = hideScopeCol(mut rightScopes, cName)
 						}
 					}
 				}
 			}
 
-			let joinTable = ScopeTable{Name: "", Alias: leftTable.Alias + "_" + rightTable.Alias, TableOid: 0, RangeIndex: rangeIndex, Cols: mergedCols}
-			return FromClauseItem.Join(FromJoin{Left: leftItem, Right: rightItem, JoinType: joinType, Quals: quals, Cols: mergedDescs}), joinTable
+			if jExpr.Natural {
+				for lc in leftScopes {
+					for lCol in lc.Cols {
+						if lCol.Hidden { continue }
+						let rcOpt = findVisibleScopeCol(rightScopes, lCol.Name)
+						if let rc = rcOpt {
+							let jq = try joinColumnQual(lCol, rc)
+							quals = append(quals, jq)
+							_ = hideScopeCol(mut rightScopes, lCol.Name)
+						}
+					}
+				}
+			}
+
+			mut allScopesOut = concatScopeTables(leftScopes, rightScopes)
+			return FromClauseItem.Join(FromJoin{Left: leftItem, Right: rightItem, JoinType: joinType, Quals: quals, Cols: mergedDescs}), allScopesOut
 		}
 		_ => {
-			let emptyTable = ScopeTable{Name: "", Alias: "anon", TableOid: 0, RangeIndex: rangeIndex, Cols: []ScopeCol{}}
-			return FromClauseItem.Values(FromValues{Rows: [][]Expr{}, Alias: "anon", RangeIndex: rangeIndex, Cols: []ColDesc{}}), emptyTable
+			let st = ScopeTable{Name: "", Alias: "anon", TableOid: 0, RangeIndex: rangeIndex, Cols: []ScopeCol{}}
+			return FromClauseItem.Values(FromValues{Rows: [][]Expr{}, Alias: "anon", RangeIndex: rangeIndex, Cols: []ColDesc{}}), []ScopeTable{st}
 		}
 	}
-	let fallbackTable = ScopeTable{Name: "", Alias: "anon", TableOid: 0, RangeIndex: rangeIndex, Cols: []ScopeCol{}}
-	return FromClauseItem.Values(FromValues{Rows: [][]Expr{}, Alias: "anon", RangeIndex: rangeIndex, Cols: []ColDesc{}}), fallbackTable
+	fail types.ErrorFault(types.NewError("XX000", "unreachable FROM item"))
 }
 
 fn analyzeExpr(c catalog.Catalog, tx txn.Txn, scopes []Scope, ctes []CteInfo, flags ExprFlags, groupByExprs []Expr, stats mut QueryStats, params mut []u32, expr parse.Expr, targetType u32) !Expr {
