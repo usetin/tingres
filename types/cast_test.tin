@@ -1,0 +1,56 @@
+package types
+
+import "crucible"
+
+fn TestCastRulesAndRounding(t mut crucible.T) {
+	let fortyTwo = FromI64(Int4Oid, 42)
+	let numeric = Cast(fortyTwo, NumericOid) catch err {
+		t.Error("integer to numeric: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "integer to numeric", numeric.Text(), "42")
+	t.True("integer to numeric implicit", CanCast(Int4Oid, NumericOid, true))
+	t.True("numeric to integer is not implicit", !CanCast(NumericOid, Int4Oid, true))
+	t.True("text input cast is explicit", !CanCast(TextOid, Int4Oid, true))
+	let half = Parse(NumericOid, "2.5") catch _ { return }
+	let rounded = Cast(half, Int4Oid) catch err {
+		t.Error("numeric to integer: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "numeric cast rounds ties away", rounded.Text(), "3")
+	let negHalf = Parse(NumericOid, "-2.5") catch _ { return }
+	let roundedNegative = Cast(negHalf, Int4Oid) catch _ { return }
+	crucible.Equal(mut t, "negative numeric cast rounding", roundedNegative.Text(), "-3")
+	let truth = Cast(FromBool(true), Int2Oid) catch _ { return }
+	crucible.Equal(mut t, "bool to smallint", truth.Text(), "1")
+	let falseValue = Cast(FromI64(Int4Oid, 0), BoolOid) catch _ { return }
+	crucible.Equal(mut t, "zero to bool", falseValue.Text(), "false")
+}
+
+fn TestStringTypmodsAndCastErrors(t mut crucible.T) {
+	let padded = CastTypmod(FromStr(TextOid, "cat"), BpcharOid, 5) catch _ { return }
+	crucible.Equal(mut t, "bpchar pads and trims on output", padded.Text(), "cat")
+	crucible.Equal(mut t, "bpchar retains declared padding", padded.s, "cat  ")
+	let varcharTooLong = CastTypmod(FromStr(TextOid, "kitty"), VarcharOid, 3) catch err {
+		crucible.Equal(mut t, "varchar length SQLSTATE", ErrorCode(err), "22001")
+		crucible.Equal(mut t, "varchar length message", ErrorMessage(err), "value too long for type character varying(3)")
+		return
+	}
+	_ = varcharTooLong
+	t.Error("varchar typmod accepted too many characters")
+}
+
+fn TestBinaryErrorsAndOidWire(t mut crucible.T) {
+	let invalid = DecodeBinary(Int4Oid, []u8{0}) catch err {
+		crucible.Equal(mut t, "binary error SQLSTATE", ErrorCode(err), "22P03")
+		crucible.Equal(mut t, "binary error message", ErrorMessage(err), "invalid binary representation for type integer")
+		return
+	}
+	_ = invalid
+	t.Error("short int4 binary input succeeded")
+	mut encoded = []u8{}
+	EncodeBinary(FromI64(OidOid, 4294967295), mut encoded)
+	crucible.Equal(mut t, "oid binary width", len(encoded), i64(4))
+	let decoded = DecodeBinary(OidOid, encoded) catch _ { return }
+	crucible.Equal(mut t, "oid binary value", decoded.Text(), "4294967295")
+}

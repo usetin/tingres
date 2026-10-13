@@ -1,37 +1,96 @@
 // Package server connects PostgreSQL protocol sessions to the query executor.
 package server
 
-import "../proto"
+import "atomic"
+import "lane"
 import "say"
 import "twine"
 import "wire"
+import "../proto"
 
-// Serve starts the TCP listener and handles connections until an accept error occurs.
-// The initial M1 executor is deliberately small; unsupported statements return 0A000.
+const startupTimeout = 10s
+const idleTimeout = 60s
+const defaultMaxConnections = 100
+
+shared let activeConnections = atomic.NewInt(0)
+
+// Serve accepts connections and schedules each session as an independent task.
+// wire.Listen exposes one shared listener on all platforms; Linux SO_REUSEPORT
+// needs a wire API that is not available in this Tin checkout.
 fn Serve(addr str, cfg proto.Config) ! {
 	let listener = try wire.Listen(addr)
-	for {
-		let sock = listener.Accept() catch _ { continue }
-		let conn = proto.Accept(sock, cfg) catch err {
-			say.Line("tingres startup failed: {err}")
-			mut dropped = sock
-			dropped.Close()
-			continue
-		}
-		mut c = conn
-		serve_connection(mut c, false) catch err {
-			say.Line("tingres connection closed: {err}")
-			c.Close()
-		}
+	mut keepAlive = lane.New[bool](1)
+	scope sessions {
+		sessions.spawn(fn() ! {
+			for {
+				let accepted = listener.Accept() catch _ { continue }
+				if !reserve_connection(connection_limit(cfg)) {
+					proto.RejectStartup(accepted, "53300", "sorry, too many clients already") catch _ {
+					}
+					mut rejected = accepted
+					rejected.Close()
+					continue
+				}
+				let client = accepted
+				sessions.spawn(fn() ! {
+					mut acceptedClient = client
+					serve_accepted(mut acceptedClient, cfg) catch err {
+						say.Line("tingres connection closed: {err}")
+					}
+				})
+			}
+		})
+		for { let _ = keepAlive.Recv() catch _ { false } }
 	}
+}
+
+fn connection_limit(cfg proto.Config) i64 {
+	if cfg.MaxConnections <= 0 {
+		return defaultMaxConnections
+	}
+	return cfg.MaxConnections
+}
+
+fn reserve_connection(maxAllowed i64) bool {
+	let current = activeConnections.Add(1)
+	if current <= maxAllowed {
+		return true
+	}
+	activeConnections.Add(-1)
+	return false
+}
+
+fn serve_accepted(sock mut wire.Conn, cfg proto.Config) ! {
+	defer activeConnections.Add(-1)
+	try run_client(mut sock, cfg)
+}
+
+fn run_client(client mut wire.Conn, cfg proto.Config) ! {
+	client.SetTimeout(startupTimeout)
+	let conn = proto.Accept(client, cfg) catch err {
+		client.Close()
+		fail err
+	}
+	mut c = conn
+	c.SetTimeout(idleTimeout)
+	serve_connection(mut c, false) catch err {
+		c.Close()
+		fail err
+	}
+	c.Close()
 }
 
 // ServeOne accepts and answers one client connection, for conformance tests and probes.
 fn ServeOne(listener wire.Listener, cfg proto.Config) ! {
-	let sock = try listener.Accept()
-	let conn = try proto.Accept(sock, cfg)
-	mut c = conn
-	try serve_connection(mut c, true)
+	mut sock = try listener.Accept()
+	if !reserve_connection(connection_limit(cfg)) {
+		proto.RejectStartup(sock, "53300", "sorry, too many clients already") catch _ {
+		}
+		mut rejected = sock
+		rejected.Close()
+		return
+	}
+	try serve_accepted(mut sock, cfg)
 }
 
 fn serve_connection(c mut proto.Conn, oneShot bool) ! {
@@ -52,11 +111,11 @@ fn serve_connection(c mut proto.Conn, oneShot bool) ! {
 					try c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "0A000", Message: "feature not supported by the M1 executor"})
 				}
 				try c.SendReadyForQuery('I')
-				if oneShot { c.Close()
-					return }
+				if oneShot {
+					return
+				}
 			}
-			proto.Message.Terminate => { c.Close()
-				return }
+			proto.Message.Terminate => { return }
 			proto.Message.Flush => {
 			}
 			_ => {

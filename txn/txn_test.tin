@@ -3,6 +3,15 @@ package txn
 import "crucible"
 import "../store"
 import "quarry"
+import "hearth"
+
+type VisibilityCase struct {
+	Name str
+	Snapshot Snapshot
+	Rel u32
+	Tuple store.HeapTuple
+	Want bool
+}
 
 fn testManager(name str) !(str, store.Store, Manager) {
 	let dir = quarry.TempDir() + "/tingres-txn-" + name
@@ -23,40 +32,263 @@ fn abortForTest(t mut crucible.T, m mut Manager, tx mut Txn) {
 	m.Abort(mut tx) catch err { t.Error("abort: {err}") }
 }
 
+fn expectVisibilityCases(t mut crucible.T, m mut Manager, cases []VisibilityCase) {
+	for c in cases {
+		crucible.Equal(mut t, c.Name, m.VisibleTuple(c.Snapshot, c.Rel, c.Tuple), c.Want)
+	}
+}
+
 fn TestSnapshotAndVisibility(t mut crucible.T) {
-	let (_, _, manager) = testManager("snapshot") catch err {
+	let (_, db0, manager) = testManager("snapshot") catch err {
 		t.Error("manager: {err}")
 		return
 	}
+	mut db = db0
 	mut m = manager
+	crucible.NoFault("create test heap", db.CreateHeap(42))
 	mut first = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let tid = m.HeapInsert(first, 42, []u8{1}) catch err {
+		t.Error("insert first: {err}")
+		return
+	}
+	let row = db.HeapFetch(42, tid, []u8{}) catch err {
+		t.Error("fetch first: {err}")
+		return
+	}
 	let snap = m.Snapshot(first)
-	crucible.Equal(mut t, "own insert before next command is invisible", m.Visible(snap, TupleHeader{Xmin: first.xid, Cid: 0}), false)
+	crucible.Equal(mut t, "own insert before next command is invisible", m.VisibleTuple(snap, 42, row), false)
 	first.CommandCounterIncrement()
 	let next = m.Snapshot(first)
-	crucible.Equal(mut t, "own insert after command is visible", m.Visible(next, TupleHeader{Xmin: first.xid, Cid: 0}), true)
+	crucible.Equal(mut t, "own insert after command is visible", m.VisibleTuple(next, 42, row), true)
 	mut second = beginForTest(mut t, mut m, Isolation.ReadCommitted)
-	crucible.Equal(mut t, "uncommitted foreign insert is invisible", m.Visible(m.Snapshot(second), TupleHeader{Xmin: first.xid}), false)
+	crucible.Equal(mut t, "uncommitted foreign insert is invisible", m.VisibleTuple(m.Snapshot(second), 42, row), false)
 	crucible.NoFault("commit first", m.Commit(mut first))
-	crucible.Equal(mut t, "committed insert is visible to a later statement", m.Visible(m.Snapshot(second), TupleHeader{Xmin: first.xid}), true)
+	crucible.Equal(mut t, "committed insert is visible to a later statement", m.VisibleTuple(m.Snapshot(second), 42, row), true)
 	abortForTest(mut t, mut m, mut second)
 }
 
+fn TestMvccVisibilityRuleTable(t mut crucible.T) {
+	let (_, db0, manager) = testManager("visibility-table") catch err {
+		t.Error("open manager: {err}")
+		return
+	}
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create test heap", db.CreateHeap(46))
+	let seedTid = db.HeapInsert(store.NewXidCtx(2, 0), 46, []u8{1}) catch err {
+		t.Error("seed tuple: {err}")
+		return
+	}
+	let seed2Tid = db.HeapInsert(store.NewXidCtx(2, 0), 46, []u8{2}) catch err {
+		t.Error("seed second tuple: {err}")
+		return
+	}
+	let seed3Tid = db.HeapInsert(store.NewXidCtx(2, 0), 46, []u8{3}) catch err {
+		t.Error("seed third tuple: {err}")
+		return
+	}
+	let seed4Tid = db.HeapInsert(store.NewXidCtx(2, 0), 46, []u8{4}) catch err {
+		t.Error("seed fourth tuple: {err}")
+		return
+	}
+	let seed = db.HeapFetch(46, seedTid, []u8{}) catch err {
+		t.Error("fetch seed: {err}")
+		return
+	}
+	let seed2 = db.HeapFetch(46, seed2Tid, []u8{}) catch err {
+		t.Error("fetch seed 2: {err}")
+		return
+	}
+	let seed3 = db.HeapFetch(46, seed3Tid, []u8{}) catch err {
+		t.Error("fetch seed 3: {err}")
+		return
+	}
+	let seed4 = db.HeapFetch(46, seed4Tid, []u8{}) catch err {
+		t.Error("fetch seed 4: {err}")
+		return
+	}
+	mut older = beginForTest(mut t, mut m, Isolation.RepeatableRead)
+	let oldSnapshot = m.Snapshot(older)
+	mut own = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let ownTid = m.HeapInsert(own, 46, []u8{5}) catch err {
+		t.Error("insert own: {err}")
+		return
+	}
+	let ownTuple = db.HeapFetch(46, ownTid, []u8{}) catch err {
+		t.Error("fetch own: {err}")
+		return
+	}
+	let ownBeforeCommand = m.Snapshot(own)
+	own.CommandCounterIncrement()
+	let ownAfterCommand = m.Snapshot(own)
+	mut writer = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let writerTid = m.HeapInsert(writer, 46, []u8{6}) catch err {
+		t.Error("insert concurrent: {err}")
+		return
+	}
+	let writerTuple = db.HeapFetch(46, writerTid, []u8{}) catch err {
+		t.Error("fetch concurrent: {err}")
+		return
+	}
+	mut reader = beginForTest(mut t, mut m, Isolation.RepeatableRead)
+	let inProgressXmin = m.Snapshot(reader)
+	mut ownDeleter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("delete own tuple", m.HeapDelete(ownDeleter, 46, seed2Tid))
+	let ownDeleted = db.HeapFetch(46, seed2Tid, []u8{}) catch err {
+		t.Error("fetch own delete: {err}")
+		return
+	}
+	let ownDeleteSameCommand = m.Snapshot(ownDeleter)
+	ownDeleter.CommandCounterIncrement()
+	let ownDeleteNextCommand = m.Snapshot(ownDeleter)
+	mut concurrentDeleter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("delete concurrent tuple", m.HeapDelete(concurrentDeleter, 46, seed3Tid))
+	let concurrentDeleted = db.HeapFetch(46, seed3Tid, []u8{}) catch err {
+		t.Error("fetch concurrent delete: {err}")
+		return
+	}
+	mut deleteReader = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let inProgressXmax = m.Snapshot(deleteReader)
+
+	let beforeCompletion = []VisibilityCase{
+		VisibilityCase{Name: "bootstrap xmin is committed", Snapshot: oldSnapshot, Rel: 46, Tuple: seed, Want: true},
+		VisibilityCase{Name: "own cmin is invisible in its command", Snapshot: ownBeforeCommand, Rel: 46, Tuple: ownTuple, Want: false},
+		VisibilityCase{Name: "own cmin is visible in the next command", Snapshot: ownAfterCommand, Rel: 46, Tuple: ownTuple, Want: true},
+		VisibilityCase{Name: "xid in snapshot xip is invisible", Snapshot: inProgressXmin, Rel: 46, Tuple: writerTuple, Want: false},
+		VisibilityCase{Name: "in-progress xmax keeps old version visible", Snapshot: inProgressXmax, Rel: 46, Tuple: concurrentDeleted, Want: true},
+		VisibilityCase{Name: "own cmax is visible in deleting command", Snapshot: ownDeleteSameCommand, Rel: 46, Tuple: ownDeleted, Want: true},
+		VisibilityCase{Name: "own cmax hides tuple in following command", Snapshot: ownDeleteNextCommand, Rel: 46, Tuple: ownDeleted, Want: false},
+		VisibilityCase{Name: "xmax after old snapshot leaves tuple visible", Snapshot: oldSnapshot, Rel: 46, Tuple: ownDeleted, Want: true},
+	}
+	expectVisibilityCases(mut t, mut m, beforeCompletion)
+	crucible.NoFault("commit concurrent insert", m.Commit(mut writer))
+	crucible.NoFault("commit own delete", m.Commit(mut ownDeleter))
+	abortForTest(mut t, mut m, mut concurrentDeleter)
+	mut abortedWriter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let abortedTid = m.HeapInsert(abortedWriter, 46, []u8{7}) catch err {
+		t.Error("insert aborted: {err}")
+		return
+	}
+	crucible.NoFault("abort concurrent insert", m.Abort(mut abortedWriter))
+	let abortedTuple = db.HeapFetch(46, abortedTid, []u8{}) catch err {
+		t.Error("fetch aborted: {err}")
+		return
+	}
+	mut committedDeleter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("delete for committed xmax", m.HeapDelete(committedDeleter, 46, seed4Tid))
+	crucible.NoFault("commit xmax", m.Commit(mut committedDeleter))
+	let committedDeleted = db.HeapFetch(46, seed4Tid, []u8{}) catch err {
+		t.Error("fetch committed xmax: {err}")
+		return
+	}
+	mut fresh = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let afterCompletion = []VisibilityCase{
+		VisibilityCase{Name: "xip remains invisible after concurrent commit", Snapshot: inProgressXmin, Rel: 46, Tuple: writerTuple, Want: false},
+		VisibilityCase{Name: "new snapshot sees committed insert", Snapshot: m.Snapshot(fresh), Rel: 46, Tuple: writerTuple, Want: true},
+		VisibilityCase{Name: "aborted xmin is invisible", Snapshot: m.Snapshot(fresh), Rel: 46, Tuple: abortedTuple, Want: false},
+		VisibilityCase{Name: "aborted xmax leaves old version visible", Snapshot: m.Snapshot(fresh), Rel: 46, Tuple: concurrentDeleted, Want: true},
+		VisibilityCase{Name: "committed xmax after snapshot is visible", Snapshot: oldSnapshot, Rel: 46, Tuple: committedDeleted, Want: true},
+		VisibilityCase{Name: "committed xmax before snapshot hides tuple", Snapshot: m.Snapshot(fresh), Rel: 46, Tuple: committedDeleted, Want: false},
+	}
+	expectVisibilityCases(mut t, mut m, afterCompletion)
+	let hintedAbort = db.HeapFetch(46, abortedTid, []u8{}) catch err {
+		t.Error("fetch aborted hint: {err}")
+		return
+	}
+	let hintedDelete = db.HeapFetch(46, seed4Tid, []u8{}) catch err {
+		t.Error("fetch xmax hint: {err}")
+		return
+	}
+	crucible.True("aborted xmin hint set", hintedAbort.Header.Infomask()&infXminInvalid != 0)
+	let hintedAbortedXmax = db.HeapFetch(46, seed3Tid, []u8{}) catch err {
+		t.Error("fetch invalid xmax hint: {err}")
+		return
+	}
+	crucible.True("aborted xmax hint set", hintedAbortedXmax.Header.Infomask()&infXmaxInvalid != 0)
+	crucible.True("committed xmax hint set", hintedDelete.Header.Infomask()&infXmaxCommitted != 0)
+	crucible.NoFault("freeze bootstrap tuple", m.store.SetHint(46, seedTid, infXminFrozen))
+	let frozen = db.HeapFetch(46, seedTid, []u8{}) catch err {
+		t.Error("fetch frozen tuple: {err}")
+		return
+	}
+	crucible.Equal(mut t, "frozen xmin ignores old xid horizon", m.VisibleTuple(Snapshot{Xmin: 20, Xmax: 21, Xip: []u32{20}, Xid: 100, Cid: 0}, 46, frozen), true)
+	abortForTest(mut t, mut m, mut older)
+	abortForTest(mut t, mut m, mut own)
+	abortForTest(mut t, mut m, mut reader)
+	abortForTest(mut t, mut m, mut deleteReader)
+	abortForTest(mut t, mut m, mut fresh)
+}
+
+fn TestPageVisibilityCertificate(t mut crucible.T) {
+	let (_, db0, manager) = testManager("page-visible") catch err {
+		t.Error("open manager: {err}")
+		return
+	}
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create visible heap", db.CreateHeap(47))
+	mut writer = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let tid = m.HeapInsert(writer, 47, []u8{1}) catch err {
+		t.Error("insert visible row: {err}")
+		return
+	}
+	crucible.NoFault("commit visible row", m.Commit(mut writer))
+	let row = db.HeapFetch(47, tid, []u8{}) catch err {
+		t.Error("fetch visible row: {err}")
+		return
+	}
+	mut reader = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let snap = m.Snapshot(reader)
+	m.CertifyPageAllVisible(47, u32(tid.Page()))
+	crucible.True("certified page uses the all-visible fast path result", m.VisibleTuple(snap, 47, row))
+	mut next = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let nextTid = m.HeapInsert(next, 47, []u8{2}) catch err {
+		t.Error("insert after certification: {err}")
+		return
+	}
+	let nextRow = db.HeapFetch(47, nextTid, []u8{}) catch err {
+		t.Error("fetch inserted row: {err}")
+		return
+	}
+	crucible.False("insert invalidates page all-visible certificate", m.VisibleTuple(snap, 47, nextRow))
+	abortForTest(mut t, mut m, mut next)
+	abortForTest(mut t, mut m, mut reader)
+}
+
 fn TestDeleteVisibility(t mut crucible.T) {
-	let (_, _, manager) = testManager("delete") catch err {
+	let (_, db0, manager) = testManager("delete") catch err {
 		t.Error("manager: {err}")
 		return
 	}
+	mut db = db0
 	mut m = manager
+	crucible.NoFault("create test heap", db.CreateHeap(7))
+	let tid = db.HeapInsert(store.NewXidCtx(2, 0), 7, []u8{7}) catch err {
+		t.Error("seed row: {err}")
+		return
+	}
+	let row = db.HeapFetch(7, tid, []u8{}) catch err {
+		t.Error("fetch seed row: {err}")
+		return
+	}
 	mut deleter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
 	let before = m.Snapshot(deleter)
-	let row = TupleHeader{Xmin: 2, Xmax: deleter.xid, Cid: 0}
-	crucible.Equal(mut t, "own delete remains visible in its command", m.Visible(before, row), true)
+	crucible.NoFault("delete tuple", m.HeapDelete(deleter, 7, tid))
+	let deleted = db.HeapFetch(7, tid, []u8{}) catch err {
+		t.Error("fetch deleted row: {err}")
+		return
+	}
+	crucible.Equal(mut t, "own delete remains visible in its command", m.VisibleTuple(before, 7, deleted), true)
 	deleter.CommandCounterIncrement()
-	crucible.Equal(mut t, "own delete hides row in the next command", m.Visible(m.Snapshot(deleter), row), false)
+	crucible.Equal(mut t, "own delete hides row in the next command", m.VisibleTuple(m.Snapshot(deleter), 7, deleted), false)
 	abortForTest(mut t, mut m, mut deleter)
 	mut other = beginForTest(mut t, mut m, Isolation.ReadCommitted)
-	crucible.Equal(mut t, "aborted delete leaves row visible", m.Visible(m.Snapshot(other), TupleHeader{Xmin: 2, Xmax: deleter.xid}), true)
+	crucible.Equal(mut t, "aborted delete leaves row visible", m.VisibleTuple(m.Snapshot(other), 7, deleted), true)
+	let afterHint = db.HeapFetch(7, tid, []u8{}) catch err {
+		t.Error("fetch hinted row: {err}")
+		return
+	}
+	crucible.True("aborted xmax receives invalid hint", afterHint.Header.Infomask()&infXmaxInvalid != 0)
 	abortForTest(mut t, mut m, mut other)
 }
 
@@ -90,22 +322,184 @@ fn TestTupleLocks(t mut crucible.T) {
 }
 
 fn TestIsolationSnapshots(t mut crucible.T) {
-	let (_, _, manager) = testManager("isolation") catch err {
+	let (_, db0, manager) = testManager("isolation") catch err {
 		t.Error("manager: {err}")
 		return
 	}
+	mut db = db0
 	mut m = manager
+	crucible.NoFault("create test heap", db.CreateHeap(43))
 	mut repeatable = beginForTest(mut t, mut m, Isolation.RepeatableRead)
-	let readCommitted = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	mut readCommitted = beginForTest(mut t, mut m, Isolation.ReadCommitted)
 	mut writer = beginForTest(mut t, mut m, Isolation.ReadCommitted)
-	let inserted = TupleHeader{Xmin: writer.xid, Cid: 0}
+	let tid = m.HeapInsert(writer, 43, []u8{3}) catch err {
+		t.Error("insert writer: {err}")
+		return
+	}
+	let inserted = db.HeapFetch(43, tid, []u8{}) catch err {
+		t.Error("fetch writer: {err}")
+		return
+	}
 	writer.CommandCounterIncrement()
 	crucible.NoFault("commit writer", m.Commit(mut writer))
-	crucible.Equal(mut t, "repeatable read keeps its original horizon", m.Visible(m.Snapshot(repeatable), inserted), false)
-	crucible.Equal(mut t, "read committed takes a new snapshot", m.Visible(m.Snapshot(readCommitted), inserted), true)
+	crucible.Equal(mut t, "repeatable read keeps its original horizon", m.VisibleTuple(m.Snapshot(repeatable), 43, inserted), false)
+	crucible.Equal(mut t, "read committed takes a new snapshot", m.VisibleTuple(m.Snapshot(readCommitted), 43, inserted), true)
 	abortForTest(mut t, mut m, mut repeatable)
-	mut readCommittedMut = readCommitted
-	abortForTest(mut t, mut m, mut readCommittedMut)
+	abortForTest(mut t, mut m, mut readCommitted)
+}
+
+fn TestCommittedAndAbortedVisibilityHints(t mut crucible.T) {
+	let (_, db0, manager) = testManager("mvcc-hints") catch err {
+		t.Error("open manager: {err}")
+		return
+	}
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create test heap", db.CreateHeap(44))
+	mut oldReader = beginForTest(mut t, mut m, Isolation.RepeatableRead)
+	let oldSnapshot = m.Snapshot(oldReader)
+	mut writer = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let insertedTid = m.HeapInsert(writer, 44, []u8{4}) catch err {
+		t.Error("insert committed row: {err}")
+		return
+	}
+	crucible.NoFault("commit insert", m.Commit(mut writer))
+	let inserted = db.HeapFetch(44, insertedTid, []u8{}) catch err {
+		t.Error("fetch committed row: {err}")
+		return
+	}
+	crucible.Equal(mut t, "insert after repeatable snapshot is invisible", m.VisibleTuple(oldSnapshot, 44, inserted), false)
+	mut freshReader = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.Equal(mut t, "committed insert is visible to a later snapshot", m.VisibleTuple(m.Snapshot(freshReader), 44, inserted), true)
+	let hintedInsert = db.HeapFetch(44, insertedTid, []u8{}) catch err {
+		t.Error("fetch committed hint: {err}")
+		return
+	}
+	crucible.True("committed xmin hint is durable", hintedInsert.Header.Infomask()&infXminCommitted != 0)
+
+	mut abortedWriter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let abortedTid = m.HeapInsert(abortedWriter, 44, []u8{5}) catch err {
+		t.Error("insert aborted row: {err}")
+		return
+	}
+	crucible.NoFault("abort insert", m.Abort(mut abortedWriter))
+	let aborted = db.HeapFetch(44, abortedTid, []u8{}) catch err {
+		t.Error("fetch aborted row: {err}")
+		return
+	}
+	crucible.Equal(mut t, "aborted insert stays invisible", m.VisibleTuple(m.Snapshot(freshReader), 44, aborted), false)
+	let hintedAbort = db.HeapFetch(44, abortedTid, []u8{}) catch err {
+		t.Error("fetch invalid hint: {err}")
+		return
+	}
+	crucible.True("aborted xmin receives invalid hint", hintedAbort.Header.Infomask()&infXminInvalid != 0)
+
+	let seedTid = db.HeapInsert(store.NewXidCtx(2, 0), 44, []u8{6}) catch err {
+		t.Error("seed delete row: {err}")
+		return
+	}
+	mut deleteWriter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("delete committed row", m.HeapDelete(deleteWriter, 44, seedTid))
+	crucible.NoFault("commit delete", m.Commit(mut deleteWriter))
+	let deleted = db.HeapFetch(44, seedTid, []u8{}) catch err {
+		t.Error("fetch committed delete: {err}")
+		return
+	}
+	crucible.Equal(mut t, "delete after repeatable snapshot is visible", m.VisibleTuple(oldSnapshot, 44, deleted), true)
+	mut afterDelete = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.Equal(mut t, "committed delete hides tuple", m.VisibleTuple(m.Snapshot(afterDelete), 44, deleted), false)
+	let hintedDelete = db.HeapFetch(44, seedTid, []u8{}) catch err {
+		t.Error("fetch committed xmax hint: {err}")
+		return
+	}
+	crucible.True("committed xmax hint is durable", hintedDelete.Header.Infomask()&infXmaxCommitted != 0)
+	abortForTest(mut t, mut m, mut oldReader)
+	abortForTest(mut t, mut m, mut freshReader)
+	abortForTest(mut t, mut m, mut afterDelete)
+}
+
+fn TestDirtyUpdateAndLockOnlyResults(t mut crucible.T) {
+	let (_, db0, manager) = testManager("dirty-update") catch err {
+		t.Error("open manager: {err}")
+		return
+	}
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create test heap", db.CreateHeap(45))
+	let tid = db.HeapInsert(store.NewXidCtx(2, 0), 45, []u8{7}) catch err {
+		t.Error("seed row: {err}")
+		return
+	}
+	mut updater = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	mut observer = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("mark row being updated", m.HeapDelete(updater, 45, tid))
+	let pending = db.HeapFetch(45, tid, []u8{}) catch err {
+		t.Error("fetch pending update: {err}")
+		return
+	}
+	let dirty = m.HeapTupleSatisfiesDirty(observer, pending.Header)
+	crucible.Equal(mut t, "dirty helper reports writer", dirty.Code, TupleCheckCode.BeingModified)
+	crucible.Equal(mut t, "dirty helper names writer xid", dirty.By, updater.Xid())
+	crucible.Equal(mut t, "update helper also waits", m.HeapTupleSatisfiesUpdate(observer, pending.Header).Code, TupleCheckCode.BeingModified)
+	crucible.NoFault("commit updater", m.Commit(mut updater))
+	let committed = db.HeapFetch(45, tid, []u8{}) catch err {
+		t.Error("fetch committed update: {err}")
+		return
+	}
+	let updated = m.HeapTupleSatisfiesUpdate(observer, committed.Header)
+	crucible.Equal(mut t, "update helper reports committed update", updated.Code, TupleCheckCode.Updated)
+	crucible.Equal(mut t, "update helper names committed xid", updated.By, updater.Xid())
+
+	let lockedTid = db.HeapInsert(store.NewXidCtx(2, 0), 45, []u8{8}) catch err {
+		t.Error("seed lock-only row: {err}")
+		return
+	}
+	mut locker = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("set lock-only xmax", db.HeapDelete(store.NewXidCtx(locker.Xid(), 0), 45, lockedTid))
+	crucible.NoFault("set lock-only hint", m.store.SetHint(45, lockedTid, infXmaxLockOnly))
+	let lockOnly = db.HeapFetch(45, lockedTid, []u8{}) catch err {
+		t.Error("fetch lock-only row: {err}")
+		return
+	}
+	crucible.Equal(mut t, "lock-only xmax does not hide tuple", m.VisibleTuple(m.Snapshot(observer), 45, lockOnly), true)
+	crucible.Equal(mut t, "update waits for lock-only xid", m.HeapTupleSatisfiesUpdate(observer, lockOnly.Header).Code, TupleCheckCode.BeingModified)
+	crucible.NoFault("commit locker", m.Commit(mut locker))
+	let released = db.HeapFetch(45, lockedTid, []u8{}) catch err {
+		t.Error("fetch released tuple: {err}")
+		return
+	}
+	crucible.Equal(mut t, "finished lock-only xid no longer blocks", m.HeapTupleSatisfiesUpdate(observer, released.Header).Code, TupleCheckCode.Ok)
+	crucible.NoFault("delete own row", m.HeapDelete(observer, 45, lockedTid))
+	let ownDelete = db.HeapFetch(45, lockedTid, []u8{}) catch err {
+		t.Error("fetch own delete: {err}")
+		return
+	}
+	crucible.Equal(mut t, "update identifies own modification", m.HeapTupleSatisfiesUpdate(observer, ownDelete.Header).Code, TupleCheckCode.SelfModified)
+	abortForTest(mut t, mut m, mut observer)
+}
+
+fn TestSnapshotRegistryAndGlobalXmin(t mut crucible.T) {
+	let (_, _, manager) = testManager("snapshot-registry") catch err {
+		t.Error("open manager: {err}")
+		return
+	}
+	mut m = manager
+	mut older = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let olderXid = older.Xid()
+	mut repeatable = beginForTest(mut t, mut m, Isolation.RepeatableRead)
+	crucible.NoFault("commit older transaction", m.Commit(mut older))
+	crucible.Equal(mut t, "repeatable transaction retains its snapshot horizon", m.GlobalXmin(), olderXid)
+	abortForTest(mut t, mut m, mut repeatable)
+
+	mut oldest = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	mut readCommitted = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let handle = m.AcquireSnapshot(readCommitted)
+	let oldestXid = oldest.Xid()
+	crucible.NoFault("commit xmin source", m.Commit(mut oldest))
+	crucible.Equal(mut t, "registered statement snapshot retains global xmin", m.GlobalXmin(), oldestXid)
+	m.ReleaseSnapshot(handle)
+	crucible.Equal(mut t, "released statement snapshot advances global xmin", m.GlobalXmin(), readCommitted.Xid())
+	abortForTest(mut t, mut m, mut readCommitted)
 }
 
 fn TestDurableCommitAbortAndXidReservation(t mut crucible.T) {
@@ -150,4 +544,64 @@ fn TestClogUsesTwoBitsPerXid(t mut crucible.T) {
 	crucible.NoFault("abort b", m.Abort(mut b))
 	crucible.Equal(mut t, "commit state encoded", m.clogState(a.Xid()), XidState.Committed)
 	crucible.Equal(mut t, "abort state encoded", m.clogState(b.Xid()), XidState.Aborted)
+}
+
+fn BenchmarkSnapshotTake(b mut crucible.B) {
+	let (_, _, manager) = testManager("bench-snapshot") catch _ { return }
+	mut m = manager
+	mut tx = m.Begin(Isolation.ReadCommitted) catch _ { return }
+	for i in 0..b.N {
+		let xmax = arena { m.Snapshot(tx).Xmax }
+		if xmax == 0 || i < 0 { continue }
+	}
+	m.Abort(mut tx) catch _ { }
+	hearth.Reset()
+}
+
+fn BenchmarkVisibilityCheck(b mut crucible.B) {
+	let (_, db0, manager) = testManager("bench-visible") catch _ { return }
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create benchmark heap", db.CreateHeap(48))
+	mut writer = m.Begin(Isolation.ReadCommitted) catch _ { return }
+	let tid = m.HeapInsert(writer, 48, []u8{1}) catch _ { return }
+	m.Commit(mut writer) catch _ { return }
+	let row = db.HeapFetch(48, tid, []u8{}) catch _ { return }
+	mut reader = m.Begin(Isolation.ReadCommitted) catch _ { return }
+	let snap = m.Snapshot(reader)
+	_ = m.VisibleTuple(snap, 48, row)
+	let hintedRow = db.HeapFetch(48, tid, []u8{}) catch _ { return }
+	for i in 0..b.N {
+		let visible = m.Visible(snap, hintedRow.Header)
+		if !visible || i < 0 { continue }
+	}
+	m.Abort(mut reader) catch _ { }
+	hearth.Reset()
+}
+
+fn BenchmarkUncontendedLockAcquire(b mut crucible.B) {
+	let (_, _, manager) = testManager("bench-lock-free") catch _ { return }
+	mut m = manager
+	mut tx = m.Begin(Isolation.ReadCommitted) catch _ { return }
+	for i in 0..b.N {
+		m.LockRelation(tx, 4800, LockMode.AccessShare) catch _ { }
+		if i < 0 { continue }
+	}
+	m.Abort(mut tx) catch _ { }
+	hearth.Reset()
+}
+
+fn BenchmarkContendedLockAcquire(b mut crucible.B) {
+	let (_, _, manager) = testManager("bench-lock-contended") catch _ { return }
+	mut m = manager
+	mut holder = m.Begin(Isolation.ReadCommitted) catch _ { return }
+	mut waiter = m.Begin(Isolation.ReadCommitted) catch _ { return }
+	if !m.TryLockRelation(holder, 4801, LockMode.AccessExclusive) { return }
+	for i in 0..b.N {
+	if m.TryLockRelation(waiter, 4801, LockMode.AccessShare) { continue }
+		if i < 0 { continue }
+	}
+	m.Abort(mut waiter) catch _ { }
+	m.Abort(mut holder) catch _ { }
+	hearth.Reset()
 }

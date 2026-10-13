@@ -48,6 +48,25 @@ type Snapshot struct {
 	Cid u32
 }
 
+type SnapshotHandle struct {
+	Id u64
+	Value Snapshot
+}
+
+type TupleCheckCode enum {
+	Ok
+	Invisible
+	SelfModified
+	Updated
+	BeingModified
+}
+
+type TupleCheck struct {
+	Code TupleCheckCode
+	By u32
+	Ctid store.Tid
+}
+
 // LockMode is one of PostgreSQL's eight relation lock modes.
 type LockMode enum {
 	AccessShare
@@ -92,12 +111,19 @@ type TupleLockHolder struct {
 	mode TupleLock
 }
 
-// TupleHeader is the subset of a heap header required for visibility.
-type TupleHeader struct {
-	Xmin u32
-	Xmax u32
-	Cid u32
-	Infomask u16
+type DeleteCommand struct {
+	xid u32
+	cid u32
+}
+
+type TuplePageKey struct {
+	rel u32
+	page u32
+}
+
+type PageVisibility struct {
+	xmin u32
+	xmax u32
 }
 
 // Manager owns transaction ids, outcomes, active snapshots and relation locks.
@@ -107,10 +133,24 @@ type Manager struct {
 	reservedUntil u32
 	clog map[u32][]u8
 	active map[u32]bool
+	txnXmin map[u32]u32
 	locks map[LockKey][]LockHolder
 	tupleLocks map[TupleLockKey][]TupleLockHolder
+	deleteCommands map[TupleLockKey]DeleteCommand
+	snapshots map[u64]Snapshot
+	publishedXip []u32
+	publishedXmin u32
+	allVisiblePages map[TuplePageKey]PageVisibility
+	nextSnapshot u64
 	version u64
 }
+
+const infXmaxLockOnly u16 = 0x0080
+const infXminCommitted u16 = 0x0100
+const infXminInvalid u16 = 0x0200
+const infXminFrozen u16 = 0x0300
+const infXmaxCommitted u16 = 0x0400
+const infXmaxInvalid u16 = 0x0800
 
 // NewManager recovers the durable xid horizon and commit log from the store.
 fn NewManager(s mut store.Store) !Manager {
@@ -119,7 +159,7 @@ fn NewManager(s mut store.Store) !Manager {
 	try s.RegisterRecordKind(walXidAbort, "txn abort")
 	try s.RegisterRecordKind(walClogPage, "txn clog page")
 	s.CreateHeap(xactRel) catch _ { }
-	mut m = Manager{store: s, nextXid: 3, reservedUntil: 3, clog: make(map[u32][]u8), active: make(map[u32]bool), locks: make(map[LockKey][]LockHolder), tupleLocks: make(map[TupleLockKey][]TupleLockHolder), version: 1}
+	mut m = Manager{store: s, nextXid: 3, reservedUntil: 3, clog: make(map[u32][]u8), active: make(map[u32]bool), txnXmin: make(map[u32]u32), locks: make(map[LockKey][]LockHolder), tupleLocks: make(map[TupleLockKey][]TupleLockHolder), deleteCommands: make(map[TupleLockKey]DeleteCommand), snapshots: make(map[u64]Snapshot), publishedXip: []u32{}, publishedXmin: 3, allVisiblePages: make(map[TuplePageKey]PageVisibility), nextSnapshot: 1, version: 1}
 	mut scan = s.HeapScan(xactRel)
 	for {
 		let (tuple, ok) = scan.Next()
@@ -134,21 +174,24 @@ fn NewManager(s mut store.Store) !Manager {
 	}
 	if m.nextXid < 3 { m.nextXid = 3 }
 	m.reservedUntil = m.nextXid
+	m.publishedXmin = m.nextXid
 	try m.recoverInflight()
 	try m.reserveXids()
 	return m
 }
 
-// Begin starts a transaction at the current xid horizon.
+// Begin starts a transaction at the current xid horizon. Serializable currently has repeatable-read semantics; SSI is not implemented.
 fn (m mut Manager) Begin(iso Isolation) !Txn {
 	if m.nextXid >= m.reservedUntil {
 		try m.reserveXids()
 	}
 	let xid = m.nextXid
 	m.nextXid += 1
-	let activeXids = m.activeXids()
-	let xmin = m.minimumActive(xid)
+	let activeXids = m.publishedXip
+	let xmin = m.publishedXmin
 	m.active[xid] = true
+	if iso == Isolation.ReadCommitted { m.txnXmin[xid] = xid } else { m.txnXmin[xid] = xmin }
+	m.refreshPublishedXip()
 	m.version += 1
 	return Txn{xid: xid, iso: iso, cid: 0, startXmin: xmin, startXmax: xid, startXip: activeXids, active: true}
 }
@@ -173,8 +216,51 @@ fn (m Manager) Snapshot(t Txn) Snapshot {
 	if t.iso != Isolation.ReadCommitted {
 		return Snapshot{Xmin: t.startXmin, Xmax: t.startXmax, Xip: t.startXip, Xid: t.xid, Cid: t.cid}
 	}
-	let activeXids = m.activeXids()
-	return Snapshot{Xmin: m.minimumActive(t.xid), Xmax: m.nextXid, Xip: activeXids, Xid: t.xid, Cid: t.cid}
+	return Snapshot{Xmin: m.publishedXmin, Xmax: m.nextXid, Xip: m.publishedXip, Xid: t.xid, Cid: t.cid}
+}
+
+// AcquireSnapshot registers a statement snapshot until ReleaseSnapshot is called.
+fn (m mut Manager) AcquireSnapshot(t Txn) SnapshotHandle {
+	let snap = m.Snapshot(t)
+	let id = m.nextSnapshot
+	m.nextSnapshot += 1
+	m.snapshots[id] = snap
+	return SnapshotHandle{Id: id, Value: snap}
+}
+
+// ReleaseSnapshot removes a registered statement snapshot from the vacuum horizon.
+fn (m mut Manager) ReleaseSnapshot(h SnapshotHandle) {
+	delete(m.snapshots, h.Id)
+}
+
+// GlobalXmin returns the oldest xid retained by any active transaction or registered snapshot.
+fn (m Manager) GlobalXmin() u32 {
+	mut xmin = m.nextXid
+	for xid, horizon in m.txnXmin {
+		let (isActive, active) = m.active[xid]
+		if active && isActive && horizon < xmin { xmin = horizon }
+	}
+	for _, snap in m.snapshots {
+		if snap.Xmin < xmin { xmin = snap.Xmin }
+	}
+	if xmin < 3 { return 3 }
+	return xmin
+}
+
+fn (m mut Manager) releaseTxnSnapshots(xid u32) {
+	mut ids = []u64{}
+	for id, snap in m.snapshots {
+		if snap.Xid == xid { ids = append(ids, id) }
+	}
+	for id in ids { delete(m.snapshots, id) }
+}
+
+fn (m mut Manager) releaseDeleteCommands(xid u32) {
+	mut keys = []TupleLockKey{}
+	for key, value in m.deleteCommands {
+		if value.xid == xid { keys = append(keys, key) }
+	}
+	for key in keys { delete(m.deleteCommands, key) }
 }
 
 // Commit records a committed outcome and releases transaction locks.
@@ -185,6 +271,10 @@ fn (m mut Manager) Commit(t mut Txn) ! {
 	let lsn = try m.persistState(t.xid, XidState.Committed, walXidCommit)
 	try m.store.Sync(lsn)
 	delete(m.active, t.xid)
+	delete(m.txnXmin, t.xid)
+	m.refreshPublishedXip()
+	m.releaseTxnSnapshots(t.xid)
+	m.releaseDeleteCommands(t.xid)
 	t.active = false
 	m.version += 1
 	m.releaseLocks(t.xid)
@@ -198,6 +288,10 @@ fn (m mut Manager) Abort(t mut Txn) ! {
 	}
 	_ = try m.persistState(t.xid, XidState.Aborted, walXidAbort)
 	delete(m.active, t.xid)
+	delete(m.txnXmin, t.xid)
+	m.refreshPublishedXip()
+	m.releaseTxnSnapshots(t.xid)
+	m.releaseDeleteCommands(t.xid)
 	t.active = false
 	m.version += 1
 	m.releaseLocks(t.xid)
@@ -326,28 +420,148 @@ fn cloneBytes(src []u8) []u8 {
 	return dst
 }
 
-// Visible applies snapshot visibility to one tuple header.
-fn (m Manager) Visible(snap Snapshot, h TupleHeader) bool {
-	if h.Xmin == snap.Xid {
-		if h.Cid >= snap.Cid {
-			return false
+// Visible applies PostgreSQL MVCC visibility to a store tuple header.
+fn (m Manager) Visible(snap Snapshot, h store.TupleHeader) bool {
+	let (visible, _) = m.visibleHeader(snap, h, snap.Cid)
+	return visible
+}
+
+// VisibleTuple applies MVCC visibility and persists final xmin/xmax hint bits.
+fn (m mut Manager) VisibleTuple(snap Snapshot, rel store.RelId, tuple store.HeapTuple) bool {
+	let pageKey = TuplePageKey{rel: u32(rel), page: u32(tuple.Tid.Page())}
+	let (pageVisibility, allVisible) = m.allVisiblePages[pageKey]
+	if allVisible && snap.Xmin >= pageVisibility.xmin && snap.Xmax >= pageVisibility.xmax {
+		return true
+	}
+	mut cmax = snap.Cid
+	if tuple.Header.Xmax() == snap.Xid {
+		let key = tupleLockKey(rel, tuple.Tid)
+		let (deleteCommand, hasDeleteCid) = m.deleteCommands[key]
+		if hasDeleteCid && deleteCommand.xid == snap.Xid { cmax = deleteCommand.cid }
+	}
+	let (visible, hints) = m.visibleHeader(snap, tuple.Header, cmax)
+	let missingHints = hints & ~tuple.Header.Infomask()
+	if missingHints != 0 {
+		m.store.SetHint(rel, tuple.Tid, missingHints) catch _ { }
+	}
+	return visible
+}
+
+// HeapInsert writes a tuple with the transaction's current xid and command id.
+fn (m mut Manager) HeapInsert(t Txn, rel store.RelId, payload []u8) !store.Tid {
+	if !t.active { fail "25000 transaction is not active" }
+	let tid = try m.store.HeapInsert(store.NewXidCtx(t.xid, t.cid), rel, payload)
+	delete(m.allVisiblePages, TuplePageKey{rel: u32(rel), page: u32(tid.Page())})
+	return tid
+}
+
+// HeapDelete records the current command id for own-delete visibility and updates xmax.
+fn (m mut Manager) HeapDelete(t Txn, rel store.RelId, tid store.Tid) ! {
+	if !t.active { fail "25000 transaction is not active" }
+	try m.store.HeapDelete(store.NewXidCtx(t.xid, t.cid), rel, tid)
+	delete(m.allVisiblePages, TuplePageKey{rel: u32(rel), page: u32(tid.Page())})
+	m.deleteCommands[tupleLockKey(rel, tid)] = DeleteCommand{xid: t.xid, cid: t.cid}
+}
+
+// CertifyPageAllVisible records a full-page visibility pass for later snapshots.
+// Callers must certify only after every live tuple on the page is known visible.
+fn (m mut Manager) CertifyPageAllVisible(rel store.RelId, page u32) {
+	m.allVisiblePages[TuplePageKey{rel: u32(rel), page: page}] = PageVisibility{xmin: m.publishedXmin, xmax: m.nextXid}
+}
+
+// InvalidatePageVisibility clears a cached page certificate after an external store write.
+fn (m mut Manager) InvalidatePageVisibility(rel store.RelId, page u32) {
+	delete(m.allVisiblePages, TuplePageKey{rel: u32(rel), page: page})
+}
+
+fn (m Manager) visibleHeader(snap Snapshot, h store.TupleHeader, cmax u32) (bool, u16) {
+	mut hints = u16(0)
+	let xmin = h.Xmin()
+	let xminBits = h.Infomask() & infXminFrozen
+	if xmin == 0 || xminBits == infXminInvalid { return false, hints }
+	if xmin == snap.Xid {
+		if h.Cid() >= snap.Cid { return false, hints }
+	} else {
+		mut committed = xminBits == infXminFrozen || xminBits&infXminCommitted != 0
+		if !committed {
+			let state = m.State(xmin)
+			if state == XidState.Aborted {
+				hints |= infXminInvalid
+				return false, hints
+			}
+			if state == XidState.Committed {
+				hints |= infXminCommitted
+				committed = true
+			}
+			if !committed { return false, hints }
 		}
-	} else if h.Infomask & infXminFrozen != 0 {
-	} else if xidIn(h.Xmin, snap.Xip) || h.Xmin >= snap.Xmax {
-		return false
-	} else if h.Xmin != 0 && m.State(h.Xmin) != XidState.Committed {
-		return false
+		// A committed xmin below the snapshot horizon cannot be in xip or beyond xmax.
+		if xmin >= snap.Xmin && (xidIn(xmin, snap.Xip) || xmin >= snap.Xmax) { return false, hints }
 	}
-	if h.Xmax == 0 || h.Infomask & infXmaxLockOnly != 0 || h.Infomask & infXmaxInvalid != 0 {
-		return true
+	let xmax = h.Xmax()
+	let xmaxBits = h.Infomask()
+	if xmax == 0 || xmaxBits&infXmaxInvalid != 0 || xmaxBits&infXmaxLockOnly != 0 { return true, hints }
+	if xmax == snap.Xid {
+		return cmax >= snap.Cid, hints
 	}
-	if h.Xmax == snap.Xid {
-		return h.Cid >= snap.Cid
+	if xmaxBits&infXmaxCommitted != 0 {
+		if xmax < snap.Xmin { return false, hints }
+		if xidIn(xmax, snap.Xip) || xmax >= snap.Xmax { return true, hints }
+		return false, hints
 	}
-	if xidIn(h.Xmax, snap.Xip) || h.Xmax >= snap.Xmax {
-		return true
+	if xidIn(xmax, snap.Xip) || xmax >= snap.Xmax { return true, hints }
+	let xmaxState = m.State(xmax)
+	if xmaxState == XidState.Committed {
+		hints |= infXmaxCommitted
+		return false, hints
 	}
-	return m.State(h.Xmax) != XidState.Committed
+	if xmaxState == XidState.Aborted { hints |= infXmaxInvalid }
+	return true, hints
+}
+
+// HeapTupleSatisfiesDirty reports whether a write must wait before it can inspect this tuple.
+fn (m Manager) HeapTupleSatisfiesDirty(t Txn, h store.TupleHeader) TupleCheck {
+	let xmin = h.Xmin()
+	let xminBits = h.Infomask() & infXminFrozen
+	mut xminState = m.State(xmin)
+	if xminBits == infXminFrozen || xminBits&infXminCommitted != 0 { xminState = XidState.Committed }
+	if xmin == 0 || xminBits == infXminInvalid || xminState == XidState.Aborted {
+		return TupleCheck{Code: TupleCheckCode.Invisible, By: 0, Ctid: h.Ctid()}
+	}
+	if xmin == t.xid && h.Cid() >= t.cid {
+		return TupleCheck{Code: TupleCheckCode.Invisible, By: 0, Ctid: h.Ctid()}
+	}
+	if xmin != t.xid && (xminState == XidState.InProgress || xminState == XidState.SubCommitted) {
+		return TupleCheck{Code: TupleCheckCode.BeingModified, By: xmin, Ctid: h.Ctid()}
+	}
+	let xmax = h.Xmax()
+	let xmaxBits = h.Infomask()
+	if xmax == 0 || xmaxBits&infXmaxInvalid != 0 {
+		return TupleCheck{Code: TupleCheckCode.Ok, By: 0, Ctid: h.Ctid()}
+	}
+	if xmax == t.xid {
+		return TupleCheck{Code: TupleCheckCode.SelfModified, By: xmax, Ctid: h.Ctid()}
+	}
+	let xmaxState = m.State(xmax)
+	if xmaxBits&infXmaxLockOnly != 0 {
+		if xmaxState == XidState.InProgress || xmaxState == XidState.SubCommitted {
+			return TupleCheck{Code: TupleCheckCode.BeingModified, By: xmax, Ctid: h.Ctid()}
+		}
+		return TupleCheck{Code: TupleCheckCode.Ok, By: 0, Ctid: h.Ctid()}
+	}
+	if xmaxBits&infXmaxCommitted != 0 { return TupleCheck{Code: TupleCheckCode.Updated, By: xmax, Ctid: h.Ctid()} }
+	if xmaxState == XidState.InProgress || xmaxState == XidState.SubCommitted {
+		return TupleCheck{Code: TupleCheckCode.BeingModified, By: xmax, Ctid: h.Ctid()}
+	}
+	if xmaxState == XidState.Committed {
+		return TupleCheck{Code: TupleCheckCode.Updated, By: xmax, Ctid: h.Ctid()}
+	}
+	return TupleCheck{Code: TupleCheckCode.Ok, By: 0, Ctid: h.Ctid()}
+}
+
+// HeapTupleSatisfiesUpdate returns the executor's update result for the current transaction.
+fn (m Manager) HeapTupleSatisfiesUpdate(t Txn, h store.TupleHeader) TupleCheck {
+	return m.HeapTupleSatisfiesDirty(t, h)
 }
 
 // FinishStatement advances the caller's command counter.
@@ -355,18 +569,21 @@ fn FinishStatement(t mut Txn) {
 	t.cid += 1
 }
 
-const infXminFrozen = 1
-const infXmaxInvalid = 2
-const infXmaxLockOnly = 4
-
 fn (m Manager) activeXids() []u32 {
+	return m.publishedXip
+}
+
+fn (m mut Manager) refreshPublishedXip() {
 	mut out = []u32{}
+	mut xmin = m.nextXid
 	for xid, isActive in m.active {
 		if isActive {
 			out = append(out, xid)
+			if xid < xmin { xmin = xid }
 		}
 	}
-	return out
+	m.publishedXip = out
+	m.publishedXmin = xmin
 }
 
 fn (m Manager) minimumActive(fallback u32) u32 {
@@ -388,17 +605,30 @@ fn xidIn(xid u32, xs []u32) bool {
 	return false
 }
 
+fn tupleLockKey(rel store.RelId, tid store.Tid) TupleLockKey {
+	return TupleLockKey{rel: u32(rel), page: u32(tid.Page()), slot: tid.Slot()}
+}
+
 // LockRelation acquires a relation lock if no incompatible holder exists.
 fn (m mut Manager) LockRelation(t Txn, rel u32, mode LockMode) ! {
+	if !m.TryLockRelation(t, rel, mode) {
+		fail "55P03 could not obtain lock on relation"
+	}
+	return
+}
+
+// TryLockRelation checks and acquires without allocating an error on contention.
+fn (m mut Manager) TryLockRelation(t Txn, rel u32, mode LockMode) bool {
 	let key = LockKey{rel: rel}
 	let holders = m.locks[key]
 	for h in holders {
+		if h.xid == t.xid && h.mode == mode { return true }
 		if h.xid != t.xid && conflicts(mode, h.mode) {
-			fail "55P03 could not obtain lock on relation"
+			return false
 		}
 	}
 	m.locks[key] = append(holders, LockHolder{xid: t.xid, mode: mode})
-	return
+	return true
 }
 
 // LockTuple acquires a tuple lock if no incompatible holder owns that tuple.
@@ -406,6 +636,7 @@ fn (m mut Manager) LockTuple(t Txn, rel u32, page u32, slot u16, mode TupleLock)
 	let key = TupleLockKey{rel: rel, page: page, slot: slot}
 	let holders = m.tupleLocks[key]
 	for h in holders {
+		if h.xid == t.xid && h.mode == mode { return }
 		if h.xid != t.xid && tupleConflicts(mode, h.mode) {
 			fail "55P03 could not obtain lock on tuple"
 		}

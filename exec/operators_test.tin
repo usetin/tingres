@@ -1,0 +1,354 @@
+package exec
+
+import "../types"
+import "../plan"
+import "../catalog"
+import "../store"
+import "../txn"
+import "crucible"
+
+fn pullAll(t mut crucible.T, cur mut dyn Cursor) [][]types.Datum {
+	mut rows = [][]types.Datum{}
+	for {
+		let (row, ok) = cur.Next() catch err {
+			t.Error("cursor pull failed: {err}")
+			break
+		}
+		if !ok {
+			break
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+fn TestOperatorsFilterProjectLimitUnique(t mut crucible.T) {
+	// Values input: (1), (2), (2), (3), (4)
+	mut vRows = [][]plan.Expr{}
+	for i in []i64{1, 2, 2, 3, 4} {
+		vRows = append(vRows, []plan.Expr{
+			plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, i), Type: types.Int4Oid}),
+		})
+	}
+	let colDesc = plan.ColDesc{Name: "c1", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: 1}
+	mut vPlan = plan.Plan.Values(plan.ValuesNode{
+		Rows: vRows,
+		Cols: []plan.ColDesc{colDesc},
+		Cost: plan.Cost{},
+	})
+
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+
+	// 1. Unique: (1), (2), (3), (4)
+	mut uPlan = plan.Plan.Unique(plan.UniqueNode{
+		Input: vPlan,
+		Cols: []plan.ColDesc{colDesc},
+		Cost: plan.Cost{},
+	})
+	mut uCur = BuildCursor(mut uPlan, mut ctx) catch err {
+		t.Error("BuildCursor Unique failed: {err}")
+		return
+	}
+	let uRows = pullAll(mut t, mut uCur)
+	t.True("unique rows count is 4", len(uRows) == 4)
+	if len(uRows) == 4 {
+		t.True("row 0 is 1", uRows[0][0].Text() == "1")
+		t.True("row 1 is 2", uRows[1][0].Text() == "2")
+		t.True("row 2 is 3", uRows[2][0].Text() == "3")
+		t.True("row 3 is 4", uRows[3][0].Text() == "4")
+	}
+
+	// 2. Filter: c1 > 2 -> (3), (4)
+	let c1Ref = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.Int4Oid})
+	let const2 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 2), Type: types.Int4Oid})
+	let gtOp = types.LookupOperator(">", types.Int4Oid, types.Int4Oid)
+	if let op = gtOp {
+		let pred = plan.Expr.OpCall(plan.OpCallExpr{Op: ">", Func: op, Args: []plan.Expr{c1Ref, const2}, Type: types.BoolOid})
+		mut fPlan = plan.Plan.Filter(plan.FilterNode{
+			Input: uPlan,
+			Predicate: pred,
+			Cols: []plan.ColDesc{colDesc},
+			Cost: plan.Cost{},
+		})
+		mut fCur = BuildCursor(mut fPlan, mut ctx) catch err {
+			t.Error("BuildCursor Filter failed: {err}")
+			return
+		}
+		let fRows = pullAll(mut t, mut fCur)
+		t.True("filtered rows count is 2", len(fRows) == 2)
+		if len(fRows) == 2 {
+			t.True("fRow 0 is 3", fRows[0][0].Text() == "3")
+			t.True("fRow 1 is 4", fRows[1][0].Text() == "4")
+		}
+	}
+
+	// 3. Limit / Offset: offset 1, count 2 over Values -> (2), (2)
+	let const1 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: types.Int4Oid})
+	mut limPlan = plan.Plan.Limit(plan.LimitNode{
+		Input: vPlan,
+		Count: const2,
+		Offset: const1,
+		Cols: []plan.ColDesc{colDesc},
+		Cost: plan.Cost{},
+	})
+	mut lCur = BuildCursor(mut limPlan, mut ctx) catch err {
+		t.Error("BuildCursor Limit failed: {err}")
+		return
+	}
+	let lRows = pullAll(mut t, mut lCur)
+	t.True("limit rows count is 2", len(lRows) == 2)
+	if len(lRows) == 2 {
+		t.True("lRow 0 is 2", lRows[0][0].Text() == "2")
+		t.True("lRow 1 is 2", lRows[1][0].Text() == "2")
+	}
+}
+
+fn TestOperatorsSort(t mut crucible.T) {
+	// Values input: 30, 10, 20
+	let vRows = [][]plan.Expr{
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 30), Type: types.Int4Oid})},
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 10), Type: types.Int4Oid})},
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 20), Type: types.Int4Oid})},
+	}
+	let colDesc = plan.ColDesc{Name: "v", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: 1}
+	mut vPlan = plan.Plan.Values(plan.ValuesNode{
+		Rows: vRows,
+		Cols: []plan.ColDesc{colDesc},
+		Cost: plan.Cost{},
+	})
+
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+	let col0 = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.Int4Oid})
+
+	// Ascending Sort -> 10, 20, 30
+	mut sortAscPlan = plan.Plan.Sort(plan.SortNode{
+		Input: vPlan,
+		Keys: []plan.SortKey{plan.SortKey{Expr: col0, Descending: false, NullsFirst: false}},
+		Limit: -1,
+		Cols: []plan.ColDesc{colDesc},
+		Cost: plan.Cost{},
+	})
+	mut sCur = BuildCursor(mut sortAscPlan, mut ctx) catch err {
+		t.Error("BuildCursor Sort failed: {err}")
+		return
+	}
+	let sRows = pullAll(mut t, mut sCur)
+	t.True("sort count is 3", len(sRows) == 3)
+	if len(sRows) == 3 {
+		t.True("first is 10", sRows[0][0].Text() == "10")
+		t.True("second is 20", sRows[1][0].Text() == "20")
+		t.True("third is 30", sRows[2][0].Text() == "30")
+	}
+
+	// Descending Sort with Top-1 -> 30
+	mut sortDescPlan = plan.Plan.Sort(plan.SortNode{
+		Input: vPlan,
+		Keys: []plan.SortKey{plan.SortKey{Expr: col0, Descending: true, NullsFirst: false}},
+		Limit: 1,
+		Cols: []plan.ColDesc{colDesc},
+		Cost: plan.Cost{},
+	})
+	mut topCur = BuildCursor(mut sortDescPlan, mut ctx) catch err {
+		t.Error("BuildCursor TopSort failed: {err}")
+		return
+	}
+	let topRows = pullAll(mut t, mut topCur)
+	t.True("top-1 count is 1", len(topRows) == 1)
+	if len(topRows) == 1 {
+		t.True("top is 30", topRows[0][0].Text() == "30")
+	}
+}
+
+fn TestOperatorsNestLoopAndHashJoin(t mut crucible.T) {
+	// Left: (1, 'A'), (2, 'B'), (3, 'C')
+	let leftRows = [][]plan.Expr{
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: types.Int4Oid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "A"), Type: types.TextOid})},
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 2), Type: types.Int4Oid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "B"), Type: types.TextOid})},
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 3), Type: types.Int4Oid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "C"), Type: types.TextOid})},
+	}
+	let leftCols = []plan.ColDesc{
+		plan.ColDesc{Name: "id", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: 1},
+		plan.ColDesc{Name: "val", Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 2},
+	}
+	mut leftPlan = plan.Plan.Values(plan.ValuesNode{Rows: leftRows, Cols: leftCols, Cost: plan.Cost{}})
+
+	// Right: (2, 'two'), (3, 'three'), (4, 'four')
+	let rightRows = [][]plan.Expr{
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 2), Type: types.Int4Oid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "two"), Type: types.TextOid})},
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 3), Type: types.Int4Oid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "three"), Type: types.TextOid})},
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 4), Type: types.Int4Oid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "four"), Type: types.TextOid})},
+	}
+	let rightCols = []plan.ColDesc{
+		plan.ColDesc{Name: "rid", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: 1},
+		plan.ColDesc{Name: "rval", Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 2},
+	}
+	mut rightPlan = plan.Plan.Values(plan.ValuesNode{Rows: rightRows, Cols: rightCols, Cost: plan.Cost{}})
+
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+
+	// Equal qual: slot 0 (Left id) = slot 2 (Right rid)
+	let leftKey = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.Int4Oid})
+	let rightKeyInJoined = plan.Expr.ColRef(plan.ColRefExpr{Slot: 2, RangeIndex: 2, AttNo: 1, Type: types.Int4Oid})
+	let rightKeyDirect = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 2, AttNo: 1, Type: types.Int4Oid})
+	let eqOp = types.LookupOperator("=", types.Int4Oid, types.Int4Oid)
+	if let op = eqOp {
+		let qual = plan.Expr.OpCall(plan.OpCallExpr{Op: "=", Func: op, Args: []plan.Expr{leftKey, rightKeyInJoined}, Type: types.BoolOid})
+
+		// 1. NestLoop Inner Join: matches id 2 and 3 -> 2 rows
+		mut nlPlan = plan.Plan.NestLoop(plan.NestLoopNode{
+			Left: leftPlan,
+			Right: rightPlan,
+			JoinType: plan.JoinType.Inner,
+			Quals: []plan.Expr{qual},
+			Cols: []plan.ColDesc{},
+			Cost: plan.Cost{},
+		})
+		mut nlCur = BuildCursor(mut nlPlan, mut ctx) catch err {
+			t.Error("BuildCursor NestLoop failed: {err}")
+			return
+		}
+		let nlRows = pullAll(mut t, mut nlCur)
+		t.True("nest loop inner count is 2", len(nlRows) == 2)
+
+		// 2. NestLoop Left Join: id 1 (unmatched), id 2, id 3 -> 3 rows
+		mut nlLeftPlan = plan.Plan.NestLoop(plan.NestLoopNode{
+			Left: leftPlan,
+			Right: rightPlan,
+			JoinType: plan.JoinType.Left,
+			Quals: []plan.Expr{qual},
+			Cols: []plan.ColDesc{},
+			Cost: plan.Cost{},
+		})
+		mut nlLeftCur = BuildCursor(mut nlLeftPlan, mut ctx) catch err {
+			t.Error("BuildCursor NestLoop Left failed: {err}")
+			return
+		}
+		let nlLeftRows = pullAll(mut t, mut nlLeftCur)
+		t.True("nest loop left join count is 3", len(nlLeftRows) == 3)
+		if len(nlLeftRows) == 3 {
+			t.True("unmatched right is null", types.IsNull(nlLeftRows[0][2]))
+		}
+
+		// 3. HashJoin Inner: id 2 and 3 -> 2 rows
+		mut hjPlan = plan.Plan.HashJoin(plan.HashJoinNode{
+			Left: leftPlan,
+			Right: rightPlan,
+			JoinType: plan.JoinType.Inner,
+			LeftKeys: []plan.Expr{leftKey},
+			RightKeys: []plan.Expr{rightKeyDirect},
+			Quals: []plan.Expr{},
+			Cols: []plan.ColDesc{},
+			Cost: plan.Cost{},
+		})
+		mut hjCur = BuildCursor(mut hjPlan, mut ctx) catch err {
+			t.Error("BuildCursor HashJoin failed: {err}")
+			return
+		}
+		let hjRows = pullAll(mut t, mut hjCur)
+		t.True("hash join inner count is 2", len(hjRows) == 2)
+	}
+}
+
+fn TestOperatorsHashAggAndWindow(t mut crucible.T) {
+	// Rows: ('cat', 10), ('cat', 20), ('dog', 5)
+	let rows = [][]plan.Expr{
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "cat"), Type: types.TextOid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 10), Type: types.Int4Oid})},
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "cat"), Type: types.TextOid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 20), Type: types.Int4Oid})},
+		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "dog"), Type: types.TextOid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 5), Type: types.Int4Oid})},
+	}
+	mut vPlan = plan.Plan.Values(plan.ValuesNode{
+		Rows: rows,
+		Cols: []plan.ColDesc{},
+		Cost: plan.Cost{},
+	})
+
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+
+	let groupCol = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.TextOid})
+	let valCol = plan.Expr.ColRef(plan.ColRefExpr{Slot: 1, RangeIndex: 1, AttNo: 2, Type: types.Int4Oid})
+
+	// Group by col 0, sum(col 1)
+	let sumAgg = types.LookupAgg("sum", []u32{types.Int4Oid})
+	if let sAgg = sumAgg {
+		let aggRef = plan.AggRefExpr{
+			Slot: 1,
+			Agg: sAgg,
+			Args: []plan.Expr{valCol},
+			Distinct: false,
+			Type: types.Int8Oid,
+		}
+		mut aggPlan = plan.Plan.HashAgg(plan.HashAggNode{
+			Input: vPlan,
+			GroupKeys: []plan.Expr{groupCol},
+			Aggs: []plan.AggRefExpr{aggRef},
+			Cols: []plan.ColDesc{},
+			Cost: plan.Cost{},
+		})
+		mut aCur = BuildCursor(mut aggPlan, mut ctx) catch err {
+			t.Error("BuildCursor HashAgg failed: {err}")
+			return
+		}
+		let aRows = pullAll(mut t, mut aCur)
+		t.True("aggregated groups count is 2", len(aRows) == 2)
+		// Check sums
+		for r in aRows {
+			if r[0].Text() == "cat" {
+				t.True("sum(cat) = 30", r[1].Text() == "30")
+			} else if r[0].Text() == "dog" {
+				t.True("sum(dog) = 5", r[1].Text() == "5")
+			}
+		}
+	}
+
+	// Window function: row_number()
+	let winRef = plan.WindowFuncRefExpr{
+		Slot: 2,
+		Name: "row_number",
+		Args: []plan.Expr{},
+		WindowIndex: 0,
+		Type: types.Int8Oid,
+	}
+	mut winPlan = plan.Plan.WindowAgg(plan.WindowAggNode{
+		Input: vPlan,
+		Funcs: []plan.WindowFuncRefExpr{winRef},
+		Partitions: []plan.Expr{},
+		OrderKeys: []plan.SortKey{},
+		Frame: plan.WindowFrame{},
+		Cols: []plan.ColDesc{},
+		Cost: plan.Cost{},
+	})
+	mut wCur = BuildCursor(mut winPlan, mut ctx) catch err {
+		t.Error("BuildCursor WindowAgg failed: {err}")
+		return
+	}
+	let wRows = pullAll(mut t, mut wCur)
+	t.True("window rows count is 3", len(wRows) == 3)
+	if len(wRows) == 3 {
+		t.True("row_number 1", wRows[0][2].Text() == "1")
+		t.True("row_number 2", wRows[1][2].Text() == "2")
+		t.True("row_number 3", wRows[2][2].Text() == "3")
+	}
+}
+
+fn TestOperatorsFunctionScan(t mut crucible.T) {
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+
+	let genFn = types.LookupFunc("generate_series", []u32{types.Int4Oid, types.Int4Oid})
+	if let f = genFn {
+		let c1 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: types.Int4Oid})
+		let c3 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 3), Type: types.Int4Oid})
+		let fnCall = plan.Expr.FuncCall(plan.FuncCallExpr{Func: f, Args: []plan.Expr{c1, c3}, Type: types.Int4Oid})
+		mut fnPlan = plan.Plan.FunctionScan(plan.FunctionScanNode{Expr: fnCall, Cols: []plan.ColDesc{}, Cost: plan.Cost{}})
+		mut fnCur = BuildCursor(mut fnPlan, mut ctx) catch err {
+			t.Error("BuildCursor FunctionScan failed: {err}")
+			return
+		}
+		let fnRows = pullAll(mut t, mut fnCur)
+		t.True("generate_series count is 3", len(fnRows) == 3)
+		if len(fnRows) == 3 {
+			t.True("series 1", fnRows[0][0].Text() == "1")
+			t.True("series 2", fnRows[1][0].Text() == "2")
+			t.True("series 3", fnRows[2][0].Text() == "3")
+		}
+	}
+}

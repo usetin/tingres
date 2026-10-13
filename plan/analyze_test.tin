@@ -1,0 +1,330 @@
+package plan
+
+import "../types"
+import "../catalog"
+import "../txn"
+import "../store"
+import "../parse"
+import "crucible"
+import "quarry"
+
+type TestEnv struct {
+	Cat catalog.Catalog
+	Txn txn.Txn
+	Dir str
+}
+
+fn setupTestEnv(t mut crucible.T, testName str) ?TestEnv {
+	let dir = quarry.TempDir() + "/tingres-analyze-" + testName
+	quarry.RemoveAll(dir) catch _ { }
+	mut db = store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false}) catch err {
+		t.Error("store open: {err}")
+		return nil
+	}
+	let m = txn.NewManager(mut db) catch err {
+		t.Error("txn manager: {err}")
+		return nil
+	}
+	mut c = catalog.Open(mut db, m) catch err {
+		t.Error("catalog open: " + types.ErrorMessage(err))
+		return nil
+	}
+	mut txnMgr = m
+	let currentTxn = txnMgr.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin txn: {err}")
+		return nil
+	}
+
+	// Create users table
+	let usersDef = catalog.TableDef{
+		Schema: "public",
+		Name: "users",
+		Columns: []catalog.ColumnDef{
+			catalog.ColumnDef{Name: "id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "name", Type: types.TextOid, Typmod: -1, Nullable: true},
+			catalog.ColumnDef{Name: "age", Type: types.Int4Oid, Typmod: -1, Nullable: true},
+		},
+	}
+	_ = c.CreateTable(currentTxn, usersDef) catch err {
+		t.Error("create users: " + types.ErrorMessage(err))
+		return nil
+	}
+
+	// Create orders table
+	let ordersDef = catalog.TableDef{
+		Schema: "public",
+		Name: "orders",
+		Columns: []catalog.ColumnDef{
+			catalog.ColumnDef{Name: "id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "user_id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "amount", Type: types.Float8Oid, Typmod: -1, Nullable: true},
+		},
+	}
+	_ = c.CreateTable(currentTxn, ordersDef) catch err {
+		t.Error("create orders: " + types.ErrorMessage(err))
+		return nil
+	}
+	currentTxn.CommandCounterIncrement()
+
+	return TestEnv{Cat: c, Txn: currentTxn, Dir: dir}
+}
+
+fn cleanupTestEnv(env TestEnv) {
+	quarry.RemoveAll(env.Dir) catch _ { }
+}
+
+fn parseSql(sql str) !parse.Stmt {
+	let stmts = try parse.Parse(sql)
+	return stmts[0]
+}
+
+fn assertSqlError(t mut crucible.T, env TestEnv, sql str, expectedCode str, expectedMsgSubstring str) {
+	let stmt = parseSql(sql) catch err {
+		t.Error("parse failed for '" + sql + "': " + types.ErrorMessage(err))
+		return
+	}
+	mut params = []u32{}
+	let res = AnalyzeStatement(env.Cat, env.Txn, stmt, mut params) catch err {
+		let code = types.ErrorCode(err)
+		let msg = types.ErrorMessage(err)
+		crucible.Equal(mut t, "SQLSTATE code for " + sql, code, expectedCode)
+		if expectedMsgSubstring != "" {
+			t.True("message contains expected substring: " + msg, len(msg) > 0)
+		}
+		return
+	}
+	_ = res
+	t.Error("expected error " + expectedCode + " but analysis succeeded for: " + sql)
+}
+
+fn TestAnalyzeErrorCodes(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "errors")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	// 42P01: relation does not exist
+	assertSqlError(mut t, env, "SELECT * FROM nonexistent", "42P01", "relation \"nonexistent\" does not exist")
+	// 42P01: missing FROM-clause entry for table
+	assertSqlError(mut t, env, "SELECT orders.id FROM users", "42P01", "missing FROM-clause entry for table \"orders\"")
+
+	// 42703: column does not exist
+	assertSqlError(mut t, env, "SELECT foo FROM users", "42703", "column \"foo\" does not exist")
+	assertSqlError(mut t, env, "SELECT users.foo FROM users", "42703", "column users.foo does not exist")
+
+	// 42712: table name specified more than once
+	assertSqlError(mut t, env, "SELECT * FROM users u, users u", "42712", "table name \"u\" specified more than once")
+
+	// 42803: aggregate in WHERE
+	assertSqlError(mut t, env, "SELECT * FROM users WHERE count(*) > 0", "42803", "aggregate functions are not allowed in WHERE")
+
+	// 42803: aggregate in GROUP BY
+	assertSqlError(mut t, env, "SELECT sum(age) FROM users GROUP BY count(*)", "42803", "aggregate functions are not allowed in GROUP BY")
+
+	// 42803: aggregate function calls cannot be nested
+	assertSqlError(mut t, env, "SELECT sum(count(id)) FROM users", "42803", "aggregate function calls cannot be nested")
+
+	// 42803: column must appear in GROUP BY
+	assertSqlError(mut t, env, "SELECT name, sum(age) FROM users", "42803", "must appear in the GROUP BY clause or be used in an aggregate function")
+
+	// 42P20: window functions not allowed in WHERE
+	assertSqlError(mut t, env, "SELECT * FROM users WHERE row_number() OVER () > 1", "42P20", "window functions are not allowed in WHERE")
+
+	// 42883: operator does not exist
+	assertSqlError(mut t, env, "SELECT name + age FROM users", "42883", "operator does not exist")
+
+	// 42883: function does not exist
+	assertSqlError(mut t, env, "SELECT nonexistent_func(id) FROM users", "42883", "does not exist")
+
+	// 42P19: circular reference in CTE
+	assertSqlError(mut t, env, "WITH RECURSIVE r AS (SELECT * FROM r) SELECT * FROM r", "42P19", "circular reference in CTE \"r\"")
+
+	// 42804: CASE type mismatch
+	assertSqlError(mut t, env, "SELECT CASE WHEN id > 0 THEN name ELSE id END FROM users", "42804", "cannot be matched")
+
+	cleanupTestEnv(env)
+}
+
+fn TestAnalyzePositiveQueries(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "positive")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	// 1. Star expansion
+	let stmt1 = parseSql("SELECT * FROM users") catch err {
+		t.Error("parse star: " + types.ErrorMessage(err))
+		return
+	}
+	mut params1 = []u32{}
+	let q1 = AnalyzeStatement(env.Cat, env.Txn, stmt1, mut params1) catch err {
+		t.Error("analyze star: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "star targets count", len(q1.Targets), 3)
+	crucible.Equal(mut t, "col1 name", q1.Targets[0].Name, "id")
+	crucible.Equal(mut t, "col2 name", q1.Targets[1].Name, "name")
+	crucible.Equal(mut t, "col3 name", q1.Targets[2].Name, "age")
+
+	// 2. Qualified star expansion
+	let stmt2 = parseSql("SELECT u.* FROM users u") catch err {
+		t.Error("parse u.*: " + types.ErrorMessage(err))
+		return
+	}
+	mut params2 = []u32{}
+	let q2 = AnalyzeStatement(env.Cat, env.Txn, stmt2, mut params2) catch err {
+		t.Error("analyze u.*: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "qualified star targets count", len(q2.Targets), 3)
+
+	// 3. Parameter type inference
+	let stmt3 = parseSql("SELECT * FROM users WHERE id = $1") catch err {
+		t.Error("parse param: " + types.ErrorMessage(err))
+		return
+	}
+	mut params3 = []u32{}
+	let q3 = AnalyzeStatement(env.Cat, env.Txn, stmt3, mut params3) catch err {
+		t.Error("analyze param: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "inferred params count", len(params3), 1)
+	crucible.Equal(mut t, "param 1 type is int4", params3[0], u32(types.Int4Oid))
+	t.True("has where clause", q3.Where != nil)
+
+	// 4. Aggregate query
+	let stmt4 = parseSql("SELECT count(*), sum(age) FROM users") catch err {
+		t.Error("parse agg: " + types.ErrorMessage(err))
+		return
+	}
+	mut params4 = []u32{}
+	let q4 = AnalyzeStatement(env.Cat, env.Txn, stmt4, mut params4) catch err {
+		t.Error("analyze agg: " + types.ErrorMessage(err))
+		return
+	}
+	t.True("has aggs flag set", q4.HasAggs)
+	crucible.Equal(mut t, "agg targets count", len(q4.Targets), 2)
+
+	// 5. CTE query
+	let stmt5 = parseSql("WITH young AS (SELECT id, name FROM users WHERE age < 30) SELECT * FROM young") catch err {
+		t.Error("parse cte: " + types.ErrorMessage(err))
+		return
+	}
+	mut params5 = []u32{}
+	let q5 = AnalyzeStatement(env.Cat, env.Txn, stmt5, mut params5) catch err {
+		t.Error("analyze cte: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "cte targets count", len(q5.Targets), 2)
+	crucible.Equal(mut t, "cte target 1", q5.Targets[0].Name, "id")
+	crucible.Equal(mut t, "cte target 2", q5.Targets[1].Name, "name")
+
+	// 6. Join with USING
+	let stmt6 = parseSql("SELECT * FROM users JOIN orders ON users.id = orders.user_id") catch err {
+		t.Error("parse join: " + types.ErrorMessage(err))
+		return
+	}
+	mut params6 = []u32{}
+	let q6 = AnalyzeStatement(env.Cat, env.Txn, stmt6, mut params6) catch err {
+		t.Error("analyze join: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "join star targets count", len(q6.Targets), 6)
+
+	cleanupTestEnv(env)
+}
+
+fn TestAnalyzeMoreErrors(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "more_errors")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	// 42702: ambiguous column reference (id exists in both users and orders)
+	assertSqlError(mut t, env, "SELECT id FROM users, orders", "42702", "column reference \"id\" is ambiguous")
+
+	// 42804: WHERE argument not boolean
+	assertSqlError(mut t, env, "SELECT * FROM users WHERE age", "42804", "argument of WHERE must be type boolean, not type integer")
+
+	// 42601: UNION column count mismatch
+	assertSqlError(mut t, env, "SELECT id, name FROM users UNION SELECT id FROM users", "42601", "each UNION query must have the same number of columns")
+
+	// 42804: UNION type mismatch
+	assertSqlError(mut t, env, "SELECT name FROM users UNION SELECT id FROM users", "42804", "UNION types text and integer cannot be matched")
+
+	// 42P01: INSERT into nonexistent table
+	assertSqlError(mut t, env, "INSERT INTO nonexistent VALUES (1)", "42P01", "relation \"nonexistent\" does not exist")
+
+	// 42P01: UPDATE nonexistent table
+	assertSqlError(mut t, env, "UPDATE nonexistent SET id = 1", "42P01", "relation \"nonexistent\" does not exist")
+
+	// 42P01: DELETE nonexistent table
+	assertSqlError(mut t, env, "DELETE FROM nonexistent", "42P01", "relation \"nonexistent\" does not exist")
+
+	// 42703: UPDATE with unknown column in WHERE
+	assertSqlError(mut t, env, "UPDATE users SET age = 30 WHERE nonexistent_col = 1", "42703", "column \"nonexistent_col\" does not exist")
+
+	// 42703: DELETE with unknown column in WHERE
+	assertSqlError(mut t, env, "DELETE FROM users WHERE nonexistent_col = 1", "42703", "column \"nonexistent_col\" does not exist")
+
+	cleanupTestEnv(env)
+}
+
+fn TestAnalyzeDmlAndParams(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "dml_params")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	// INSERT analysis
+	let stmtIns = parseSql("INSERT INTO users VALUES (1, 'Alice', 25)") catch err {
+		t.Error("parse insert: " + types.ErrorMessage(err))
+		return
+	}
+	mut paramsIns = []u32{}
+	let qIns = AnalyzeStatement(env.Cat, env.Txn, stmtIns, mut paramsIns) catch err {
+		t.Error("analyze insert: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "insert command", qIns.Command, "INSERT")
+	crucible.Equal(mut t, "insert targets count", len(qIns.Targets), 3)
+
+	// UPDATE analysis
+	let stmtUpd = parseSql("UPDATE users SET age = 30 WHERE id = 1") catch err {
+		t.Error("parse update: " + types.ErrorMessage(err))
+		return
+	}
+	mut paramsUpd = []u32{}
+	let qUpd = AnalyzeStatement(env.Cat, env.Txn, stmtUpd, mut paramsUpd) catch err {
+		t.Error("analyze update: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "update command", qUpd.Command, "UPDATE")
+	t.True("update where not nil", qUpd.Where != nil)
+
+	// DELETE analysis
+	let stmtDel = parseSql("DELETE FROM users WHERE age > 50") catch err {
+		t.Error("parse delete: " + types.ErrorMessage(err))
+		return
+	}
+	mut paramsDel = []u32{}
+	let qDel = AnalyzeStatement(env.Cat, env.Txn, stmtDel, mut paramsDel) catch err {
+		t.Error("analyze delete: " + types.ErrorMessage(err))
+		return
+	}
+	crucible.Equal(mut t, "delete command", qDel.Command, "DELETE")
+	t.True("delete where not nil", qDel.Where != nil)
+
+	// Multi-parameter inference
+	let stmtParams = parseSql("SELECT * FROM users WHERE id = $1 AND age = $2") catch err {
+		t.Error("parse multi params: " + types.ErrorMessage(err))
+		return
+	}
+	mut paramsMulti = []u32{}
+	let qParams = AnalyzeStatement(env.Cat, env.Txn, stmtParams, mut paramsMulti) catch err {
+		t.Error("analyze multi params: " + types.ErrorMessage(err))
+		return
+	}
+	_ = qParams
+	crucible.Equal(mut t, "params count is 2", len(paramsMulti), 2)
+	crucible.Equal(mut t, "param 1 is int4", paramsMulti[0], u32(types.Int4Oid))
+	crucible.Equal(mut t, "param 2 is int4", paramsMulti[1], u32(types.Int4Oid))
+
+	cleanupTestEnv(env)
+}

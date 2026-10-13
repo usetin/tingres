@@ -1,0 +1,151 @@
+package exec
+
+import "../types"
+import "../plan"
+import "../catalog"
+import "../txn"
+import "../store"
+import "crucible"
+import "quarry"
+
+fn createDiffSession(name str) !(Session, txn.Manager) {
+	let dir = quarry.TempDir() + "/tingres-diff-" + name
+	quarry.RemoveAll(dir) catch _ { }
+	mut db = try store.Open(dir, store.Options{BufferPages: 32, SyncOnWrite: false})
+	mut m = try txn.NewManager(mut db)
+	let c = try catalog.Open(mut db, m)
+	let s = NewSession(c, m, "postgres", "postgres")
+	return s, m
+}
+
+fn TestDifferentialWorkloadSuite(t mut crucible.T) {
+	let (sess, _) = createDiffSession("workload") catch err {
+		t.Error("setup diff session failed: {err}")
+		return
+	}
+	mut s = sess
+
+	// Run a sequence of DDL, DML, queries, joins, aggregates, transactions, and system functions
+	let stmts = []str{
+		// DDL
+		"CREATE TABLE depts (dept_id int, dept_name text);",
+		"CREATE TABLE emps (emp_id int, name text, dept_id int, salary int);",
+		"CREATE INDEX idx_emp_id ON emps (emp_id);",
+
+		// DML: insert depts
+		"INSERT INTO depts VALUES (10, 'Engineering');",
+		"INSERT INTO depts VALUES (20, 'Sales');",
+		"INSERT INTO depts VALUES (30, 'Marketing');",
+
+		// DML: insert emps
+		"INSERT INTO emps VALUES (101, 'Alice', 10, 100000);",
+		"INSERT INTO emps VALUES (102, 'Bob', 10, 90000);",
+		"INSERT INTO emps VALUES (103, 'Carol', 20, 80000);",
+		"INSERT INTO emps VALUES (104, 'Dave', 20, 85000);",
+		"INSERT INTO emps VALUES (105, 'Eve', 30, 95000);",
+
+		// Queries with projections and filters
+		"SELECT name, salary FROM emps WHERE dept_id = 10;",
+		"SELECT name, salary FROM emps WHERE salary > 90000;",
+
+		// Expressions and arithmetic
+		"SELECT name, salary + 5000 FROM emps WHERE dept_id = 20;",
+
+		// Updates
+		"UPDATE emps SET salary = 92000 WHERE emp_id = 102;",
+
+		// Deletes
+		"DELETE FROM emps WHERE emp_id = 104;",
+
+		// Transaction block with savepoints
+		"BEGIN;",
+		"INSERT INTO emps VALUES (106, 'Frank', 30, 70000);",
+		"SAVEPOINT sp_frank;",
+		"INSERT INTO emps VALUES (107, 'Grace', 30, 60000);",
+		"ROLLBACK TO SAVEPOINT sp_frank;",
+		"COMMIT;",
+
+		// Joins
+		"SELECT emps.name, depts.dept_name FROM emps JOIN depts ON emps.dept_id = depts.dept_id;",
+
+		// Aggregates
+		"SELECT dept_id, count(*), sum(salary), avg(salary), min(salary), max(salary) FROM emps GROUP BY dept_id;",
+
+		// Order by and Limit
+		"SELECT name, salary FROM emps ORDER BY salary DESC LIMIT 3;",
+
+		// System functions
+		"SELECT version();",
+		"SELECT current_database();",
+		"SELECT current_schema();",
+		"SELECT pg_backend_pid();",
+
+		// GUCs
+		"SET search_path = public;",
+		"SHOW search_path;",
+		"RESET search_path;",
+
+		// Cleanup
+		"DROP TABLE emps;",
+		"DROP TABLE depts;",
+	}
+
+	mut count = 0
+	for sql in stmts {
+		mut sink = NewRecordSink()
+		s.Simple(sql, mut sink) catch err {
+			t.Error("statement {count} failed: {sql} err={err}")
+			return
+		}
+		count += 1
+	}
+	t.True("executed all workload statements", count == len(stmts))
+}
+
+fn TestDifferentialExtendedProtocolSuite(t mut crucible.T) {
+	let (sess, _) = createDiffSession("ext_suite") catch err {
+		t.Error("setup ext session failed: {err}")
+		return
+	}
+	mut s = sess
+
+	// Parse prepared statement with parameter
+	s.Parse("prep_calc", "SELECT $1 + 10;", []u32{types.Int4Oid}) catch err {
+		t.Error("Parse prep_calc failed: {err}")
+		return
+	}
+
+	// Describe prepared statement
+	let desc = s.Describe('S', "prep_calc") catch err {
+		t.Error("Describe prep_calc failed: {err}")
+		return
+	}
+	t.True("1 param oid", len(desc.ParamOids) == 1)
+	t.True("1 result col", len(desc.Cols) == 1)
+
+	// Bind with parameter value 32
+	mut bindParams = []types.Datum{types.FromI64(types.Int4Oid, 32)}
+	s.Bind("portal_calc", "prep_calc", mut bindParams, []i16{0}) catch err {
+		t.Error("Bind portal_calc failed: {err}")
+		return
+	}
+
+	// Execute portal
+	mut sink = NewRecordSink()
+	s.Execute("portal_calc", 0, mut sink) catch err {
+		t.Error("Execute portal_calc failed: {err}")
+		return
+	}
+	t.True("got 1 result row", len(sink.Rows) == 1)
+	if len(sink.Rows) == 1 {
+		t.True("result is 42", sink.Rows[0][0].Text() == "42")
+	}
+
+	// Close portal and statement
+	s.Close('P', "portal_calc") catch err {
+		t.Error("Close portal failed: {err}")
+	}
+	s.Close('S', "prep_calc") catch err {
+		t.Error("Close statement failed: {err}")
+	}
+}

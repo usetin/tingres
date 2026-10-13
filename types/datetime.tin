@@ -1,0 +1,945 @@
+package types
+
+import "mint"
+import "twine"
+import "tide"
+
+const microsPerSecond i64 = 1000000
+const microsPerMinute i64 = 60000000
+const microsPerHour i64 = 3600000000
+const microsPerDay i64 = 86400000000
+const pgEpochDays i64 = 10957
+const pgEpochUnixSeconds i64 = 946684800
+const pgInfinity i64 = 9223372036854775807
+
+type ParsedTimestamp struct {
+	year i64
+	month i64
+	day i64
+	hour i64
+	minute i64
+	secondMicros i64
+	offset i64
+	hasZone bool
+	ok bool
+	outOfRange bool
+}
+
+mut sessionTimeZone = "UTC"
+mut testClockSet = false
+mut testClockMicros i64 = 0
+
+// SetTimeZone selects the zone used to parse and render timestamptz values.
+fn SetTimeZone(name str) ! {
+	let trimmed = twine.TrimSpace(name)
+	if trimmed == "" { fail PgFault("22023", "invalid value for parameter \"TimeZone\": \"{name}\"") }
+	if is_fixed_zone(trimmed) {
+		sessionTimeZone = keep(normalize_zone_name(trimmed))
+		return
+	}
+	let zone = tide.LoadZone(trimmed) catch _ { fail PgFault("22023", "invalid value for parameter \"TimeZone\": \"{name}\"") }
+	_ = zone
+	sessionTimeZone = keep(trimmed)
+}
+
+// TimeZone returns the configured session time zone name.
+fn TimeZone() str { return sessionTimeZone }
+
+// SetClockUnixMicros fixes now/current_timestamp/clock_timestamp to a Unix timestamp in microseconds.
+fn SetClockUnixMicros(unixMicros i64) {
+	testClockMicros = unixMicros-pgEpochUnixSeconds*microsPerSecond
+	testClockSet = true
+}
+
+// ResetClock restores the wall clock used by now/current_timestamp/clock_timestamp.
+fn ResetClock() {
+	testClockSet = false
+	testClockMicros = 0
+}
+
+// Now returns the current transaction timestamp as timestamptz.
+fn Now() Datum { return FromI64(TimestamptzOid, current_timestamp_micros()) }
+
+// CurrentTimestamp returns the current transaction timestamp as timestamptz.
+fn CurrentTimestamp() Datum { return Now() }
+
+// ClockTimestamp returns the current wall clock as timestamptz.
+fn ClockTimestamp() Datum { return Now() }
+
+fn current_timestamp_micros() i64 {
+	if testClockSet { return testClockMicros }
+	return tide.Wall()/1000-pgEpochUnixSeconds*microsPerSecond
+}
+
+// ParseDateTime parses date, time, timetz, timestamp, timestamptz and interval input.
+fn ParseDateTime(oid Oid, input str) !Datum {
+	let raw = twine.TrimSpace(input)
+	let lower = ascii_lower(raw)
+	if oid == DateOid {
+		if lower == "infinity" || lower == "+infinity" { return FromI64(oid, pgInfinity) }
+		if lower == "-infinity" { return FromI64(oid, 0-pgInfinity) }
+		if lower == "today" || lower == "now" { return FromI64(oid, timestamp_local_date(current_timestamp_micros())) }
+		if lower == "epoch" { return FromI64(oid, 0-pgEpochDays) }
+		let (year, month, day, syntax) = parse_date_fields(raw)
+		if !syntax { fail PgFault("22007", "invalid input syntax for type date: \"{input}\"") }
+		if month < 1 || month > 12 || day < 1 || day > tide.DaysIn(year, month) { fail datetime_range(input) }
+		return FromI64(oid, tide.DaysFromCivil(year, month, day)-pgEpochDays)
+	}
+	if oid == TimeOid || oid == TimetzOid {
+		let (local, offset, hasZone, ok, outOfRange) = parse_time_value(raw)
+		if !ok {
+			if outOfRange { fail datetime_range(input) }
+			fail PgFault("22007", "invalid input syntax for type {sql_type_name(oid)}: \"{input}\"")
+		}
+		mut resolvedOffset = offset
+		if !hasZone { resolvedOffset = session_offset(current_timestamp_micros()) }
+		if oid == TimeOid { return FromI64(oid, local) }
+		return Datum{oid: oid, null: false, i: local, f: 0.0, b: false, s: "", bytes: []u8{}, months: 0, days: 0, offset: resolvedOffset}
+	}
+	if oid == TimestampOid || oid == TimestamptzOid {
+		if lower == "infinity" || lower == "+infinity" { return FromI64(oid, pgInfinity) }
+		if lower == "-infinity" { return FromI64(oid, 0-pgInfinity) }
+		if lower == "epoch" { return FromI64(oid, 0-pgEpochUnixSeconds*microsPerSecond) }
+		if lower == "now" { return FromI64(oid, current_timestamp_micros()) }
+		if lower == "today" { return FromI64(oid, timestamp_local_date(current_timestamp_micros())*microsPerDay) }
+		let parts = parse_timestamp_fields(raw)
+		if !parts.ok {
+			if parts.outOfRange { fail datetime_range(input) }
+			fail PgFault("22007", "invalid input syntax for type {sql_type_name(oid)}: \"{input}\"")
+		}
+		if parts.month < 1 || parts.month > 12 || parts.day < 1 || parts.day > tide.DaysIn(parts.year, parts.month) { fail datetime_range(input) }
+		let local = (tide.DaysFromCivil(parts.year, parts.month, parts.day)-pgEpochDays)*microsPerDay+parts.hour*microsPerHour+parts.minute*microsPerMinute+parts.secondMicros
+		if oid == TimestampOid { return FromI64(oid, local) }
+		if parts.hasZone { return FromI64(oid, local-parts.offset*microsPerSecond) }
+		return FromI64(oid, local_to_utc(local, parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.secondMicros))
+	}
+	if oid == IntervalOid { return try ParseInterval(raw) }
+	fail PgFault("0A000", "temporal input is not implemented for type OID {oid}")
+}
+
+fn datetime_range(input str) ! {
+	fail ErrorFault(NewPgError("22008", "date/time field value out of range: \"{input}\"", "", "Perhaps you need a different \"datestyle\" setting.", 0))
+}
+
+fn parse_date_fields(raw str) (i64, i64, i64, bool) {
+	let s = twine.TrimSpace(raw)
+	let firstDash = find_byte(s, '-', 0)
+	if firstDash > 0 && firstDash+1 < len(s) {
+		let secondDash = find_byte(s, '-', firstDash+1)
+		if secondDash > firstDash+1 {
+			let year = mint.Atoi(s[:firstDash]) catch _ { return 0, 0, 0, false }
+			let month = mint.Atoi(s[firstDash+1:secondDash]) catch _ { return 0, 0, 0, false }
+			let day = mint.Atoi(s[secondDash+1:]) catch _ { return 0, 0, 0, false }
+			return year, month, day, true
+		}
+	}
+	let slash1 = find_byte(s, '/', 0)
+	if slash1 > 0 {
+		let slash2 = find_byte(s, '/', slash1+1)
+		if slash2 > slash1+1 {
+			let a = mint.Atoi(s[:slash1]) catch _ { return 0, 0, 0, false }
+			let b = mint.Atoi(s[slash1+1:slash2]) catch _ { return 0, 0, 0, false }
+			mut year = mint.Atoi(s[slash2+1:]) catch _ { return 0, 0, 0, false }
+			if year >= 0 && year < 100 { if year < 70 { year += 2000 } else { year += 1900 } }
+			if a > 12 && b <= 12 { return year, b, a, true }
+			return year, a, b, true
+		}
+	}
+	let words = split_words(s)
+	if len(words) == 3 {
+		let monthA = month_number(words[0])
+		let monthB = month_number(words[1])
+		if monthA > 0 {
+			let day = mint.Atoi(words[1]) catch _ { return 0, 0, 0, false }
+			let year = mint.Atoi(words[2]) catch _ { return 0, 0, 0, false }
+			return year, monthA, day, true
+		}
+		if monthB > 0 {
+			let day = mint.Atoi(words[0]) catch _ { return 0, 0, 0, false }
+			let year = mint.Atoi(words[2]) catch _ { return 0, 0, 0, false }
+			return year, monthB, day, true
+		}
+	}
+	return 0, 0, 0, false
+}
+
+fn parse_timestamp_fields(raw str) ParsedTimestamp {
+	let s = twine.TrimSpace(raw)
+	mut split = find_byte(s, 'T', 0)
+	if split < 0 { split = find_byte(s, 't', 0) }
+	if split < 0 { split = find_byte(s, ' ', 0) }
+	mut dateText = s
+	mut timeText = "00:00:00"
+	if split >= 0 {
+		dateText = twine.TrimSpace(s[:split])
+		timeText = twine.TrimSpace(s[split+1:])
+	}
+	let (year, month, day, dateOk) = parse_date_fields(dateText)
+	if !dateOk { return ParsedTimestamp{year: 0, month: 0, day: 0, hour: 0, minute: 0, secondMicros: 0, offset: 0, hasZone: false, ok: false, outOfRange: false} }
+	let (timeMicros, offset, hasZone, timeOk, timeOutOfRange) = parse_time_value(timeText)
+	if !timeOk { return ParsedTimestamp{year: 0, month: 0, day: 0, hour: 0, minute: 0, secondMicros: 0, offset: 0, hasZone: false, ok: false, outOfRange: timeOutOfRange} }
+	let hour = timeMicros/microsPerHour
+	let minute = (timeMicros%microsPerHour)/microsPerMinute
+	let secMicros = timeMicros%microsPerMinute
+	return ParsedTimestamp{year: year, month: month, day: day, hour: hour, minute: minute, secondMicros: secMicros, offset: offset, hasZone: hasZone, ok: true, outOfRange: false}
+}
+
+fn parse_time_value(raw str) (i64, i64, bool, bool, bool) {
+	mut s = twine.TrimSpace(raw)
+	if len(s) == 0 { return 0, 0, false, false, false }
+	mut offset = i64(0)
+	mut hasZone = false
+	let lower = ascii_lower(s)
+	if twine.HasSuffix(lower, "utc") || twine.HasSuffix(lower, "gmt") {
+		s = twine.TrimSpace(s[:len(s)-3])
+		hasZone = true
+	} else if twine.HasSuffix(lower, "z") {
+		s = s[:len(s)-1]
+		hasZone = true
+	} else {
+		mut zoneAt = -1
+		for i in 1..len(s) { if s[i] == '+' || s[i] == '-' { zoneAt = i } }
+		if zoneAt > 0 {
+			let zone = s[zoneAt:]
+			let parsed = parse_zone_offset(zone)
+			if parsed < -86400 || parsed > 86400 { return 0, 0, false, false, true }
+			offset = parsed
+			s = twine.TrimSpace(s[:zoneAt])
+			hasZone = true
+		}
+	}
+	let parts = split_char(s, ':')
+	if len(parts) < 2 || len(parts) > 3 { return 0, 0, false, false, false }
+	let hour = mint.Atoi(parts[0]) catch _ { return 0, 0, false, false, false }
+	let minute = mint.Atoi(parts[1]) catch _ { return 0, 0, false, false, false }
+	mut secondMicros = i64(0)
+	if len(parts) == 3 {
+		let (sec, usec, syntax) = parse_second(parts[2])
+		if !syntax { return 0, 0, false, false, false }
+		secondMicros = sec*microsPerSecond+usec
+	}
+	let second = secondMicros/microsPerSecond
+	if hour < 0 || hour > 24 || minute < 0 || minute > 59 || second < 0 || second > 60 { return 0, 0, false, false, true }
+	if hour == 24 && (minute != 0 || secondMicros != 0) { return 0, 0, false, false, true }
+	return hour*microsPerHour+minute*microsPerMinute+secondMicros, offset, hasZone, true, false
+}
+
+fn parse_second(s str) (i64, i64, bool) {
+	let dot = find_byte(s, '.', 0)
+	mut whole = s
+	mut fraction = ""
+	if dot >= 0 {
+		whole = s[:dot]
+		fraction = s[dot+1:]
+	}
+	let second = mint.Atoi(whole) catch _ { return 0, 0, false }
+	if len(fraction) > 9 { fraction = fraction[:9] }
+	for len(fraction) < 6 { fraction += "0" }
+	mut digits = fraction
+	if len(digits) > 6 { digits = digits[:6] }
+	mut usec = i64(0)
+	if len(digits) > 0 { usec = mint.Atoi(digits) catch _ { return 0, 0, false } }
+	if len(fraction) > 6 && fraction[6] >= '5' { return second, usec+1, true }
+	return second, usec, true
+}
+
+fn parse_zone_offset(s str) i64 {
+	if len(s) < 2 { return 0 }
+	mut sign = i64(0)
+	if s[0] == '-' { sign = -1 } else if s[0] == '+' { sign = 1 } else { return 0 }
+	let body = s[1:]
+	let colon = find_byte(body, ':', 0)
+	mut hourText = body
+	mut minuteText = "0"
+	if colon >= 0 {
+		hourText = body[:colon]
+		minuteText = body[colon+1:]
+	} else if len(body) == 4 {
+		hourText = body[:2]
+		minuteText = body[2:]
+	}
+	let hour = mint.Atoi(hourText) catch _ { return 0 }
+	let minute = mint.Atoi(minuteText) catch _ { return 0 }
+	if hour > 15 || minute > 59 { return 90000 }
+	return sign*(hour*3600+minute*60)
+}
+
+fn local_to_utc(local i64, year i64, month i64, day i64, hour i64, minute i64, secMicros i64) i64 {
+	if is_fixed_zone(sessionTimeZone) { return local-zone_offset(sessionTimeZone)*microsPerSecond }
+	let zone = tide.LoadZone(sessionTimeZone) catch _ { return local }
+	if year < 1678 || year > 2261 { return local }
+	let ns = tide.DateIn(year, month, day, hour, minute, secMicros/microsPerSecond, (secMicros%microsPerSecond)*1000, zone)
+	return ns/1000-pgEpochUnixSeconds*microsPerSecond
+}
+
+fn session_offset(timestampMicros i64) i64 {
+	if is_fixed_zone(sessionTimeZone) { return zone_offset(sessionTimeZone) }
+	let zone = tide.LoadZone(sessionTimeZone) catch _ { return 0 }
+	let unixMicros = timestampMicros+pgEpochUnixSeconds*microsPerSecond
+	if unixMicros > 9223372036854775 || unixMicros < -9223372036854775 { return 0 }
+	return tide.In(unixMicros*1000, zone).Offset
+}
+
+fn is_fixed_zone(name str) bool {
+	if name == "UTC" || name == "GMT" || name == "Etc/UTC" { return true }
+	if len(name) >= 3 && (name[:3] == "UTC" || name[:3] == "GMT") { return name[3] == '+' || name[3] == '-' }
+	return len(name) >= 2 && (name[0] == '+' || name[0] == '-')
+}
+
+fn normalize_zone_name(name str) str {
+	if name == "GMT" || name == "Etc/UTC" { return "UTC" }
+	if twine.HasPrefix(name, "GMT") { return "UTC"+name[3:] }
+	return name
+}
+
+fn zone_offset(name str) i64 {
+	if name == "UTC" { return 0 }
+	mut normalized = name
+	if twine.HasPrefix(name, "UTC") { normalized = name[3:] }
+	return parse_zone_offset(normalized)
+}
+
+// DateText renders an ISO date value.
+fn DateText(d Datum) str {
+	if d.i == pgInfinity { return "infinity" }
+	if d.i == 0-pgInfinity { return "-infinity" }
+	return date_text_days(d.i)
+}
+
+// TimeText renders a time without time zone.
+fn TimeText(d Datum) str { return time_text_micros(d.i, false, 0) }
+
+// TimetzText renders time with its numeric UTC offset.
+fn TimetzText(d Datum) str { return time_text_micros(d.i, true, d.offset) }
+
+// TimestampText renders a timestamp without time zone.
+fn TimestampText(d Datum) str {
+	if d.i == pgInfinity { return "infinity" }
+	if d.i == 0-pgInfinity { return "-infinity" }
+	return timestamp_text_micros(d.i)
+}
+
+// TimestamptzText renders timestamptz in the current session time zone.
+fn TimestamptzText(d Datum) str {
+	if d.i == pgInfinity { return "infinity" }
+	if d.i == 0-pgInfinity { return "-infinity" }
+	let offset = session_offset(d.i)
+	let local = d.i+offset*microsPerSecond
+	let body = timestamp_text_micros(local)
+	return body+format_zone(offset)
+}
+
+fn date_text_days(days i64) str {
+	let (year, month, day) = tide.CivilFromDays(days+pgEpochDays)
+	return four_digit(year)+"-"+two_digit(month)+"-"+two_digit(day)
+}
+
+fn timestamp_text_micros(micros i64) str {
+	let days = floor_div(micros, microsPerDay)
+	let time = floor_mod(micros, microsPerDay)
+	return date_text_days(days)+" "+time_text_micros(time, false, 0)
+}
+
+fn time_text_micros(value i64, withZone bool, offset i64) str {
+	if value == microsPerDay {
+		mut text = "24:00:00"
+		if withZone { text += format_zone(offset) }
+		return text
+	}
+	let normalized = floor_mod(value, microsPerDay)
+	let hour = normalized/microsPerHour
+	let minute = (normalized%microsPerHour)/microsPerMinute
+	let second = (normalized%microsPerMinute)/microsPerSecond
+	let micro = normalized%microsPerSecond
+	mut out = two_digit(hour)+":"+two_digit(minute)+":"+two_digit(second)
+	if micro != 0 {
+		let fraction = six_digit(micro)
+		out += "."+twine.TrimRight(fraction, "0")
+	}
+	if withZone { out += format_zone(offset) }
+	return out
+}
+
+fn format_zone(offset i64) str {
+	mut sign = "+"
+	mut value = offset
+	if offset < 0 {
+		sign = "-"
+		value = 0-offset
+	}
+	let hours = value/3600
+	let minutes = (value%3600)/60
+	if minutes == 0 { return sign+two_digit(hours) }
+	return sign+two_digit(hours)+":"+two_digit(minutes)
+}
+
+// ParseInterval parses PostgreSQL's unit, year-month, @ and ISO-8601 interval forms.
+fn ParseInterval(raw str) !Datum {
+	let s = twine.TrimSpace(raw)
+	if len(s) > 0 && (s[0] == 'P' || s[0] == 'p' || (len(s) > 1 && s[0] == '-' && (s[1] == 'P' || s[1] == 'p'))) { return try parse_iso_interval(s) }
+	let dash = find_byte(s, '-', 1)
+	if dash > 0 && find_byte(s, ' ', 0) < 0 {
+		let years = mint.Atoi(s[:dash]) catch _ { fail interval_syntax(raw) }
+		let months = mint.Atoi(s[dash+1:]) catch _ { fail interval_syntax(raw) }
+		return interval_datum(0, 0, years*12+months)
+	}
+	let words = split_words(s)
+	mut months = i64(0)
+	mut days = i64(0)
+	mut micros = i64(0)
+	mut at = i64(0)
+	if len(words) > 0 && words[0] == "@" { at = 1 }
+	for at < len(words) {
+		let token = words[at]
+		if twine.HasSuffix(token, ":") || token == "ago" {
+			at += 1
+			continue
+		}
+		if at+1 < len(words) && find_byte(token, ':', 0) >= 0 {
+			micros += try parse_interval_clock(token)
+			at += 1
+			continue
+		}
+		let number = mint.ParseFloat(token) catch _ { fail interval_syntax(raw) }
+		if at+1 >= len(words) {
+			micros += i64(number*3600000000.0)
+			break
+		}
+		let unit = ascii_lower(words[at+1])
+		if unit == "year" || unit == "years" || unit == "yr" || unit == "yrs" { months += i64(number*12.0) } else if unit == "mon" || unit == "mons" || unit == "month" || unit == "months" { months += i64(number) } else if unit == "week" || unit == "weeks" { days += i64(number*7.0) } else if unit == "day" || unit == "days" { days += i64(number) } else if unit == "hour" || unit == "hours" || unit == "hr" || unit == "hrs" { micros += i64(number*3600000000.0) } else if unit == "min" || unit == "mins" || unit == "minute" || unit == "minutes" { micros += i64(number*60000000.0) } else if unit == "sec" || unit == "secs" || unit == "second" || unit == "seconds" { micros += i64(number*1000000.0) } else if unit == "msec" || unit == "millisecond" || unit == "milliseconds" { micros += i64(number*1000.0) } else { fail interval_syntax(raw) }
+		at += 2
+	}
+	return interval_datum(micros, days, months)
+}
+
+fn parse_iso_interval(raw str) !Datum {
+	mut s = raw
+	mut sign = i64(1)
+	if s[0] == '-' {
+		sign = -1
+		s = s[1:]
+	}
+	if len(s) == 0 || (s[0] != 'P' && s[0] != 'p') { fail interval_syntax(raw) }
+	mut months = i64(0)
+	mut days = i64(0)
+	mut micros = i64(0)
+	mut token = ""
+	mut inTime = false
+	for c in s[1:] {
+		if c == 'T' || c == 't' {
+			inTime = true
+			continue
+		}
+		if (c >= '0' && c <= '9') || c == '.' { token += str([]u8{u8(c)}) } else {
+			let value = mint.ParseFloat(token) catch _ { fail interval_syntax(raw) }
+			if c == 'Y' || c == 'y' { months += i64(value*12.0) } else if c == 'M' || c == 'm' { if inTime { micros += i64(value*60000000.0) } else { months += i64(value) } } else if c == 'D' || c == 'd' { days += i64(value) } else if c == 'H' || c == 'h' { micros += i64(value*3600000000.0) } else if c == 'S' || c == 's' { micros += i64(value*1000000.0) } else { fail interval_syntax(raw) }
+			token = ""
+		}
+	}
+	if token != "" { fail interval_syntax(raw) }
+	return interval_datum(sign*micros, sign*days, sign*months)
+}
+
+fn interval_syntax(raw str) ! { fail PgFault("22007", "invalid input syntax for type interval: \"{raw}\"") }
+
+fn parse_interval_clock(s str) !i64 {
+	let parts = split_char(s, ':')
+	if len(parts) < 2 || len(parts) > 3 { fail PgFault("22007", "invalid input syntax for type interval: \"{s}\"") }
+	let hour = mint.Atoi(parts[0]) catch _ { fail PgFault("22007", "invalid input syntax for type interval: \"{s}\"") }
+	let minute = mint.Atoi(parts[1]) catch _ { fail PgFault("22007", "invalid input syntax for type interval: \"{s}\"") }
+	mut second = i64(0)
+	if len(parts) == 3 {
+		let (whole, fraction, ok) = parse_second(parts[2])
+		if !ok { fail PgFault("22007", "invalid input syntax for type interval: \"{s}\"") }
+		second = whole*microsPerSecond+fraction
+	}
+	return hour*microsPerHour+minute*microsPerMinute+second
+}
+
+fn interval_datum(micros i64, days i64, months i64) Datum {
+	return Datum{oid: IntervalOid, null: false, i: micros, f: 0.0, b: false, s: "", bytes: []u8{}, months: months, days: days, offset: 0}
+}
+
+// IntervalText returns PostgreSQL's ISO-style default interval output.
+fn IntervalText(d Datum) str {
+	mut parts = []str{}
+	let years = d.months/12
+	let months = d.months%12
+	if years != 0 { parts = append(parts, mint.Itoa(years)+if_plural(years, " year", " years")) }
+	if months != 0 { parts = append(parts, mint.Itoa(months)+if_plural(months, " mon", " mons")) }
+	if d.days != 0 { parts = append(parts, mint.Itoa(d.days)+if_plural(d.days, " day", " days")) }
+	let time = interval_clock_text(d.i)
+	if time != "00:00:00" || len(parts) == 0 { parts = append(parts, time) }
+	return join_words(parts)
+}
+
+fn interval_clock_text(micros i64) str {
+	mut sign = ""
+	mut value = micros
+	if micros < 0 {
+		sign = "-"
+		value = 0-micros
+	}
+	let hours = value/microsPerHour
+	let minutes = (value%microsPerHour)/microsPerMinute
+	let seconds = (value%microsPerMinute)/microsPerSecond
+	let fraction = value%microsPerSecond
+	mut out = sign+two_digit(hours)+":"+two_digit(minutes)+":"+two_digit(seconds)
+	if fraction != 0 { out += "."+twine.TrimRight(six_digit(fraction), "0") }
+	return out
+}
+
+// CompareDateTime compares date/time scalar values, applying PostgreSQL time/timetz ordering.
+fn CompareDateTime(a Datum, b Datum) i64 {
+	mut x = a.i
+	mut y = b.i
+	if a.oid == TimetzOid {
+		x = floor_mod(a.i-a.offset*microsPerSecond, microsPerDay)
+		y = floor_mod(b.i-b.offset*microsPerSecond, microsPerDay)
+	}
+	return compare_i64(x, y)
+}
+
+// CompareInterval compares intervals using PostgreSQL's 30-day month normalization.
+fn CompareInterval(a Datum, b Datum) i64 {
+	let left = interval_sort_numeric(a)
+	let right = interval_sort_numeric(b)
+	return CompareNumeric(left, right)
+}
+
+fn interval_sort_numeric(d Datum) Datum {
+	let months = ParseNumeric(mint.Itoa(d.months)) catch _ { return FromStr(NumericOid, "0") }
+	let monthFactor = ParseNumeric("2592000000000") catch _ { return FromStr(NumericOid, "0") }
+	let monthValue = NumericMul(months, monthFactor) catch _ { return FromStr(NumericOid, "0") }
+	let days = ParseNumeric(mint.Itoa(d.days)) catch _ { return FromStr(NumericOid, "0") }
+	let dayFactor = ParseNumeric("86400000000") catch _ { return FromStr(NumericOid, "0") }
+	let dayValue = NumericMul(days, dayFactor) catch _ { return FromStr(NumericOid, "0") }
+	let time = ParseNumeric(mint.Itoa(d.i)) catch _ { return FromStr(NumericOid, "0") }
+	let dayAndTime = NumericAdd(dayValue, time) catch _ { return FromStr(NumericOid, "0") }
+	return NumericAdd(monthValue, dayAndTime) catch _ { FromStr(NumericOid, "0") }
+}
+
+// DateAddDays adds a signed day count to a date.
+fn DateAddDays(date Datum, days i64) !Datum {
+	let result = date.i+days
+	if result > 2147483647 || result < -2147483648 { fail ErrorFault(NewError("22008", "date out of range")) }
+	return FromI64(DateOid, result)
+}
+
+// TimestampSubtract returns the elapsed time between two timestamps as an interval.
+fn TimestampSubtract(a Datum, b Datum) !Datum {
+	if a.i == pgInfinity || a.i == 0-pgInfinity || b.i == pgInfinity || b.i == 0-pgInfinity { fail ErrorFault(NewError("22008", "timestamp out of range")) }
+	let diff = a.i - b.i
+	return interval_datum(diff % microsPerDay, diff / microsPerDay, 0)
+}
+
+// TimestampAddInterval applies months, days, then microseconds to a timestamp.
+fn TimestampAddInterval(ts Datum, interval Datum) !Datum {
+	if ts.i == pgInfinity || ts.i == 0-pgInfinity { return ts }
+	mut local = ts.i
+	let isTz = ts.oid == TimestamptzOid
+	if isTz { local += session_offset(ts.i)*microsPerSecond }
+	let dayIndex = floor_div(local, microsPerDay)
+	let time = floor_mod(local, microsPerDay)
+	let (year, month, day) = tide.CivilFromDays(dayIndex+pgEpochDays)
+	let absoluteMonth = year*12+(month-1)+interval.months
+	let nextYear = floor_div(absoluteMonth, 12)
+	let nextMonth = floor_mod(absoluteMonth, 12)+1
+	let clampedDay = min(day, tide.DaysIn(nextYear, nextMonth))
+	let newDayIndex = tide.DaysFromCivil(nextYear, nextMonth, clampedDay)-pgEpochDays+interval.days
+	local = newDayIndex*microsPerDay+time+interval.i
+	if isTz {
+		let (y, m, d) = tide.CivilFromDays(floor_div(local, microsPerDay)+pgEpochDays)
+		let tod = floor_mod(local, microsPerDay)
+		let utc = local_to_utc(local, y, m, d, tod/microsPerHour, (tod%microsPerHour)/microsPerMinute, tod%microsPerMinute)
+		return FromI64(TimestamptzOid, utc)
+	}
+	return FromI64(TimestampOid, local)
+}
+
+// Extract returns the PostgreSQL numeric result for a date/time field.
+fn Extract(field str, d Datum) !Datum {
+	let normalized = ascii_lower(field)
+	if normalized == "second" {
+		let seconds = try date_part_value("second", d)
+		return try ParseNumeric(mint.Itoa(seconds)+"."+six_digit(temporal_fraction(d)))
+	}
+	if normalized == "milliseconds" || normalized == "millisecond" {
+		let seconds = try date_part_value("second", d)
+		let millis = seconds*1000+temporal_fraction(d)/1000
+		return try ParseNumeric(mint.Itoa(millis)+".000")
+	}
+	if normalized == "microseconds" || normalized == "microsecond" {
+		let seconds = try date_part_value("second", d)
+		return try ParseNumeric(mint.Itoa(seconds*1000000+temporal_fraction(d)))
+	}
+	if normalized == "epoch" { return try ParseNumeric(extract_epoch_text(d)) }
+	let value = try date_part_value(field, d)
+	return try ParseNumeric(mint.Itoa(value))
+}
+
+// DatePart returns a floating-point date/time field result.
+fn DatePart(field str, d Datum) !Datum {
+	let extracted = try Extract(field, d)
+	let value = mint.ParseFloat(extracted.Text()) catch _ { 0.0 }
+	return FromF64(Float8Oid, value)
+}
+
+fn temporal_fraction(d Datum) i64 {
+	if d.oid == DateOid { return 0 }
+	return floor_mod(d.i, microsPerSecond)
+}
+
+fn if_offset(d Datum) i64 {
+	if d.oid == TimetzOid { return d.offset }
+	return 0
+}
+
+fn extract_epoch_text(d Datum) str {
+	if d.oid == DateOid { return mint.Itoa(d.i*86400+pgEpochUnixSeconds) }
+	if d.oid == TimeOid { return micros_seconds_text(d.i) }
+	if d.oid == TimetzOid { return micros_seconds_text(d.i-d.offset*microsPerSecond) }
+	return micros_seconds_text(d.i+pgEpochUnixSeconds*microsPerSecond)
+}
+
+fn micros_seconds_text(micros i64) str {
+	let seconds = floor_div(micros, microsPerSecond)
+	let fraction = floor_mod(micros, microsPerSecond)
+	return mint.Itoa(seconds)+"."+six_digit(fraction)
+}
+
+fn date_part_value(field str, d Datum) !i64 {
+	let f = ascii_lower(field)
+	if d.i == pgInfinity || d.i == 0-pgInfinity {
+		if f == "epoch" { return d.i/pgInfinity }
+		fail PgFault("22008", "cannot extract {field} from an infinite value")
+	}
+	mut year = i64(2000)
+	mut month = i64(1)
+	mut day = i64(1)
+	mut hour = i64(0)
+	mut minute = i64(0)
+	mut second = i64(0)
+	if d.oid == DateOid {
+		let (dateYear, dateMonth, dateDay) = tide.CivilFromDays(d.i+pgEpochDays)
+		year = dateYear
+		month = dateMonth
+		day = dateDay
+	} else if d.oid == TimeOid || d.oid == TimetzOid {
+		mut value = d.i
+		if d.oid == TimetzOid { value = floor_mod(d.i-d.offset*microsPerSecond, microsPerDay) }
+		hour = value/microsPerHour
+		minute = value%microsPerHour/microsPerMinute
+		second = value%microsPerMinute/microsPerSecond
+	} else {
+		mut local = d.i
+		if d.oid == TimestamptzOid { local += session_offset(d.i)*microsPerSecond }
+		let (dateYear, dateMonth, dateDay) = tide.CivilFromDays(floor_div(local, microsPerDay)+pgEpochDays)
+		year = dateYear
+		month = dateMonth
+		day = dateDay
+		let time = floor_mod(local, microsPerDay)
+		hour = time/microsPerHour
+		minute = time%microsPerHour/microsPerMinute
+		second = time%microsPerMinute/microsPerSecond
+	}
+	if f == "year" || f == "years" { return year }
+	if f == "month" || f == "months" { return month }
+	if f == "day" || f == "days" { return day }
+	if f == "hour" || f == "hours" { return hour }
+	if f == "minute" || f == "minutes" { return minute }
+	if f == "second" || f == "seconds" { return second }
+	if f == "decade" { return year/10 }
+	if f == "century" { return (year+99)/100 }
+	if f == "millennium" { return (year+999)/1000 }
+	if f == "quarter" { return (month+2)/3 }
+	if f == "dow" { return floor_mod(tide.DaysFromCivil(year, month, day)+4, 7) }
+	if f == "isodow" { return floor_mod(tide.DaysFromCivil(year, month, day)+3, 7)+1 }
+	if f == "epoch" {
+		if d.oid == TimestamptzOid { return floor_div(d.i, microsPerSecond)+pgEpochUnixSeconds }
+		if d.oid == TimeOid || d.oid == TimetzOid { return floor_div(d.i-(if_offset(d))*microsPerSecond, microsPerSecond) }
+		return tide.DaysFromCivil(year, month, day)*86400+hour*3600+minute*60+second
+	}
+	fail PgFault("22023", "unit \"{field}\" not recognized for type {sql_type_name(d.oid)}")
+}
+
+// DateTrunc truncates a timestamp to a supported date/time field.
+fn DateTrunc(field str, d Datum) !Datum {
+	let f = ascii_lower(field)
+	if d.oid == DateOid {
+		if f == "year" {
+			let (y, _, _) = tide.CivilFromDays(d.i+pgEpochDays)
+			return FromI64(DateOid, tide.DaysFromCivil(y, 1, 1)-pgEpochDays)
+		}
+		if f == "month" {
+			let (y, m, _) = tide.CivilFromDays(d.i+pgEpochDays)
+			return FromI64(DateOid, tide.DaysFromCivil(y, m, 1)-pgEpochDays)
+		}
+		return d
+	}
+	if d.oid != TimestampOid && d.oid != TimestamptzOid { fail PgFault("22023", "unit \"{field}\" not supported for type {sql_type_name(d.oid)}") }
+	mut local = d.i
+	if d.oid == TimestamptzOid { local += session_offset(d.i)*microsPerSecond }
+	mut days = floor_div(local, microsPerDay)
+	mut time = floor_mod(local, microsPerDay)
+	if f == "year" || f == "quarter" || f == "month" || f == "week" || f == "day" {
+		let (year, month, day) = tide.CivilFromDays(days+pgEpochDays)
+		if f == "year" { days = tide.DaysFromCivil(year, 1, 1)-pgEpochDays } else if f == "quarter" { days = tide.DaysFromCivil(year, ((month-1)/3)*3+1, 1)-pgEpochDays } else if f == "month" { days = tide.DaysFromCivil(year, month, 1)-pgEpochDays } else if f == "week" { days -= floor_mod(days+pgEpochDays+10, 7) } else { _ = day }
+		time = 0
+	} else if f == "hour" { time = time/microsPerHour*microsPerHour } else if f == "minute" { time = time/microsPerMinute*microsPerMinute } else if f == "second" { time = time/microsPerSecond*microsPerSecond } else if f == "millisecond" { time = time/1000*1000 } else if f != "microsecond" { fail PgFault("22023", "unit \"{field}\" not recognized for type {sql_type_name(d.oid)}") }
+	local = days*microsPerDay+time
+	if d.oid == TimestamptzOid { local -= session_offset(d.i)*microsPerSecond }
+	return FromI64(d.oid, local)
+}
+
+// Age returns a calendar interval between timestamps.
+fn Age(a Datum, b Datum) !Datum {
+	mut localA = a.i
+	mut localB = b.i
+	if a.oid == TimestamptzOid { localA += session_offset(a.i)*microsPerSecond }
+	if b.oid == TimestamptzOid { localB += session_offset(b.i)*microsPerSecond }
+	let dayA = floor_div(localA, microsPerDay)
+	let dayB = floor_div(localB, microsPerDay)
+	let (yearA, monthA, dateA) = tide.CivilFromDays(dayA+pgEpochDays)
+	let (yearB, monthB, dateB) = tide.CivilFromDays(dayB+pgEpochDays)
+	let timeA = floor_mod(localA, microsPerDay)
+	let timeB = floor_mod(localB, microsPerDay)
+	mut months = (yearA-yearB)*12+monthA-monthB
+	mut days = dateA-dateB
+	mut micros = timeA-timeB
+	if micros < 0 {
+		micros += microsPerDay
+		days -= 1
+	}
+	if days < 0 {
+		months -= 1
+		days += tide.DaysIn(yearA, monthA)
+	}
+	return interval_datum(micros, days, months)
+}
+
+// MakeDate constructs a date from calendar fields.
+fn MakeDate(year i64, month i64, day i64) !Datum {
+	if month < 1 || month > 12 || day < 1 || day > tide.DaysIn(year, month) { fail ErrorFault(NewError("22008", "date field value out of range: \"{year}-{month}-{day}\"")) }
+	return FromI64(DateOid, tide.DaysFromCivil(year, month, day)-pgEpochDays)
+}
+
+// MakeTimestamp constructs a timestamp from calendar fields and seconds.
+fn MakeTimestamp(year i64, month i64, day i64, hour i64, minute i64, seconds f64) !Datum {
+	if month < 1 || month > 12 || day < 1 || day > tide.DaysIn(year, month) || hour < 0 || hour > 24 || minute < 0 || minute > 59 || seconds < 0.0 || seconds >= 61.0 { fail ErrorFault(NewError("22008", "timestamp field value out of range")) }
+	let micros = i64(seconds*1000000.0)
+	if hour == 24 && (minute != 0 || micros != 0) { fail ErrorFault(NewError("22008", "timestamp field value out of range")) }
+	return FromI64(TimestampOid, (tide.DaysFromCivil(year, month, day)-pgEpochDays)*microsPerDay+hour*microsPerHour+minute*microsPerMinute+micros)
+}
+
+fn CastTemporal(d Datum, to Oid) !Datum {
+	if d.oid == to { return d }
+	if d.oid == DateOid {
+		if to == TimestampOid { return FromI64(to, d.i*microsPerDay) }
+		if to == TimestamptzOid {
+			let (year, month, day) = tide.CivilFromDays(d.i+pgEpochDays)
+			let local = d.i*microsPerDay
+			return FromI64(to, local_to_utc(local, year, month, day, 0, 0, 0))
+		}
+	}
+	if d.oid == TimestampOid || d.oid == TimestamptzOid {
+		mut local = d.i
+		if d.oid == TimestamptzOid { local += session_offset(d.i)*microsPerSecond }
+		if to == DateOid { return FromI64(to, floor_div(local, microsPerDay)) }
+		if to == TimeOid { return FromI64(to, floor_mod(local, microsPerDay)) }
+		if to == TimestampOid { return FromI64(to, local) }
+		if to == TimestamptzOid && d.oid == TimestampOid {
+			let days = floor_div(local, microsPerDay)
+			let tod = floor_mod(local, microsPerDay)
+			let (year, month, day) = tide.CivilFromDays(days+pgEpochDays)
+			return FromI64(to, local_to_utc(local, year, month, day, tod/microsPerHour, tod%microsPerHour/microsPerMinute, tod%microsPerMinute))
+		}
+	}
+	if d.oid == TimeOid && to == TimetzOid {
+		return Datum{oid: to, null: false, i: d.i, f: 0.0, b: false, s: "", bytes: []u8{}, months: 0, days: 0, offset: session_offset(current_timestamp_micros())}
+	}
+	if d.oid == TimetzOid && to == TimeOid { return FromI64(to, d.i) }
+	return try ParseDateTime(to, d.Text())
+}
+
+// ToChar formats common PostgreSQL date/time template patterns.
+fn ToChar(d Datum, pattern str) str {
+	let text = d.Text()
+	let (year, month, day, hour, minute, seconds, weekday) = temporal_fields(d)
+	mut out = ""
+	mut i = i64(0)
+	for i < len(pattern) {
+		if slice_eq(pattern, i, "HH24") {
+			out += two_digit(hour)
+			i += 4
+		} else if slice_eq(pattern, i, "YYYY") {
+			out += four_digit(year)
+			i += 4
+		} else if slice_eq(pattern, i, "Mon") {
+			out += month_short(month)
+			i += 3
+		} else if slice_eq(pattern, i, "Day") {
+			out += weekday_name(weekday)
+			i += 3
+		} else if slice_eq(pattern, i, "MM") {
+			out += two_digit(month)
+			i += 2
+		} else if slice_eq(pattern, i, "DD") {
+			out += two_digit(day)
+			i += 2
+		} else if slice_eq(pattern, i, "MI") {
+			out += two_digit(minute)
+			i += 2
+		} else if slice_eq(pattern, i, "SS") {
+			out += two_digit(seconds)
+			i += 2
+		} else if slice_eq(pattern, i, "MS") {
+			out += three_digit((d.i%microsPerSecond)/1000)
+			i += 2
+		} else {
+			out += str([]u8{pattern[i]})
+			i += 1
+		}
+	}
+	_ = text
+	return out
+}
+
+fn temporal_fields(d Datum) (i64, i64, i64, i64, i64, i64, i64) {
+	mut local = d.i
+	if d.oid == DateOid { local = d.i*microsPerDay }
+	if d.oid == TimestamptzOid { local += session_offset(d.i)*microsPerSecond }
+	let dayIndex = floor_div(local, microsPerDay)
+	let (year, month, day) = tide.CivilFromDays(dayIndex+pgEpochDays)
+	let time = floor_mod(local, microsPerDay)
+	let hour = time/microsPerHour
+	let minute = (time%microsPerHour)/microsPerMinute
+	let second = (time%microsPerMinute)/microsPerSecond
+	return year, month, day, hour, minute, second, floor_mod(dayIndex+pgEpochDays+4, 7)
+}
+
+fn timestamp_local_date(timestampMicros i64) i64 {
+	let local = timestampMicros+session_offset(timestampMicros)*microsPerSecond
+	return floor_div(local, microsPerDay)
+}
+
+fn find_byte(s str, c u8, from i64) i64 {
+	for i in from..len(s) { if s[i] == c { return i } }
+	return -1
+}
+
+fn split_char(s str, c u8) []str {
+	mut out = []str{}
+	mut start = i64(0)
+	for i in 0..len(s) {
+		if s[i] == c {
+			out = append(out, s[start:i])
+			start = i+1
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+
+fn split_words(s str) []str {
+	mut out = []str{}
+	mut start = -1
+	for i in 0..len(s) {
+		let c = s[i]
+		if c == ' ' || c == '\t' || c == ',' {
+			if start >= 0 {
+				out = append(out, s[start:i])
+				start = -1
+			}
+		} else if start < 0 { start = i }
+	}
+	if start >= 0 { out = append(out, s[start:]) }
+	return out
+}
+
+fn month_number(s str) i64 {
+	let value = ascii_lower(s)
+	if value == "jan" || value == "january" { return 1 }
+	if value == "feb" || value == "february" { return 2 }
+	if value == "mar" || value == "march" { return 3 }
+	if value == "apr" || value == "april" { return 4 }
+	if value == "may" { return 5 }
+	if value == "jun" || value == "june" { return 6 }
+	if value == "jul" || value == "july" { return 7 }
+	if value == "aug" || value == "august" { return 8 }
+	if value == "sep" || value == "september" { return 9 }
+	if value == "oct" || value == "october" { return 10 }
+	if value == "nov" || value == "november" { return 11 }
+	if value == "dec" || value == "december" { return 12 }
+	return 0
+}
+
+fn ascii_lower(s str) str {
+	mut out = []u8{}
+	for c in s {
+		if c >= 'A' && c <= 'Z' { out = append(out, u8(c+('a'-'A'))) } else { out = append(out, u8(c)) }
+	}
+	return str(out)
+}
+
+fn four_digit(v i64) str {
+	mut sign = ""
+	mut value = v
+	if v < 0 {
+		sign = "-"
+		value = 0-v
+	}
+	let s = mint.Itoa(value)
+	return sign+zeroes(max(0, 4-len(s)))+s
+}
+
+fn two_digit(v i64) str {
+	let s = mint.Itoa(v)
+	if len(s) < 2 { return "0"+s }
+	return s
+}
+fn three_digit(v i64) str {
+	let s = mint.Itoa(v)
+	return zeroes(max(0, 3-len(s)))+s
+}
+fn six_digit(v i64) str {
+	let s = mint.Itoa(v)
+	return zeroes(max(0, 6-len(s)))+s
+}
+fn if_plural(n i64, one str, many str) str {
+	if n == 1 || n == -1 { return one }
+	return many
+}
+
+fn join_words(words []str) str {
+	mut out = ""
+	for i, word in words {
+		if i > 0 { out += " " }
+		out += word
+	}
+	return out
+}
+
+fn month_short(month i64) str {
+	let names = []str{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+	if month < 1 || month > 12 { return "" }
+	return names[month-1]
+}
+
+fn weekday_name(day i64) str {
+	let names = []str{"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"}
+	return names[floor_mod(day, 7)]
+}
+
+fn slice_eq(s str, at i64, token str) bool { return at+len(token) <= len(s) && s[at:at+len(token)] == token }
+fn floor_div(a i64, b i64) i64 {
+	mut q = a/b
+	if a-q*b < 0 { q -= 1 }
+	return q
+}
+fn floor_mod(a i64, b i64) i64 { return a-floor_div(a, b)*b }
+fn compare_i64(a i64, b i64) i64 {
+	if a < b { return -1 }
+	if a > b { return 1 }
+	return 0
+}

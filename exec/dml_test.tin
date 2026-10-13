@@ -1,0 +1,203 @@
+package exec
+
+import "../types"
+import "../plan"
+import "../catalog"
+import "../txn"
+import "../store"
+import "crucible"
+import "quarry"
+
+fn setupDmlTest(name str) !(catalog.Catalog, txn.Txn) {
+	let dir = quarry.TempDir() + "/tingres-dml-" + name
+	quarry.RemoveAll(dir) catch _ { }
+	mut db = try store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false})
+	mut m = try txn.NewManager(mut db)
+	let c = try catalog.Open(mut db, m)
+	let t = try m.Begin(txn.Isolation.ReadCommitted)
+	return c, t
+}
+
+fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
+	let (cat, txnVal) = setupDmlTest("not_null_uniq") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+
+	let cols = []catalog.Column{
+		catalog.Column{Name: "id", Number: 1, Type: types.Int4Oid, Typmod: -1, Nullable: false},
+		catalog.Column{Name: "val", Number: 2, Type: types.TextOid, Typmod: -1, Nullable: true},
+	}
+	let tbl = catalog.Table{
+		Oid: 20001,
+		Schema: "public",
+		Name: "users",
+		Cols: cols,
+		Rel: 20001,
+		Indexes: []catalog.Index{catalog.Index{Oid: 20002, Name: "users_pk", Rel: 20002, Unique: true}},
+		CreatedBy: 0,
+		CreatedCommand: 0,
+		DroppedBy: 0,
+		DroppedCommand: 0,
+		System: false,
+	}
+
+	mut ctx = ExprContext{
+		Row: []types.Datum{},
+		Params: []types.Datum{},
+		Txn: txnVal,
+		Catalog: cat,
+	}
+
+	mut sink = NewRecordSink()
+
+	// 1. Insert valid row (1, 'alice')
+	let row1 = []plan.Expr{
+		plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: types.Int4Oid}),
+		plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "alice"), Type: types.TextOid}),
+	}
+	mut insertNode1 = plan.ModifyTableNode{
+		Kind: plan.ModifyKind.Insert,
+		Table: tbl,
+		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{row1}, Cols: []plan.ColDesc{}, Cost: plan.Cost{}}),
+		TargetCols: []i16{1, 2},
+		OnConflict: nil,
+		Returning: []plan.Expr{},
+		Cols: []plan.ColDesc{},
+		Cost: plan.Cost{},
+	}
+	let tag1 = ExecuteModifyTable(mut insertNode1, mut ctx, mut sink) catch err {
+		t.Error("insert valid row failed: {err}")
+		return
+	}
+	t.True("insert tag is INSERT 0 1", tag1 == "INSERT 0 1")
+
+	// 2. Insert with NULL into not-null column 'id' must fail with 23502
+	mut nullFail = false
+	let nullRow = []plan.Expr{
+		plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.Int4Oid}),
+		plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "bob"), Type: types.TextOid}),
+	}
+	mut insertNull = plan.ModifyTableNode{
+		Kind: plan.ModifyKind.Insert,
+		Table: tbl,
+		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{nullRow}, Cols: []plan.ColDesc{}, Cost: plan.Cost{}}),
+		TargetCols: []i16{1, 2},
+		OnConflict: nil,
+		Returning: []plan.Expr{},
+		Cols: []plan.ColDesc{},
+		Cost: plan.Cost{},
+	}
+	ExecuteModifyTable(mut insertNull, mut ctx, mut sink) catch err {
+		nullFail = true
+		let pgErr = types.ErrorFromFault(err)
+		t.True("error code 23502", pgErr.Code == "23502")
+	}
+	t.True("not null violation rejected", nullFail)
+
+	// 3. Insert duplicate id 1 must fail with 23505 (unique constraint violation)
+	mut uniqFail = false
+	let dupRow = []plan.Expr{
+		plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: types.Int4Oid}),
+		plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "alice2"), Type: types.TextOid}),
+	}
+	mut insertDup = plan.ModifyTableNode{
+		Kind: plan.ModifyKind.Insert,
+		Table: tbl,
+		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{dupRow}, Cols: []plan.ColDesc{}, Cost: plan.Cost{}}),
+		TargetCols: []i16{1, 2},
+		OnConflict: nil,
+		Returning: []plan.Expr{},
+		Cols: []plan.ColDesc{},
+		Cost: plan.Cost{},
+	}
+	ExecuteModifyTable(mut insertDup, mut ctx, mut sink) catch err {
+		uniqFail = true
+		let pgErr = types.ErrorFromFault(err)
+		t.True("error code 23505", pgErr.Code == "23505")
+	}
+	t.True("unique violation rejected", uniqFail)
+
+	// 4. ON CONFLICT DO NOTHING must succeed and skip the conflicting insert
+	mut insertDoNothing = plan.ModifyTableNode{
+		Kind: plan.ModifyKind.Insert,
+		Table: tbl,
+		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{dupRow}, Cols: []plan.ColDesc{}, Cost: plan.Cost{}}),
+		TargetCols: []i16{1, 2},
+		OnConflict: plan.OnConflictPlan{
+			ArbiterCols: []i16{1},
+			Action: plan.ModifyKind.Insert,
+			UpdateExprs: []plan.Expr{},
+			Where: nil,
+		},
+		Returning: []plan.Expr{},
+		Cols: []plan.ColDesc{},
+		Cost: plan.Cost{},
+	}
+	let tagDoNothing = ExecuteModifyTable(mut insertDoNothing, mut ctx, mut sink) catch err {
+		t.Error("on conflict do nothing failed: {err}")
+		return
+	}
+	t.True("insert 0 affected", tagDoNothing == "INSERT 0 0")
+}
+
+fn TestDmlReturningAndCommandTags(t mut crucible.T) {
+	let (cat, txnVal) = setupDmlTest("returning_tags") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+
+	let cols = []catalog.Column{
+		catalog.Column{Name: "num", Number: 1, Type: types.Int4Oid, Typmod: -1, Nullable: false},
+	}
+	let tbl = catalog.Table{
+		Oid: 20003,
+		Schema: "public",
+		Name: "items",
+		Cols: cols,
+		Rel: 20003,
+		Indexes: []catalog.Index{},
+		CreatedBy: 0,
+		CreatedCommand: 0,
+		DroppedBy: 0,
+		DroppedCommand: 0,
+		System: false,
+	}
+
+	mut ctx = ExprContext{
+		Row: []types.Datum{},
+		Params: []types.Datum{},
+		Txn: txnVal,
+		Catalog: cat,
+	}
+
+	mut sink = NewRecordSink()
+
+	// Multi-row INSERT with RETURNING: (10), (20)
+	let r1 = []plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 10), Type: types.Int4Oid})}
+	let r2 = []plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 20), Type: types.Int4Oid})}
+	let retCol = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.Int4Oid})
+	let retColDesc = plan.ColDesc{Name: "num", Oid: types.Int4Oid, Typmod: -1, TableOid: tbl.Oid, Attno: 1}
+
+	mut insertRet = plan.ModifyTableNode{
+		Kind: plan.ModifyKind.Insert,
+		Table: tbl,
+		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{r1, r2}, Cols: []plan.ColDesc{retColDesc}, Cost: plan.Cost{}}),
+		TargetCols: []i16{1},
+		OnConflict: nil,
+		Returning: []plan.Expr{retCol},
+		Cols: []plan.ColDesc{retColDesc},
+		Cost: plan.Cost{},
+	}
+
+	let tag = ExecuteModifyTable(mut insertRet, mut ctx, mut sink) catch err {
+		t.Error("insert returning failed: {err}")
+		return
+	}
+	t.True("tag is INSERT 0 2", tag == "INSERT 0 2")
+	t.True("returned 2 rows", len(sink.Rows) == 2)
+	if len(sink.Rows) == 2 {
+		t.True("first returned 10", sink.Rows[0][0].Text() == "10")
+		t.True("second returned 20", sink.Rows[1][0].Text() == "20")
+	}
+}

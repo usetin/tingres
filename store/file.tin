@@ -213,17 +213,26 @@ fn (f mut RelationFiles) Drop(rel RelId) ! {
 
 // ReadPage reads one complete 8 KiB block from a relation.
 fn (f RelationFiles) ReadPage(rel RelId, block PageNo) !Page {
+	mut p = NewPage()
+	try f.ReadPageInto(rel, block, mut p.Data)
+	return p
+}
+
+// ReadPageInto loads a complete block into caller-owned storage without allocating page memory.
+fn (f RelationFiles) ReadPageInto(rel RelId, block PageNo, out mut []u8) ! {
+	if len(out) != PageSize {
+		fail "store: relation page buffer must be 8 KiB"
+	}
 	let size = try f.Size(rel)
 	let offset = i64(block) * PageSize
 	if offset+PageSize > size {
 		fail "store: relation block is beyond end of file"
 	}
-	mut p = NewPage()
-	let n = try f.ReadAt(rel, offset, mut p.Data)
-	if n != PageSize || !p.Valid() {
+	let n = try f.ReadAt(rel, offset, mut out)
+	let page = Page{Data: out}
+	if n != PageSize || !page.Valid() {
 		fail "store: invalid relation page"
 	}
-	return p
 }
 
 // WritePage writes one complete block and extends the relation when needed.

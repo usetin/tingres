@@ -1,0 +1,614 @@
+package parse
+
+fn (p mut Parser) parseExpression(minPrecedence i64) !Expr {
+	try p.enter()
+	let initialDepth = p.Depth
+	mut left = try p.parsePrefix()
+	for !p.done() {
+		let word = lowerAscii(p.text())
+		if p.StopWord != "" && word == p.StopWord { break }
+		if word == "::" {
+			let pos = p.Tokens[p.At].Pos
+			p.At += 1
+			let target = try p.parseTypeName()
+			left = Expr.Cast(CastExpr{Pos: pos, Value: left, TypeName: target, Syntax: "::"})
+			continue
+		}
+		if word == "collate" {
+			let pos = p.Tokens[p.At].Pos
+			p.At += 1
+			let name = try p.parseQualifiedName()
+			left = Expr.Collate(CollateExpr{Pos: pos, Value: left, Collation: name})
+			continue
+		}
+		if word == "at" && p.At + 2 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "time" && lowerAscii(p.Tokens[p.At + 2].Text) == "zone" {
+			let pos = p.Tokens[p.At].Pos
+			p.At += 3
+			let zone = try p.parseExpression(6)
+			left = Expr.AtTimeZone(AtTimeZoneExpr{Pos: pos, Value: left, Zone: zone})
+			continue
+		}
+		if p.text() == "[" {
+			let pos = p.Tokens[p.At].Pos
+			p.At += 1
+			mut indices = []SubscriptIndex{}
+			for {
+				mut indexPos = pos
+				if !p.done() { indexPos = p.Tokens[p.At].Pos }
+				mut lower ?Expr = nil
+				mut upper ?Expr = nil
+				mut sliced = false
+				if p.eat(":") {
+					sliced = true
+					if p.text() != "]" && p.text() != "," { upper = try p.parseExpression(0) }
+				} else {
+					let first = try p.parseExpression(0)
+					if p.eat(":") {
+						sliced = true
+						lower = first
+						if p.text() != "]" && p.text() != "," { upper = try p.parseExpression(0) }
+					} else { lower = first }
+				}
+				indices = append(indices, SubscriptIndex{Pos: indexPos, Lower: lower, Upper: upper, Slice: sliced})
+				if !p.eat(",") { break }
+			}
+			try p.expect("]")
+			left = Expr.Subscript(SubscriptExpr{Pos: pos, Array: left, Indices: indices})
+			continue
+		}
+		if p.eat(".") {
+			if p.eat("*") {
+				let parts = match left { ColumnRef(v) => v.Parts _ => []Identifier{} }
+				let pos = valuePos(left)
+				left = Expr.ColumnRef(ColumnRefExpr{Pos: pos, Parts: parts, Star: true})
+			} else {
+				let field = try p.parseIdentifier()
+				let pos = field.Pos
+				if let existing = columnRefWith(left, field) {
+					left = Expr.ColumnRef(existing)
+				} else {
+					left = Expr.Field(FieldExpr{Pos: pos, Value: left, Field: field})
+				}
+			}
+			continue
+		}
+		let nextWord = word
+		mut negated = false
+		mut specialWord = nextWord
+		mut opTokens = 1
+		if nextWord == "not" && p.At + 1 < len(p.Tokens) {
+			let afterNot = lowerAscii(p.Tokens[p.At + 1].Text)
+			if afterNot == "in" || afterNot == "between" || afterNot == "like" || afterNot == "ilike" || afterNot == "similar" {
+				negated = true
+				specialWord = afterNot
+				opTokens = 2
+			}
+		}
+		let precedence = expressionPrecedence(specialWord, p.kind())
+		if precedence == 0 || precedence < minPrecedence { break }
+		let operatorToken = p.Tokens[p.At]
+		if specialWord == "is" {
+			p.At += 1
+			mut isNot = p.eat("not")
+			let test = lowerAscii(p.text())
+			if test == "distinct" {
+				p.At += 1
+				try p.expect("from")
+				let right = try p.parseExpression(precedence + 1)
+				left = Expr.Is(IsExpr{Pos: operatorToken.Pos, Operand: left, Test: "distinct from", Negated: isNot, Right: right})
+			} else if test == "null" || test == "true" || test == "false" || test == "unknown" {
+				p.At += 1
+				left = Expr.Is(IsExpr{Pos: operatorToken.Pos, Operand: left, Test: test, Negated: isNot, Right: nil})
+			} else { try p.errorHere() }
+			continue
+		}
+		if specialWord == "isnull" || specialWord == "notnull" {
+			p.At += 1
+			left = Expr.Is(IsExpr{Pos: operatorToken.Pos, Operand: left, Test: "null", Negated: specialWord == "notnull", Right: nil})
+			continue
+		}
+		if specialWord == "between" {
+			p.At += opTokens
+			let symmetric = p.eat("symmetric")
+			let lowerBound = try p.parseExpression(precedence + 1)
+			try p.expect("and")
+			let upperBound = try p.parseExpression(precedence + 1)
+			left = Expr.Between(BetweenExpr{Pos: operatorToken.Pos, Operand: left, Lower: lowerBound, Upper: upperBound, Symmetric: symmetric, Negated: negated})
+			continue
+		}
+		if specialWord == "in" {
+			p.At += opTokens
+			try p.expect("(")
+			try p.enter()
+			mut query ?SelectStmt = nil
+			mut items = []Expr{}
+			if p.isQueryStart() { query = try p.parseSelect() } else if p.text() != ")" { items = try p.parseExpressionList(")") }
+			if query == nil && len(items) == 0 { try p.errorHere() }
+			try p.expect(")")
+			p.leave()
+			left = Expr.In(InExpr{Pos: operatorToken.Pos, Operand: left, Items: items, Query: query, Negated: negated})
+			continue
+		}
+		if specialWord == "like" || specialWord == "ilike" || specialWord == "similar" {
+			p.At += opTokens
+			mut kind = specialWord
+			if specialWord == "similar" {
+				try p.expect("to")
+				kind = "similar to"
+			}
+			let pattern = try p.parseExpression(precedence + 1)
+			mut escape ?Expr = nil
+			if p.eat("escape") { escape = try p.parseExpression(precedence + 1) }
+			left = Expr.Like(LikeExpr{Pos: operatorToken.Pos, Operand: left, Pattern: pattern, Kind: kind, Escape: escape, Negated: negated})
+			continue
+		}
+		if specialWord == "and" || specialWord == "or" {
+			p.At += 1
+			let right = try p.parseExpression(precedence + 1)
+			left = Expr.Boolean(BooleanExpr{Pos: operatorToken.Pos, Op: specialWord, Args: []Expr{left, right}})
+			continue
+		}
+		if (specialWord == "any" || specialWord == "all" || specialWord == "some") && operatorToken.Kind == "word" {
+			break
+		}
+		p.At += 1
+		if (p.text() == "any" || p.text() == "all" || p.text() == "some") && p.At < len(p.Tokens) {
+			let quantifier = lowerAscii(p.take().Text)
+			try p.expect("(")
+			try p.enter()
+			mut array = Expr.Default(DefaultExpr{Pos: operatorToken.Pos})
+			mut query ?SelectStmt = nil
+			if p.isQueryStart() { query = try p.parseSelect() } else { array = try p.parseExpression(0) }
+			try p.expect(")")
+			p.leave()
+			left = Expr.Quantified(QuantifiedExpr{Pos: operatorToken.Pos, Left: left, Op: operatorToken.Text, Quantifier: quantifier, Array: array, Query: query})
+			continue
+		}
+		let right = try p.parseExpression(precedence + 1)
+		left = Expr.Binary(BinaryExpr{Pos: operatorToken.Pos, Left: left, Op: lowerAscii(operatorToken.Text), Right: right})
+	}
+	p.Depth = initialDepth - 1
+	return left
+}
+
+fn expressionPrecedence(word str, kind str) i64 {
+	if word == "or" { return 1 }
+	if word == "and" { return 2 }
+	if word == "isnull" || word == "notnull" || word == "is" || word == "in" || word == "not" || word == "between" || word == "like" || word == "ilike" || word == "similar" { return 4 }
+	if word == "=" || word == "!=" || word == "<>" || word == "<" || word == ">" || word == "<=" || word == ">=" || word == "~" || word == "~*" || word == "!~" || word == "!~*" || word == "@>" || word == "<@" { return 4 }
+	if kind == "operator" {
+		if word == "->" || word == "->>" || word == "#>" || word == "#>>" { return 9 }
+		if word == "::" { return 10 }
+		if word == "^" { return 8 }
+		if word == "*" || word == "/" || word == "%" { return 7 }
+		if word == "+" || word == "-" { return 6 }
+		return 5
+	}
+	return 0
+}
+
+fn columnRefWith(value Expr, field Identifier) ?ColumnRefExpr {
+	return match value {
+		ColumnRef(v) if !v.Star => appendColumn(v, field)
+		_ => nil
+	}
+}
+
+fn appendColumn(value ColumnRefExpr, field Identifier) ColumnRefExpr {
+	mut parts = []Identifier{}
+	for part in value.Parts { parts = append(parts, part) }
+	parts = append(parts, field)
+	return ColumnRefExpr{Pos: value.Pos, Parts: parts, Star: false}
+}
+
+fn (p Parser) isQueryStart() bool {
+	let word = lowerAscii(p.text())
+	return word == "select" || word == "with" || word == "values" || word == "table"
+}
+
+fn (p mut Parser) parsePrefix() !Expr {
+	if p.done() { try p.errorHere() }
+	let token = p.take()
+	let word = lowerAscii(token.Text)
+	if token.Kind == "number" { return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "number", Value: token.Text}) }
+	if token.Kind == "string" || token.Kind == "bit" || token.Kind == "hex" {
+		return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: token.Kind, Value: token.Text})
+	}
+	if token.Kind == "param" { return Expr.Param(ParamExpr{Pos: token.Pos, N: parseDigits(token.Text[1:])}) }
+	if token.Kind == "operator" && (word == "+" || word == "-" || word == "~" || word == "@") {
+		let right = try p.parseExpression(8)
+		return Expr.Unary(UnaryExpr{Pos: token.Pos, Op: token.Text, Operand: right})
+	}
+	if word == "not" {
+		let right = try p.parseExpression(3)
+		return Expr.Unary(UnaryExpr{Pos: token.Pos, Op: "not", Operand: right})
+	}
+	if word == "null" || word == "true" || word == "false" || word == "unknown" {
+		return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: word, Value: word})
+	}
+	if word == "default" { return Expr.Default(DefaultExpr{Pos: token.Pos}) }
+	if word == "case" { return try p.parseCase(token.Pos) }
+	if word == "cast" { return try p.parseCast(token.Pos) }
+	if word == "exists" { return try p.parseExists(token.Pos) }
+	if word == "array" { return try p.parseArray(token.Pos) }
+	if word == "row" { return try p.parseRow(token.Pos, true) }
+	if word == "extract" { return try p.parseExtract(token.Pos) }
+	if word == "substring" { return try p.parseSubstring(token.Pos) }
+	if word == "position" { return try p.parsePosition(token.Pos) }
+	if word == "trim" { return try p.parseTrim(token.Pos) }
+	if word == "overlay" { return try p.parseOverlay(token.Pos) }
+	if word == "user" || word == "current_date" || word == "current_user" || word == "session_user" || word == "current_role" || word == "current_catalog" || word == "current_schema" || word == "current_timestamp" || word == "current_time" || word == "localtimestamp" || word == "localtime" {
+		mut args = []Expr{}
+		if p.eat("(") {
+			if p.text() != ")" { args = try p.parseExpressionList(")") }
+			try p.expect(")")
+		}
+		return Expr.Special(SpecialExpr{Pos: token.Pos, Name: word, Args: args})
+	}
+	if token.Kind == "word" && (word == "date" || word == "time" || word == "timestamp" || word == "interval") && p.kind() == "string" {
+		let literal = p.take()
+		return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "typed_" + word, Value: literal.Text})
+	}
+	if token.Kind == "word" && token.KeywordClass == "reserved" { fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{token.Text}\"") }
+	if token.Kind == "quoted" || token.Kind == "word" {
+		let first = decodeIdentifier(token.Text)
+		mut parts = []Identifier{Identifier{Pos: token.Pos, Name: first.Name, Quoted: first.Quoted}}
+		for p.text() == "." && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Kind != "operator" {
+			if p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "*" { break }
+			p.At += 1
+			let part = try p.parseIdentifier()
+			parts = append(parts, part)
+			if len(parts) == 3 { break }
+		}
+		if p.text() == "(" { return try p.parseFunction(token.Pos, QualifiedName{Pos: token.Pos, Parts: parts}) }
+		if len(parts) == 1 && p.text() == "(" { return try p.parseFunction(token.Pos, QualifiedName{Pos: token.Pos, Parts: parts}) }
+		if p.text() == "." && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "*" {
+			p.At += 2
+			return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Parts: parts, Star: true})
+		}
+		return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Parts: parts})
+	}
+	if token.Text == "*" { return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Star: true}) }
+	if token.Text == "(" { return try p.parseParenExpression(token.Pos) }
+	fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{token.Text}\"")
+}
+
+fn parseDigits(s str) i64 {
+	mut n = 0
+	for _, c in s { if isDigit(u8(c)) { n = n * 10 + i64(c) - 48 } }
+	return n
+}
+
+fn (p mut Parser) parseExpressionList(end str) ![]Expr {
+	mut values = []Expr{}
+	if p.text() == end { return values }
+	for {
+		let value = try p.parseExpression(0)
+		values = append(values, value)
+		if !p.eat(",") { break }
+	}
+	return values
+}
+
+fn (p mut Parser) parseParenExpression(pos i64) !Expr {
+	try p.enter()
+	if p.isQueryStart() {
+		let query = try p.parseSelect()
+		try p.expect(")")
+		p.leave()
+		return Expr.Subquery(SubqueryExpr{Pos: pos, Query: query})
+	}
+	if p.text() == ")" { try p.errorHere() }
+	let first = try p.parseExpression(0)
+	if p.eat(",") {
+		mut fields = []Expr{first}
+		let second = try p.parseExpression(0)
+		fields = append(fields, second)
+		for p.eat(",") {
+			let next = try p.parseExpression(0)
+			fields = append(fields, next)
+		}
+		try p.expect(")")
+		p.leave()
+		return Expr.Row(RowExpr{Pos: pos, Fields: fields, Explicit: false})
+	}
+	try p.expect(")")
+	p.leave()
+	return first
+}
+
+fn (p mut Parser) parseCase(pos i64) !Expr {
+	mut operand ?Expr = nil
+	if p.text() != "when" { operand = try p.parseExpression(0) }
+	mut whens = []WhenClause{}
+	for p.eat("when") {
+		let whenPos = p.Tokens[p.At - 1].Pos
+		let condition = try p.parseExpression(0)
+		try p.expect("then")
+		let result = try p.parseExpression(0)
+		whens = append(whens, WhenClause{Pos: whenPos, Condition: condition, Result: result})
+	}
+	mut elseExpr ?Expr = nil
+	if p.eat("else") { elseExpr = try p.parseExpression(0) }
+	try p.expect("end")
+	if len(whens) == 0 { fail syntaxMessage(p.Source, p.pos(), "syntax error at or near \"case\"") }
+	return Expr.Case(CaseExpr{Pos: pos, Operand: operand, Whens: whens, ElseExpr: elseExpr})
+}
+
+fn (p mut Parser) parseCast(pos i64) !Expr {
+	try p.expect("(")
+	let value = try p.parseExpression(0)
+	try p.expect("as")
+	let target = try p.parseTypeName()
+	try p.expect(")")
+	return Expr.Cast(CastExpr{Pos: pos, Value: value, TypeName: target, Syntax: "cast"})
+}
+
+fn (p mut Parser) parseExists(pos i64) !Expr {
+	try p.expect("(")
+	let query = try p.parseSelect()
+	try p.expect(")")
+	return Expr.Exists(ExistsExpr{Pos: pos, Query: query})
+}
+
+fn (p mut Parser) parseArray(pos i64) !Expr {
+	if p.eat("[") {
+		let values = try p.parseExpressionList("]")
+		try p.expect("]")
+		return Expr.Array(ArrayExpr{Pos: pos, Elements: values})
+	}
+	if p.eat("(") {
+		let query = try p.parseSelect()
+		try p.expect(")")
+		return Expr.ArraySubquery(ArraySubqueryExpr{Pos: pos, Query: query})
+	}
+	fail syntaxMessage(p.Source, p.pos(), "syntax error at or near \"array\"")
+}
+
+fn (p mut Parser) parseRow(pos i64, explicit bool) !Expr {
+	try p.expect("(")
+	let fields = try p.parseExpressionList(")")
+	try p.expect(")")
+	return Expr.Row(RowExpr{Pos: pos, Fields: fields, Explicit: explicit})
+}
+
+fn (p mut Parser) parseFunction(pos i64, name QualifiedName) !Expr {
+	try p.expect("(")
+	mut distinct = false
+	mut all = false
+	if p.eat("distinct") { distinct = true } else if p.eat("all") { all = true }
+	mut args = []FunctionArgument{}
+	mut orderBy = []SortBy{}
+	if p.text() == "*" {
+		let star = p.take()
+		args = append(args, FunctionArgument{Pos: star.Pos, Value: Expr.ColumnRef(ColumnRefExpr{Pos: star.Pos, Star: true})})
+	} else if p.text() != ")" {
+		for {
+			if p.eat("order") {
+				try p.expect("by")
+				orderBy = try p.parseSortList(")")
+				break
+			}
+			let argPos = p.Tokens[p.At].Pos
+			let variadic = p.eat("variadic")
+			mut argName ?Identifier = nil
+			if p.At + 1 < len(p.Tokens) && (p.Tokens[p.At + 1].Text == "=>" || p.Tokens[p.At + 1].Text == ":=") && p.canBeIdentifier() {
+				argName = try p.parseIdentifier()
+				p.At += 1
+			}
+			let value = try p.parseExpression(0)
+			args = append(args, FunctionArgument{Pos: argPos, Name: argName, Value: value, Variadic: variadic})
+			if p.eat(",") { continue }
+			if p.eat("order") {
+				try p.expect("by")
+				orderBy = try p.parseSortList(")")
+			}
+			break
+		}
+	}
+	try p.expect(")")
+	mut filter ?Expr = nil
+	mut over ?WindowSpec = nil
+	mut withinOrder = []SortBy{}
+	for !p.done() {
+		if p.eat("filter") {
+			try p.expect("(")
+			try p.expect("where")
+			filter = try p.parseExpression(0)
+			try p.expect(")")
+		} else if p.eat("within") {
+			try p.expect("group")
+			try p.expect("(")
+			try p.expect("order")
+			try p.expect("by")
+			withinOrder = try p.parseSortList(")")
+			try p.expect(")")
+		} else if p.eat("over") {
+			if p.eat("(") {
+				over = try p.parseWindowSpec(pos)
+				try p.expect(")")
+			} else {
+				let windowName = try p.parseIdentifier()
+				over = WindowSpec{Pos: windowName.Pos, Name: windowName}
+			}
+		} else { break }
+	}
+	return Expr.Call(FunctionCallExpr{Pos: pos, Name: name, Distinct: distinct, All: all, Args: args, OrderBy: orderBy, Filter: filter, Over: over, WithinGroup: withinOrder})
+}
+
+fn (p mut Parser) parseSortList(end str) ![]SortBy {
+	mut values = []SortBy{}
+	for {
+		mut pos = len(p.Source)
+		if !p.done() { pos = p.Tokens[p.At].Pos }
+		let value = try p.parseExpression(0)
+		mut direction = ""
+		mut nulls = ""
+		mut using = ""
+		if p.eat("using") {
+			if p.done() { try p.errorHere() }
+			using = p.take().Text
+		} else if p.eat("asc") { direction = "asc" } else if p.eat("desc") { direction = "desc" }
+		if p.eat("nulls") { if p.eat("first") { nulls = "first" } else if p.eat("last") { nulls = "last" } else { try p.errorHere() } }
+		values = append(values, SortBy{Pos: pos, Value: value, Direction: direction, Nulls: nulls, UsingOperator: using})
+		if !p.eat(",") { break }
+		if p.text() == end { try p.errorHere() }
+	}
+	return values
+}
+
+fn (p mut Parser) parseWindowSpec(pos i64) !WindowSpec {
+	mut name ?Identifier = nil
+	mut partition = []Expr{}
+	mut order = []SortBy{}
+	mut frame ?WindowFrame = nil
+	if p.canBeIdentifier() && lowerAscii(p.text()) != "partition" && lowerAscii(p.text()) != "order" && lowerAscii(p.text()) != "rows" && lowerAscii(p.text()) != "range" && lowerAscii(p.text()) != "groups" {
+		name = try p.parseIdentifier()
+	}
+	if p.eat("partition") {
+		try p.expect("by")
+		partition = try p.parseExpressionListUntilAny("order", "rows", "range", "groups", ")")
+	}
+	if p.eat("order") {
+		try p.expect("by")
+		order = try p.parseSortListUntilAny("rows", "range", "groups", ")")
+	}
+	if p.text() == "rows" || p.text() == "range" || p.text() == "groups" { frame = try p.parseWindowFrame() }
+	return WindowSpec{Pos: pos, Name: name, PartitionBy: partition, OrderBy: order, Frame: frame}
+}
+
+fn (p mut Parser) parseWindowFrame() !WindowFrame {
+	let token = p.take()
+	let mode = token.Text
+	mut start = WindowFrameBound{Pos: token.Pos, Kind: "current row"}
+	mut end ?WindowFrameBound = nil
+	if p.eat("between") {
+		start = try p.parseFrameBound()
+		try p.expect("and")
+		end = try p.parseFrameBound()
+	} else { start = try p.parseFrameBound() }
+	mut exclude = ""
+	if p.eat("exclude") {
+		if p.eat("current") {
+			try p.expect("row")
+			exclude = "current row"
+		} else if p.eat("group") { exclude = "group" } else if p.eat("ties") { exclude = "ties" } else if p.eat("no") {
+			try p.expect("others")
+			exclude = "no others"
+		} else { try p.errorHere() }
+	}
+	return WindowFrame{Pos: token.Pos, Mode: mode, Start: start, End: end, Exclude: exclude}
+}
+
+fn (p mut Parser) parseFrameBound() !WindowFrameBound {
+	let token = p.take()
+	let word = lowerAscii(token.Text)
+	if word == "unbounded" {
+		let direction = lowerAscii(p.take().Text)
+		return WindowFrameBound{Pos: token.Pos, Kind: "unbounded " + direction}
+	}
+	if word == "current" {
+		try p.expect("row")
+		return WindowFrameBound{Pos: token.Pos, Kind: "current row"}
+	}
+	p.At -= 1
+	let offset = try p.parseExpression(0)
+	if p.done() { try p.errorHere() }
+	let direction = lowerAscii(p.take().Text)
+	if direction != "preceding" && direction != "following" { try p.errorHere() }
+	return WindowFrameBound{Pos: token.Pos, Kind: direction, Offset: offset}
+}
+
+fn (p mut Parser) parseExpressionListUntilAny(a str, b str, c str, d str, end str) ![]Expr {
+	mut out = []Expr{}
+	for {
+		let value = try p.parseExpression(0)
+		out = append(out, value)
+		if !p.eat(",") { break }
+		if p.text() == end { try p.errorHere() }
+	}
+	if p.text() != a && p.text() != b && p.text() != c && p.text() != d && p.text() != end { try p.errorHere() }
+	return out
+}
+
+fn (p mut Parser) parseSortListUntilAny(a str, b str, c str, end str) ![]SortBy {
+	mut out = []SortBy{}
+	for {
+		let value = try p.parseExpression(0)
+		mut direction = ""
+		mut nulls = ""
+		if p.eat("asc") { direction = "asc" } else if p.eat("desc") { direction = "desc" }
+		if p.eat("nulls") { if p.eat("first") { nulls = "first" } else if p.eat("last") { nulls = "last" } }
+		out = append(out, SortBy{Pos: valuePos(value), Value: value, Direction: direction, Nulls: nulls})
+		if !p.eat(",") { break }
+	}
+	if p.text() != a && p.text() != b && p.text() != c && p.text() != end { try p.errorHere() }
+	return out
+}
+
+fn (p mut Parser) parseExtract(pos i64) !Expr {
+	try p.expect("(")
+	let field = try p.parseIdentifier()
+	try p.expect("from")
+	let value = try p.parseExpression(0)
+	try p.expect(")")
+	return Expr.Special(SpecialExpr{Pos: pos, Name: "extract", Field: field, FromExpr: value})
+}
+
+fn (p mut Parser) parseSubstring(pos i64) !Expr {
+	try p.expect("(")
+	let source = try p.parseExpression(0)
+	mut args = []Expr{source}
+	mut from ?Expr = nil
+	mut forExpr ?Expr = nil
+	if p.eat("from") { from = try p.parseExpression(0) } else if p.eat(",") {
+		let length = try p.parseExpression(0)
+		args = append(args, length)
+		if p.eat(",") { forExpr = try p.parseExpression(0) }
+	}
+	if p.eat("for") { forExpr = try p.parseExpression(0) }
+	try p.expect(")")
+	return Expr.Special(SpecialExpr{Pos: pos, Name: "substring", Args: args, FromExpr: from, ForExpr: forExpr})
+}
+
+fn (p mut Parser) parsePosition(pos i64) !Expr {
+	try p.expect("(")
+	let oldStop = p.StopWord
+	p.StopWord = "in"
+	let first = try p.parseExpression(0)
+	p.StopWord = oldStop
+	try p.expect("in")
+	let second = try p.parseExpression(0)
+	try p.expect(")")
+	return Expr.Special(SpecialExpr{Pos: pos, Name: "position", Args: []Expr{first}, FromExpr: second})
+}
+
+fn (p mut Parser) parseTrim(pos i64) !Expr {
+	try p.expect("(")
+	mut using = ""
+	if p.eat("leading") { using = "leading" } else if p.eat("trailing") { using = "trailing" } else if p.eat("both") { using = "both" }
+	mut args = []Expr{}
+	mut from ?Expr = nil
+	if p.eat("from") { from = try p.parseExpression(0) } else {
+		let first = try p.parseExpression(0)
+		if p.eat("from") {
+			args = append(args, first)
+			from = try p.parseExpression(0)
+		} else { args = append(args, first) }
+	}
+	try p.expect(")")
+	return Expr.Special(SpecialExpr{Pos: pos, Name: "trim", Args: args, FromExpr: from, Using: using})
+}
+
+fn (p mut Parser) parseOverlay(pos i64) !Expr {
+	try p.expect("(")
+	let source = try p.parseExpression(0)
+	try p.expect("placing")
+	let replacement = try p.parseExpression(0)
+	try p.expect("from")
+	let start = try p.parseExpression(0)
+	mut forExpr ?Expr = nil
+	if p.eat("for") { forExpr = try p.parseExpression(0) }
+	try p.expect(")")
+	return Expr.Special(SpecialExpr{Pos: pos, Name: "overlay", Args: []Expr{source, replacement}, FromExpr: start, ForExpr: forExpr})
+}
