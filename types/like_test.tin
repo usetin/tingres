@@ -56,3 +56,22 @@ fn likeFalse(t mut crucible.T, text str, pattern str, escape str) {
 	}
 	t.False("{text} LIKE {pattern}", matcher.Matches(text))
 }
+
+// TestLikeEscapeErrors pins PostgreSQL's escape-string validation.
+fn TestLikeEscapeErrors(t mut crucible.T) {
+	likeEscapeFault(mut t, "LIKE", "ab", "xy", "invalid escape string")
+	likeEscapeFault(mut t, "LIKE", "ab\\", "\\", "LIKE pattern must not end with escape character")
+	likeEscapeFault(mut t, "SIMILAR TO", "ab", "xy", "invalid escape string")
+	likeTrue(mut t, "a_b", "a_b", "")
+	likeFalse(mut t, "a%b", "a\\%b", "")
+}
+
+fn likeEscapeFault(t mut crucible.T, name str, pattern str, escape str, wantMessage str) {
+	let got = likeOperator(name, "abc", pattern, escape) catch err {
+		if ErrorCode(err) != "22025" || ErrorMessage(err) != wantMessage {
+			t.Error("{name} {pattern}: got {ErrorCode(err)} {ErrorMessage(err)}, want 22025 {wantMessage}")
+		}
+		return
+	}
+	t.Error("{name} {pattern}: got {got.Text()}, want SQLSTATE 22025")
+}

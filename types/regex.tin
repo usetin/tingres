@@ -267,7 +267,7 @@ fn similarRegexMatch(text str, pattern str, escape str) !Datum {
 fn similarRegexPattern(pattern str, escape str) !str {
 	let chars = textRunes(pattern)
 	let esc = textRunes(escape)
-	if len(esc) > 1 { try pgRaise("22025", "SIMILAR TO escape must be a single character") }
+	if len(esc) > 1 { try pgRaiseHint("22025", "invalid escape string", "Escape string must be empty or one character.") }
 	mut out = ""
 	mut i = i64(0)
 	for i < len(chars) {
