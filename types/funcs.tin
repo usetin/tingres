@@ -611,6 +611,7 @@ fn callStringSpecial(name str, args []Datum) !Datum {
 			first = false
 		}
 	} else {
+		if IsNull(args[0]) { return Null() }
 		out = try formatString(args)
 	}
 	return FromStr(TextOid, out)
@@ -633,7 +634,7 @@ let builtinFuncRegistry = builtinFuncs()
 fn registerBasicFuncs(funcs mut []Func) {
 	registerOperators(mut funcs)
 	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, OidOid, Float4Oid, Float8Oid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid, NumericOid, DateOid, TimeOid, TimestampOid, TimestamptzOid, IntervalOid, UnknownLiteralOid} {
-		registerFunc(mut funcs, function1("pg_typeof", []Oid{oid}, TextOid, true, false, fn(p1 Datum) !Datum { return try pgTypeName(p1.Oid()) }))
+		registerFunc(mut funcs, function1("pg_typeof", []Oid{oid}, TextOid, false, false, fn(p1 Datum) !Datum { return try pgTypeName(p1.Oid()) }))
 	}
 }
 

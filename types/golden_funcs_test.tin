@@ -140,7 +140,7 @@ fn (parser mut GoldenParser) parsePrimary() !Datum {
 	if c >= '0' && c <= '9' { return try parser.readNumber() }
 	let name = parser.readIdentifier()
 	if len(name) == 0 { fail "expected a literal, function, or parenthesized expression" }
-	if name == "null" { return Null() }
+	if name == "null" { return Datum{oid: UnknownLiteralOid, null: true, i: 0, f: 0.0, b: false, s: "", bytes: []u8{}} }
 	if name == "true" { return FromBool(true) }
 	if name == "false" { return FromBool(false) }
 	if name == "not" {

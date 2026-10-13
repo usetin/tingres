@@ -99,6 +99,11 @@ regexp_match('a', 'a', 'z')	ERROR: invalid regular expression option: "z"
 '2024-01-02 10:00'::timestamp <= '2024-01-03'::timestamp	true
 '10:00'::time < '12:00'::time	true
 '1 day'::interval < '2 days'::interval	true
+pg_typeof(NULL)	unknown
+pg_typeof(NULL::int4)	integer
+pg_typeof(NULL::text)	text
+format(NULL::text, 'a')	NULL
+quote_literal(NULL::text)	NULL
 sqrt(2::float8)	1.4142135623730951
 power(2::float8, 10)	1024
 round(2.5::float8)	2

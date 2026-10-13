@@ -54,6 +54,7 @@ fn stringUnary(name str, arg Datum) !Datum {
 	if name == "reverse" { return FromStr(TextOid, reverseText(s)) }
 	if name == "md5" { return FromStr(TextOid, md5Text(s)) }
 	if name == "quote_ident" { return FromStr(TextOid, quoteIdent(s)) }
+	if name == "quote_nullable" && IsNull(arg) { return FromStr(TextOid, "NULL") }
 	if name == "quote_literal" || name == "quote_nullable" { return FromStr(TextOid, quoteLiteral(s)) }
 	return FromStr(TextOid, s)
 }

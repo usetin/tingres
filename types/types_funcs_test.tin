@@ -315,6 +315,9 @@ fn TestStringFunctionErrorsDifferential(t mut crucible.T) {
 	goldenCheck(mut t, "substring('abcdef', 2, 3)", "bcd")
 	goldenCheck(mut t, "to_hex(255)", "ff")
 	goldenCheck(mut t, "quote_ident('')", `""`)
+	goldenCheck(mut t, "quote_nullable(NULL)", "NULL")
+	goldenCheck(mut t, "pg_typeof(NULL)", "unknown")
+	goldenCheck(mut t, "pg_typeof(NULL::int4)", "integer")
 	goldenCheck(mut t, "quote_ident('A')", `"A"`)
 }
 
