@@ -14,8 +14,8 @@ fn TestPlannerConstantFolding(t mut crucible.T) {
 			Op: "+",
 			Func: fnVal,
 			Args: []Expr{
-				Expr.Const(ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: u32(types.Int4Oid)}),
-				Expr.Const(ConstExpr{Value: types.FromI64(types.Int4Oid, 2), Type: u32(types.Int4Oid)}),
+				mkInt4Const(types.Int4Oid, 1),
+				mkInt4Const(types.Int4Oid, 2),
 			},
 			Type: u32(types.Int4Oid),
 		})
@@ -34,8 +34,8 @@ fn TestPlannerConstantFolding(t mut crucible.T) {
 	let andExpr = Expr.BoolExpr(BoolExpr{
 		Op: BoolOp.And,
 		Args: []Expr{
-			Expr.Const(ConstExpr{Value: types.FromBool(true), Type: u32(types.BoolOid)}),
-			Expr.Const(ConstExpr{Value: types.FromBool(false), Type: u32(types.BoolOid)}),
+			mkBoolConst(true),
+			mkBoolConst(false),
 		},
 		Type: u32(types.BoolOid),
 	})
@@ -53,8 +53,8 @@ fn TestPlannerConstantFolding(t mut crucible.T) {
 	let orExpr = Expr.BoolExpr(BoolExpr{
 		Op: BoolOp.Or,
 		Args: []Expr{
-			Expr.Const(ConstExpr{Value: types.FromBool(false), Type: u32(types.BoolOid)}),
-			Expr.Const(ConstExpr{Value: types.FromBool(true), Type: u32(types.BoolOid)}),
+			mkBoolConst(false),
+			mkBoolConst(true),
 		},
 		Type: u32(types.BoolOid),
 	})
@@ -72,7 +72,7 @@ fn TestPlannerConstantFolding(t mut crucible.T) {
 	let notExpr = Expr.BoolExpr(BoolExpr{
 		Op: BoolOp.Not,
 		Args: []Expr{
-			Expr.Const(ConstExpr{Value: types.FromBool(false), Type: u32(types.BoolOid)}),
+			mkBoolConst(false),
 		},
 		Type: u32(types.BoolOid),
 	})
@@ -88,7 +88,7 @@ fn TestPlannerConstantFolding(t mut crucible.T) {
 
 	// IS NULL on non-null -> false
 	let nullTest = Expr.NullTest(NullTestExpr{
-		Arg: Expr.Const(ConstExpr{Value: types.FromStr(types.TextOid, "hello"), Type: u32(types.TextOid)}),
+		Arg: mkStrConst(types.TextOid, "hello"),
 		Test: NullTestType.IsNull,
 		Type: u32(types.BoolOid),
 	})

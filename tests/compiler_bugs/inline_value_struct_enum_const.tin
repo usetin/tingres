@@ -1,0 +1,28 @@
+// Tin miscompiles an inline value-struct constructor used as an
+// enum-variant struct field once two or more such locals are live: the
+// datum's fields read back shifted, so `oid` becomes the integer argument.
+// Materialising the datum in a local first (or constructing it in a small
+// helper function) avoids it; the second constant below reads back correctly,
+// which shows the corruption is a stack-layout bug, not a bad literal.
+//
+// Expected output:
+//   a 23 1
+//   b 23 2
+package main
+
+import "say"
+import "../../plan"
+import "../../types"
+
+fn main() {
+	let a = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: u32(types.Int4Oid)})
+	let b = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 2), Type: u32(types.Int4Oid)})
+	match a {
+		Const(l) => { say.Line("a", l.Value.Oid(), l.Value.Text()) }
+		_ => { say.Line("a notconst") }
+	}
+	match b {
+		Const(l) => { say.Line("b", l.Value.Oid(), l.Value.Text()) }
+		_ => { say.Line("b notconst") }
+	}
+}

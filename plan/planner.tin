@@ -90,6 +90,39 @@ fn costNestLoop(outer Cost, inner Cost, outRows f64, width i64) Cost {
 	}
 }
 
+// mkConstExpr builds a Const expression from a scalar or materialised datum.
+// The datum is always bound to a local first: constructing a value struct
+// inline inside the enum literal is miscompiled by Tin when other large locals
+// are in scope (see BUGS.md), so all constant construction goes through here.
+fn mkConstExpr(d types.Datum, typ u32) Expr {
+	let ce = ConstExpr{Value: d, Type: typ}
+	return Expr.Const(ce)
+}
+
+// mkInt4Const builds an integer Const expression of the given integer type.
+fn mkInt4Const(oid types.Oid, v i64) Expr {
+	let d = types.FromI64(oid, v)
+	return mkConstExpr(d, u32(oid))
+}
+
+// mkBoolConst builds a boolean Const expression.
+fn mkBoolConst(v bool) Expr {
+	let d = types.FromBool(v)
+	return mkConstExpr(d, u32(types.BoolOid))
+}
+
+// mkStrConst builds a text-family Const expression.
+fn mkStrConst(oid types.Oid, v str) Expr {
+	let d = types.FromStr(oid, v)
+	return mkConstExpr(d, u32(oid))
+}
+
+// mkNullConst builds a typed NULL Const expression.
+fn mkNullConst(typ u32) Expr {
+	let d = types.Null()
+	return mkConstExpr(d, typ)
+}
+
 // foldExpr performs constant folding on expression trees.
 fn foldExpr(expr Expr) Expr {
 	match expr {
@@ -103,7 +136,7 @@ fn foldExpr(expr Expr) Expr {
 					let castVal = types.Cast(lit.Value, types.Oid(c.Type)) catch _ {
 						return Expr.Cast(CastExpr{Arg: foldedArg, Type: c.Type, Typmod: c.Typmod})
 					}
-					return Expr.Const(ConstExpr{Value: castVal, Type: c.Type})
+					return mkConstExpr(castVal, c.Type)
 				}
 				_ => {
 					return Expr.Cast(CastExpr{Arg: foldedArg, Type: c.Type, Typmod: c.Typmod})
@@ -116,9 +149,9 @@ fn foldExpr(expr Expr) Expr {
 				Const(lit) => {
 					let isNull = types.IsNull(lit.Value)
 					if nt.Test == NullTestType.IsNull {
-						return Expr.Const(ConstExpr{Value: types.FromBool(isNull), Type: u32(types.BoolOid)})
+						return mkBoolConst(isNull)
 					} else {
-						return Expr.Const(ConstExpr{Value: types.FromBool(!isNull), Type: u32(types.BoolOid)})
+						return mkBoolConst(!isNull)
 					}
 				}
 				_ => {
@@ -140,7 +173,7 @@ fn foldExpr(expr Expr) Expr {
 								if !types.IsNull(lit.Value) {
 									let b = lit.Value.Text() == "t" || lit.Value.Text() == "true"
 									if !b {
-										return Expr.Const(ConstExpr{Value: types.FromBool(false), Type: u32(types.BoolOid)})
+										return mkBoolConst(false)
 									}
 								} else {
 									nonConstArgs = append(nonConstArgs, fa)
@@ -152,7 +185,7 @@ fn foldExpr(expr Expr) Expr {
 						}
 					}
 					if len(nonConstArgs) == 0 {
-						return Expr.Const(ConstExpr{Value: types.FromBool(true), Type: u32(types.BoolOid)})
+						return mkBoolConst(true)
 					}
 					if len(nonConstArgs) == 1 {
 						return nonConstArgs[0]
@@ -167,7 +200,7 @@ fn foldExpr(expr Expr) Expr {
 								if !types.IsNull(lit.Value) {
 									let b = lit.Value.Text() == "t" || lit.Value.Text() == "true"
 									if b {
-										return Expr.Const(ConstExpr{Value: types.FromBool(true), Type: u32(types.BoolOid)})
+										return mkBoolConst(true)
 									}
 								} else {
 									nonConstArgs = append(nonConstArgs, fa)
@@ -179,7 +212,7 @@ fn foldExpr(expr Expr) Expr {
 						}
 					}
 					if len(nonConstArgs) == 0 {
-						return Expr.Const(ConstExpr{Value: types.FromBool(false), Type: u32(types.BoolOid)})
+						return mkBoolConst(false)
 					}
 					if len(nonConstArgs) == 1 {
 						return nonConstArgs[0]
@@ -192,7 +225,7 @@ fn foldExpr(expr Expr) Expr {
 							Const(lit) => {
 								if !types.IsNull(lit.Value) {
 									let b = lit.Value.Text() == "t" || lit.Value.Text() == "true"
-									return Expr.Const(ConstExpr{Value: types.FromBool(!b), Type: u32(types.BoolOid)})
+									return mkBoolConst(!b)
 								}
 							}
 							_ => {}
@@ -229,7 +262,7 @@ fn foldExpr(expr Expr) Expr {
 					let res = lf.Call([]types.Datum{leftVal, rightVal}) catch _ {
 						return Expr.OpCall(OpCallExpr{Op: op.Op, Func: op.Func, Args: foldedArgs, Type: op.Type})
 					}
-					return Expr.Const(ConstExpr{Value: res, Type: op.Type})
+					return mkConstExpr(res, op.Type)
 				}
 			}
 			return Expr.OpCall(OpCallExpr{Op: op.Op, Func: op.Func, Args: foldedArgs, Type: op.Type})
