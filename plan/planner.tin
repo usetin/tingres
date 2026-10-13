@@ -542,12 +542,17 @@ break } }
 		Rows: havingPlan.Cost().Rows,
 		Width: i64(len(outCols) * 8),
 	}
-	let projectedPlan = Plan.Project(ProjectNode{
+	// Drop a trivial identity projection (every output column is the input column
+	// at the same position) so single-table queries explain like PostgreSQL's.
+	mut projectedPlan = Plan.Project(ProjectNode{
 		Input: havingPlan,
 		Exprs: projExprs,
 		Cols: outCols,
 		Cost: projCost,
 	})
+	if isIdentityProjection(projExprs, havingPlan.Cols()) {
+		projectedPlan = havingPlan
+	}
 
 	// 5. DISTINCT
 	mut distinctPlan = projectedPlan
@@ -603,6 +608,20 @@ break } }
 	}
 
 	return finalPlan
+}
+
+// isIdentityProjection reports whether exprs is exactly the input columns in order.
+fn isIdentityProjection(exprs []Expr, inputCols []ColDesc) bool {
+	if len(exprs) != len(inputCols) { return false }
+	for i, e in exprs {
+		match e {
+			ColRef(c) => {
+				if c.Slot != i64(i) { return false }
+			}
+			_ => { return false }
+		}
+	}
+	return true
 }
 
 fn findAggRefs(expr Expr) []AggRefExpr {
@@ -825,6 +844,139 @@ fn planFromJoinList(c catalog.Catalog, tx txn.Txn, items mut []FromClauseItem, a
 	return currentPlan
 }
 
+// --- Index selection ---------------------------------------------------------
+
+// strHasPrefix reports whether s starts with p.
+fn strHasPrefix(s str, p str) bool {
+	return len(p) <= len(s) && s[:len(p)] == p
+}
+
+// strHasSuffix reports whether s ends with p.
+fn strHasSuffix(s str, p str) bool {
+	return len(p) <= len(s) && s[len(s)-len(p):] == p
+}
+
+// inferIndexColumns recovers an index's key columns from its name. The catalog
+// Index carries no column list, so plan/ uses the PostgreSQL naming convention
+// <table>_<col>[_<col>...][_pkey|_key|_idx|_index|_unique]: the leading table
+// name and one trailing suffix are stripped, then column names are consumed
+// left to right. A "...._pkey" index with no decodable key falls back to the
+// table's leading column (the primary key).
+fn inferIndexColumns(idx catalog.Index, tbl catalog.Table) []str {
+	mut rest = idx.Name
+	if strHasPrefix(rest, tbl.Name + "_") {
+		rest = rest[len(tbl.Name)+1:]
+	}
+	for suffix in []str{"_pkey", "_unique", "_index", "_idx", "_key"} {
+		if strHasSuffix(rest, suffix) {
+			rest = rest[:len(rest)-len(suffix)]
+			break
+		}
+	}
+	mut cols = []str{}
+	mut remaining = rest
+	for col in tbl.Cols {
+		if remaining == col.Name {
+			cols = append(cols, col.Name)
+			remaining = ""
+		} else if strHasPrefix(remaining, col.Name + "_") {
+			cols = append(cols, col.Name)
+			remaining = remaining[len(col.Name)+1:]
+		}
+	}
+	if len(cols) == 0 && (strHasSuffix(idx.Name, "_pkey") || strHasSuffix(idx.Name, "_key")) {
+		if len(tbl.Cols) > 0 {
+			cols = append(cols, tbl.Cols[0].Name)
+		}
+	}
+	return cols
+}
+
+// tableColAttno returns the 1-based attribute number of a named table column.
+fn tableColAttno(tbl catalog.Table, name str) (i16, bool) {
+	for col in tbl.Cols {
+		if col.Name == name {
+			return col.Number, true
+		}
+	}
+	return 0, false
+}
+
+// isIndexOp reports whether op can be used as a B-tree index qualification.
+fn isIndexOp(op str) bool {
+	return op == "=" || op == "<" || op == "<=" || op == ">" || op == ">="
+}
+
+// defaultSelectivity mirrors PostgreSQL's default operator selectivities.
+fn defaultSelectivity(op str) f64 {
+	if op == "=" { return 0.005 }
+	if op == "<" || op == ">" || op == "<=" || op == ">=" { return 0.3333 }
+	if op == "<>" { return 0.995 }
+	return 0.5
+}
+
+// matchIndexQuals pairs index columns with equality/range quals on a table scan.
+// It returns the matched quals (as Index Cond), their bounds, and the leftover
+// quals that must still be applied as a filter. Matching stops at the first
+// index column with no qual, so only a usable key prefix is consumed.
+fn matchIndexQuals(idxCols []str, tbl catalog.Table, quals []Expr) ([]Expr, []IndexBound, []Expr) {
+	mut used = make([]bool, len(quals))
+	mut usedQuals = []Expr{}
+	mut bounds = []IndexBound{}
+	for i, colName in idxCols {
+		let (attno, ok) = tableColAttno(tbl, colName)
+		if !ok { break }
+		mut found = false
+		for qi, q in quals {
+			if used[qi] || found { continue }
+			match q {
+				OpCall(op) => {
+					if len(op.Args) == 2 && isIndexOp(op.Op) {
+						match op.Args[0] {
+							ColRef(c) => {
+								if c.AttNo == attno {
+									used[qi] = true
+									usedQuals = append(usedQuals, q)
+									bounds = append(bounds, IndexBound{
+										Col: i,
+										Op: op.Op,
+										Value: op.Args[1],
+										Inclusive: op.Op == "=" || op.Op == "<=" || op.Op == ">=",
+									})
+									found = true
+								}
+							}
+							_ => {}
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+		if !found { break }
+	}
+	mut remaining = []Expr{}
+	for qi, q in quals {
+		if !used[qi] { remaining = append(remaining, q) }
+	}
+	return usedQuals, bounds, remaining
+}
+
+// estimateIndexRows estimates the rows returned for a matched index prefix.
+fn estimateIndexRows(baseRows f64, bounds []IndexBound, unique bool) f64 {
+	mut rows = baseRows
+	mut allEquality = len(bounds) > 0
+	for b in bounds {
+		rows *= defaultSelectivity(b.Op)
+		if b.Op != "=" { allEquality = false }
+	}
+	if allEquality && unique && len(bounds) > 0 {
+		return 1.0
+	}
+	if rows < 1.0 { rows = 1.0 }
+	return rows
+}
+
 fn planTableScan(c catalog.Catalog, tx txn.Txn, tbl FromTable, allQuals []Expr) !Plan {
 	mut tableQuals = []Expr{}
 	for q in allQuals {
@@ -835,50 +987,46 @@ fn planTableScan(c catalog.Catalog, tx txn.Txn, tbl FromTable, allQuals []Expr) 
 
 	let catTable = c.LookupTable(tx, tbl.Schema, tbl.Name)
 	let width = i64(len(tbl.Cols) * 8)
-	let defaultRows = 100.0
+	let baseRows = 100.0
 
 	if let t = catTable {
-		// Index Scan Selection
-		if len(t.Indexes) > 0 && len(tableQuals) > 0 {
-			for idx in t.Indexes {
-				// Check for point lookup equality: col = <const> or col = $n
-				for q in tableQuals {
-					match q {
-						OpCall(op) => {
-							if op.Op == "=" && len(op.Args) == 2 {
-								match op.Args[0] {
-									ColRef(_) => {
-										let isPointLookup = idx.Unique
-										let cost = costIndexScan(defaultRows, width, i64(len(tableQuals)), isPointLookup)
-										return Plan.IndexScan(IndexScanNode{
-											Table: t,
-											Index: idx,
-											Bounds: []IndexBound{},
-											Quals: []Expr{q},
-											Direction: ScanDirection.Forward,
-											Filter: nil,
-											Cols: tbl.Cols,
-											Cost: cost,
-										})
-									}
-									_ => {}
-								}
-							}
-						}
-						_ => {}
-					}
-				}
+		let seqCost = costSeqScan(baseRows, width, i64(len(tableQuals)))
+
+		// Primary-key point lookup fast path: a unique index whose whole key is
+		// matched by equality is always an Index Scan (pgbench-style lookups).
+		for idx in t.Indexes {
+			let idxCols = inferIndexColumns(idx, t)
+			if len(idxCols) == 0 { continue }
+			let (usedQuals, bounds, remaining) = matchIndexQuals(idxCols, t, tableQuals)
+			if len(usedQuals) == 0 { continue }
+			let rows = estimateIndexRows(baseRows, bounds, idx.Unique)
+			let idxCost = costIndexScan(rows, width, i64(len(usedQuals)), idx.Unique)
+			let filterCond = combineConjunction(remaining)
+			mut plan = Plan.IndexScan(IndexScanNode{
+				Table: t,
+				Index: idx,
+				Bounds: bounds,
+				Quals: usedQuals,
+				Direction: ScanDirection.Forward,
+				Filter: filterCond,
+				Cols: tbl.Cols,
+				Cost: idxCost,
+			})
+			if idx.Unique && len(usedQuals) == len(idxCols) && rows <= 1.0 {
+				return plan
+			}
+			if idxCost.Total < seqCost.Total {
+				return plan
 			}
 		}
 
-		let cost = costSeqScan(defaultRows, width, i64(len(tableQuals)))
 		let filterCond = combineConjunction(tableQuals)
 		return Plan.SeqScan(SeqScanNode{
 			Table: t,
 			Filter: filterCond,
 			Projection: []Expr{},
 			Cols: tbl.Cols,
-			Cost: cost,
+			Cost: seqCost,
 		})
 	}
 

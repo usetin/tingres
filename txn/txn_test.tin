@@ -572,7 +572,7 @@ fn BenchmarkVisibilityCheck(b mut crucible.B) {
 	_ = m.VisibleTuple(snap, 48, row)
 	let hintedRow = db.HeapFetch(48, tid, []u8{}) catch _ { return }
 	for i in 0..b.N {
-		let visible = m.Visible(snap, hintedRow.Header)
+		let visible = m.HeapTupleSatisfiesMVCC(snap, hintedRow.Header)
 		if !visible || i < 0 { continue }
 	}
 	m.Abort(mut reader) catch _ { }

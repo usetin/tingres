@@ -759,7 +759,7 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 							RangeIndex: rangeIndex,
 							Hidden: false,
 						})
-						colDescs = append(colDescs, ColDesc{Name: cName, Oid: col.Oid, Typmod: col.Typmod, TableOid: 0, Attno: i16(i + 1)})
+						colDescs = append(colDescs, ColDesc{Name: cName, Oid: col.Oid, Typmod: col.Typmod, TableOid: 0, Attno: i16(i + 1), RangeIndex: rangeIndex, SourceName: aliasName})
 					}
 					let st = ScopeTable{Name: name, Alias: aliasName, TableOid: 0, RangeIndex: rangeIndex, Cols: scopeCols}
 					return FromClauseItem.Table(FromTable{
@@ -794,7 +794,7 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 						RangeIndex: rangeIndex,
 						Hidden: false,
 					})
-					colDescs = append(colDescs, ColDesc{Name: cName, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number})
+					colDescs = append(colDescs, ColDesc{Name: cName, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number, RangeIndex: rangeIndex, SourceName: aliasName})
 				}
 				let st = ScopeTable{Name: name, Alias: aliasName, TableOid: tbl.Oid, RangeIndex: rangeIndex, Cols: scopeCols}
 				return FromClauseItem.Table(FromTable{TableOid: tbl.Oid, Schema: tbl.Schema, Name: tbl.Name, Alias: aliasName, RangeIndex: rangeIndex, Cols: colDescs}), []ScopeTable{st}
@@ -826,7 +826,7 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 					RangeIndex: rangeIndex,
 					Hidden: false,
 				})
-				colDescs = append(colDescs, ColDesc{Name: cName, Oid: target.Col.Oid, Typmod: target.Col.Typmod, TableOid: 0, Attno: i16(i + 1)})
+				colDescs = append(colDescs, ColDesc{Name: cName, Oid: target.Col.Oid, Typmod: target.Col.Typmod, TableOid: 0, Attno: i16(i + 1), RangeIndex: rangeIndex, SourceName: aliasName})
 			}
 			let st = ScopeTable{Name: aliasName, Alias: aliasName, TableOid: 0, RangeIndex: rangeIndex, Cols: scopeCols}
 			return FromClauseItem.Subquery(FromSubquery{Query: subQuery, Alias: aliasName, RangeIndex: rangeIndex, Cols: colDescs}), []ScopeTable{st}
@@ -845,10 +845,10 @@ fn analyzeFromItem(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes []C
 
 			mut mergedDescs = []ColDesc{}
 			for col in fromItemCols(leftItem) {
-				mergedDescs = append(mergedDescs, ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: col.Attno})
+				mergedDescs = append(mergedDescs, ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: col.Attno, RangeIndex: col.RangeIndex, SourceName: col.SourceName})
 			}
 			for col in fromItemCols(rightItem) {
-				mergedDescs = append(mergedDescs, ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: col.Attno})
+				mergedDescs = append(mergedDescs, ColDesc{Name: col.Name, Oid: col.Oid, Typmod: col.Typmod, TableOid: col.TableOid, Attno: col.Attno, RangeIndex: col.RangeIndex, SourceName: col.SourceName})
 			}
 
 			mut quals = []Expr{}
@@ -1367,7 +1367,7 @@ fn analyzeInsert(c catalog.Catalog, tx txn.Txn, params mut []u32, ins parse.Inse
 		mut targets = []TargetCol{}
 		mut cols = []ColDesc{}
 		for i, col in tbl.Cols {
-			let colDesc = ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number}
+			let colDesc = ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number, RangeIndex: 1, SourceName: tblName}
 			cols = append(cols, colDesc)
 			targets = append(targets, TargetCol{
 				Expr: Expr.ColRef(ColRefExpr{Slot: i64(i), RangeIndex: 1, AttNo: col.Number, Type: col.Type}),
@@ -1419,7 +1419,7 @@ fn analyzeUpdate(c catalog.Catalog, tx txn.Txn, params mut []u32, upd parse.Upda
 				RangeIndex: 1,
 				Hidden: false,
 			})
-			cols = append(cols, ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number})
+			cols = append(cols, ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number, RangeIndex: 1, SourceName: tblName})
 		}
 		let scopes = []Scope{Scope{Tables: []ScopeTable{ScopeTable{Name: tblName, Alias: tblName, TableOid: tbl.Oid, RangeIndex: 1, Cols: scopeCols}}}}
 
@@ -1473,7 +1473,7 @@ fn analyzeDelete(c catalog.Catalog, tx txn.Txn, params mut []u32, del parse.Dele
 				RangeIndex: 1,
 				Hidden: false,
 			})
-			cols = append(cols, ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number})
+			cols = append(cols, ColDesc{Name: col.Name, Oid: col.Type, Typmod: col.Typmod, TableOid: tbl.Oid, Attno: col.Number, RangeIndex: 1, SourceName: tblName})
 		}
 		let scopes = []Scope{Scope{Tables: []ScopeTable{ScopeTable{Name: tblName, Alias: tblName, TableOid: tbl.Oid, RangeIndex: 1, Cols: scopeCols}}}}
 

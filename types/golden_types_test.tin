@@ -1,0 +1,303 @@
+package types
+
+import "crucible"
+import "mint"
+import "quarry"
+import "twine"
+
+// TestPostgreSqlTypesGoldens evaluates the numeric and date/time corpora in
+// types/testdata/golden_numeric.txt and golden_datetime.txt and compares every
+// result against the output captured from a real PostgreSQL 17.
+
+fn TestPostgreSqlTypesGoldens(t mut crucible.T) {
+	SetTimeZone("UTC") catch err {
+		t.Error("set UTC: {ErrorMessage(err)}")
+		return
+	}
+	let numeric = quarry.ReadFile("types/testdata/golden_numeric.txt") catch err {
+		t.Error("could not load numeric goldens: {err}")
+		return
+	}
+	let datetime = quarry.ReadFile("types/testdata/golden_datetime.txt") catch err {
+		t.Error("could not load date/time goldens: {err}")
+		return
+	}
+	let numericCount = testTypeGoldenFile(mut t, "numeric", numeric)
+	let datetimeCount = testTypeGoldenFile(mut t, "datetime", datetime)
+	t.True("numeric corpus has at least 300 expressions", numericCount >= 300)
+	t.True("date/time corpus has at least 300 expressions", datetimeCount >= 300)
+}
+
+fn testTypeGoldenFile(t mut crucible.T, group str, contents str) i64 {
+	mut count = i64(0)
+	mut failures = i64(0)
+	for lineNo, line in twine.Split(contents, "\n") {
+		if len(line) == 0 { continue }
+		let fields = twine.SplitN(line, "\t", 2)
+		if len(fields) != 2 {
+			t.Error("{group} golden line {lineNo+1} is not tab separated")
+			continue
+		}
+		count += 1
+		let expression = fields[0]
+		let expected = fields[1]
+		if arena { typeGoldenMatches(expression, expected) } { continue }
+		if failures >= 40 { continue }
+		failures += 1
+		let got = evalTypeGoldenExpression(expression) catch err {
+			t.Error("{group} {expression}: got ERROR: {ErrorMessage(err)}, want {expected}")
+			continue
+		}
+		if expected == "NULL" {
+			t.Error("{group} {expression}: got {got.Text()}, want SQL NULL")
+		} else {
+			t.Error("{group} {expression}: got {got.Text()}, want {expected}")
+		}
+	}
+	return count
+}
+
+// typeGoldenMatches reports whether one corpus line evaluates to the expected
+// result. It is run inside an arena so the per-expression allocations are freed.
+fn typeGoldenMatches(expression str, expected str) bool {
+	let got = evalTypeGoldenExpression(expression) catch err {
+		return "ERROR: " + ErrorMessage(err) == expected
+	}
+	if expected == "NULL" { return IsNull(got) }
+	if twine.HasPrefix(expected, "ERROR: ") { return false }
+	return got.Text() == expected
+}
+
+// TypeGoldenParser evaluates a restricted PostgreSQL expression subset using
+// this package's numeric and temporal functions.
+type TypeGoldenParser value struct {
+	Source str
+	Pos i64
+}
+
+fn evalTypeGoldenExpression(source str) !Datum {
+	mut parser = TypeGoldenParser{Source: keep(source), Pos: 0}
+	let value = try parser.parseExpression(0)
+	parser.skipSpace()
+	if parser.Pos != len(parser.Source) { fail "unexpected input at byte {parser.Pos}" }
+	return value
+}
+
+fn (parser mut TypeGoldenParser) skipSpace() {
+	for parser.Pos < len(parser.Source) && parser.Source[parser.Pos] <= 32 { parser.Pos += 1 }
+}
+
+fn (parser TypeGoldenParser) starts(text str) bool {
+	return len(text) <= len(parser.Source)-parser.Pos && parser.Source[parser.Pos:parser.Pos+len(text)] == text
+}
+
+fn (parser mut TypeGoldenParser) parseExpression(minPrecedence i64) !Datum {
+	mut left = try parser.parsePrimary()
+	for {
+		parser.skipSpace()
+		if parser.starts("::") {
+			parser.Pos += 2
+			left = try parser.parseCast(left)
+			continue
+		}
+		let (op, precedence, width) = parser.binaryOperator()
+		if width == 0 || precedence < minPrecedence { break }
+		parser.Pos += width
+		let right = try parser.parseExpression(precedence+1)
+		if let f = LookupTypeOperator(op, left.Oid(), right.Oid()) {
+			left = try f.Call2(left, right)
+		} else {
+			fail "operator {op} is not defined for {left.Oid()} and {right.Oid()}"
+		}
+	}
+	return left
+}
+
+fn (parser mut TypeGoldenParser) parsePrimary() !Datum {
+	parser.skipSpace()
+	if parser.Pos >= len(parser.Source) { fail "unexpected end of expression" }
+	if parser.starts("(") {
+		parser.Pos += 1
+		let value = try parser.parseExpression(0)
+		parser.skipSpace()
+		if !parser.starts(")") { fail "expected closing parenthesis" }
+		parser.Pos += 1
+		return value
+	}
+	if parser.starts("'") { return try parser.readString() }
+	if parser.starts("-") || parser.starts("+") {
+		let op = parser.Source[parser.Pos:parser.Pos+1]
+		parser.Pos += 1
+		let value = try parser.parseExpression(7)
+		if let f = LookupTypeFunc(op, []Oid{value.Oid()}) { return try f.Call1(value) }
+		fail "unary operator {op} is missing"
+	}
+	let c = parser.Source[parser.Pos]
+	if c >= '0' && c <= '9' || c == '.' { return try parser.readNumber() }
+	let name = parser.readIdentifier()
+	if len(name) == 0 { fail "expected a literal, function, or parenthesized expression" }
+	if name == "null" { return Null() }
+	if name == "true" { return FromBool(true) }
+	if name == "false" { return FromBool(false) }
+	parser.skipSpace()
+	if !parser.starts("(") { fail "unsupported name {name}" }
+	parser.Pos += 1
+	mut args = []Datum{}
+	parser.skipSpace()
+	if !parser.starts(")") {
+		for {
+			let arg = try parser.parseExpression(0)
+			args = append(args, arg)
+			parser.skipSpace()
+			if parser.starts(",") {
+				parser.Pos += 1
+				continue
+			}
+			break
+		}
+	}
+	parser.skipSpace()
+	if !parser.starts(")") { fail "expected closing function parenthesis" }
+	parser.Pos += 1
+	let argOids = typeArgOids(args)
+	if let f = LookupTypeFunc(name, argOids) { return try f.Call(args) }
+	fail "function {name} is not defined for these arguments"
+}
+
+fn typeArgOids(args []Datum) []Oid {
+	mut oids = make([]Oid, 0, len(args))
+	for arg in args { oids = append(oids, arg.Oid()) }
+	return oids
+}
+
+fn (parser mut TypeGoldenParser) readString() !Datum {
+	parser.Pos += 1
+	mut out = ""
+	for parser.Pos < len(parser.Source) {
+		let c = parser.Source[parser.Pos]
+		if c == '\'' {
+			if parser.Pos+1 < len(parser.Source) && parser.Source[parser.Pos+1] == '\'' {
+				out += "'"
+				parser.Pos += 2
+				continue
+			}
+			parser.Pos += 1
+			return FromStr(UnknownLiteralOid, out)
+		}
+		out += parser.Source[parser.Pos:parser.Pos+1]
+		parser.Pos += 1
+	}
+	fail "unterminated string literal"
+}
+
+fn (parser mut TypeGoldenParser) readNumber() !Datum {
+	let start = parser.Pos
+	mut decimal = false
+	mut sawExponent = false
+	for parser.Pos < len(parser.Source) {
+		let c = parser.Source[parser.Pos]
+		if c >= '0' && c <= '9' { parser.Pos += 1
+		} else if c == '.' {
+			decimal = true
+			parser.Pos += 1
+		} else if (c == 'e' || c == 'E') && !sawExponent {
+			decimal = true
+			sawExponent = true
+			parser.Pos += 1
+			if parser.Pos < len(parser.Source) && (parser.Source[parser.Pos] == '+' || parser.Source[parser.Pos] == '-') { parser.Pos += 1 }
+		} else { break }
+	}
+	let text = parser.Source[start:parser.Pos]
+	if decimal { return try ParseNumeric(text) }
+	let value = Parse(Int8Oid, text) catch _ { return try ParseNumeric(text) }
+	if value.i >= -2147483648 && value.i <= 2147483647 { return FromI64(Int4Oid, value.i) }
+	return value
+}
+
+fn (parser mut TypeGoldenParser) readIdentifier() str {
+	parser.skipSpace()
+	let start = parser.Pos
+	for parser.Pos < len(parser.Source) {
+		let c = parser.Source[parser.Pos]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' { parser.Pos += 1 } else { break }
+	}
+	return twine.ToLower(parser.Source[start:parser.Pos])
+}
+
+fn (parser mut TypeGoldenParser) binaryOperator() (str, i64, i64) {
+	for op in []str{"<=", ">=", "<>", "!=", "=", "<", ">", "+", "-", "*", "/", "%", "^"} {
+		if parser.starts(op) { return op, typeGoldenPrecedence(op), len(op) }
+	}
+	return "", -1, 0
+}
+
+fn typeGoldenPrecedence(op str) i64 {
+	if op == "=" || op == "<>" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" { return 3 }
+	if op == "+" || op == "-" { return 4 }
+	if op == "^" { return 6 }
+	return 5
+}
+
+fn (parser mut TypeGoldenParser) parseCast(value Datum) !Datum {
+	let name = parser.readIdentifier()
+	let target = typeGoldenOid(name)
+	if target == 0 { fail "unsupported test cast target {name}" }
+	if parser.starts("(") {
+		parser.Pos += 1
+		let precision = parser.readIntArgument()
+		mut scale = i64(0)
+		parser.skipSpace()
+		if parser.starts(",") {
+			parser.Pos += 1
+			scale = parser.readIntArgument()
+		}
+		parser.skipSpace()
+		if !parser.starts(")") { fail "expected closing typmod parenthesis" }
+		parser.Pos += 1
+		return try castGoldenTypmod(value, target, precision, scale)
+	}
+	if IsNull(value) { return Datum{oid: target, null: true, i: 0, f: 0.0, b: false, s: "", bytes: []u8{}} }
+	if value.Oid() == UnknownLiteralOid { return try Parse(target, value.Text()) }
+	return try Cast(value, target)
+}
+
+fn (parser mut TypeGoldenParser) readIntArgument() i64 {
+	parser.skipSpace()
+	let start = parser.Pos
+	for parser.Pos < len(parser.Source) {
+		let c = parser.Source[parser.Pos]
+		if c >= '0' && c <= '9' { parser.Pos += 1 } else { break }
+	}
+	return mint.Atoi(parser.Source[start:parser.Pos]) catch _ { 0 }
+}
+
+fn castGoldenTypmod(value Datum, target Oid, precision i64, scale i64) !Datum {
+	if target != NumericOid { fail "typmod cast for target {target} is not supported" }
+	if IsNull(value) { return Null() }
+	if value.Oid() == UnknownLiteralOid { return try ParseNumericTypmod(value.Text(), precision, scale) }
+	return try ParseNumericTypmod(value.Text(), precision, scale)
+}
+
+fn typeGoldenOid(name str) Oid {
+	return match name {
+		"boolean", "bool" => BoolOid
+		"smallint", "int2" => Int2Oid
+		"integer", "int", "int4" => Int4Oid
+		"bigint", "int8" => Int8Oid
+		"real", "float4" => Float4Oid
+		"double", "float8" => Float8Oid
+		"text" => TextOid
+		"varchar" => VarcharOid
+		"bpchar", "char" => BpcharOid
+		"bytea" => ByteaOid
+		"uuid" => UuidOid
+		"numeric" => NumericOid
+		"date" => DateOid
+		"time" => TimeOid
+		"timetz" => TimetzOid
+		"timestamp" => TimestampOid
+		"timestamptz" => TimestamptzOid
+		"interval" => IntervalOid
+		_ => Oid(0)
+	}
+}

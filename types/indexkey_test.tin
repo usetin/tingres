@@ -1,0 +1,184 @@
+package types
+
+import "crucible"
+import "mint"
+
+// TestIndexKeyOrdering checks that memcmp order on IndexKey matches Compare
+// for random pairs of every supported type, including NULL, negative zero,
+// NaN, infinities, numeric specials and intervals.
+fn TestIndexKeyOrdering(t mut crucible.T) {
+	mut rng = Rng{state: 0x9e3779b97f4a7c15}
+	let oids = []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, OidOid, Float4Oid, Float8Oid,
+		NumericOid, DateOid, TimeOid, TimetzOid, TimestampOid, TimestamptzOid, IntervalOid,
+		ByteaOid, UuidOid, TextOid, VarcharOid, BpcharOid}
+	mut failures = i64(0)
+	for oid in oids {
+		let values = random_datums(mut rng, oid, 40)
+		for a in values {
+			for b in values {
+				let want = sign_of(Compare(a, b))
+				let got = sign_of(bytes_compare(IndexKey(a), IndexKey(b)))
+				if want != got && failures < 20 {
+					t.Error("IndexKey {sql_type_name(oid)} {a.Text()} vs {b.Text()}: memcmp {got}, compare {want}")
+					failures += 1
+				}
+			}
+		}
+	}
+	t.True("NULL sorts after every value", bytes_compare(IndexKey(FromI64(Int4Oid, 9223372036854775807)), IndexKey(Null())) < 0)
+	t.True("NULL keys are equal", bytes_compare(IndexKey(Null()), IndexKey(Null())) == 0)
+	t.True("no ordering failures", failures == 0)
+}
+
+// TestIndexKeyNullAndSpecialOrdering pins the type-specific corner cases.
+fn TestIndexKeyNullAndSpecialOrdering(t mut crucible.T) {
+	let negZero = Parse(Float8Oid, "-0") catch _ { return }
+	let posZero = Parse(Float8Oid, "0") catch _ { return }
+	t.True("negative zero equals positive zero", Compare(negZero, posZero) == 0)
+	t.True("negative zero key equals positive zero key", bytes_compare(IndexKey(negZero), IndexKey(posZero)) == 0)
+	let nan = Parse(Float8Oid, "NaN") catch _ { return }
+	let inf = Parse(Float8Oid, "Infinity") catch _ { return }
+	let ninf = Parse(Float8Oid, "-Infinity") catch _ { return }
+	t.True("NaN sorts after infinity", bytes_compare(IndexKey(inf), IndexKey(nan)) < 0)
+	t.True("negative infinity sorts first", bytes_compare(IndexKey(ninf), IndexKey(FromI64(Float8Oid, 0))) < 0)
+	let negNumeric = ParseNumeric("-5") catch _ { return }
+	let zeroNumeric = ParseNumeric("0") catch _ { return }
+	let posNumeric = ParseNumeric("5") catch _ { return }
+	t.True("numeric negative before zero", bytes_compare(IndexKey(negNumeric), IndexKey(zeroNumeric)) < 0)
+	t.True("numeric zero before positive", bytes_compare(IndexKey(zeroNumeric), IndexKey(posNumeric)) < 0)
+	let bigNeg = ParseNumeric("-100") catch _ { return }
+	t.True("more negative numeric sorts first", bytes_compare(IndexKey(bigNeg), IndexKey(negNumeric)) < 0)
+}
+
+// TestCompositeIndexKeyOrdering checks the multi-column key helper against a
+// lexicographic comparison of the same rows.
+fn TestCompositeIndexKeyOrdering(t mut crucible.T) {
+	mut rng = Rng{state: 0x243f6a8885a308d3}
+	let oids = []Oid{Int4Oid, TextOid, NumericOid, TimestampOid}
+	mut rows = [][]Datum{}
+	for i in 0..60 {
+		mut row = []Datum{}
+		for oid in oids { row = append(row, random_datum(mut rng, oid)) }
+		rows = append(rows, row)
+		_ = i
+	}
+	mut failures = i64(0)
+	for a in rows {
+		for b in rows {
+			let want = sign_of(compare_rows(a, b))
+			let got = sign_of(bytes_compare(CompositeIndexKey(a), CompositeIndexKey(b)))
+			if want != got && failures < 10 {
+				t.Error("CompositeIndexKey: memcmp {got}, compare {want}")
+				failures += 1
+			}
+		}
+	}
+	t.True("no composite ordering failures", failures == 0)
+}
+
+fn compare_rows(a []Datum, b []Datum) i64 {
+	for i in 0..len(a) {
+		let c = Compare(a[i], b[i])
+		if c != 0 { return c }
+	}
+	return 0
+}
+
+fn sign_of(v i64) i64 {
+	if v < 0 { return -1 }
+	if v > 0 { return 1 }
+	return 0
+}
+
+fn bytes_compare(a []u8, b []u8) i64 {
+	let n = min(len(a), len(b))
+	for i in 0..n {
+		if a[i] < b[i] { return -1 }
+		if a[i] > b[i] { return 1 }
+	}
+	if len(a) < len(b) { return -1 }
+	if len(a) > len(b) { return 1 }
+	return 0
+}
+
+// Rng is a small deterministic LCG used to build reproducible test inputs.
+type Rng struct {
+	state u64
+}
+
+fn (r mut Rng) next() u64 {
+	r.state = r.state*%6364136223846793005+%1442695040888963407
+	return r.state
+}
+
+fn (r mut Rng) below(n i64) i64 {
+	return i64((r.next() >> 1)%u64(n))
+}
+
+fn random_datums(r mut Rng, oid Oid, n i64) []Datum {
+	mut out = []Datum{}
+	for i in 0..n {
+		out = append(out, random_datum(mut r, oid))
+		_ = i
+	}
+	return out
+}
+
+fn random_datum(r mut Rng, oid Oid) Datum {
+	if oid == BoolOid { return FromBool(r.below(2) == 1) }
+	if oid == Int2Oid { return FromI64(Int2Oid, r.below(65536)-32768) }
+	if oid == Int4Oid { return FromI64(Int4Oid, r.below(2000000)-1000000) }
+	if oid == Int8Oid { return FromI64(Int8Oid, r.below(2000000)-1000000) }
+	if oid == OidOid { return FromI64(OidOid, r.below(2000000)) }
+	if oid == Float4Oid || oid == Float8Oid {
+		let pick = r.below(10)
+		if pick == 0 { return Parse(oid, "NaN") catch _ { FromF64(oid, 0.0) } }
+		if pick == 1 { return Parse(oid, "Infinity") catch _ { FromF64(oid, 0.0) } }
+		if pick == 2 { return Parse(oid, "-Infinity") catch _ { FromF64(oid, 0.0) } }
+		if pick == 3 { return FromF64(oid, -0.0) }
+		if pick == 4 { return FromF64(oid, 0.0) }
+		let whole = r.below(2000)-1000
+		let frac = r.below(1000)
+		return FromF64(oid, f64(whole)+f64(frac)/1000.0)
+	}
+	if oid == NumericOid {
+		let pick = r.below(12)
+		if pick == 0 { return FromStr(NumericOid, "NaN") }
+		if pick == 1 { return FromStr(NumericOid, "Infinity") }
+		if pick == 2 { return FromStr(NumericOid, "-Infinity") }
+		let whole = i64(r.below(2000000))-1000000
+		let frac = r.below(10000)
+		mut text = mint.Itoa(whole)
+		if pick%3 == 0 { text += "."+mint.Itoa(frac) }
+		return FromStr(NumericOid, text)
+	}
+	if oid == DateOid { return FromI64(DateOid, r.below(40000)-20000) }
+	if oid == TimeOid { return FromI64(TimeOid, r.below(microsPerDay)) }
+	if oid == TimetzOid { return Datum{oid: TimetzOid, null: false, i: r.below(microsPerDay), f: 0.0, b: false, s: "", bytes: []u8{}, months: 0, days: 0, offset: r.below(30)*900-13500} }
+	if oid == TimestampOid || oid == TimestamptzOid { return FromI64(oid, r.below(40000*microsPerDay)-20000*microsPerDay) }
+	if oid == IntervalOid { return interval_datum(i64(r.below(4000*microsPerDay))-2000*microsPerDay, i64(r.below(2000))-1000, i64(r.below(200))-100) }
+	if oid == ByteaOid {
+		mut b = []u8{}
+		for j in 0..r.below(8) { b = append(b, u8(r.below(256))) }
+		return FromBytes(ByteaOid, b)
+	}
+	if oid == UuidOid {
+		mut text = ""
+		for j in 0..32 {
+			if j == 8 || j == 12 || j == 16 || j == 20 { text += "-" }
+			text += str([]u8{hex_digit(r.below(16))})
+		}
+		return FromStr(UuidOid, text)
+	}
+	mut text = ""
+	let length = r.below(8)
+	for j in 0..length {
+		text += str([]u8{u8('a'+r.below(26))})
+	}
+	return FromStr(oid, text)
+}
+
+fn hex_digit(v i64) u8 {
+	if v < 10 { return u8('0'+v) }
+	return u8('a'+(v-10))
+}

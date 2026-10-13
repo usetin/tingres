@@ -104,13 +104,12 @@ fn Parse(oid Oid, text str) !Datum {
 		}
 		Int2Oid, Int4Oid, Int8Oid, OidOid => {
 			let n = mint.ParseInt(text, 10) catch err {
-				if fault.Is(err, mint.ErrRange) { fail PgFault("22003", "value out of range for type {sql_type_name(oid)}") }
+				if fault.Is(err, mint.ErrRange) { fail PgFault("22003", "value \"{text}\" is out of range for type {sql_type_name(oid)}") }
 				fail PgFault("22P02", "invalid input syntax for type {sql_type_name(oid)}: \"{text}\"")
 			}
-			if oid == Int2Oid && (n < -32768 || n > 32767) { fail PgFault("22003", "value out of range for type smallint") }
-			if oid == Int4Oid && (n < -2147483648 || n > 2147483647) { fail PgFault("22003", "integer out of range") }
-			if oid == OidOid && (n < 0 || u64(n) > 4294967295) { fail PgFault("22003", "value out of range for type oid") }
-			if oid == Int8Oid && (n < -9223372036854775807-1 || n > 9223372036854775807) { fail PgFault("22003", "bigint out of range") }
+			if oid == Int2Oid && (n < -32768 || n > 32767) { fail PgFault("22003", "value \"{text}\" is out of range for type smallint") }
+			if oid == Int4Oid && (n < -2147483648 || n > 2147483647) { fail PgFault("22003", "value \"{text}\" is out of range for type integer") }
+			if oid == OidOid && (n < 0 || u64(n) > 4294967295) { fail PgFault("22003", "value \"{text}\" is out of range for type oid") }
 			return FromI64(oid, n)
 		}
 		Float4Oid => {
@@ -139,6 +138,14 @@ fn Parse(oid Oid, text str) !Datum {
 		}
 		_ => { fail PgFault("0A000", "unsupported input type OID {oid}") }
 	}
+}
+
+// input_type_name is the name PostgreSQL prints from an input-function error,
+// which is shorter than format_type's name for time and timestamp.
+fn input_type_name(oid Oid) str {
+	if oid == TimeOid { return "time" }
+	if oid == TimestampOid { return "timestamp" }
+	return sql_type_name(oid)
 }
 
 fn sql_type_name(oid Oid) str {

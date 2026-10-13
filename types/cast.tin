@@ -2,6 +2,7 @@ package types
 
 import "mint"
 import "twine"
+import "gauge"
 
 // CanCast reports whether PostgreSQL permits a cast at the requested context.
 // `implicit` is true for expression/operator resolution and false for an explicit cast.
@@ -41,11 +42,13 @@ fn Cast(d Datum, to Oid) !Datum {
 		if d.oid == Float4Oid || d.oid == Float8Oid { return try ParseNumeric(float_text(d)) }
 		return try ParseNumeric(d.Text())
 	}
-	if is_integer_oid(to) && (d.oid == NumericOid || d.oid == Float4Oid || d.oid == Float8Oid) {
-		let n = try ParseNumeric(d.Text())
-		let rounded = try NumericRound(n, 0)
-		return try Parse(to, rounded.Text())
+	if is_integer_oid(d.oid) && is_integer_oid(to) { return try cast_to_int(mint.Itoa(d.i), to) }
+	if is_integer_oid(to) && d.oid == NumericOid {
+		let parsed = try ParseNumeric(d.Text())
+		let rounded = try NumericRound(parsed, 0)
+		return try cast_to_int(rounded.Text(), to)
 	}
+	if is_integer_oid(to) && (d.oid == Float4Oid || d.oid == Float8Oid) { return try cast_float_to_int(d.f, to) }
 	if (to == Float4Oid || to == Float8Oid) && d.oid == NumericOid {
 		let f = mint.ParseFloat(d.Text()) catch _ { fail ErrorFault(NewError("22003", "value out of range for type {sql_type_name(to)}")) }
 		return FromF64(to, if_float_target(to, f))
@@ -82,6 +85,32 @@ fn CastTypmod(d Datum, to Oid, typmod i64) !Datum {
 fn is_string_oid(oid Oid) bool { return oid == TextOid || oid == VarcharOid || oid == BpcharOid || oid == NameOid }
 fn is_integer_oid(oid Oid) bool { return oid == Int2Oid || oid == Int4Oid || oid == Int8Oid || oid == OidOid }
 fn is_temporal_oid(oid Oid) bool { return oid == DateOid || oid == TimeOid || oid == TimetzOid || oid == TimestampOid || oid == TimestamptzOid || oid == IntervalOid }
+
+// cast_to_int applies PostgreSQL's cast-site integer range messages.
+fn cast_to_int(text str, to Oid) !Datum {
+	let n = mint.ParseInt(text, 10) catch _ { fail ErrorFault(NewError("22003", cast_int_range_message(to))) }
+	if to == Int2Oid && (n < -32768 || n > 32767) { fail ErrorFault(NewError("22003", cast_int_range_message(to))) }
+	if to == Int4Oid && (n < -2147483648 || n > 2147483647) { fail ErrorFault(NewError("22003", cast_int_range_message(to))) }
+	if to == OidOid && (n < 0 || u64(n) > 4294967295) { fail ErrorFault(NewError("22003", cast_int_range_message(to))) }
+	return FromI64(to, n)
+}
+
+// cast_float_to_int rounds to nearest with ties to even, as PostgreSQL's
+// float8-to-integer casts do.
+fn cast_float_to_int(v f64, to Oid) !Datum {
+	if v != v { fail ErrorFault(NewError("22003", cast_int_range_message(to))) }
+	let rounded = gauge.RoundToEven(v)
+	if rounded < -9223372036854775808.0 || rounded >= 9223372036854775808.0 { fail ErrorFault(NewError("22003", cast_int_range_message(to))) }
+	return try cast_to_int(mint.Itoa(i64(rounded)), to)
+}
+
+fn cast_int_range_message(to Oid) str {
+	if to == Int2Oid { return "smallint out of range" }
+	if to == Int4Oid { return "integer out of range" }
+	if to == OidOid { return "value out of range for type oid" }
+	return "bigint out of range"
+}
+
 fn temporal_cast_pair(from Oid, to Oid) bool {
 	if from == DateOid { return to == TimestampOid || to == TimestamptzOid }
 	if from == TimestampOid { return to == DateOid || to == TimeOid || to == TimestamptzOid }

@@ -1,0 +1,87 @@
+package plan
+
+import "crucible"
+import "../types"
+import "../catalog"
+
+// explainFor prepares a query against the test catalog and returns its EXPLAIN lines.
+fn explainFor(t mut crucible.T, env TestEnv, sql str, params []u32) []str {
+	let stmt = parseSql(sql) catch err {
+		t.Error("parse '" + sql + "': " + types.ErrorMessage(err))
+		return []str{}
+	}
+	let prep = Prepare(env.Cat, env.Txn, stmt, params) catch err {
+		t.Error("prepare '" + sql + "': " + types.ErrorMessage(err))
+		return []str{}
+	}
+	return Explain(prep, false)
+}
+
+fn TestExplainRendering(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "explain_render")
+	if envOpt == nil { return }
+	let env = envOpt
+	if let tbl = env.Cat.LookupTable(env.Txn, "public", "users") {
+		let idxDef = catalog.IndexDef{Table: tbl, Name: "users_pkey", Unique: true}
+		_ = env.Cat.CreateIndex(env.Txn, idxDef) catch _ { return }
+		env.Txn.CommandCounterIncrement()
+	}
+
+	// A bare table scan is a single node with no projection.
+	let lines1 = explainFor(mut t, env, "SELECT * FROM users", []u32{})
+	crucible.Equal(mut t, "scan lines", len(lines1), 1)
+	crucible.Equal(mut t, "scan node", lines1[0], "Seq Scan on users  (cost=0.00..2.29 rows=100 width=24)")
+
+	// A pushed-down filter renders on its own line, indented two spaces.
+	let lines2 = explainFor(mut t, env, "SELECT * FROM users WHERE age > 21", []u32{})
+	crucible.Equal(mut t, "filter root", lines2[0], "Seq Scan on users  (cost=0.00..2.54 rows=100 width=24)")
+	crucible.Equal(mut t, "filter detail", lines2[1], "  Filter: (age > 21)")
+
+	// A primary-key point lookup becomes an index scan with an index condition.
+	let lines3 = explainFor(mut t, env, "SELECT * FROM users WHERE id = 1", []u32{})
+	crucible.Equal(mut t, "index node", lines3[0], "Index Scan using users_pkey on users  (cost=0.00..8.02 rows=1 width=24)")
+	crucible.Equal(mut t, "index cond", lines3[1], "  Index Cond: (id = 1)")
+
+	// Parameters render as $n in the index condition.
+	let lines4 = explainFor(mut t, env, "SELECT * FROM users WHERE id = $1", []u32{u32(types.Int4Oid)})
+	crucible.Equal(mut t, "param index cond", lines4[1], "  Index Cond: (id = $1)")
+
+	// Equijoins render a qualified hash condition.
+	let lines5 = explainFor(mut t, env, "SELECT * FROM users JOIN orders ON users.id = orders.user_id", []u32{})
+	crucible.Equal(mut t, "join root", lines5[0], "Hash Join  (cost=3.29..6.84 rows=1001 width=48)")
+	crucible.Equal(mut t, "join cond", lines5[1], "  Hash Cond: (users.id = orders.user_id)")
+
+	// ORDER BY renders a sort key.
+	let lines6 = explainFor(mut t, env, "SELECT name FROM users ORDER BY name", []u32{})
+	crucible.Equal(mut t, "sort root", lines6[0], "Sort  (cost=6.79..7.79 rows=100 width=8)")
+	crucible.Equal(mut t, "sort key", lines6[1], "  Sort Key: name")
+
+	// GROUP BY renders a group key.
+	let lines7 = explainFor(mut t, env, "SELECT age, count(*) FROM users GROUP BY age", []u32{})
+	crucible.Equal(mut t, "agg group key", lines7[2], "    Group Key: age")
+
+	// JSON output carries the node type and costs.
+	let stmtJ = parseSql("SELECT * FROM users WHERE age > 21") catch err {
+		t.Error("parse json: " + types.ErrorMessage(err))
+		return
+	}
+	let prepJ = Prepare(env.Cat, env.Txn, stmtJ, []u32{}) catch err {
+		t.Error("prepare json: " + types.ErrorMessage(err))
+		return
+	}
+	let jsonStr = ExplainJson(prepJ)
+	t.True("json node type", len(jsonStr) > 0 && containsSub(jsonStr, "\"Node Type\": \"Seq Scan on users\""))
+	t.True("json plan rows", containsSub(jsonStr, "\"Plan Rows\": 100"))
+
+	cleanupTestEnv(env)
+}
+
+// containsSub reports whether s contains sub.
+fn containsSub(s str, sub str) bool {
+	if len(sub) == 0 { return true }
+	if len(sub) > len(s) { return false }
+	for i in 0..(len(s) - len(sub) + 1) {
+		if s[i:i+len(sub)] == sub { return true }
+	}
+	return false
+}

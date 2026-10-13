@@ -1,0 +1,383 @@
+'2024-01-31'::date	2024-01-31
+'0001-01-01'::date	0001-01-01
+'9999-12-31'::date	9999-12-31
+'2024-02-29'::date	2024-02-29
+'2023-02-29'::date	ERROR: date/time field value out of range: "2023-02-29"
+'2024-13-01'::date	ERROR: date/time field value out of range: "2024-13-01"
+'infinity'::date	infinity
+'-infinity'::date	-infinity
+'epoch'::date	1970-01-01
+'Jan 31, 2024'::date	2024-01-31
+'01/31/2024'::date	2024-01-31
+'2024-01-31'::text::date	2024-01-31
+'abc'::date	ERROR: invalid input syntax for type date: "abc"
+'2024-1-1'::date	2024-01-01
+'12:34:56'::time	12:34:56
+'12:34:56.789'::time	12:34:56.789
+'12:34:56.789000'::time	12:34:56.789
+'24:00:00'::time	24:00:00
+'00:00:00'::time	00:00:00
+'25:00:00'::time	ERROR: date/time field value out of range: "25:00:00"
+'12:30'::time	12:30:00
+'12:34:56.789+02'::timetz	12:34:56.789+02
+'12:34:56+00'::timetz	12:34:56+00
+'12:34:56-05:30'::timetz	12:34:56-05:30
+'12:34:56+02:00'::timetz	12:34:56+02
+'2024-01-31 12:34:56'::timestamp	2024-01-31 12:34:56
+'2024-01-31T12:34:56'::timestamp	2024-01-31 12:34:56
+'2024-01-31 12:34:56.789'::timestamp	2024-01-31 12:34:56.789
+'2024-01-31 12:34:56.789123'::timestamp	2024-01-31 12:34:56.789123
+'2000-01-01 00:00:00'::timestamp	2000-01-01 00:00:00
+'1970-01-01 00:00:00'::timestamp	1970-01-01 00:00:00
+'infinity'::timestamp	infinity
+'-infinity'::timestamp	-infinity
+'epoch'::timestamp	1970-01-01 00:00:00
+'2024-01-31 12:34:56+02'::timestamptz	2024-01-31 10:34:56+00
+'2024-01-31 12:34:56Z'::timestamptz	2024-01-31 12:34:56+00
+'2024-06-30 12:00:00'::timestamptz	2024-06-30 12:00:00+00
+'2024-01-31 12:34:56.789+05:45'::timestamptz	2024-01-31 06:49:56.789+00
+'bogus'::timestamp	ERROR: invalid input syntax for type timestamp: "bogus"
+'2024-02-30 00:00:00'::timestamp	ERROR: date/time field value out of range: "2024-02-30 00:00:00"
+'1 day 2 hours'::interval	1 day 02:00:00
+'-1 day 2 hours'::interval	-1 days +02:00:00
+'1 year 2 mons'::interval	1 year 2 mons
+'-1 year'::interval	-1 years
+'14 mons'::interval	1 year 2 mons
+'1 mon 15 days'::interval	1 mon 15 days
+'1.5 years'::interval	1 year 6 mons
+'1.5 mons'::interval	1 mon 15 days
+'1.5 weeks'::interval	10 days 12:00:00
+'2.5 days'::interval	2 days 12:00:00
+'1.5 hours'::interval	01:30:00
+'1.5 minutes'::interval	00:01:30
+'1.5 seconds'::interval	00:00:01.5
+'-0.5 hours'::interval	-00:30:00
+'0'::interval	00:00:00
+'1-2'::interval	1 year 2 mons
+'2-3'::interval	2 years 3 mons
+'@ 5 min'::interval	00:05:00
+'P1Y2M3DT4H5M6S'::interval	1 year 2 mons 3 days 04:05:06
+'P1D'::interval	1 day
+'PT1H'::interval	01:00:00
+'2 days 3 hours 4 minutes 5 seconds'::interval	2 days 03:04:05
+'-2 days -3 hours'::interval	-2 days -03:00:00
+'1 day -2 hours'::interval	1 day -02:00:00
+'1 year 2 mons 3 days 04:05:06.789'::interval	1 year 2 mons 3 days 04:05:06.789
+'1 xyz'::interval	ERROR: invalid input syntax for type interval: "1 xyz"
+'13 days'::interval	13 days
+'50 hours'::interval	50:00:00
+'2024-01-31'::date::timestamp	2024-01-31 00:00:00
+'2024-01-31'::date::timestamptz	2024-01-31 00:00:00+00
+'2024-01-31 12:00:00'::timestamp::date	2024-01-31
+'2024-01-31 12:00:00'::timestamp::time	12:00:00
+'2024-01-31 12:00:00'::timestamp::timestamptz	2024-01-31 12:00:00+00
+'2024-01-31 12:00:00+02'::timestamptz::timestamp	2024-01-31 10:00:00
+'2024-01-31 12:00:00+02'::timestamptz::date	2024-01-31
+'2024-01-31 12:00:00+02'::timestamptz::time	10:00:00
+'12:34:56'::time::timetz	12:34:56+00
+'12:34:56+02'::timetz::time	12:34:56
+'2024-01-31'::date::text	2024-01-31
+'2024-01-31 12:00:00'::timestamp::text	2024-01-31 12:00:00
+'1 day'::interval::text	1 day
+'2024-01-31'::date = '2024-01-31'::date	true
+'2024-01-31'::date <> '2024-01-31'::date	false
+'2024-01-31'::date < '2024-01-31'::date	false
+'2024-01-31'::date <= '2024-01-31'::date	true
+'2024-01-31'::date > '2024-01-31'::date	false
+'2024-01-31'::date >= '2024-01-31'::date	true
+'2024-01-31'::date = '2024-02-01'::date	false
+'2024-01-31'::date <> '2024-02-01'::date	true
+'2024-01-31'::date < '2024-02-01'::date	true
+'2024-01-31'::date <= '2024-02-01'::date	true
+'2024-01-31'::date > '2024-02-01'::date	false
+'2024-01-31'::date >= '2024-02-01'::date	false
+'2024-01-31'::date = '2023-01-31'::date	false
+'2024-01-31'::date <> '2023-01-31'::date	true
+'2024-01-31'::date < '2023-01-31'::date	false
+'2024-01-31'::date <= '2023-01-31'::date	false
+'2024-01-31'::date > '2023-01-31'::date	true
+'2024-01-31'::date >= '2023-01-31'::date	true
+'2024-01-31'::date = '2024-01-31'::date	true
+'2024-01-31'::date <> '2024-01-31'::date	false
+'2024-01-31'::date < '2024-01-31'::date	false
+'2024-01-31'::date <= '2024-01-31'::date	true
+'2024-01-31'::date > '2024-01-31'::date	false
+'2024-01-31'::date >= '2024-01-31'::date	true
+'2024-02-01'::date = '2024-01-31'::date	false
+'2024-02-01'::date <> '2024-01-31'::date	true
+'2024-02-01'::date < '2024-01-31'::date	false
+'2024-02-01'::date <= '2024-01-31'::date	false
+'2024-02-01'::date > '2024-01-31'::date	true
+'2024-02-01'::date >= '2024-01-31'::date	true
+'2024-02-01'::date = '2024-02-01'::date	true
+'2024-02-01'::date <> '2024-02-01'::date	false
+'2024-02-01'::date < '2024-02-01'::date	false
+'2024-02-01'::date <= '2024-02-01'::date	true
+'2024-02-01'::date > '2024-02-01'::date	false
+'2024-02-01'::date >= '2024-02-01'::date	true
+'2024-02-01'::date = '2023-01-31'::date	false
+'2024-02-01'::date <> '2023-01-31'::date	true
+'2024-02-01'::date < '2023-01-31'::date	false
+'2024-02-01'::date <= '2023-01-31'::date	false
+'2024-02-01'::date > '2023-01-31'::date	true
+'2024-02-01'::date >= '2023-01-31'::date	true
+'2024-02-01'::date = '2024-01-31'::date	false
+'2024-02-01'::date <> '2024-01-31'::date	true
+'2024-02-01'::date < '2024-01-31'::date	false
+'2024-02-01'::date <= '2024-01-31'::date	false
+'2024-02-01'::date > '2024-01-31'::date	true
+'2024-02-01'::date >= '2024-01-31'::date	true
+'2023-01-31'::date = '2024-01-31'::date	false
+'2023-01-31'::date <> '2024-01-31'::date	true
+'2023-01-31'::date < '2024-01-31'::date	true
+'2023-01-31'::date <= '2024-01-31'::date	true
+'2023-01-31'::date > '2024-01-31'::date	false
+'2023-01-31'::date >= '2024-01-31'::date	false
+'2023-01-31'::date = '2024-02-01'::date	false
+'2023-01-31'::date <> '2024-02-01'::date	true
+'2023-01-31'::date < '2024-02-01'::date	true
+'2023-01-31'::date <= '2024-02-01'::date	true
+'2023-01-31'::date > '2024-02-01'::date	false
+'2023-01-31'::date >= '2024-02-01'::date	false
+'2023-01-31'::date = '2023-01-31'::date	true
+'2023-01-31'::date <> '2023-01-31'::date	false
+'2023-01-31'::date < '2023-01-31'::date	false
+'2023-01-31'::date <= '2023-01-31'::date	true
+'2023-01-31'::date > '2023-01-31'::date	false
+'2023-01-31'::date >= '2023-01-31'::date	true
+'2023-01-31'::date = '2024-01-31'::date	false
+'2023-01-31'::date <> '2024-01-31'::date	true
+'2023-01-31'::date < '2024-01-31'::date	true
+'2023-01-31'::date <= '2024-01-31'::date	true
+'2023-01-31'::date > '2024-01-31'::date	false
+'2023-01-31'::date >= '2024-01-31'::date	false
+'2024-01-31'::date = '2024-01-31'::date	true
+'2024-01-31'::date <> '2024-01-31'::date	false
+'2024-01-31'::date < '2024-01-31'::date	false
+'2024-01-31'::date <= '2024-01-31'::date	true
+'2024-01-31'::date > '2024-01-31'::date	false
+'2024-01-31'::date >= '2024-01-31'::date	true
+'2024-01-31'::date = '2024-02-01'::date	false
+'2024-01-31'::date <> '2024-02-01'::date	true
+'2024-01-31'::date < '2024-02-01'::date	true
+'2024-01-31'::date <= '2024-02-01'::date	true
+'2024-01-31'::date > '2024-02-01'::date	false
+'2024-01-31'::date >= '2024-02-01'::date	false
+'2024-01-31'::date = '2023-01-31'::date	false
+'2024-01-31'::date <> '2023-01-31'::date	true
+'2024-01-31'::date < '2023-01-31'::date	false
+'2024-01-31'::date <= '2023-01-31'::date	false
+'2024-01-31'::date > '2023-01-31'::date	true
+'2024-01-31'::date >= '2023-01-31'::date	true
+'2024-01-31'::date = '2024-01-31'::date	true
+'2024-01-31'::date <> '2024-01-31'::date	false
+'2024-01-31'::date < '2024-01-31'::date	false
+'2024-01-31'::date <= '2024-01-31'::date	true
+'2024-01-31'::date > '2024-01-31'::date	false
+'2024-01-31'::date >= '2024-01-31'::date	true
+'2024-01-31 12:00:00'::timestamp < '2024-01-31 12:00:00'::timestamp	false
+'2024-01-31 12:00:00'::timestamp = '2024-01-31 12:00:00'::timestamp	true
+'2024-01-31 12:00:00'::timestamp > '2024-01-31 12:00:00'::timestamp	false
+'2024-01-31 12:00:00'::timestamp < '2024-01-31 13:00:00'::timestamp	true
+'2024-01-31 12:00:00'::timestamp = '2024-01-31 13:00:00'::timestamp	false
+'2024-01-31 12:00:00'::timestamp > '2024-01-31 13:00:00'::timestamp	false
+'2024-01-31 12:00:00'::timestamp < '2024-01-01 00:00:00'::timestamp	false
+'2024-01-31 12:00:00'::timestamp = '2024-01-01 00:00:00'::timestamp	false
+'2024-01-31 12:00:00'::timestamp > '2024-01-01 00:00:00'::timestamp	true
+'2024-01-31 13:00:00'::timestamp < '2024-01-31 12:00:00'::timestamp	false
+'2024-01-31 13:00:00'::timestamp = '2024-01-31 12:00:00'::timestamp	false
+'2024-01-31 13:00:00'::timestamp > '2024-01-31 12:00:00'::timestamp	true
+'2024-01-31 13:00:00'::timestamp < '2024-01-31 13:00:00'::timestamp	false
+'2024-01-31 13:00:00'::timestamp = '2024-01-31 13:00:00'::timestamp	true
+'2024-01-31 13:00:00'::timestamp > '2024-01-31 13:00:00'::timestamp	false
+'2024-01-31 13:00:00'::timestamp < '2024-01-01 00:00:00'::timestamp	false
+'2024-01-31 13:00:00'::timestamp = '2024-01-01 00:00:00'::timestamp	false
+'2024-01-31 13:00:00'::timestamp > '2024-01-01 00:00:00'::timestamp	true
+'2024-01-01 00:00:00'::timestamp < '2024-01-31 12:00:00'::timestamp	true
+'2024-01-01 00:00:00'::timestamp = '2024-01-31 12:00:00'::timestamp	false
+'2024-01-01 00:00:00'::timestamp > '2024-01-31 12:00:00'::timestamp	false
+'2024-01-01 00:00:00'::timestamp < '2024-01-31 13:00:00'::timestamp	true
+'2024-01-01 00:00:00'::timestamp = '2024-01-31 13:00:00'::timestamp	false
+'2024-01-01 00:00:00'::timestamp > '2024-01-31 13:00:00'::timestamp	false
+'2024-01-01 00:00:00'::timestamp < '2024-01-01 00:00:00'::timestamp	false
+'2024-01-01 00:00:00'::timestamp = '2024-01-01 00:00:00'::timestamp	true
+'2024-01-01 00:00:00'::timestamp > '2024-01-01 00:00:00'::timestamp	false
+'1 day'::interval < '1 day'::interval	false
+'1 day'::interval = '1 day'::interval	true
+'1 day'::interval > '1 day'::interval	false
+'1 day'::interval < '2 days'::interval	true
+'1 day'::interval = '2 days'::interval	false
+'1 day'::interval > '2 days'::interval	false
+'1 day'::interval < '-1 day'::interval	false
+'1 day'::interval = '-1 day'::interval	false
+'1 day'::interval > '-1 day'::interval	true
+'2 days'::interval < '1 day'::interval	false
+'2 days'::interval = '1 day'::interval	false
+'2 days'::interval > '1 day'::interval	true
+'2 days'::interval < '2 days'::interval	false
+'2 days'::interval = '2 days'::interval	true
+'2 days'::interval > '2 days'::interval	false
+'2 days'::interval < '-1 day'::interval	false
+'2 days'::interval = '-1 day'::interval	false
+'2 days'::interval > '-1 day'::interval	true
+'-1 day'::interval < '1 day'::interval	true
+'-1 day'::interval = '1 day'::interval	false
+'-1 day'::interval > '1 day'::interval	false
+'-1 day'::interval < '2 days'::interval	true
+'-1 day'::interval = '2 days'::interval	false
+'-1 day'::interval > '2 days'::interval	false
+'-1 day'::interval < '-1 day'::interval	false
+'-1 day'::interval = '-1 day'::interval	true
+'-1 day'::interval > '-1 day'::interval	false
+'2024-01-31'::date + 1	2024-02-01
+'2024-01-31'::date - 1	2024-01-30
+'2024-01-31'::date + -1	2024-01-30
+'2024-01-31'::date - -1	2024-02-01
+'2024-01-31'::date + 30	2024-03-01
+'2024-01-31'::date - 30	2024-01-01
+'2024-01-31'::date + 365	2025-01-30
+'2024-01-31'::date - 365	2023-01-31
+'2024-02-28'::date + 1	2024-02-29
+'2024-02-28'::date - 1	2024-02-27
+'2024-02-28'::date + -1	2024-02-27
+'2024-02-28'::date - -1	2024-02-29
+'2024-02-28'::date + 30	2024-03-29
+'2024-02-28'::date - 30	2024-01-29
+'2024-02-28'::date + 365	2025-02-27
+'2024-02-28'::date - 365	2023-02-28
+'2024-01-31'::date - '2024-01-01'::date	30
+'2024-01-01 01:02:03'::timestamp - '2024-01-02 03:04:05'::timestamp	-1 days -02:02:02
+'2024-01-02 03:04:05'::timestamp - '2024-01-01 01:02:03'::timestamp	1 day 02:02:02
+'2024-03-01 00:00:00'::timestamp - '2024-01-31 12:00:00'::timestamp	29 days 12:00:00
+'2024-01-31 12:00:00'::timestamp - '2024-03-01 00:00:00'::timestamp	-29 days -12:00:00
+'2024-01-31 12:00:00'::timestamp + '1 month'::interval	2024-02-29 12:00:00
+'2024-01-31 12:00:00'::timestamp - '1 month'::interval	2023-12-31 12:00:00
+'2024-01-31 12:00:00'::timestamp + '1 day'::interval	2024-02-01 12:00:00
+'2024-01-31 12:00:00'::timestamp - '1 day'::interval	2024-01-30 12:00:00
+'2024-01-31 12:00:00'::timestamp + '2 hours 30 minutes'::interval	2024-01-31 14:30:00
+'2024-01-31 12:00:00'::timestamp - '2 hours 30 minutes'::interval	2024-01-31 09:30:00
+'2024-01-31 12:00:00'::timestamp + '-1 day'::interval	2024-01-30 12:00:00
+'2024-01-31 12:00:00'::timestamp - '-1 day'::interval	2024-02-01 12:00:00
+'2024-02-29 12:00:00'::timestamp + '1 month'::interval	2024-03-29 12:00:00
+'2024-02-29 12:00:00'::timestamp - '1 month'::interval	2024-01-29 12:00:00
+'2024-02-29 12:00:00'::timestamp + '1 day'::interval	2024-03-01 12:00:00
+'2024-02-29 12:00:00'::timestamp - '1 day'::interval	2024-02-28 12:00:00
+'2024-02-29 12:00:00'::timestamp + '2 hours 30 minutes'::interval	2024-02-29 14:30:00
+'2024-02-29 12:00:00'::timestamp - '2 hours 30 minutes'::interval	2024-02-29 09:30:00
+'2024-02-29 12:00:00'::timestamp + '-1 day'::interval	2024-02-28 12:00:00
+'2024-02-29 12:00:00'::timestamp - '-1 day'::interval	2024-03-01 12:00:00
+'1 day'::interval + '2 hours'::interval	1 day 02:00:00
+'1 day'::interval - '2 hours'::interval	1 day -02:00:00
+'1 day'::interval + '-1 day'::interval	00:00:00
+'1 day'::interval - '-1 day'::interval	2 days
+'1 month'::interval + '2 hours'::interval	1 mon 02:00:00
+'1 month'::interval - '2 hours'::interval	1 mon -02:00:00
+'1 month'::interval + '-1 day'::interval	1 mon -1 days
+'1 month'::interval - '-1 day'::interval	1 mon 1 day
+-'1 day'::interval	-1 days
+-'1 month 2 days'::interval	-1 mons -2 days
+date_part('year', '2024-02-29'::date)	2024
+date_part('month', '2024-02-29'::date)	2
+date_part('day', '2024-02-29'::date)	29
+date_part('hour', '2024-02-29'::date)	0
+date_part('minute', '2024-02-29'::date)	0
+date_part('quarter', '2024-02-29'::date)	1
+date_part('dow', '2024-02-29'::date)	4
+date_part('isodow', '2024-02-29'::date)	4
+date_part('decade', '2024-02-29'::date)	202
+date_part('century', '2024-02-29'::date)	21
+date_part('millennium', '2024-02-29'::date)	3
+date_part('year', '2024-05-15'::date)	2024
+date_part('month', '2024-05-15'::date)	5
+date_part('day', '2024-05-15'::date)	15
+date_part('hour', '2024-05-15'::date)	0
+date_part('minute', '2024-05-15'::date)	0
+date_part('quarter', '2024-05-15'::date)	2
+date_part('dow', '2024-05-15'::date)	3
+date_part('isodow', '2024-05-15'::date)	3
+date_part('decade', '2024-05-15'::date)	202
+date_part('century', '2024-05-15'::date)	21
+date_part('millennium', '2024-05-15'::date)	3
+date_part('year', '2024-01-01 00:00:56.789'::timestamp)	2024
+date_part('month', '2024-01-01 00:00:56.789'::timestamp)	1
+date_part('day', '2024-01-01 00:00:56.789'::timestamp)	1
+date_part('hour', '2024-01-01 00:00:56.789'::timestamp)	0
+date_part('minute', '2024-01-01 00:00:56.789'::timestamp)	0
+date_part('quarter', '2024-01-01 00:00:56.789'::timestamp)	1
+date_part('dow', '2024-01-01 00:00:56.789'::timestamp)	1
+date_part('isodow', '2024-01-01 00:00:56.789'::timestamp)	1
+date_part('decade', '2024-01-01 00:00:56.789'::timestamp)	202
+date_part('century', '2024-01-01 00:00:56.789'::timestamp)	21
+date_part('millennium', '2024-01-01 00:00:56.789'::timestamp)	3
+date_part('year', '2024-07-04 13:14:15.123456'::timestamp)	2024
+date_part('month', '2024-07-04 13:14:15.123456'::timestamp)	7
+date_part('day', '2024-07-04 13:14:15.123456'::timestamp)	4
+date_part('hour', '2024-07-04 13:14:15.123456'::timestamp)	13
+date_part('minute', '2024-07-04 13:14:15.123456'::timestamp)	14
+date_part('quarter', '2024-07-04 13:14:15.123456'::timestamp)	3
+date_part('dow', '2024-07-04 13:14:15.123456'::timestamp)	4
+date_part('isodow', '2024-07-04 13:14:15.123456'::timestamp)	4
+date_part('decade', '2024-07-04 13:14:15.123456'::timestamp)	202
+date_part('century', '2024-07-04 13:14:15.123456'::timestamp)	21
+date_part('millennium', '2024-07-04 13:14:15.123456'::timestamp)	3
+date_part('year', '12:34:56.789'::time)	ERROR: unit "year" not supported for type time without time zone
+date_part('month', '12:34:56.789'::time)	ERROR: unit "month" not supported for type time without time zone
+date_part('day', '12:34:56.789'::time)	ERROR: unit "day" not supported for type time without time zone
+date_part('hour', '12:34:56.789'::time)	12
+date_part('minute', '12:34:56.789'::time)	34
+date_part('quarter', '12:34:56.789'::time)	ERROR: unit "quarter" not supported for type time without time zone
+date_part('dow', '12:34:56.789'::time)	ERROR: unit "dow" not supported for type time without time zone
+date_part('isodow', '12:34:56.789'::time)	ERROR: unit "isodow" not supported for type time without time zone
+date_part('decade', '12:34:56.789'::time)	ERROR: unit "decade" not supported for type time without time zone
+date_part('century', '12:34:56.789'::time)	ERROR: unit "century" not supported for type time without time zone
+date_part('millennium', '12:34:56.789'::time)	ERROR: unit "millennium" not supported for type time without time zone
+date_part('second', '2024-01-01 00:00:56.789'::timestamp)	56.789
+date_part('milliseconds', '2024-01-01 00:00:56.789'::timestamp)	56789
+date_part('microseconds', '2024-01-01 00:00:56.789'::timestamp)	56789000
+date_part('epoch', '2024-01-01 00:00:56.789'::timestamp)	1704067256.789
+date_part('second', '2024-07-04 13:14:15.123456'::timestamp)	15.123456
+date_part('milliseconds', '2024-07-04 13:14:15.123456'::timestamp)	15123.456
+date_part('microseconds', '2024-07-04 13:14:15.123456'::timestamp)	15123456
+date_part('epoch', '2024-07-04 13:14:15.123456'::timestamp)	1720098855.123456
+date_part('second', '12:34:56.789'::time)	56.789
+date_part('milliseconds', '12:34:56.789'::time)	56789
+date_part('microseconds', '12:34:56.789'::time)	56789000
+date_part('epoch', '12:34:56.789'::time)	45296.789
+date_trunc('year', '2024-05-15 12:34:56.789'::timestamp)	2024-01-01 00:00:00
+date_trunc('quarter', '2024-05-15 12:34:56.789'::timestamp)	2024-04-01 00:00:00
+date_trunc('month', '2024-05-15 12:34:56.789'::timestamp)	2024-05-01 00:00:00
+date_trunc('week', '2024-05-15 12:34:56.789'::timestamp)	2024-05-13 00:00:00
+date_trunc('day', '2024-05-15 12:34:56.789'::timestamp)	2024-05-15 00:00:00
+date_trunc('hour', '2024-05-15 12:34:56.789'::timestamp)	2024-05-15 12:00:00
+date_trunc('minute', '2024-05-15 12:34:56.789'::timestamp)	2024-05-15 12:34:00
+date_trunc('second', '2024-05-15 12:34:56.789'::timestamp)	2024-05-15 12:34:56
+date_trunc('year', '2024-01-01 00:00:00'::timestamp)	2024-01-01 00:00:00
+date_trunc('quarter', '2024-01-01 00:00:00'::timestamp)	2024-01-01 00:00:00
+date_trunc('month', '2024-01-01 00:00:00'::timestamp)	2024-01-01 00:00:00
+date_trunc('week', '2024-01-01 00:00:00'::timestamp)	2024-01-01 00:00:00
+date_trunc('day', '2024-01-01 00:00:00'::timestamp)	2024-01-01 00:00:00
+date_trunc('hour', '2024-01-01 00:00:00'::timestamp)	2024-01-01 00:00:00
+date_trunc('minute', '2024-01-01 00:00:00'::timestamp)	2024-01-01 00:00:00
+date_trunc('second', '2024-01-01 00:00:00'::timestamp)	2024-01-01 00:00:00
+age('2024-03-01'::timestamp, '2024-01-31'::timestamp)	1 mon 1 day
+age('2024-01-31'::timestamp, '2024-03-01'::timestamp)	-1 mons -1 days
+age('2024-02-29'::timestamp, '2024-01-31'::timestamp)	29 days
+age('2024-01-01 01:02:03'::timestamp, '2023-12-31 23:00:00'::timestamp)	02:02:03
+make_date(2024, 1, 31)	2024-01-31
+make_date(2024, 2, 29)	2024-02-29
+make_date(2024, 13, 1)	ERROR: date field value out of range: 2024-13-01
+make_date(2024, 2, 30)	ERROR: date field value out of range: 2024-02-30
+make_date(2000, 12, 31)	2000-12-31
+make_timestamp(2024, 1, 31, 12, 34, 56.789::float8)	2024-01-31 12:34:56.789
+make_timestamp(2024, 2, 29, 0, 0, 0)	2024-02-29 00:00:00
+to_char('2024-01-31 12:34:56.789'::timestamp, 'YYYY-MM-DD HH24:MI:SS.MS')	2024-01-31 12:34:56.789
+to_char('2024-01-31 12:34:56.789'::timestamp, 'HH12:MI:SS AM')	12:34:56 PM
+to_char('2024-01-31 00:00:00'::timestamp, 'HH12:MI AM')	12:00 AM
+to_char('2024-01-31 12:34:56.789'::timestamp, 'Mon DD, YYYY')	Jan 31, 2024
+to_char('2024-01-31 12:34:56.789'::timestamp, 'Month')	January  
+to_char('2024-01-31 12:34:56.789'::timestamp, 'Day')	Wednesday
+to_char('2024-01-31 12:34:56.789'::timestamp, 'Dy')	Wed
+to_char('2024-01-31 12:34:56.789'::timestamp, 'HH24:MI:SS.US')	12:34:56.789000
+to_char('2024-01-31'::date, 'YYYY-MM-DD')	2024-01-31
+to_char('2024-01-31'::date, 'D')	4
+to_char('2024-07-04 23:59:59'::timestamp, 'YYYY-MM-DD HH12:MI:SS AM')	2024-07-04 11:59:59 PM

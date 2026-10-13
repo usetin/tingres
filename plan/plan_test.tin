@@ -77,9 +77,10 @@ fn TestPhysicalPlanNodes(t mut crucible.T) {
 		CatalogVersion: 42,
 	}
 	let lines = Explain(prep, false)
-	t.True("explain non-empty", len(lines) >= 2)
-	t.True("root is filter", lines[0] == "Filter  (cost=0.00..12.00 rows=50 width=36)")
-	t.True("child is scan", lines[1] == "  ->  Seq Scan on users  (cost=0.00..10.50 rows=100 width=36)")
+	t.True("explain non-empty", len(lines) >= 3)
+	crucible.Equal(mut t, "explain root", lines[0], "Filter  (cost=0.00..12.00 rows=50 width=36)")
+	crucible.Equal(mut t, "explain filter detail", lines[1], "  Filter: NOT")
+	crucible.Equal(mut t, "explain child scan", lines[2], "  ->  Seq Scan on users  (cost=0.00..10.50 rows=100 width=36)")
 }
 
 fn TestPrepareAndCatalogVersion(t mut crucible.T) {

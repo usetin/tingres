@@ -36,11 +36,13 @@ fn ErrorFault(e PgError) ! {
 	fail say.Fault("{payload}")
 }
 
-// ErrorFromFault extracts a PostgreSQL payload from a package fault.
+// ErrorFromFault extracts a PostgreSQL payload from a package fault, even when
+// the fault was wrapped with context (fault.Wrap) along the way.
 fn ErrorFromFault(err fault) PgError {
 	let raw = fault.Message(err)
-	if !twine.HasPrefix(raw, "@PGERR1@") { return PgError{Severity: "ERROR", Code: "XX000", Message: raw, Detail: "", Hint: "", Position: 0} }
-	let body = raw[8:]
+	let markerAt = twine.Index(raw, "@PGERR1@")
+	if markerAt < 0 { return PgError{Severity: "ERROR", Code: "XX000", Message: raw, Detail: "", Hint: "", Position: 0} }
+	let body = raw[markerAt+8:]
 	let (code, at1, ok1) = read_pg_field(body, 0)
 	let (severity, at2, ok2) = read_pg_field(body, at1)
 	let (message, at3, ok3) = read_pg_field(body, at2)

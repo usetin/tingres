@@ -1,0 +1,183 @@
+package types
+
+// This file registers the numeric, temporal and interval scalar functions and
+// operators that live in numeric.tin, datetime.tin and cast.tin. The shared
+// registry in funcs.tin only covers the scalar types owned by the other agent,
+// so these are collected in their own registry. RegisterTypeFuncs() adds them
+// to the global builtin registry and can be called from funcs.tin's
+// builtinFuncs() to make them visible to LookupFunc.
+
+// TypeFuncRegistry is the global registry plus the numeric/date/time entries.
+let typeFuncRegistry = buildTypeFuncRegistry()
+
+fn buildTypeFuncRegistry() []Func {
+	mut funcs = []Func{}
+	RegisterTypeFuncs(mut funcs)
+	for f in builtinFuncRegistry {
+		if !hasFuncSignature(funcs, f) { funcs = append(funcs, f) }
+	}
+	return funcs
+}
+
+// hasFuncSignature reports whether funcs already holds name/argument signature.
+fn hasFuncSignature(funcs []Func, candidate Func) bool {
+	for f in funcs {
+		if f.Name != candidate.Name || len(f.Args) != len(candidate.Args) { continue }
+		mut same = true
+		for i in 0..len(f.Args) { if f.Args[i] != candidate.Args[i] { same = false } }
+		if same { return true }
+	}
+	return false
+}
+
+// RegisterTypeFuncs appends the numeric, temporal and interval operators and
+// functions to funcs.
+fn RegisterTypeFuncs(funcs mut []Func) {
+	registerNumericFuncs(mut funcs)
+	registerDateTimeFuncs(mut funcs)
+}
+
+fn registerNumericFuncs(funcs mut []Func) {
+	for _, op in []str{"=", "<>", "<", "<=", ">", ">="} {
+		registerFunc(mut funcs, function2(op, []Oid{NumericOid, NumericOid}, BoolOid, true, false, fn(a Datum, b Datum) !Datum {
+			return FromBool(compareOp(op, CompareNumeric(a, b)))
+		}))
+	}
+	for _, op in []str{"+", "-", "*", "/", "%"} {
+		registerFunc(mut funcs, function2(op, []Oid{NumericOid, NumericOid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum {
+			return try numericOperator(op, a, b)
+		}))
+	}
+	registerFunc(mut funcs, function1("+", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return a }))
+	registerFunc(mut funcs, function1("-", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericNeg(a) }))
+	registerFunc(mut funcs, function1("abs", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericAbs(a) }))
+	registerFunc(mut funcs, function1("round", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericRound(a, 0) }))
+	registerFunc(mut funcs, function2("round", []Oid{NumericOid, Int4Oid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try NumericRound(a, b.i) }))
+	registerFunc(mut funcs, function1("trunc", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericTrunc(a, 0) }))
+	registerFunc(mut funcs, function2("trunc", []Oid{NumericOid, Int4Oid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return NumericTrunc(a, b.i) }))
+	registerFunc(mut funcs, function1("ceil", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericCeil(a) }))
+	registerFunc(mut funcs, function1("ceiling", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericCeil(a) }))
+	registerFunc(mut funcs, function1("floor", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericFloor(a) }))
+	registerFunc(mut funcs, function1("sign", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return NumericSign(a) }))
+	registerFunc(mut funcs, function2("mod", []Oid{NumericOid, NumericOid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try NumericMod(a, b) }))
+	registerFunc(mut funcs, function1("sqrt", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericSqrt(a) }))
+	registerFunc(mut funcs, function2("power", []Oid{NumericOid, NumericOid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try NumericPow(a, b) }))
+	registerFunc(mut funcs, function1("exp", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericExp(a) }))
+	registerFunc(mut funcs, function1("ln", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericLn(a) }))
+	registerFunc(mut funcs, function1("log", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericLog10(a) }))
+	registerFunc(mut funcs, function2("div", []Oid{NumericOid, NumericOid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try NumericDivInt(a, b) }))
+	registerFunc(mut funcs, function2("^", []Oid{NumericOid, NumericOid}, NumericOid, true, false, fn(a Datum, b Datum) !Datum { return try NumericPow(a, b) }))
+}
+
+fn numericOperator(op str, a Datum, b Datum) !Datum {
+	if op == "+" { return try NumericAdd(a, b) }
+	if op == "-" { return try NumericSub(a, b) }
+	if op == "*" { return try NumericMul(a, b) }
+	if op == "/" { return try NumericDiv(a, b) }
+	if op == "%" { return try NumericMod(a, b) }
+	fail "unknown numeric operator {op}"
+}
+
+fn registerDateTimeFuncs(funcs mut []Func) {
+	let temporal = []Oid{DateOid, TimeOid, TimetzOid, TimestampOid, TimestamptzOid, IntervalOid}
+	for _, oid in temporal {
+		for _, op in []str{"=", "<>", "<", "<=", ">", ">="} {
+			registerFunc(mut funcs, function2(op, []Oid{oid, oid}, BoolOid, true, false, fn(a Datum, b Datum) !Datum {
+				return FromBool(compareOp(op, Compare(a, b)))
+			}))
+		}
+	}
+	for _, oid in []Oid{DateOid, TimeOid, TimetzOid, TimestampOid, TimestamptzOid} {
+		registerFunc(mut funcs, function2("date_part", []Oid{TextOid, oid}, Float8Oid, true, false, fn(field Datum, value Datum) !Datum {
+			return try DatePart(field.s, value)
+		}))
+		registerFunc(mut funcs, function2("date_trunc", []Oid{TextOid, oid}, oid, true, false, fn(field Datum, value Datum) !Datum {
+			return try DateTrunc(field.s, value)
+		}))
+		registerFunc(mut funcs, function2("to_char", []Oid{oid, TextOid}, TextOid, true, false, fn(value Datum, pattern Datum) !Datum {
+			return FromStr(TextOid, ToChar(value, pattern.s))
+		}))
+	}
+	for _, oid in []Oid{TimestampOid, TimestamptzOid} {
+		registerFunc(mut funcs, function2("age", []Oid{oid, oid}, IntervalOid, true, false, fn(a Datum, b Datum) !Datum {
+			return try Age(a, b)
+		}))
+	}
+	registerFunc(mut funcs, function3("make_date", []Oid{Int4Oid, Int4Oid, Int4Oid}, DateOid, true, false, fn(y Datum, m Datum, d Datum) !Datum {
+		return try MakeDate(y.i, m.i, d.i)
+	}))
+	registerFunc(mut funcs, function("make_timestamp", []Oid{Int4Oid, Int4Oid, Int4Oid, Int4Oid, Int4Oid, Float8Oid}, TimestampOid, true, false, fn(args []Datum) !Datum {
+		return try MakeTimestamp(args[0].i, args[1].i, args[2].i, args[3].i, args[4].i, args[5].f)
+	}))
+	registerFunc(mut funcs, function2("+", []Oid{DateOid, Int4Oid}, DateOid, true, false, fn(a Datum, b Datum) !Datum {
+		return try DateAddDays(a, b.i)
+	}))
+	registerFunc(mut funcs, function2("-", []Oid{DateOid, Int4Oid}, DateOid, true, false, fn(a Datum, b Datum) !Datum {
+		return try DateAddDays(a, 0-b.i)
+	}))
+	registerFunc(mut funcs, function2("-", []Oid{DateOid, DateOid}, Int4Oid, true, false, fn(a Datum, b Datum) !Datum {
+		return FromI64(Int4Oid, a.i-b.i)
+	}))
+	for _, oid in []Oid{TimestampOid, TimestamptzOid} {
+		registerFunc(mut funcs, function2("-", []Oid{oid, oid}, IntervalOid, true, false, fn(a Datum, b Datum) !Datum {
+			return try TimestampSubtract(a, b)
+		}))
+		registerFunc(mut funcs, function2("+", []Oid{oid, IntervalOid}, oid, true, false, fn(a Datum, b Datum) !Datum {
+			return try TimestampAddInterval(a, b)
+		}))
+		registerFunc(mut funcs, function2("-", []Oid{oid, IntervalOid}, oid, true, false, fn(a Datum, b Datum) !Datum {
+			return try TimestampAddInterval(a, interval_negate(b))
+		}))
+	}
+	registerFunc(mut funcs, function2("+", []Oid{IntervalOid, IntervalOid}, IntervalOid, true, false, fn(a Datum, b Datum) !Datum {
+		return interval_add(a, b, 1)
+	}))
+	registerFunc(mut funcs, function2("-", []Oid{IntervalOid, IntervalOid}, IntervalOid, true, false, fn(a Datum, b Datum) !Datum {
+		return interval_add(a, b, -1)
+	}))
+	registerFunc(mut funcs, function1("-", []Oid{IntervalOid}, IntervalOid, true, false, fn(a Datum) !Datum { return interval_negate(a) }))
+}
+
+fn interval_negate(a Datum) Datum {
+	return interval_datum(0-a.i, 0-a.days, 0-a.months)
+}
+
+fn interval_add(a Datum, b Datum, sign i64) Datum {
+	return interval_datum(a.i+sign*b.i, a.days+sign*b.days, a.months+sign*b.months)
+}
+
+// LookupTypeFunc resolves a function or operator against the global registry
+// extended with this package's numeric and temporal entries.
+fn LookupTypeFunc(name str, argOids []Oid) ?Func {
+	if let f = lookupSpecial(name, argOids) { return f }
+	let funcs = typeFuncRegistry
+	let unknownCategory = resolveUnknownCategory(name, funcs, argOids)
+	mut best ?Func = nil
+	mut bestCost = i64(9223372036854775807)
+	mut bestExact = -1
+	mut bestPreferred = -1
+	mut tied = false
+	for candidate in funcs {
+		if candidate.Name != name { continue }
+		let (ok, cost, exact) = resolveCandidate(candidate, argOids)
+		if !ok { continue }
+		if !matchesUnknownCategory(candidate, argOids, unknownCategory) { continue }
+		let preferred = unknownPreferredCount(candidate, argOids, unknownCategory)
+		if exact > bestExact || (exact == bestExact && cost < bestCost) || (exact == bestExact && cost == bestCost && preferred > bestPreferred) {
+			best = candidate
+			bestCost = cost
+			bestExact = exact
+			bestPreferred = preferred
+			tied = false
+		} else if exact == bestExact && cost == bestCost && preferred == bestPreferred {
+			tied = true
+		}
+	}
+	if tied || best == nil { return nil }
+	return bindFunc(best)
+}
+
+// LookupTypeOperator resolves a binary operator with the extended registry.
+fn LookupTypeOperator(name str, left Oid, right Oid) ?Func {
+	return LookupTypeFunc(name, []Oid{left, right})
+}

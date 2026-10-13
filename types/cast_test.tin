@@ -27,6 +27,65 @@ fn TestCastRulesAndRounding(t mut crucible.T) {
 	crucible.Equal(mut t, "zero to bool", falseValue.Text(), "false")
 }
 
+fn TestTextIoAndCastRules(t mut crucible.T) {
+	let numeric = Cast(FromStr(TextOid, "12.50"), NumericOid) catch err {
+		t.Error("text to numeric: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "text to numeric keeps scale", numeric.Text(), "12.50")
+	let dateValue = Parse(DateOid, "2024-01-31") catch _ { return }
+	let text = Cast(dateValue, TextOid) catch _ { return }
+	crucible.Equal(mut t, "date to text", text.Text(), "2024-01-31")
+	let date = Cast(FromStr(TextOid, "2024-01-31"), DateOid) catch err {
+		t.Error("text to date: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "text to date", date.Text(), "2024-01-31")
+	let badDate = Cast(FromStr(TextOid, "abc"), DateOid) catch err {
+		crucible.Equal(mut t, "text to date SQLSTATE", ErrorCode(err), "22007")
+		crucible.Equal(mut t, "text to date message", ErrorMessage(err), "invalid input syntax for type date: \"abc\"")
+		return
+	}
+	_ = badDate
+	t.Error("text to date accepted junk")
+}
+
+fn TestIntegerCastMessages(t mut crucible.T) {
+	let four = Parse(Int4Oid, "40000") catch _ { return }
+	let narrowed = Cast(four, Int2Oid) catch err {
+		crucible.Equal(mut t, "int4 to int2 SQLSTATE", ErrorCode(err), "22003")
+		crucible.Equal(mut t, "int4 to int2 message", ErrorMessage(err), "smallint out of range")
+		return
+	}
+	_ = narrowed
+	t.Error("int4 to int2 overflow succeeded")
+	let badText = Parse(Int2Oid, "40000") catch err {
+		crucible.Equal(mut t, "int2 input SQLSTATE", ErrorCode(err), "22003")
+		crucible.Equal(mut t, "int2 input message", ErrorMessage(err), "value \"40000\" is out of range for type smallint")
+		return
+	}
+	_ = badText
+	t.Error("int2 input overflow succeeded")
+	let half = Parse(Float8Oid, "2.5") catch _ { return }
+	let rounded = Cast(half, Int4Oid) catch _ { return }
+	crucible.Equal(mut t, "float8 to int4 ties to even", rounded.Text(), "2")
+	let negHalf = Parse(Float8Oid, "-2.5") catch _ { return }
+	let negRounded = Cast(negHalf, Int4Oid) catch _ { return }
+	crucible.Equal(mut t, "negative float8 to int4 ties to even", negRounded.Text(), "-2")
+}
+
+fn TestImplicitCastMatrix(t mut crucible.T) {
+	t.True("int2 to int4 implicit", CanCast(Int2Oid, Int4Oid, true))
+	t.True("int4 to numeric implicit", CanCast(Int4Oid, NumericOid, true))
+	t.True("numeric to float8 implicit", CanCast(NumericOid, Float8Oid, true))
+	t.True("int4 to int2 not implicit", !CanCast(Int4Oid, Int2Oid, true))
+	t.True("numeric to int4 not implicit", !CanCast(NumericOid, Int4Oid, true))
+	t.True("text to int4 only explicit", CanCast(TextOid, Int4Oid, false) && !CanCast(TextOid, Int4Oid, true))
+	t.True("int4 to text only explicit", CanCast(Int4Oid, TextOid, false) && !CanCast(Int4Oid, TextOid, true))
+	t.True("bool to int4 only explicit", CanCast(BoolOid, Int4Oid, false) && !CanCast(BoolOid, Int4Oid, true))
+	t.True("date to timestamp only explicit", CanCast(DateOid, TimestampOid, false) && !CanCast(DateOid, TimestampOid, true))
+}
+
 fn TestStringTypmodsAndCastErrors(t mut crucible.T) {
 	let padded = CastTypmod(FromStr(TextOid, "cat"), BpcharOid, 5) catch _ { return }
 	crucible.Equal(mut t, "bpchar pads and trims on output", padded.Text(), "cat")
