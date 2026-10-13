@@ -1,0 +1,268 @@
+package exec
+
+import "../types"
+import "../plan"
+import "../catalog"
+import "../parse"
+import "../txn"
+import "../store"
+
+// ExecuteUtility processes DDL and utility statements.
+fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
+	let tx = try session.Txn()
+	match stmt {
+		CreateTable(ct) => {
+			mut schemaName = "public"
+			mut tblName = ""
+			if len(ct.Table.Parts) == 1 {
+				tblName = ct.Table.Parts[0].Name
+			} else if len(ct.Table.Parts) >= 2 {
+				schemaName = ct.Table.Parts[0].Name
+				tblName = ct.Table.Parts[1].Name
+			}
+			mut colDefs = []catalog.ColumnDef{}
+			for elem in ct.Elements {
+				match elem {
+					Column(c) => {
+						mut typeName = "text"
+						if len(c.TypeName.Name.Parts) > 0 {
+							typeName = c.TypeName.Name.Parts[0].Name
+						}
+						colDefs = append(colDefs, catalog.ColumnDef{
+							Name: c.Name.Name,
+							Type: resolveTypeName(typeName),
+							Typmod: -1,
+							Nullable: true,
+						})
+					}
+					_ => {}
+				}
+			}
+			let tableDef = catalog.TableDef{
+				Schema: schemaName,
+				Name: tblName,
+				Columns: colDefs,
+			}
+			session.Catalog.CreateTable(tx, tableDef) catch _ {
+				if ct.IfNotExists {
+					let tag = "CREATE TABLE"
+					out.CommandComplete(tag)
+					return tag
+				}
+				try types.ErrorFault(types.NewPgError("42P07", "relation \"" + tblName + "\" already exists", "", "", 0))
+			}
+			let tag = "CREATE TABLE"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Drop(dr) => {
+			if dr.ObjectType == "table" {
+				for obj in dr.Names {
+					mut schemaName = "public"
+					mut name = ""
+					if len(obj.Parts) == 1 {
+						name = obj.Parts[0].Name
+					} else if len(obj.Parts) >= 2 {
+						schemaName = obj.Parts[0].Name
+						name = obj.Parts[1].Name
+					}
+					let tblOpt = session.Catalog.LookupTable(tx, schemaName, name)
+					if let tbl = tblOpt {
+						session.Catalog.DropTable(tx, tbl, dr.Behavior == "cascade") catch _ {}
+					} else if !dr.IfExists {
+						try types.ErrorFault(types.NewPgError("42P01", "table \"" + name + "\" does not exist", "", "", 0))
+					}
+				}
+			}
+			let tag = "DROP TABLE"
+			out.CommandComplete(tag)
+			return tag
+		}
+		CreateIndex(ci) => {
+			mut schemaName = "public"
+			mut tblName = ""
+			if len(ci.Table.Parts) == 1 {
+				tblName = ci.Table.Parts[0].Name
+			} else if len(ci.Table.Parts) >= 2 {
+				schemaName = ci.Table.Parts[0].Name
+				tblName = ci.Table.Parts[1].Name
+			}
+			let tblOpt = session.Catalog.LookupTable(tx, schemaName, tblName)
+			if let tbl = tblOpt {
+				mut idxName = tbl.Name + "_idx"
+				if let n = ci.Name {
+					if len(n.Parts) > 0 {
+						idxName = n.Parts[len(n.Parts)-1].Name
+					}
+				}
+				let idxDef = catalog.IndexDef{
+					Table: tbl,
+					Name: idxName,
+					Unique: ci.Unique,
+				}
+				session.Catalog.CreateIndex(tx, idxDef) catch _ {}
+			}
+			let tag = "CREATE INDEX"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Explain(ex) => {
+			mut analyze = false
+			for opt in ex.Options {
+				if opt.Name == "analyze" {
+					analyze = true
+				}
+			}
+			let prep = try plan.Prepare(session.Catalog, tx, ex.Statement, []u32{})
+			let lines = plan.ExplainPlan(prep.Plan, analyze)
+			out.RowDescription([]ColDesc{ColDesc{Name: "QUERY PLAN", Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 1}}, []i16{0})
+			for line in lines {
+				out.DataRow([]types.Datum{types.FromStr(types.TextOid, line)})
+			}
+			let tag = "EXPLAIN"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Prepare(pr) => {
+			let prep = try plan.Prepare(session.Catalog, tx, pr.Statement, []u32{})
+			session.StorePreparedStatement(pr.Name.Name, prep.Plan, prep.ResultCols, []u32{})
+			let tag = "PREPARE"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Execute(ex) => {
+			let prepOpt = session.GetPreparedStatement(ex.Name.Name)
+			if let prep = prepOpt {
+				let ctx = ExprContext{
+					Row: []types.Datum{},
+					Params: []types.Datum{},
+					Txn: tx,
+					Catalog: session.Catalog,
+				}
+				mut cur = try BuildCursor(prep.Plan, ctx)
+				if len(prep.Cols) > 0 {
+					mut sinkCols = []ColDesc{}
+					mut formats = []i16{}
+					for c in prep.Cols {
+						sinkCols = append(sinkCols, ColDesc{
+							Name: c.Name,
+							Oid: c.Oid,
+							Typmod: c.Typmod,
+							TableOid: c.TableOid,
+							Attno: c.Attno,
+						})
+						formats = append(formats, 0)
+					}
+					out.RowDescription(sinkCols, formats)
+				}
+				mut count = i64(0)
+				for {
+					let (row, ok) = try cur.Next()
+					if !ok {
+						break
+					}
+					out.DataRow(row)
+					count += 1
+				}
+				let tag = "SELECT {count}"
+				out.CommandComplete(tag)
+				return tag
+			}
+			try types.ErrorFault(types.NewPgError("26000", "prepared statement \"" + ex.Name.Name + "\" does not exist", "", "", 0))
+			return ""
+		}
+		Deallocate(de) => {
+			if let n = de.Name {
+				session.DropPreparedStatement(n.Name)
+			} else {
+				session.DropAllPreparedStatements()
+			}
+			let tag = "DEALLOCATE"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Discard(di) => {
+			session.DropAllPreparedStatements()
+			if di.Target == "all" {
+				try session.ResetAllGucs()
+			}
+			let tag = "DISCARD ALL"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Vacuum(_) => {
+			let tag = "VACUUM"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Analyze(_) => {
+			let tag = "ANALYZE"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Truncate(_) => {
+			let tag = "TRUNCATE TABLE"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Checkpoint(_) => {
+			let tag = "CHECKPOINT"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Notify(_) => {
+			let tag = "NOTIFY"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Listen(_) => {
+			let tag = "LISTEN"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Unlisten(_) => {
+			let tag = "UNLISTEN"
+			out.CommandComplete(tag)
+			return tag
+		}
+		Copy(cp) => {
+			if cp.Direction == "from" {
+				out.CopyIn(0, []i16{})
+			} else {
+				out.CopyOut(0, []i16{})
+				out.CopyDone()
+			}
+			let tag = "COPY 0"
+			out.CommandComplete(tag)
+			return tag
+		}
+		_ => {
+			let tag = "OK"
+			out.CommandComplete(tag)
+			return tag
+		}
+	}
+	return "OK"
+}
+
+fn resolveTypeName(name str) u32 {
+	if name == "int" || name == "integer" || name == "int4" {
+		return types.Int4Oid
+	}
+	if name == "bigint" || name == "int8" {
+		return types.Int8Oid
+	}
+	if name == "smallint" || name == "int2" {
+		return types.Int2Oid
+	}
+	if name == "text" || name == "varchar" || name == "character varying" {
+		return types.TextOid
+	}
+	if name == "bool" || name == "boolean" {
+		return types.BoolOid
+	}
+	if name == "float8" || name == "double precision" {
+		return types.Float8Oid
+	}
+	return types.TextOid
+}

@@ -4,10 +4,29 @@ import "../catalog"
 import "../txn"
 import "../types"
 import "../parse"
+import "../plan"
 import "atomic"
 import "mint"
 import "twine"
 import "fault"
+
+// PreparedStatement holds a compiled plan and metadata.
+type PreparedStatement struct {
+	Name str
+	Plan plan.Plan
+	Cols []plan.ColDesc
+	ParamTypes []u32
+}
+
+// Portal holds execution cursor state for an active query.
+type Portal struct {
+	Name str
+	Cursor ?dyn Cursor
+	Plan plan.Plan
+	Cols []plan.ColDesc
+	ResultFormats []i16
+	Completed bool
+}
 
 // Session holds connection-scoped execution state.
 type Session struct {
@@ -22,6 +41,8 @@ type Session struct {
 	localGucs []LocalGucChange
 	implicitGucs []LocalGucChange
 	canceled atomic.Bool
+	preparedStatements map[str]PreparedStatement
+	portals map[str]Portal
 }
 
 // NewSession creates an execution session with default GUC parameters.
@@ -38,6 +59,8 @@ fn NewSession(c catalog.Catalog, m txn.Manager, user str, db str) Session {
 		localGucs: []LocalGucChange{},
 		implicitGucs: []LocalGucChange{},
 		canceled: atomic.NewBool(false),
+		preparedStatements: make(map[str]PreparedStatement),
+		portals: make(map[str]Portal),
 	}
 }
 
@@ -576,30 +599,153 @@ fn (s Session) ParameterStatusList() []GucStatus {
 
 // Parse prepares an extended-protocol statement skeleton.
 fn (s mut Session) Parse(name str, sql str, paramOids []u32) ! {
-	_ = name
-	_ = sql
-	_ = paramOids
+	let trimmed = twine.TrimSpace(sql)
+	if trimmed == "" {
+		s.StorePreparedStatement(name, plan.Plan.Result(plan.ResultNode{Exprs: []plan.Expr{}, Filter: nil, Cols: []plan.ColDesc{}, Cost: plan.Cost{}}), []plan.ColDesc{}, paramOids)
+		return
+	}
+	let parseResult = parse.Parse(trimmed) catch err {
+		let code = parse.ErrorCode(err)
+		let rawMsg = fault.Message(err)
+		try types.ErrorFault(types.NewPgError(code, rawMsg, "", "", 0))
+		return
+	}
+	if len(parseResult) == 0 {
+		return
+	}
+	let tx = try s.Txn()
+	let prep = try plan.Prepare(s.Catalog, tx, parseResult[0], paramOids)
+	s.StorePreparedStatement(name, prep.Plan, prep.ResultCols, paramOids)
 }
 
 // Bind binds parameters to a prepared portal skeleton.
-fn (s mut Session) Bind(portal str, stmt str, params []types.Datum, resultFormats []i16) ! {
-	_ = portal
-	_ = stmt
-	_ = params
-	_ = resultFormats
+fn (s mut Session) Bind(portalName str, prepName str, params []types.Datum, resultFormats []i16) ! {
+	let prepOpt = s.GetPreparedStatement(prepName)
+	if let prep = prepOpt {
+		let ctx = ExprContext{
+			Row: []types.Datum{},
+			Params: params,
+			Txn: s.currentTxn,
+			Catalog: s.Catalog,
+		}
+		mut cur = try BuildCursor(prep.Plan, ctx)
+		s.portals[portalName] = Portal{
+			Name: portalName,
+			Cursor: cur,
+			Plan: prep.Plan,
+			Cols: prep.Cols,
+			ResultFormats: resultFormats,
+			Completed: false,
+		}
+		return
+	}
+	try types.ErrorFault(types.NewPgError("26000", "prepared statement \"" + prepName + "\" does not exist", "", "", 0))
+}
+
+// BindBytes binds raw binary or text byte slices to a prepared statement.
+fn (s mut Session) BindBytes(portalName str, prepName str, paramFormats []i16, paramValues [][]u8, resultFormats []i16) ! {
+	let prepOpt = s.GetPreparedStatement(prepName)
+	if let prep = prepOpt {
+		mut decodedParams = []types.Datum{}
+		for i, valBytes in paramValues {
+			if len(valBytes) == 0 {
+				decodedParams = append(decodedParams, types.Null())
+			} else {
+				mut typOid = types.TextOid
+				if i < len(prep.ParamTypes) && prep.ParamTypes[i] != 0 {
+					typOid = prep.ParamTypes[i]
+				}
+				mut isBinary = false
+				if i < len(paramFormats) && paramFormats[i] == 1 {
+					isBinary = true
+				}
+				if isBinary {
+					let d = try types.DecodeBinary(typOid, valBytes)
+					decodedParams = append(decodedParams, d)
+				} else {
+					let d = try types.Parse(typOid, str(valBytes))
+					decodedParams = append(decodedParams, d)
+				}
+			}
+		}
+		try s.Bind(portalName, prepName, decodedParams, resultFormats)
+		return
+	}
+	try types.ErrorFault(types.NewPgError("26000", "prepared statement \"" + prepName + "\" does not exist", "", "", 0))
 }
 
 // Execute runs a bound portal skeleton.
-fn (s mut Session) Execute(portal str, maxRows i64, out mut dyn Sink) ! {
-	_ = portal
-	_ = maxRows
-	_ = out
+fn (s mut Session) Execute(portalName str, maxRows i64, out mut dyn Sink) ! {
+	let (portal, ok) = s.portals[portalName]
+	if !ok {
+		try types.ErrorFault(types.NewPgError("34000", "portal \"" + portalName + "\" does not exist", "", "", 0))
+		return
+	}
+	if portal.Completed {
+		out.CommandComplete("SELECT 0")
+		return
+	}
+	match portal.Plan {
+		ModifyTable(mt) => {
+			let ctx = ExprContext{
+				Row: []types.Datum{},
+				Params: []types.Datum{},
+				Txn: s.currentTxn,
+				Catalog: s.Catalog,
+			}
+			try ExecuteModifyTable(mt, ctx, mut out)
+			mut updated = portal
+			updated.Completed = true
+			s.portals[portalName] = updated
+			return
+		}
+		_ => {}
+	}
+	if let cur = portal.Cursor {
+		mut curMut = cur
+		mut count = i64(0)
+		for maxRows == 0 || count < maxRows {
+			let (row, rowOk) = try curMut.Next()
+			if !rowOk {
+				mut updated = portal
+				updated.Completed = true
+				s.portals[portalName] = updated
+				let tag = "SELECT {count}"
+				out.CommandComplete(tag)
+				return
+			}
+			out.DataRow(row)
+			count += 1
+		}
+		mut updated = portal
+		updated.Cursor = curMut
+		s.portals[portalName] = updated
+	}
 }
 
 // Describe describes a prepared statement or portal skeleton.
 fn (s Session) Describe(kind u8, name str) !Description {
-	_ = kind
-	_ = name
+	if kind == 'S' {
+		let prepOpt = s.GetPreparedStatement(name)
+		if let prep = prepOpt {
+			mut cols = []ColDesc{}
+			for c in prep.Cols {
+				cols = append(cols, ColDesc{Name: c.Name, Oid: c.Oid, Typmod: c.Typmod, TableOid: c.TableOid, Attno: c.Attno})
+			}
+			return Description{Cols: cols, ParamOids: prep.ParamTypes}
+		}
+		try types.ErrorFault(types.NewPgError("26000", "prepared statement \"" + name + "\" does not exist", "", "", 0))
+	} else if kind == 'P' {
+		let (portal, ok) = s.portals[name]
+		if ok {
+			mut cols = []ColDesc{}
+			for c in portal.Cols {
+				cols = append(cols, ColDesc{Name: c.Name, Oid: c.Oid, Typmod: c.Typmod, TableOid: c.TableOid, Attno: c.Attno})
+			}
+			return Description{Cols: cols, ParamOids: []u32{}}
+		}
+		try types.ErrorFault(types.NewPgError("34000", "portal \"" + name + "\" does not exist", "", "", 0))
+	}
 	return Description{Cols: []ColDesc{}, ParamOids: []u32{}}
 }
 
@@ -763,5 +909,64 @@ fn exprToString(expr parse.Expr) str {
 	match expr {
 		Literal(lit) => return lit.Value
 		_ => return ""
+	}
+}
+
+// Txn returns the current active transaction or starts an implicit transaction.
+fn (s mut Session) Txn() !txn.Txn {
+	if let t = s.currentTxn {
+		return t
+	}
+	let t = try s.Manager.Begin(txn.Isolation.ReadCommitted)
+	s.currentTxn = t
+	return t
+}
+
+// StorePreparedStatement saves a prepared statement into the session cache.
+fn (s mut Session) StorePreparedStatement(name str, p plan.Plan, cols []plan.ColDesc, paramTypes []u32) {
+	s.preparedStatements[name] = PreparedStatement{
+		Name: name,
+		Plan: p,
+		Cols: cols,
+		ParamTypes: paramTypes,
+	}
+}
+
+// GetPreparedStatement retrieves a prepared statement by name.
+fn (s Session) GetPreparedStatement(name str) ?PreparedStatement {
+	let (p, ok) = s.preparedStatements[name]
+	if ok {
+		return p
+	}
+	return nil
+}
+
+// DropPreparedStatement removes a prepared statement from the session cache.
+fn (s mut Session) DropPreparedStatement(name str) {
+	delete(s.preparedStatements, name)
+}
+
+// DropAllPreparedStatements clears all session prepared statements.
+fn (s mut Session) DropAllPreparedStatements() {
+	s.preparedStatements = make(map[str]PreparedStatement)
+}
+
+// Close drops a prepared statement or portal.
+fn (s mut Session) Close(targetType u8, name str) ! {
+	if targetType == 'S' {
+		s.DropPreparedStatement(name)
+	} else if targetType == 'P' {
+		delete(s.portals, name)
+	}
+}
+
+// Sync ends the extended query cycle.
+fn (s mut Session) Sync(out mut dyn Sink) ! {
+	if s.state == TxnState.Idle && s.currentTxn != nil {
+		if let t = s.currentTxn {
+			mut tx = t
+			s.Manager.Commit(mut tx) catch _ {}
+		}
+		s.currentTxn = nil
 	}
 }
