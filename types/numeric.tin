@@ -5,6 +5,9 @@ import "mint"
 import "twine"
 
 const NumericBase i64 = 10000
+const numericDecDigits i64 = 4
+const minNumericSigDigits i64 = 16
+const maxNumericDisplayScale i64 = 1000
 
 // Numeric stores PostgreSQL base-10000 digits and the display scale.
 type Numeric value struct {
@@ -364,13 +367,14 @@ fn NumericMul(a Datum, b Datum) !Datum {
 	return FromStr(NumericOid, format_numeric(n))
 }
 
-// NumericDiv divides a numeric Datum to PostgreSQL's default 20 fractional digits.
+// NumericDiv divides a numeric Datum using PostgreSQL's select_div_scale result scale.
 fn NumericDiv(a Datum, b Datum) !Datum {
 	let x = try parse_numeric_value(NumericText(a))
 	let y = try parse_numeric_value(NumericText(b))
 	if y.sign == 0 && y.special == 0 { fail ErrorFault(NewError("22012", "division by zero")) }
 	if x.special != 0 || y.special != 0 { return FromStr(NumericOid, numeric_special_div(x, y)) }
-	if x.sign == 0 { return FromStr(NumericOid, "0.00000000000000000000") }
+	let rscale = select_div_scale(x, y)
+	if x.sign == 0 { return FromStr(NumericOid, zero_with_scale(rscale)) }
 	let numerator = reverse_i64(x.digits)
 	let denominator = reverse_i64(y.digits)
 	let xlow = numeric_low_exp(x)
@@ -381,8 +385,10 @@ fn NumericDiv(a Datum, b Datum) !Datum {
 	let (wholeQ, rem) = big_divmod(n, d)
 	mut q = reverse_i64(wholeQ)
 	mut remainder = rem
+	// One guard decimal digit beyond rscale, rounded to four-digit groups.
+	let fracGroupCount = (rscale+1+3)/4
 	mut fracGroups = []i64{}
-	for i in 0..5 {
+	for i in 0..fracGroupCount {
 		remainder = big_mul_base_add(remainder, 0)
 		let (digit, rest) = big_div_digit(remainder, d)
 		fracGroups = append(fracGroups, digit)
@@ -393,9 +399,30 @@ fn NumericDiv(a Datum, b Datum) !Datum {
 	mut digits = []i64{}
 	digits = append(digits, q...)
 	digits = append(digits, fracGroups...)
-	mut weight = len(q)-1
-	let mutN = numeric_from_dense(x.sign*y.sign, weight, 20, digits)
-	return FromStr(NumericOid, format_numeric(mutN))
+	let weight = len(q)-1
+	let raw = numeric_from_dense(x.sign*y.sign, weight, fracGroupCount*4, digits)
+	return FromStr(NumericOid, format_numeric(numeric_round_value(raw, rscale)))
+}
+
+// select_div_scale mirrors PostgreSQL's division result-scale rule (numeric.c).
+fn select_div_scale(a Numeric, b Numeric) i64 {
+	let (weight1, firstdigit1) = numeric_first_digit(a)
+	let (weight2, firstdigit2) = numeric_first_digit(b)
+	mut qweight = weight1-weight2
+	if firstdigit1 <= firstdigit2 { qweight -= 1 }
+	mut rscale = minNumericSigDigits-qweight*numericDecDigits
+	rscale = max(rscale, a.dscale)
+	rscale = max(rscale, b.dscale)
+	rscale = max(rscale, 0)
+	rscale = min(rscale, maxNumericDisplayScale)
+	return rscale
+}
+
+fn numeric_first_digit(n Numeric) (i64, i64) {
+	for i in 0..len(n.digits) {
+		if n.digits[i] != 0 { return n.weight-i, n.digits[i] }
+	}
+	return 0, 0
 }
 
 // NumericMod returns the PostgreSQL numeric remainder of a and b.
@@ -739,13 +766,14 @@ fn numeric_special_div(a Numeric, b Numeric) str {
 	return "0"
 }
 
+// big_append_zero_groups multiplies the little-endian integer a by NBASE^n.
 fn big_append_zero_groups(a []i64, n i64) []i64 {
 	mut out = []i64{}
-	out = append(out, a...)
 	for i in 0..n {
 		out = append(out, 0)
 		_ = i
 	}
+	out = append(out, a...)
 	return out
 }
 
