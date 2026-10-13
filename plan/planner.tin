@@ -542,12 +542,17 @@ break } }
 		Rows: havingPlan.Cost().Rows,
 		Width: i64(len(outCols) * 8),
 	}
-	let projectedPlan = Plan.Project(ProjectNode{
+	// Drop a trivial identity projection (every output column is the input column
+	// at the same position) so single-table queries explain like PostgreSQL's.
+	mut projectedPlan = Plan.Project(ProjectNode{
 		Input: havingPlan,
 		Exprs: projExprs,
 		Cols: outCols,
 		Cost: projCost,
 	})
+	if isIdentityProjection(projExprs, havingPlan.Cols()) {
+		projectedPlan = havingPlan
+	}
 
 	// 5. DISTINCT
 	mut distinctPlan = projectedPlan
@@ -603,6 +608,20 @@ break } }
 	}
 
 	return finalPlan
+}
+
+// isIdentityProjection reports whether exprs is exactly the input columns in order.
+fn isIdentityProjection(exprs []Expr, inputCols []ColDesc) bool {
+	if len(exprs) != len(inputCols) { return false }
+	for i, e in exprs {
+		match e {
+			ColRef(c) => {
+				if c.Slot != i64(i) { return false }
+			}
+			_ => { return false }
+		}
+	}
+	return true
 }
 
 fn findAggRefs(expr Expr) []AggRefExpr {

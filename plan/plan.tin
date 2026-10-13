@@ -40,9 +40,49 @@ fn Explain(p Prepared, analyze bool) []str {
 
 // ExplainPlan returns text lines describing the plan tree.
 fn ExplainPlan(p Plan, analyze bool) []str {
+	mut cols = []ExplainCol{}
+	collectExplainCols(p, mut cols)
+	let qualify = explainDistinctSources(cols) > 1
 	mut lines = []str{}
-	writeExplain(p, 0, analyze, mut lines)
+	writeExplain(p, 0, analyze, cols, qualify, mut lines)
 	return lines
+}
+
+// ExplainCol is one relation column addressable by a ColRef while rendering EXPLAIN.
+type ExplainCol struct {
+	RangeIndex i64
+	Attno i16
+	Name str
+	Source str
+}
+
+// collectExplainCols gathers the addressable relation columns of a plan tree.
+fn collectExplainCols(p Plan, acc mut []ExplainCol) {
+	for col in p.Cols() {
+		if col.RangeIndex != 0 {
+			acc = append(acc, ExplainCol{RangeIndex: col.RangeIndex, Attno: col.Attno, Name: col.Name, Source: col.SourceName})
+		}
+	}
+	for child in p.Children() {
+		collectExplainCols(child, mut acc)
+	}
+}
+
+// explainDistinctSources counts the distinct relations referenced by output columns.
+fn explainDistinctSources(cols []ExplainCol) i64 {
+	mut sources = []str{}
+	for c in cols {
+		if c.Source == "" { continue }
+		mut found = false
+		for s in sources {
+			if s == c.Source {
+				found = true
+				break
+			}
+		}
+		if !found { sources = append(sources, c.Source) }
+	}
+	return i64(len(sources))
 }
 
 
@@ -60,6 +100,19 @@ fn planToJson(p Plan) str {
 	s += "\"Plan Rows\": " + say.Fmt("%d", i64(cost.Rows)) + ", "
 	s += "\"Plan Width\": " + say.Fmt("%d", cost.Width)
 
+	mut cols = []ExplainCol{}
+	collectExplainCols(p, mut cols)
+	let qualify = explainDistinctSources(cols) > 1
+	let details = nodeDetailLines(p, cols, qualify)
+	if len(details) > 0 {
+		s += ", \"Details\": ["
+		for i, d in details {
+			if i > 0 { s += ", " }
+			s += "\"" + jsonEscape(d) + "\""
+		}
+		s += "]"
+	}
+
 	let children = p.Children()
 	if len(children) > 0 {
 		s += ", \"Plans\": ["
@@ -73,12 +126,29 @@ fn planToJson(p Plan) str {
 	return s
 }
 
-fn writeExplain(p Plan, depth i64, analyze bool, lines mut []str) {
+fn jsonEscape(s str) str {
+	mut out = ""
+	for _, ch in s {
+		match ch {
+			34 => { out += "\\\"" }
+			92 => { out += "\\\\" }
+			_ => { out += str(ch) }
+		}
+	}
+	return out
+}
+
+fn indentOf(depth i64) str {
 	mut indent = ""
 	for i in 0..depth {
 		indent += "  "
 		_ = i
 	}
+	return indent
+}
+
+fn writeExplain(p Plan, depth i64, analyze bool, cols []ExplainCol, qualify bool, lines mut []str) {
+	let indent = indentOf(depth)
 	let title = nodeTitle(p)
 	let cost = p.Cost()
 	mut line = indent
@@ -88,13 +158,163 @@ fn writeExplain(p Plan, depth i64, analyze bool, lines mut []str) {
 	let costStr = say.Fmt("%.2f", cost.Startup) + ".." + say.Fmt("%.2f", cost.Total)
 	line += "{title}  (cost={costStr} rows={i64(cost.Rows)} width={cost.Width})"
 	lines = append(lines, line)
-	let detailLines = nodeDetails(p)
-	for d in detailLines {
-		lines = append(lines, indent + "      " + d)
+	for d in nodeDetailLines(p, cols, qualify) {
+		lines = append(lines, indent + "  " + d)
 	}
 	for child in p.Children() {
-		writeExplain(child, depth + 1, analyze, mut lines)
+		writeExplain(child, depth + 1, analyze, cols, qualify, mut lines)
 	}
+}
+
+// isStringColumnOid reports whether a constant of this type renders as a quoted literal.
+fn isStringColumnOid(oid u32) bool {
+	return oid == u32(types.TextOid) || oid == u32(types.VarcharOid) || oid == u32(types.BpcharOid) || oid == u32(types.NameOid)
+}
+
+// escapeExplainLiteral doubles single quotes inside a SQL literal for EXPLAIN.
+fn escapeExplainLiteral(s str) str {
+	mut out = ""
+	for _, ch in s {
+		if ch == 39 { out += "''" } else { out += str(ch) }
+	}
+	return out
+}
+
+// explainConstText renders a constant the way PostgreSQL prints it in an EXPLAIN line.
+fn explainConstText(c ConstExpr) str {
+	let v = c.Value
+	if types.IsNull(v) { return "NULL" }
+	let oid = u32(v.Oid())
+	if oid == u32(types.UnknownLiteralOid) { return "'" + escapeExplainLiteral(v.Text()) + "'" }
+	if isStringColumnOid(oid) { return "'" + escapeExplainLiteral(v.Text()) + "'::" + typeName(oid) }
+	return v.Text()
+}
+
+// explainColRef renders a column reference, qualifying it when several relations are present.
+fn explainColRef(c ColRefExpr, cols []ExplainCol, qualify bool) str {
+	for ec in cols {
+		if ec.RangeIndex == c.RangeIndex && ec.Attno == c.AttNo {
+			if qualify && ec.Source != "" { return ec.Source + "." + ec.Name }
+			return ec.Name
+		}
+	}
+	return "col" + say.Fmt("%d", c.Slot)
+}
+
+// exprText renders one expression in PostgreSQL EXPLAIN style.
+fn exprText(e Expr, cols []ExplainCol, qualify bool) str {
+	match e {
+		Const(c) => { return explainConstText(c) }
+		ColRef(c) => { return explainColRef(c, cols, qualify) }
+		Param(p) => { return "$" + say.Fmt("%d", p.N) }
+		OpCall(op) => {
+			if len(op.Args) == 1 {
+				return "(" + op.Op + " " + exprText(op.Args[0], cols, qualify) + ")"
+			}
+			if len(op.Args) == 2 {
+				return "(" + exprText(op.Args[0], cols, qualify) + " " + op.Op + " " + exprText(op.Args[1], cols, qualify) + ")"
+			}
+			return op.Op
+		}
+		FuncCall(f) => {
+			mut args = ""
+			for i, a in f.Args {
+				if i > 0 { args += ", " }
+				args += exprText(a, cols, qualify)
+			}
+			return f.Func.Name + "(" + args + ")"
+		}
+		BoolExpr(b) => {
+			if b.Op == BoolOp.Not {
+				if len(b.Args) == 1 { return "(NOT " + exprText(b.Args[0], cols, qualify) + ")" }
+				return "NOT"
+			}
+			mut joiner = " AND "
+			if b.Op == BoolOp.Or { joiner = " OR " }
+			mut out = ""
+			for i, a in b.Args {
+				if i > 0 { out += joiner }
+				out += exprText(a, cols, qualify)
+			}
+			if len(b.Args) == 1 { return out }
+			return "(" + out + ")"
+		}
+		NullTest(n) => {
+			if n.Test == NullTestType.IsNull { return "(" + exprText(n.Arg, cols, qualify) + " IS NULL)" }
+			return "(" + exprText(n.Arg, cols, qualify) + " IS NOT NULL)"
+		}
+		Cast(c) => { return "(" + exprText(c.Arg, cols, qualify) + ")::" + typeName(u32(c.Type)) }
+		AggRef(a) => {
+			mut args = ""
+			for i, arg in a.Args {
+				if i > 0 { args += ", " }
+				args += exprText(arg, cols, qualify)
+			}
+			if len(a.Args) == 0 { args = "*" }
+			return a.Agg.Name + "(" + args + ")"
+		}
+		Coalesce(c) => {
+			mut out = "COALESCE("
+			for i, a in c.Args {
+				if i > 0 { out += ", " }
+				out += exprText(a, cols, qualify)
+			}
+			return out + ")"
+		}
+		Case(_) => { return "(CASE ...)" }
+		WindowFuncRef(w) => { return w.Name + "(...)" }
+		SubLink(_) => { return "(SubPlan)" }
+		RowExpr(r) => {
+			mut out = "ROW("
+			for i, a in r.Elements {
+				if i > 0 { out += ", " }
+				out += exprText(a, cols, qualify)
+			}
+			return out + ")"
+		}
+		ArrayExpr(a) => {
+			mut out = "ARRAY["
+			for i, el in a.Elements {
+				if i > 0 { out += ", " }
+				out += exprText(el, cols, qualify)
+			}
+			return out + "]"
+		}
+	}
+	return "?"
+}
+
+// condListExplain renders a conjunction of predicates.
+fn condListExplain(conds []Expr, cols []ExplainCol, qualify bool) str {
+	mut out = ""
+	for i, c in conds {
+		if i > 0 { out += " AND " }
+		out += exprText(c, cols, qualify)
+	}
+	return out
+}
+
+// joinKeyExplain renders an equijoin condition from paired left/right keys.
+fn joinKeyExplain(left []Expr, right []Expr, cols []ExplainCol, qualify bool) str {
+	mut out = ""
+	mut n = len(left)
+	if len(right) < n { n = len(right) }
+	for i in 0..n {
+		if i > 0 { out += " AND " }
+		out += "(" + exprText(left[i], cols, qualify) + " = " + exprText(right[i], cols, qualify) + ")"
+	}
+	return out
+}
+
+fn sortKeyExplain(keys []SortKey, cols []ExplainCol, qualify bool) str {
+	mut out = ""
+	for i, k in keys {
+		if i > 0 { out += ", " }
+		out += exprText(k.Expr, cols, qualify)
+		if k.Descending { out += " DESC" }
+		if k.NullsFirst { out += " NULLS FIRST" }
+	}
+	return out
 }
 
 fn nodeTitle(p Plan) str {
@@ -140,38 +360,66 @@ fn nodeTitle(p Plan) str {
 	return "PlanNode"
 }
 
-fn nodeDetails(p Plan) []str {
+fn nodeDetailLines(p Plan, cols []ExplainCol, qualify bool) []str {
 	mut details = []str{}
 	match p {
 		SeqScan(n) => {
-			if n.Filter != nil {
-				details = append(details, "Filter: (predicate)")
+			if let f = n.Filter {
+				details = append(details, "Filter: " + exprText(f, cols, qualify))
 			}
 		}
 		IndexScan(n) => {
-			if len(n.Bounds) > 0 {
-				details = append(details, "Index Cond: (bounds)")
+			if len(n.Quals) > 0 {
+				details = append(details, "Index Cond: " + condListExplain(n.Quals, cols, qualify))
 			}
-			if n.Filter != nil {
-				details = append(details, "Filter: (predicate)")
+			if let f = n.Filter {
+				details = append(details, "Filter: " + exprText(f, cols, qualify))
 			}
 		}
 		IndexOnlyScan(n) => {
-			if len(n.Bounds) > 0 {
-				details = append(details, "Index Cond: (bounds)")
+			if len(n.Quals) > 0 {
+				details = append(details, "Index Cond: " + condListExplain(n.Quals, cols, qualify))
 			}
-			if n.Filter != nil {
-				details = append(details, "Filter: (predicate)")
+			if let f = n.Filter {
+				details = append(details, "Filter: " + exprText(f, cols, qualify))
 			}
+		}
+		Filter(n) => {
+			details = append(details, "Filter: " + exprText(n.Predicate, cols, qualify))
 		}
 		Sort(n) => {
 			if len(n.Keys) > 0 {
-				details = append(details, "Sort Key: (keys)")
+				details = append(details, "Sort Key: " + sortKeyExplain(n.Keys, cols, qualify))
 			}
 		}
 		HashJoin(n) => {
 			if len(n.LeftKeys) > 0 {
-				details = append(details, "Hash Cond: (keys)")
+				details = append(details, "Hash Cond: " + joinKeyExplain(n.LeftKeys, n.RightKeys, cols, qualify))
+			}
+		}
+		MergeJoin(n) => {
+			if len(n.LeftKeys) > 0 {
+				details = append(details, "Merge Cond: " + joinKeyExplain(n.LeftKeys, n.RightKeys, cols, qualify))
+			}
+		}
+		NestLoop(n) => {
+			if len(n.Quals) > 0 {
+				details = append(details, "Join Filter: " + condListExplain(n.Quals, cols, qualify))
+			}
+		}
+		HashAgg(n) => {
+			if len(n.GroupKeys) > 0 {
+				details = append(details, "Group Key: " + condListExplain(n.GroupKeys, cols, qualify))
+			}
+		}
+		GroupAgg(n) => {
+			if len(n.GroupKeys) > 0 {
+				details = append(details, "Group Key: " + condListExplain(n.GroupKeys, cols, qualify))
+			}
+		}
+		WindowAgg(n) => {
+			if len(n.Partitions) > 0 {
+				details = append(details, "Partition By: " + condListExplain(n.Partitions, cols, qualify))
 			}
 		}
 		_ => {}
