@@ -35,8 +35,11 @@ fn registerStringFuncs(funcs mut []Func) {
 		registerFunc(mut funcs, function3("split_part", []Oid{oid, oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringSplitPart(p1, p2, p3.i) }))
 		registerFunc(mut funcs, function3("overlay", []Oid{oid, oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringOverlay(p1, p2, p3.i, -1) }))
 		registerFunc(mut funcs, function("overlay", []Oid{oid, oid, Int4Oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringOverlay(args[0], args[1], args[2].i, args[3].i) }))
+		registerFunc(mut funcs, function2("lpad", []Oid{oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringPad(p1, p2.i, FromStr(oid, " "), false) }))
+		registerFunc(mut funcs, function2("rpad", []Oid{oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringPad(p1, p2.i, FromStr(oid, " "), true) }))
 		registerFunc(mut funcs, function3("lpad", []Oid{oid, Int4Oid, oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringPad(p1, p2.i, p3, false) }))
 		registerFunc(mut funcs, function3("rpad", []Oid{oid, Int4Oid, oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringPad(p1, p2.i, p3, true) }))
+		registerFunc(mut funcs, function1("trim", []Oid{oid}, oid, true, false, fn(p1 Datum) !Datum { return try stringTrim("btrim", p1, "") }))
 	}
 	registerFunc(mut funcs, function1("chr", []Oid{Int4Oid}, TextOid, true, false, fn(p1 Datum) !Datum { return try stringChr(p1.i) }))
 	registerFunc(mut funcs, function2("encode", []Oid{ByteaOid, TextOid}, TextOid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try encodeBytes(p1, p2.Text()) }))
@@ -145,7 +148,7 @@ fn stringRepeat(arg Datum, count i64) !Datum {
 }
 
 fn stringSplitPart(s Datum, delimiter Datum, field i64) !Datum {
-	if field == 0 { fail "field position must not be zero" }
+	if field == 0 { try pgRaise("22023", "field position must not be zero") }
 	let parts = twine.Split(s.Text(), delimiter.Text())
 	mut index = field-1
 	if field < 0 { index = len(parts)+field }
@@ -177,8 +180,10 @@ fn stringPad(s Datum, target i64, pad Datum, right bool) !Datum {
 }
 
 fn stringChr(code i64) !Datum {
-	if code == 0 { fail "null character not permitted" }
-	if code < 0 || code > 0x10ffff { fail "chr() argument out of range" }
+	if code == 0 { try pgRaise("54000", "null character not permitted") }
+	if code < 0 { try pgRaise("22023", "character number must be positive") }
+	if code > 0x10ffff { try pgRaise("54000", "requested character too large for encoding: {code}") }
+	if code >= 0xd800 && code <= 0xdfff { try pgRaise("54000", "requested character not valid for encoding: {code}") }
 	return FromStr(TextOid, glyph.RuneStr(i32(code)))
 }
 
@@ -241,13 +246,13 @@ fn formatString(args []Datum) !str {
 				i += 1
 			} else { i -= 1 }
 		}
-		if i >= len(format) { fail "unterminated format specifier" }
-		if arg <= 0 || arg >= len(args) { fail "too few arguments for format" }
+		if i >= len(format) { try pgRaiseHint("22023", "unterminated format() type specifier", "For a single \"%\" use \"%%\".") }
+		if arg <= 0 || arg >= len(args) { try pgRaise("22023", "too few arguments for format()") }
 		let v = args[arg]
 		if format[i] == 's' { if !IsNull(v) { out += v.Text() } } else if format[i] == 'I' {
-			if IsNull(v) { fail "null values cannot be formatted as an SQL identifier" }
+			if IsNull(v) { try pgRaise("22023", "null values cannot be formatted as an SQL identifier") }
 			out += quoteIdent(v.Text())
-		} else if format[i] == 'L' { if IsNull(v) { out += "NULL" } else { out += quoteLiteral(v.Text()) } } else { fail "unsupported format specifier" }
+		} else if format[i] == 'L' { if IsNull(v) { out += "NULL" } else { out += quoteLiteral(v.Text()) } } else { try pgRaiseHint("22023", "unrecognized format() type specifier \"{str(format[i])}\"", "For a single \"%\" use \"%%\".") }
 		arg += 1
 		i += 1
 	}
@@ -258,23 +263,55 @@ fn encodeBytes(value Datum, format str) !Datum {
 	if format == "hex" { return FromStr(TextOid, seal.Hex(value.bytes)) }
 	if format == "base64" { return FromStr(TextOid, seal.B64(value.bytes)) }
 	if format == "escape" { return FromStr(TextOid, byteaEscape(value.bytes)) }
-	fail "unrecognized encoding: {format}"
+	try pgRaise("22023", "unrecognized encoding: \"{format}\"")
+	return Null()
 }
 
 fn decodeBytes(value str, format str) !Datum {
 	if format == "hex" {
-		let decoded = try seal.HexDecode(value)
+		let decoded = seal.HexDecode(value) catch _ { return try hexDecodeFault(value) }
 		return FromBytes(ByteaOid, decoded)
 	}
 	if format == "base64" {
-		let decoded = try seal.B64Decode(value)
+		let decoded = seal.B64Decode(value) catch _ { return try base64DecodeFault(value) }
 		return FromBytes(ByteaOid, decoded)
 	}
 	if format == "escape" {
 		let decoded = try parse_bytea(value)
 		return FromBytes(ByteaOid, decoded)
 	}
-	fail "unrecognized encoding: {format}"
+	try pgRaise("22023", "unrecognized encoding: \"{format}\"")
+	return Null()
+}
+
+// hexDecodeFault reports the first byte that is not a hexadecimal digit, as
+// PostgreSQL's hex_decode_safe does.
+fn hexDecodeFault(value str) !Datum {
+	for i in 0..len(value) {
+		let c = value[i]
+		if !isHexDigit(c) { try pgRaise("22023", "invalid hexadecimal digit: \"{str(c)}\"") }
+		_ = i
+	}
+	try pgRaise("22023", "invalid hexadecimal digit: \"{value}\"")
+	return Null()
+}
+
+fn isHexDigit(c u8) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+fn base64DecodeFault(value str) !Datum {
+	for i in 0..len(value) {
+		let c = value[i]
+		if !isBase64Symbol(c) && c != '=' { try pgRaise("22023", "invalid symbol \"{str(c)}\" found while decoding base64 sequence") }
+		_ = i
+	}
+	try pgRaise("22023", "invalid base64 end sequence")
+	return Null()
+}
+
+fn isBase64Symbol(c u8) bool {
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '+' || c == '/'
 }
 
 fn byteaEscape(bytes []u8) str {

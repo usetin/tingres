@@ -240,6 +240,10 @@ fn goldenCheck(t mut crucible.T, expression str, want str) {
 		return
 	}
 	let text = got.Text()
+	if IsNull(got) {
+		if "NULL" != want { t.Error("{expression}: got NULL, want {want}") }
+		return
+	}
 	if text != want { t.Error("{expression}: got {text}, want {want}") }
 }
 
@@ -286,4 +290,60 @@ fn TestFixedArityFastPaths(t mut crucible.T) {
 		}
 		crucible.Equal(mut t, "int4 + Call2", fast.Text(), "5")
 	}
+}
+
+// TestStringFunctionErrorsDifferential pins PostgreSQL 17's SQLSTATE-backed
+// messages for the string and format functions.
+fn TestStringFunctionErrorsDifferential(t mut crucible.T) {
+	goldenCheck(mut t, "chr(0)", "ERROR: null character not permitted")
+	goldenCheck(mut t, "chr(-1)", "ERROR: character number must be positive")
+	goldenCheck(mut t, "chr(1114112)", "ERROR: requested character too large for encoding: 1114112")
+	goldenCheck(mut t, "chr(55296)", "ERROR: requested character not valid for encoding: 55296")
+	goldenCheck(mut t, "split_part('a,b', ',', 0)", "ERROR: field position must not be zero")
+	goldenCheck(mut t, "decode('zz', 'hex')", `ERROR: invalid hexadecimal digit: "z"`)
+	goldenCheck(mut t, "decode('!!', 'base64')", `ERROR: invalid symbol "!" found while decoding base64 sequence`)
+	goldenCheck(mut t, "encode('\\x01'::bytea, 'nope')", `ERROR: unrecognized encoding: "nope"`)
+	goldenCheck(mut t, "format('%s')", "ERROR: too few arguments for format()")
+	goldenCheck(mut t, "format('%d', 1)", `ERROR: unrecognized format() type specifier "d"`)
+	goldenCheck(mut t, "format('%')", "ERROR: unterminated format() type specifier")
+	goldenCheck(mut t, "lpad('hi', 5)", "   hi")
+	goldenCheck(mut t, "rpad('hi', 5)", "hi   ")
+	goldenCheck(mut t, "trim('  x  ')", "x")
+	goldenCheck(mut t, "left('abc', -1)", "ab")
+	goldenCheck(mut t, "right('abc', -1)", "bc")
+	goldenCheck(mut t, "repeat('ab', 3)", "ababab")
+	goldenCheck(mut t, "substring('abcdef', 2, 3)", "bcd")
+	goldenCheck(mut t, "to_hex(255)", "ff")
+	goldenCheck(mut t, "quote_ident('')", `""`)
+	goldenCheck(mut t, "quote_ident('A')", `"A"`)
+}
+
+// TestRegexNewlineSensitivity pins PostgreSQL's default non-newline-sensitive
+// matching (dot matches newline) and the 'n' option.
+fn TestRegexNewlineSensitivity(t mut crucible.T) {
+	let twoLines = "a\nb"
+	goldenCheck(mut t, "regexp_match('a\nb', 'a.b')", "{{\"a\nb\"}}")
+	goldenCheck(mut t, "regexp_match('a\nb', 'a.b', 'n')", "NULL")
+	goldenCheck(mut t, "regexp_match('a\nb', '^b')", "NULL")
+	goldenCheck(mut t, "regexp_match('a\nb', '^b', 'n')", `{b}`)
+	goldenCheck(mut t, "regexp_match('a', 'a', 'z')", `ERROR: invalid regular expression option: "z"`)
+	goldenCheck(mut t, "regexp_match('a', 'a', 'g')", `ERROR: regexp_match() does not support the "global" option`)
+	goldenCheck(mut t, "regexp_split_to_array('a', 'a', 'g')", `ERROR: regexp_split_to_array() does not support the "global" option`)
+	goldenCheck(mut t, "regexp_like('a', 'a', 'g')", `ERROR: regexp_like() does not support the "global" option`)
+	_ = twoLines
+}
+
+// TestRegexUnsupportedOptions documents the options PostgreSQL accepts but this
+// engine refuses with 0A000 (it never silently changes semantics).
+fn TestRegexUnsupportedOptions(t mut crucible.T) {
+	regexFault(mut t, "regexp_match('a b', 'a x b', 'x')", "0A000")
+	regexFault(mut t, "regexp_match('ab', 'a(?:b)', 'e')", "0A000")
+}
+
+fn regexFault(t mut crucible.T, expression str, wantCode str) {
+	let got = evalGoldenExpression(expression) catch err {
+		if ErrorCode(err) != wantCode { t.Error("{expression}: got SQLSTATE {ErrorCode(err)} ({ErrorMessage(err)}), want {wantCode}") }
+		return
+	}
+	t.Error("{expression}: got {got.Text()}, want SQLSTATE {wantCode}")
 }
