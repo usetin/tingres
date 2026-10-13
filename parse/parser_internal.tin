@@ -70,6 +70,13 @@ fn (p mut Parser) parseIdentifier() !Identifier {
 	return Identifier{Pos: token.Pos, Name: decoded.Name, Quoted: decoded.Quoted}
 }
 
+fn (p mut Parser) parseLabelIdentifier() !Identifier {
+	if p.done() || (p.kind() != "quoted" && p.kind() != "word") { try p.errorHere() }
+	let token = p.take()
+	let decoded = decodeIdentifier(token.Text)
+	return Identifier{Pos: token.Pos, Name: decoded.Name, Quoted: decoded.Quoted}
+}
+
 fn (p mut Parser) parseQualifiedName() !QualifiedName {
 	mut start = 0
 	if !p.done() { start = p.Tokens[p.At].Pos }

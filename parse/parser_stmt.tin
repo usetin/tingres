@@ -212,7 +212,7 @@ fn (p mut Parser) parseTargetList() ![]TargetEntry {
 		if !p.done() { pos = p.Tokens[p.At].Pos }
 		let value = try p.parseExpression(0)
 		mut alias ?Identifier = nil
-		if p.eat("as") { alias = try p.parseIdentifier() } else if p.canBeIdentifier() && !isSelectClause(p.text()) { alias = try p.parseIdentifier() }
+		if p.eat("as") { alias = try p.parseLabelIdentifier() } else if p.canBeIdentifier() && !isSelectClause(p.text()) { alias = try p.parseIdentifier() }
 		targets = append(targets, TargetEntry{Pos: pos, Value: value, Alias: alias})
 		if !p.eat(",") { break }
 	}
@@ -306,11 +306,11 @@ fn (p mut Parser) parseFromAtom(lateral bool) !FromItem {
 fn (p mut Parser) parseAlias() !?AliasClause {
 	mut alias ?AliasClause = nil
 	if p.eat("as") {
-		let name = try p.parseIdentifier()
+		let name = try p.parseLabelIdentifier()
 		let columns = try p.parseOptionalAliasColumns()
 		alias = AliasClause{Pos: name.Pos, Name: name, Columns: columns}
 	} else if p.canBeIdentifier() && !isFromClause(p.text()) {
-		let name = try p.parseIdentifier()
+		let name = try p.parseLabelIdentifier()
 		let columns = try p.parseOptionalAliasColumns()
 		alias = AliasClause{Pos: name.Pos, Name: name, Columns: columns}
 	}

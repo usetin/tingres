@@ -122,3 +122,30 @@ fn exprKind(value Expr) str {
 		_ => "other"
 	}
 }
+
+fn TestPostgresKeywordClassesAndLexicalForms(t mut crucible.T) {
+	let tokens = lex("SELECT user AS user, between, int, \"MixedCase\", U&\"d\\0061t\", E'it\\'s', $tag$semi;colon$tag$, $2, 1_000, 1.25e-3, ::, :=, =>, ..") catch err {
+		t.Error("PostgreSQL lexical forms rejected: {err}")
+		return
+	}
+	crucible.EqS("reserved SELECT", tokens[0].KeywordClass, "reserved")
+	crucible.EqS("reserved USER", tokens[1].KeywordClass, "reserved")
+	crucible.EqS("col_name BETWEEN", tokens[5].KeywordClass, "col_name")
+	crucible.EqS("col_name INT", tokens[7].KeywordClass, "col_name")
+	crucible.EqS("quoted identifier", tokens[9].Kind, "quoted")
+	crucible.EqS("Unicode escaped identifier", decodeIdentifier(tokens[11].Text).Name, "dat")
+	crucible.EqS("escaped string", tokens[13].Kind, "string")
+	crucible.EqS("dollar quoted string", tokens[15].Kind, "string")
+	crucible.EqS("numbered parameter", tokens[17].Kind, "param")
+	crucible.EqS("underscore numeric", tokens[19].Kind, "number")
+	crucible.EqI("first token character position", tokens[0].Pos, 1)
+}
+
+fn TestReservedWordColumnLabel(t mut crucible.T) {
+	let statements = Parse("SELECT 1 AS user") catch err {
+		t.Error("reserved column label rejected: {err}")
+		return
+	}
+	crucible.EqI("one statement", len(statements), 1)
+	crucible.EqS("reserved label preserved", Deparse(statements[0]), "SELECT 1 AS user")
+}

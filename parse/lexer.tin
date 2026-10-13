@@ -27,14 +27,16 @@ fn lowerAscii(s str) str {
 	return out
 }
 
+const pgReservedWords = "all analyse analyze and any array as asc asymmetric both case cast check collate column constraint create current_catalog current_date current_role current_time current_timestamp current_user default deferrable desc distinct do else end except false fetch for foreign from grant group having in initially intersect into lateral leading limit localtime localtimestamp not null offset on only or order placing primary references returning select session_user some symmetric system_user table then to trailing true union unique user using variadic when where window with"
+const pgUnreservedWords = "abort absent absolute access action add admin after aggregate also alter always asensitive assertion assignment at atomic attach attribute backward before begin breadth by cache call called cascade cascaded catalog chain characteristics checkpoint class close cluster columns comment comments commit committed compression conditional configuration conflict connection constraints content continue conversion copy cost csv cube current cursor cycle data database day deallocate declare defaults deferred definer delete delimiter delimiters depends depth detach dictionary disable discard document domain double drop each empty enable encoding encrypted enum error escape event exclude excluding exclusive execute explain expression extension external family filter finalize first following force format forward function functions generated global granted groups handler header hold hour identity if immediate immutable implicit import include including increment indent index indexes inherit inherits inline input insensitive insert instead invoker isolation keep key keys label language large last leakproof level listen load local location lock locked logged mapping match matched materialized maxvalue merge method minute minvalue mode month move name names nested new next nfc nfd nfkc nfkd no normalized nothing notify nowait nulls object of off oids old omit operator option options ordinality others over overriding owned owner parallel parameter parser partial partition passing password path plan plans policy preceding prepare prepared preserve prior privileges procedural procedure procedures program publication quote quotes range read reassign recheck recursive ref referencing refresh reindex relative release rename repeatable replace replica reset restart restrict return returns revoke role rollback rollup routine routines rows rule savepoint scalar schema schemas scroll search second security sequence sequences serializable server session set sets share show simple skip snapshot source sql stable standalone start statement statistics stdin stdout storage stored strict string strip subscription support sysid system tables tablespace target temp template temporary text ties transaction transform trigger truncate trusted type types uescape unbounded uncommitted unconditional unencrypted unknown unlisten unlogged until update vacuum valid validate validator value varying version view views volatile whitespace within without work wrapper write xml year yes zone"
+const pgColumnNameWords = "between bigint bit boolean char character coalesce dec decimal exists extract float greatest grouping inout int integer interval json json_array json_arrayagg json_exists json_object json_objectagg json_query json_scalar json_serialize json_table json_value least merge_action national nchar none normalize nullif numeric out overlay position precision real row setof smallint substring time timestamp treat trim values varchar xmlattributes xmlconcat xmlelement xmlexists xmlforest xmlnamespaces xmlparse xmlpi xmlroot xmlserialize xmltable"
+const pgTypeFunctionWords = "authorization binary collation concurrently cross current_schema freeze full ilike inner is isnull join left like natural notnull outer overlaps right similar tablesample verbose"
+
 fn keywordClass(word str) str {
-	if inWords(word, "all analyse analyze and any array as asc asymmetric both case cast check collate column constraint create current_catalog current_date current_role current_time current_timestamp current_user default deferrable desc distinct do else end except false fetch for foreign from grant group having in initially intersect into lateral leading limit localtime localtimestamp not null offset on only or order placing primary references returning select session_user some symmetric table then to trailing true union unique user using variadic when where window with") { return "reserved" }
-	if inWords(word, "authorization binary cross current_schema freeze full ilike inner is isnull join left like natural notnull outer overlaps placing right similar tablesample verbose") { return "type_func" }
-	if inWords(word, "between bigserial bit boolean char character coalesce dec decimal exists extract float greatest groups json json_array json_object least national nchar none normalize nullif numeric overlay position precision real row smallserial serial substring time timestamp treat trim values varchar xml") { return "type_func" }
-	if inWords(word, "array_avg array_max array_min array_sum bool_and bool_or count every max min stddev stddev_pop stddev_samp sum variance var_pop var_samp") { return "type_func" }
-	if inWords(word, "abort absolute access action add admin after aggregate also alter always assert_asymmetric assertion assignment at attach attribute backward before begin by cache call called cascade cascaded catalog chain char_length characteristics check_point checkpoint class close cluster coalesce collations collate column columns comment comments commit committed completion concurrent concurrently configuration connection constraint constraints content continue conversion convert copy cost cpu cursor cycle data database day deallocate dec declare default defaults deferred definer delete delimiter delimiters depends depth dereference describe descriptor detach dictionary disable discard disconnect document domain double drop each element enable encoding encrypted enum escape event exclude exclude first following force force_generic_plan forward generated global granted greatest handler header hold hour identity if immediate immutable implicit index indexes inherit inherits inheritance initially inline input insensitive insert instead invoker is nothing key label language large last lateral leading least level listen load local location lock locked logged mapping match materialized maxvalue method minute minvalue mode month names national nchar new next no none normalize notify nowait nullif nulls object of off oids old operator option options ordinality others out output over overriding owned owner parallel parameter parser partial partition passing password plans preceding preserve prepare prepared primary prior privileges procedural procedure procedures program publication quote range read reassign recheck recursive ref refresh reindex relative release rename repeatable replica reset restart restrict role rollback rollup routine row rows rule savepoint schema scroll search second security sequence sequences serializable server session set sets setof share show similar simple skip snapshot sql stable standalone start statement statistics stdin stdout storage strict strip subscription support symmetric sysid system tables temp template temporary text ties time timestamp to transaction transform treat trigger truncate trusted type types unbounded uncommitted unencrypted unknown unlisten unlogged until update vacuum valid validate validator value values variable verbose version view views volatile whitelist within without work wrapper write xml year zone") { return "unreserved" }
-	if inWords(word, "authorization boolean char character coalesce dec decimal exists extract float greatest int integer json least national nchar numeric overlay position precision real row smallint substring time timestamp trim varchar") { return "type_func" }
-	if inWords(word, "between bigserial bit boolean char character coalesce dec decimal exists extract float greatest int integer json least national nchar numeric overlay position precision real row smallint substring time timestamp trim varchar") { return "col_name" }
+	if inWords(word, pgReservedWords) { return "reserved" }
+	if inWords(word, pgUnreservedWords) { return "unreserved" }
+	if inWords(word, pgColumnNameWords) { return "col_name" }
+	if inWords(word, pgTypeFunctionWords) { return "type_func" }
 	return ""
 }
 
@@ -148,6 +150,7 @@ fn lex(sql str) ![]Token {
 		}
 		if c == 36 {
 			let dollarEnd = scanDollar(sql, start)
+			if dollarEnd == -2 { fail syntaxMessage(sql, start, "unterminated dollar-quoted string at or near \"{sql[start:]}\"") }
 			if dollarEnd > start {
 				at = dollarEnd
 				let raw = sql[start:at]
@@ -236,7 +239,9 @@ fn scanQuoted(sql str, start i64, quote u8, escapes bool) i64 {
 fn scanDollar(sql str, start i64) i64 {
 	let n = len(sql)
 	mut tagEnd = start + 1
-	for tagEnd < n && (isLetter(sql[tagEnd]) || isDigit(sql[tagEnd])) { tagEnd += 1 }
+	if tagEnd >= n || !(isLetter(sql[tagEnd]) || sql[tagEnd] == 95) { return -1 }
+	tagEnd += 1
+	for tagEnd < n && (isLetter(sql[tagEnd]) || isDigit(sql[tagEnd]) || sql[tagEnd] == 95) { tagEnd += 1 }
 	if tagEnd >= n || sql[tagEnd] != 36 { return -1 }
 	let marker = sql[start:tagEnd + 1]
 	let contentStart = tagEnd + 1
@@ -266,6 +271,10 @@ fn scanOperator(sql str, start i64) i64 {
 }
 
 fn decodeIdentifier(raw str) Identifier {
+	if len(raw) >= 4 && (raw[0] == 85 || raw[0] == 117) && raw[1] == 38 && raw[2] == 34 {
+		let body = raw[3:len(raw) - 1]
+		return Identifier{Name: decodeUnicodeIdentifier(body), Quoted: true}
+	}
 	if len(raw) >= 2 && raw[0] == 34 {
 		let body = raw[1:len(raw) - 1]
 		mut value = ""
@@ -282,6 +291,44 @@ fn decodeIdentifier(raw str) Identifier {
 		return Identifier{Name: value, Quoted: true}
 	}
 	return Identifier{Name: lowerAscii(raw), Quoted: false}
+}
+
+fn decodeUnicodeIdentifier(body str) str {
+	mut value = ""
+	mut at = 0
+	for at < len(body) {
+		if body[at] == 92 && at + 1 < len(body) {
+			if body[at + 1] == 92 {
+				value += "\\"
+				at += 2
+				continue
+			}
+			mut digits = 4
+			mut digitAt = at + 1
+			if body[digitAt] == 43 {
+				digits = 6
+				digitAt += 1
+			}
+			if digitAt + digits <= len(body) {
+				let codepoint = parseHexCode(body[digitAt:digitAt + digits])
+				value += str(i32(codepoint))
+				at = digitAt + digits
+				continue
+			}
+		}
+		value += str(body[at])
+		at += 1
+	}
+	return value
+}
+
+fn parseHexCode(s str) i64 {
+	mut value = 0
+	for _, c in s {
+		value *= 16
+		if c >= '0' && c <= '9' { value += i64(c - '0') } else if c >= 'a' && c <= 'f' { value += i64(c - 'a') + 10 } else if c >= 'A' && c <= 'F' { value += i64(c - 'A') + 10 }
+	}
+	return value
 }
 
 fn upperAscii(s str) str {
