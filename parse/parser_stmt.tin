@@ -24,6 +24,14 @@ fn parseStatement(sql str, tokens []Token) !Stmt {
 	} else if first == "begin" || first == "start" || first == "commit" || first == "end" || first == "rollback" || first == "abort" || first == "savepoint" || first == "release" {
 		let value = try p.parseTransaction()
 		statement = Stmt.Transaction(value)
+	} else if first == "alter" {
+		let value = try p.parseAlterTable()
+		statement = Stmt.AlterTable(value)
+	} else if first == "drop" {
+		statement = try p.parseDrop()
+	} else if first == "truncate" {
+		let value = try p.parseTruncate()
+		statement = Stmt.Truncate(value)
 	} else if first == "checkpoint" {
 		p.At += 1
 		statement = Stmt.Checkpoint(CheckpointStmt{Pos: tokens[0].Pos})
@@ -93,12 +101,10 @@ fn (p mut Parser) parseSelectAfterWith(withClause ?WithClause, pos i64) !SelectS
 		if p.text() != "row" && p.text() != "rows" { fetchCount = try p.parseExpression(0) }
 		p.eat("row")
 		p.eat("rows")
-		try p.expect("only")
-		fetch = direction + " only"
-		if p.eat("with") {
+		if p.eat("only") { fetch = direction + " only" } else if p.eat("with") {
 			try p.expect("ties")
 			fetch = direction + " with ties"
-		}
+		} else { try p.errorHere() }
 	}
 	for p.eat("for") {
 		let lockPos = p.Tokens[p.At - 1].Pos
@@ -147,6 +153,11 @@ fn (p mut Parser) parseQueryBody(minPrecedence i64) !QueryBody {
 }
 
 fn (p mut Parser) parseQueryAtom() !QueryBody {
+	if p.eat("(") {
+		let body = try p.parseQueryBody(0)
+		try p.expect(")")
+		return body
+	}
 	if p.eat("select") {
 		let core = try p.parseSelectCore(p.Tokens[p.At - 1].Pos)
 		return QueryBody.Core(core)
@@ -551,61 +562,7 @@ fn (p mut Parser) parseDelete(withClause ?WithClause) !DeleteStmt {
 }
 
 fn (p mut Parser) parseCreate() !Stmt {
-	let pos = p.Tokens[p.At].Pos
-	try p.expect("create")
-	mut temporary = ""
-	if p.eat("temp") { temporary = "temp" } else if p.eat("temporary") { temporary = "temporary" } else if p.eat("unlogged") { temporary = "unlogged" }
-	if !p.eat("table") { fail unsupportedMessage(p.Source, p.pos(), "CREATE statement") }
-	mut ifNotExists = false
-	if p.eat("if") {
-		try p.expect("not")
-		try p.expect("exists")
-		ifNotExists = true
-	}
-	let table = try p.parseQualifiedName()
-	mut elements = []TableElement{}
-	if p.eat("(") {
-		for {
-			let elementPos = p.pos()
-			if p.eat("constraint") {
-				let name = try p.parseIdentifier()
-				let constraint = try p.parseTableConstraint(elementPos, name)
-				elements = append(elements, TableElement.Constraint(constraint))
-			} else if p.text() == "primary" || p.text() == "unique" || p.text() == "check" || p.text() == "foreign" {
-				let constraint = try p.parseTableConstraint(elementPos, nil)
-				elements = append(elements, TableElement.Constraint(constraint))
-			} else {
-				let column = try p.parseColumnDef()
-				elements = append(elements, TableElement.Column(column))
-			}
-			if !p.eat(",") { break }
-		}
-		try p.expect(")")
-	}
-	mut inherits = []QualifiedName{}
-	if p.eat("inherits") {
-		try p.expect("(")
-		for {
-			let parent = try p.parseQualifiedName()
-			inherits = append(inherits, parent)
-			if !p.eat(",") { break }
-		}
-		try p.expect(")")
-	}
-	mut asQuery ?SelectStmt = nil
-	mut withData = true
-	if p.eat("as") {
-		asQuery = try p.parseSelect()
-		if p.eat("with") {
-			try p.expect("no")
-			try p.expect("data")
-			withData = false
-		} else if p.eat("with") {
-			try p.expect("data")
-		}
-	}
-	let value = CreateTableStmt{Pos: pos, Temporary: temporary, IfNotExists: ifNotExists, Table: table, Elements: elements, Inherits: inherits, AsQuery: asQuery, WithData: withData}
-	return Stmt.CreateTable(value)
+	return try p.parseCreateStatement()
 }
 
 fn (p mut Parser) parseColumnDef() !ColumnDef {

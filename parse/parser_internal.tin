@@ -5,6 +5,7 @@ type Parser struct {
 	Tokens []Token
 	At i64
 	Depth i64
+	StopWord str
 }
 
 fn (p Parser) done() bool { return p.At >= len(p.Tokens) }
