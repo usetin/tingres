@@ -11,6 +11,7 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 			try p.expect("zone")
 			name = "time zone"
 		} else {
+			if p.done() { try p.errorHere() }
 			name = lowerAscii(p.take().Text)
 			for p.eat(".") {
 				name += "." + lowerAscii(p.take().Text)
@@ -26,6 +27,7 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 			try p.expect("zone")
 			name = "time zone"
 		} else {
+			if p.done() { try p.errorHere() }
 			name = lowerAscii(p.take().Text)
 			for p.eat(".") {
 				name += "." + lowerAscii(p.take().Text)
@@ -65,6 +67,7 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 		return VariableSetStmt{Pos: pos, Kind: "set", Scope: scope, Name: name, Values: values, Default: isDefault, Local: local}
 	}
 
+	if p.done() || (p.kind() != "word" && p.kind() != "quoted") { try p.errorHere() }
 	name = lowerAscii(p.take().Text)
 	for p.eat(".") {
 		name += "." + lowerAscii(p.take().Text)
@@ -359,6 +362,7 @@ fn (p mut Parser) parseAnalyze() !AnalyzeStmt {
 fn (p mut Parser) parseDiscard() !DiscardStmt {
 	let pos = p.pos()
 	try p.expect("discard")
+	if p.done() { try p.errorHere() }
 	let target = lowerAscii(p.take().Text)
 	return DiscardStmt{Pos: pos, Target: target}
 }
@@ -383,6 +387,7 @@ fn (p mut Parser) parseGrant() !GrantStmt {
 	try p.expect("grant")
 	mut privs = []str{}
 	for {
+		if p.done() || lowerAscii(p.text()) == "on" { try p.errorHere() }
 		if p.eat("all") {
 			p.eat("privileges")
 			privs = append(privs, "all")
@@ -446,6 +451,7 @@ fn (p mut Parser) parseRevoke() !RevokeStmt {
 	}
 	mut privs = []str{}
 	for {
+		if p.done() || lowerAscii(p.text()) == "on" { try p.errorHere() }
 		if p.eat("all") {
 			p.eat("privileges")
 			privs = append(privs, "all")

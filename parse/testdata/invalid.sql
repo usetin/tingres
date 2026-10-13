@@ -1,218 +1,475 @@
 SELECT 1a
+@@
 SELECT 1b
+@@
 SELECT 1c
+@@
 SELECT 1d
+@@
 SELECT 1e
+@@
 SELECT 1f
+@@
 SELECT 1g
+@@
 SELECT 1h
+@@
 SELECT 1i
+@@
 SELECT 1j
+@@
 SELECT 1k
+@@
 SELECT 1l
+@@
 SELECT 1m
+@@
 SELECT 1n
+@@
 SELECT 1o
+@@
 SELECT 'unterminated_string_0
+@@
 SELECT 'unterminated_string_1
+@@
 SELECT 'unterminated_string_2
+@@
 SELECT 'unterminated_string_3
+@@
 SELECT 'unterminated_string_4
+@@
 SELECT 'unterminated_string_5
+@@
 SELECT 'unterminated_string_6
+@@
 SELECT 'unterminated_string_7
+@@
 SELECT 'unterminated_string_8
+@@
 SELECT 'unterminated_string_9
+@@
 SELECT 'unterminated_string_10
+@@
 SELECT 'unterminated_string_11
+@@
 SELECT 'unterminated_string_12
+@@
 SELECT 'unterminated_string_13
+@@
 SELECT 'unterminated_string_14
+@@
 SELECT "unterminated_ident_0
+@@
 SELECT "unterminated_ident_1
+@@
 SELECT "unterminated_ident_2
+@@
 SELECT "unterminated_ident_3
+@@
 SELECT "unterminated_ident_4
+@@
 SELECT "unterminated_ident_5
+@@
 SELECT "unterminated_ident_6
+@@
 SELECT "unterminated_ident_7
+@@
 SELECT "unterminated_ident_8
+@@
 SELECT "unterminated_ident_9
+@@
 SELECT "unterminated_ident_10
+@@
 SELECT "unterminated_ident_11
+@@
 SELECT "unterminated_ident_12
+@@
 SELECT "unterminated_ident_13
+@@
 SELECT "unterminated_ident_14
+@@
 SELECT 0 /* unclosed comment 0
+@@
 SELECT 1 /* unclosed comment 1
+@@
 SELECT 2 /* unclosed comment 2
+@@
 SELECT 3 /* unclosed comment 3
+@@
 SELECT 4 /* unclosed comment 4
+@@
 SELECT 5 /* unclosed comment 5
+@@
 SELECT 6 /* unclosed comment 6
+@@
 SELECT 7 /* unclosed comment 7
+@@
 SELECT 8 /* unclosed comment 8
+@@
 SELECT 9 /* unclosed comment 9
+@@
 SELECT $tag$body_without_closing_0
+@@
 SELECT $tag$body_without_closing_1
+@@
 SELECT $tag$body_without_closing_2
+@@
 SELECT $tag$body_without_closing_3
+@@
 SELECT $tag$body_without_closing_4
+@@
 SELECT $tag$body_without_closing_5
+@@
 SELECT $tag$body_without_closing_6
+@@
 SELECT $tag$body_without_closing_7
+@@
 SELECT $tag$body_without_closing_8
+@@
 SELECT $tag$body_without_closing_9
-SELECT
+@@
 SELECT 1 +
+@@
 SELECT 1 -
+@@
 SELECT 1 *
+@@
 SELECT 1 /
+@@
 SELECT 1 %
-SELECT 1 AND
-SELECT 1 OR
+@@
 SELECT 1 =
+@@
 SELECT 1 !=
+@@
 SELECT 1 <
+@@
 SELECT 1 >
+@@
 SELECT 1 <=
+@@
 SELECT 1 >=
-SELECT 1 IS
+@@
 SELECT 1 IS NOT
-SELECT 1 LIKE
-SELECT 1 ILIKE
-SELECT 1 BETWEEN
-SELECT 1 IN
+@@
 SELECT * FROM
+@@
 SELECT 1 WHERE
+@@
 SELECT 1 ORDER BY
+@@
 SELECT 1 GROUP BY
+@@
 SELECT 1 HAVING
+@@
 SELECT 1 LIMIT
+@@
 SELECT 1 OFFSET
+@@
 SELECT 1 UNION
+@@
 SELECT 1 INTERSECT
+@@
 SELECT 1 EXCEPT
+@@
 INSERT INTO
+@@
 INSERT INTO t VALUES
+@@
 UPDATE t SET
+@@
 DELETE FROM
+@@
 CREATE TABLE
+@@
 ALTER TABLE
+@@
 DROP TABLE
+@@
 CREATE INDEX
+@@
 CREATE VIEW
+@@
 TRUNCATE
+@@
 SELECT FROM
+@@
 SELECT WHERE
+@@
 SELECT GROUP
+@@
 SELECT ORDER
+@@
 SELECT HAVING
+@@
 SELECT LIMIT
+@@
 SELECT OFFSET
+@@
 SELECT ,
+@@
 SELECT 1,
+@@
 SELECT , 1
+@@
 SELECT 1,, 2
+@@
 SELECT 1 2
+@@
 SELECT (1,)
+@@
 SELECT )
+@@
 SELECT 1)
+@@
 SELECT 1 + * 2
+@@
 SELECT 1 / / 2
+@@
 SELECT 1 AND OR 2
+@@
 SELECT 1 OR AND 2
-SELECT 1 NOT NOT 2
+@@
 SELECT 1 IS DISTINCT
+@@
 SELECT 1 BETWEEN AND 2
+@@
 SELECT 1 IN ()
-SELECT 1 LIKE ESCAPE
+@@
 SELECT 1::
-SELECT 1 COLLATE
+@@
 SELECT 1 AT TIME
+@@
 SELECT CASE WHEN THEN 1 END
+@@
 SELECT CASE WHEN 1 THEN ELSE 2 END
+@@
 SELECT CASE END
+@@
 SELECT CAST()
+@@
 SELECT CAST(1)
+@@
 SELECT CAST(1 AS)
+@@
 SELECT EXTRACT()
+@@
 SELECT EXTRACT(year)
-SELECT SUBSTRING()
+@@
 SELECT POSITION()
+@@
 SELECT TRIM()
-SELECT OVERLAY()
+@@
 SELECT * FROM t JOIN
+@@
 SELECT * FROM t ON
+@@
 SELECT * FROM t USING
-SELECT * FROM (SELECT 1)
+@@
 SELECT * FROM t WHERE
+@@
 SELECT * FROM t GROUP BY
+@@
 SELECT * FROM t HAVING
+@@
 SELECT * FROM t ORDER BY
+@@
 INSERT INTO VALUES (1)
+@@
 INSERT INTO t (a,) VALUES (1)
+@@
 INSERT INTO t VALUES (1,)
+@@
 INSERT INTO t DEFAULT
+@@
 UPDATE SET a = 1
+@@
 UPDATE t a = 1
+@@
 UPDATE t SET a =
+@@
 UPDATE t SET a = 1 WHERE
+@@
 DELETE WHERE a = 1
+@@
 DELETE FROM t WHERE
+@@
 CREATE TABLE (id int)
-CREATE TABLE t ()
-CREATE TABLE t (id)
+@@
 CREATE TABLE t (id int,)
+@@
 CREATE TABLE t (id int PRIMARY)
+@@
 CREATE TABLE t (id int CONSTRAINT)
+@@
 CREATE TABLE t (id int REFERENCES)
+@@
 CREATE TABLE t (id int GENERATED)
+@@
 CREATE TABLE t (id int GENERATED ALWAYS)
+@@
 ALTER TABLE ADD COLUMN c int
+@@
 ALTER TABLE t ADD
+@@
 ALTER TABLE t DROP
+@@
 ALTER TABLE t ALTER
+@@
 ALTER TABLE t RENAME
+@@
 DROP TABLE ,
+@@
 DROP INDEX
+@@
 DROP INDEX ,
+@@
 DROP VIEW
+@@
 DROP SEQUENCE
-CREATE INDEX ON t (a)
+@@
 CREATE INDEX idx ON (a)
+@@
 CREATE INDEX idx ON t ()
+@@
 CREATE VIEW AS SELECT 1
+@@
 CREATE VIEW v SELECT 1
-CREATE SEQUENCE START
+@@
 CREATE SEQUENCE s START
+@@
 CREATE SCHEMA AUTHORIZATION
+@@
 CREATE TYPE AS ENUM ('a')
-CREATE FUNCTION f() AS 'SELECT 1'
+@@
 TRUNCATE TABLE
+@@
 TRUNCATE TABLE t,
+@@
 BEGIN ISOLATION
+@@
 BEGIN TRANSACTION ISOLATION
+@@
 SET = 1
+@@
 SET work_mem
+@@
 RESET
+@@
 SHOW
+@@
 EXPLAIN (ANALYZE
+@@
 COPY FROM STDIN
+@@
 COPY t FROM
+@@
 PREPARE AS SELECT 1
+@@
 PREPARE q SELECT 1
+@@
 EXECUTE
-DEALLOCATE PREPARE
+@@
 VACUUM (
+@@
 ANALYZE (
+@@
 DISCARD
+@@
 COMMENT ON
+@@
 COMMENT ON TABLE
+@@
 GRANT ON t TO alice
+@@
 REVOKE ON t FROM alice
+@@
 LISTEN
+@@
 NOTIFY
+@@
 LOCK
+@@
 LOCK TABLE
+@@
 CALL
+@@
+SELECT 1,
+2,
+FROM t
+@@
+SELECT
+FROM
+@@
+SELECT 1
+WHERE
+@@
+INSERT INTO t
+VALUES
+@@
+UPDATE t SET
+a =
+@@
+SELECT 'é' +
+@@
+SELECT 'é'
+WHERE
+@@
+SELECT '日本' AND OR 2
+@@
+SELECT 'é' 1
+@@
+SELECT 1, 'é', FROM t
+@@
+SELECT 'é
+@@
+SELECT "café
+@@
+SELECT /* é */ 1 2
+@@
+SELECT 'é' AT TIME
+@@
+SELECT $tag$hi$tag$ 1
+@@
+SELECT $$hi$$ 1
+@@
+SELECT 1, $tag$hi$tag$, FROM t
+@@
+SELECT $tag$hi$tag$ WHERE
+@@
+SELECT 1 $tag$
+@@
+SELECT 'é'
++
+*
+@@
+CREATE TABLE tt (
+  id int,
+)
+@@
+SELECT (
+  1
+@@
+SELECT * FROM t
+JOIN
+@@
+ALTER TABLE t
+ADD COLUMN
+@@
+SELECT CASE
+  WHEN 1 THEN
+  END
+@@
+SELECT 1,
+'日本',
+) FROM t
+@@
+SELECT $x$a$x$ $x$b$x$ 2
+@@
+SELECT 1 AS
+@@
+WITH c AS (SELECT 1)
+SELECT
+ORDER BY
+@@
+SELECT 'é' COLLATE "C" WHERE
