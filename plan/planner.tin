@@ -81,6 +81,17 @@ fn costHashJoin(left Cost, right Cost, outRows f64, width i64) Cost {
 	}
 }
 
+fn costMergeJoin(left Cost, right Cost, outRows f64, width i64) Cost {
+	let startup = left.Startup + right.Startup
+	let total = left.Total + right.Total + (left.Rows + right.Rows) * CpuOperatorCost + outRows * CpuTupleCost
+	return Cost{
+		Startup: startup,
+		Total: total,
+		Rows: outRows,
+		Width: width,
+	}
+}
+
 fn costNestLoop(outer Cost, inner Cost, outRows f64, width i64) Cost {
 	let total = outer.Total + outer.Rows * inner.Total
 	return Cost{
@@ -970,6 +981,32 @@ fn planJoinPair(left Plan, leftRanges []i64, right Plan, rightRanges []i64, qual
 	let width = left.Cost().Width + right.Cost().Width
 	let cols = concatColDesc(left.Cols(), right.Cols())
 	if hasEqui {
+		// Merge join when both inputs already arrive ordered on the join keys
+		// (for example two ordered index scans) and it is cheaper than hashing.
+		mut lKeys = []SortKey{}
+		for e in leftKeys {
+			lKeys = append(lKeys, SortKey{Expr: e, Descending: false, NullsFirst: false})
+		}
+		mut rKeys = []SortKey{}
+		for e in rightKeys {
+			rKeys = append(rKeys, SortKey{Expr: e, Descending: false, NullsFirst: false})
+		}
+		if jt == JoinType.Inner && planProvidesOrder(left, lKeys) && planProvidesOrder(right, rKeys) {
+			let mergeCost = costMergeJoin(left.Cost(), right.Cost(), outRows, width)
+			let hashCost = costHashJoin(left.Cost(), right.Cost(), outRows, width)
+			if mergeCost.Total < hashCost.Total {
+				return Plan.MergeJoin(MergeJoinNode{
+					Left: left,
+					Right: right,
+					JoinType: jt,
+					LeftKeys: leftKeys,
+					RightKeys: rightKeys,
+					Quals: rest,
+					Cols: cols,
+					Cost: mergeCost,
+				})
+			}
+		}
 		let cost = costHashJoin(left.Cost(), right.Cost(), outRows, width)
 		return Plan.HashJoin(HashJoinNode{
 			Left: left,
