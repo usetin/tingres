@@ -29,7 +29,7 @@ regression suite   [..............................]  0.0%   (0 of 225 tests)
 SQL syntax        [#######################.......]  75.3%   (35114 of 46623 regression-suite statements parse)
 ```
 
-_Generated 2026-10-13 at commit `042cc01`. Unit-test counts ran on Darwin arm64; speed is Linux-only._
+_Generated 2026-10-13 at commit `b4114df`. Unit-test counts ran on Darwin arm64; speed is Linux-only._
 
 ### PostgreSQL compatibility
 
@@ -62,15 +62,15 @@ interleaved, fsync on, medians, with the ratio (above 1.0x means tingres is fast
 
 | package | lines of Tin | unit tests |
 |---|---:|---|
-| `types` | 4592 | 21 passing |
+| `types` | 5790 | 27 passing |
 | `parse` | 6002 | 15 passing |
-| `store` | 2007 | 8 passing |
+| `store` | 2260 | 8 passing |
 | `txn` | 1296 | 12 passing |
 | `catalog` | 408 | 2 passing |
 | `plan` | 2765 | 7 passing |
-| `exec` | 5273 | FAILING |
+| `exec` | 5317 | FAILING |
 | `proto` | 571 | 4 passing |
 | `server` | 141 | 1 passing |
-| **total** | **23055** | **70 passing**, 1 package(s) failing |
+| **total** | **24550** | **76 passing**, 1 package(s) failing |
 
 <!-- stats:end -->
