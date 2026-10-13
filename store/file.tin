@@ -78,6 +78,18 @@ fn (f mut RelationFiles) Create(rel RelId) ! {
 	f.sizes[u32(rel)] = 0
 }
 
+// Ensure creates the relation file only when it does not exist, keeping any content.
+fn (f mut RelationFiles) Ensure(rel RelId) ! {
+	if f.Exists(rel) {
+		return
+	}
+	let path = f.Path(rel)
+	try quarry.WriteFile(path, "")
+	try quarry.Sync(path)
+	try quarry.Sync(f.base)
+	f.sizes[u32(rel)] = 0
+}
+
 // ReadAt reads bytes at offset without changing a shared file cursor.
 fn (f RelationFiles) ReadAt(rel RelId, offset i64, out mut []u8) !i64 {
 	if offset < 0 {

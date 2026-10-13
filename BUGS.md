@@ -20,6 +20,11 @@
   `E020 UNEXPECTED: expected a name, found 'mut'` on the *next* member. Minimal repro:
   `shape s { mut A() !\nmut B() !i64 }`. Worked around in `proto/proto.tin` by giving the write methods an `!i64`
   result. Blocked file: `proto/proto.tin`.
+- NEEDS-TIN: positional file writes (`quarry.WriteAt(path, off, data)` backed by `pwrite`) and a durable
+  data-only sync (`quarry.DataSync(path)` backed by `fdatasync`) for `store/file.tin`. Tin exposes `quarry.Sync`
+  and positional `quarry.ReadAt` only through `tin2/sysprim`, with no `WriteAt`/`fdatasync` API. Until then
+  `store` rewrites a relation through a synced replacement file, which copies the whole relation on every page
+  write and is far too costly for a database buffer pool. Blocked file: `store/file.tin`.
 
 ## Compiler diagnostics that shaped the code (not bugs, but worth knowing)
 
