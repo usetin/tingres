@@ -1,0 +1,607 @@
+package parse
+
+fn (p mut Parser) parseVariableSet() !VariableSetStmt {
+	let pos = p.pos()
+	let first = lowerAscii(p.take().Text)
+	if first == "show" {
+		mut name = ""
+		if p.eat("all") {
+			name = "all"
+		} else if p.eat("time") {
+			try p.expect("zone")
+			name = "time zone"
+		} else {
+			name = lowerAscii(p.take().Text)
+			for p.eat(".") {
+				name += "." + lowerAscii(p.take().Text)
+			}
+		}
+		return VariableSetStmt{Pos: pos, Kind: "show", Scope: "", Name: name, Values: []Expr{}, Default: false, Local: false}
+	}
+	if first == "reset" {
+		mut name = ""
+		if p.eat("all") {
+			name = "all"
+		} else if p.eat("time") {
+			try p.expect("zone")
+			name = "time zone"
+		} else {
+			name = lowerAscii(p.take().Text)
+			for p.eat(".") {
+				name += "." + lowerAscii(p.take().Text)
+			}
+		}
+		return VariableSetStmt{Pos: pos, Kind: "reset", Scope: "", Name: name, Values: []Expr{}, Default: false, Local: false}
+	}
+
+	// first == "set"
+	mut scope = ""
+	mut local = false
+	if p.eat("session") {
+		scope = "session"
+	} else if p.eat("local") {
+		scope = "local"
+		local = true
+	}
+
+	mut name = ""
+	mut isDefault = false
+	mut values = []Expr{}
+
+	if p.eat("time") {
+		try p.expect("zone")
+		name = "time zone"
+		if !p.eat("to") {
+			p.eat("=")
+		}
+		if p.eat("default") {
+			isDefault = true
+		} else if p.eat("local") {
+			values = append(values, Expr.Literal(LiteralExpr{Pos: p.pos(), Kind: "word", Value: "local"}))
+		} else {
+			let val = try p.parseExpression(0)
+			values = append(values, val)
+		}
+		return VariableSetStmt{Pos: pos, Kind: "set", Scope: scope, Name: name, Values: values, Default: isDefault, Local: local}
+	}
+
+	name = lowerAscii(p.take().Text)
+	for p.eat(".") {
+		name += "." + lowerAscii(p.take().Text)
+	}
+
+	if !p.eat("to") {
+		p.eat("=")
+	}
+	if p.eat("default") {
+		isDefault = true
+	} else {
+		for {
+			let val = try p.parseExpression(0)
+			values = append(values, val)
+			if !p.eat(",") {
+				break
+			}
+		}
+	}
+	return VariableSetStmt{Pos: pos, Kind: "set", Scope: scope, Name: name, Values: values, Default: isDefault, Local: local}
+}
+
+fn (p mut Parser) parseExplain() !ExplainStmt {
+	let pos = p.pos()
+	try p.expect("explain")
+	mut options = []ExplainOption{}
+	if p.eat("(") {
+		for {
+			let optPos = p.pos()
+			let optName = lowerAscii(p.take().Text)
+			mut val ?Expr = nil
+			if !p.done() && p.text() != "," && p.text() != ")" {
+				let expr = try p.parseExpression(0)
+				val = expr
+			}
+			options = append(options, ExplainOption{Pos: optPos, Name: optName, Value: val})
+			if !p.eat(",") {
+				break
+			}
+		}
+		try p.expect(")")
+	} else {
+		for !p.done() {
+			let w = lowerAscii(p.text())
+			if w == "analyze" || w == "verbose" || w == "costs" || w == "buffers" || w == "timing" || w == "summary" {
+				let optPos = p.pos()
+				p.At += 1
+				options = append(options, ExplainOption{Pos: optPos, Name: w})
+			} else {
+				break
+			}
+		}
+	}
+	let stmt = try p.parseStatementDispatch()
+	return ExplainStmt{Pos: pos, Options: options, Statement: stmt}
+}
+
+fn (p mut Parser) parseCopy() !CopyStmt {
+	let pos = p.pos()
+	try p.expect("copy")
+	mut table ?QualifiedName = nil
+	mut query ?SelectStmt = nil
+	mut cols = []Identifier{}
+	if p.eat("(") {
+		let sel = try p.parseSelect()
+		try p.expect(")")
+		query = sel
+	} else {
+		let t = try p.parseQualifiedName()
+		table = t
+		if p.eat("(") {
+			cols = try p.parseIdentifierList(")")
+			try p.expect(")")
+		}
+	}
+	mut direction = ""
+	if p.eat("from") {
+		direction = "from"
+	} else if p.eat("to") {
+		direction = "to"
+	} else {
+		try p.errorHere()
+	}
+	mut source = ""
+	mut filename ?str = nil
+	mut program = false
+	if p.eat("stdin") {
+		source = "stdin"
+	} else if p.eat("stdout") {
+		source = "stdout"
+	} else if p.eat("program") {
+		program = true
+		source = "program"
+		let tok = p.take()
+		filename = tok.Text
+	} else if p.kind() == "string" || p.kind() == "quoted" || p.kind() == "word" {
+		source = "file"
+		let tok = p.take()
+		filename = tok.Text
+	} else {
+		try p.errorHere()
+	}
+	mut options = []CopyOption{}
+	p.eat("with")
+	if p.eat("(") {
+		for {
+			let optPos = p.pos()
+			let optName = lowerAscii(p.take().Text)
+			mut vals = []str{}
+			for !p.done() && p.text() != "," && p.text() != ")" {
+				vals = append(vals, p.take().Text)
+			}
+			options = append(options, CopyOption{Pos: optPos, Name: optName, Values: vals})
+			if !p.eat(",") {
+				break
+			}
+		}
+		try p.expect(")")
+	} else {
+		for !p.done() {
+			let optPos = p.pos()
+			let optName = lowerAscii(p.take().Text)
+			mut vals = []str{}
+			if optName == "delimiter" || optName == "null" || optName == "quote" || optName == "escape" {
+				p.eat("as")
+				if !p.done() {
+					vals = append(vals, p.take().Text)
+				}
+			} else if optName == "csv" {
+				for !p.done() {
+					let sub = lowerAscii(p.text())
+					if sub == "header" {
+						p.At += 1
+						vals = append(vals, "header")
+					} else if sub == "quote" || sub == "escape" || sub == "null" {
+						p.At += 1
+						p.eat("as")
+						vals = append(vals, sub)
+						if !p.done() {
+							vals = append(vals, p.take().Text)
+						}
+					} else {
+						break
+					}
+				}
+			}
+			options = append(options, CopyOption{Pos: optPos, Name: optName, Values: vals})
+			if p.done() || p.text() == ";" {
+				break
+			}
+		}
+	}
+	return CopyStmt{Pos: pos, Table: table, Query: query, Columns: cols, Direction: direction, Source: source, Filename: filename, Program: program, Options: options}
+}
+
+fn (p mut Parser) parsePrepare() !PrepareStmt {
+	let pos = p.pos()
+	try p.expect("prepare")
+	let name = try p.parseIdentifier()
+	mut paramTypes = []TypeName{}
+	if p.eat("(") {
+		if p.text() != ")" {
+			for {
+				let pt = try p.parseTypeName()
+				paramTypes = append(paramTypes, pt)
+				if !p.eat(",") {
+					break
+				}
+			}
+		}
+		try p.expect(")")
+	}
+	try p.expect("as")
+	let stmt = try p.parseStatementDispatch()
+	return PrepareStmt{Pos: pos, Name: name, ParameterTypes: paramTypes, Statement: stmt}
+}
+
+fn (p mut Parser) parseExecute() !ExecuteStmt {
+	let pos = p.pos()
+	try p.expect("execute")
+	let name = try p.parseIdentifier()
+	mut params = []Expr{}
+	if p.eat("(") {
+		if p.text() != ")" {
+			params = try p.parseExpressionList(")")
+		}
+		try p.expect(")")
+	}
+	return ExecuteStmt{Pos: pos, Name: name, Parameters: params}
+}
+
+fn (p mut Parser) parseDeallocate() !DeallocateStmt {
+	let pos = p.pos()
+	try p.expect("deallocate")
+	p.eat("prepare")
+	mut all = false
+	mut name ?Identifier = nil
+	if p.eat("all") {
+		all = true
+	} else {
+		let ident = try p.parseIdentifier()
+		name = ident
+	}
+	return DeallocateStmt{Pos: pos, Name: name, All: all}
+}
+
+fn (p mut Parser) parseVacuum() !VacuumStmt {
+	let pos = p.pos()
+	try p.expect("vacuum")
+	mut full = false
+	mut freeze = false
+	mut verbose = false
+	mut analyze = false
+	mut disablePageSkipping = false
+	mut parallelExpr ?Expr = nil
+	if p.eat("(") {
+		for {
+			if p.eat("full") {
+				full = true
+			} else if p.eat("freeze") {
+				freeze = true
+			} else if p.eat("verbose") {
+				verbose = true
+			} else if p.eat("analyze") {
+				analyze = true
+			} else if p.eat("disable_page_skipping") {
+				disablePageSkipping = true
+			} else if p.eat("parallel") {
+				let expr = try p.parseExpression(0)
+				parallelExpr = expr
+			} else {
+				try p.errorHere()
+			}
+			if !p.eat(",") {
+				break
+			}
+		}
+		try p.expect(")")
+	} else {
+		for !p.done() {
+			if p.eat("full") {
+				full = true
+			} else if p.eat("freeze") {
+				freeze = true
+			} else if p.eat("verbose") {
+				verbose = true
+			} else if p.eat("analyze") {
+				analyze = true
+			} else {
+				break
+			}
+		}
+	}
+	mut table ?QualifiedName = nil
+	mut cols = []Identifier{}
+	if !p.done() && p.canBeIdentifier() {
+		let t = try p.parseQualifiedName()
+		table = t
+		if p.eat("(") {
+			cols = try p.parseIdentifierList(")")
+			try p.expect(")")
+		}
+	}
+	return VacuumStmt{Pos: pos, Full: full, Freeze: freeze, Verbose: verbose, Analyze: analyze, DisablePageSkipping: disablePageSkipping, Parallel: parallelExpr, Table: table, Columns: cols}
+}
+
+fn (p mut Parser) parseAnalyze() !AnalyzeStmt {
+	let pos = p.pos()
+	try p.expect("analyze")
+	mut verbose = false
+	if p.eat("(") {
+		if p.eat("verbose") {
+			verbose = true
+		}
+		try p.expect(")")
+	} else if p.eat("verbose") {
+		verbose = true
+	}
+	mut table ?QualifiedName = nil
+	mut cols = []Identifier{}
+	if !p.done() && p.canBeIdentifier() {
+		let t = try p.parseQualifiedName()
+		table = t
+		if p.eat("(") {
+			cols = try p.parseIdentifierList(")")
+			try p.expect(")")
+		}
+	}
+	return AnalyzeStmt{Pos: pos, Verbose: verbose, Table: table, Columns: cols}
+}
+
+fn (p mut Parser) parseDiscard() !DiscardStmt {
+	let pos = p.pos()
+	try p.expect("discard")
+	let target = lowerAscii(p.take().Text)
+	return DiscardStmt{Pos: pos, Target: target}
+}
+
+fn (p mut Parser) parseComment() !CommentStmt {
+	let pos = p.pos()
+	try p.expect("comment")
+	try p.expect("on")
+	let objType = lowerAscii(p.take().Text)
+	let name = try p.parseQualifiedName()
+	try p.expect("is")
+	mut text ?str = nil
+	if !p.eat("null") {
+		let tok = p.take()
+		text = tok.Text
+	}
+	return CommentStmt{Pos: pos, ObjectType: objType, Name: name, Text: text}
+}
+
+fn (p mut Parser) parseGrant() !GrantStmt {
+	let pos = p.pos()
+	try p.expect("grant")
+	mut privs = []str{}
+	for {
+		if p.eat("all") {
+			p.eat("privileges")
+			privs = append(privs, "all")
+		} else {
+			privs = append(privs, lowerAscii(p.take().Text))
+		}
+		if !p.eat(",") {
+			break
+		}
+	}
+	try p.expect("on")
+	mut objType = ""
+	if p.eat("table") {
+		objType = "table"
+	} else if p.eat("sequence") {
+		objType = "sequence"
+	} else if p.eat("schema") {
+		objType = "schema"
+	} else if p.eat("database") {
+		objType = "database"
+	} else if p.eat("function") {
+		objType = "function"
+	} else if p.eat("type") {
+		objType = "type"
+	}
+	mut objects = []QualifiedName{}
+	for {
+		let obj = try p.parseQualifiedName()
+		objects = append(objects, obj)
+		if !p.eat(",") {
+			break
+		}
+	}
+	try p.expect("to")
+	mut roles = []Identifier{}
+	for {
+		p.eat("group")
+		let role = try p.parseIdentifier()
+		roles = append(roles, role)
+		if !p.eat(",") {
+			break
+		}
+	}
+	mut grantOption = false
+	if p.eat("with") {
+		try p.expect("grant")
+		try p.expect("option")
+		grantOption = true
+	}
+	return GrantStmt{Pos: pos, Privileges: privs, ObjectType: objType, Objects: objects, Roles: roles, GrantOption: grantOption}
+}
+
+fn (p mut Parser) parseRevoke() !RevokeStmt {
+	let pos = p.pos()
+	try p.expect("revoke")
+	mut grantOptionFor = false
+	if p.eat("grant") {
+		try p.expect("option")
+		try p.expect("for")
+		grantOptionFor = true
+	}
+	mut privs = []str{}
+	for {
+		if p.eat("all") {
+			p.eat("privileges")
+			privs = append(privs, "all")
+		} else {
+			privs = append(privs, lowerAscii(p.take().Text))
+		}
+		if !p.eat(",") {
+			break
+		}
+	}
+	try p.expect("on")
+	mut objType = ""
+	if p.eat("table") {
+		objType = "table"
+	} else if p.eat("sequence") {
+		objType = "sequence"
+	} else if p.eat("schema") {
+		objType = "schema"
+	} else if p.eat("database") {
+		objType = "database"
+	} else if p.eat("function") {
+		objType = "function"
+	} else if p.eat("type") {
+		objType = "type"
+	}
+	mut objects = []QualifiedName{}
+	for {
+		let obj = try p.parseQualifiedName()
+		objects = append(objects, obj)
+		if !p.eat(",") {
+			break
+		}
+	}
+	try p.expect("from")
+	mut roles = []Identifier{}
+	for {
+		p.eat("group")
+		let role = try p.parseIdentifier()
+		roles = append(roles, role)
+		if !p.eat(",") {
+			break
+		}
+	}
+	mut behavior = ""
+	if p.eat("cascade") {
+		behavior = "cascade"
+	} else if p.eat("restrict") {
+		behavior = "restrict"
+	}
+	return RevokeStmt{Pos: pos, GrantOptionFor: grantOptionFor, Privileges: privs, ObjectType: objType, Objects: objects, Roles: roles, Behavior: behavior}
+}
+
+fn (p mut Parser) parseListen() !ListenStmt {
+	let pos = p.pos()
+	try p.expect("listen")
+	let ch = try p.parseIdentifier()
+	return ListenStmt{Pos: pos, Channel: ch}
+}
+
+fn (p mut Parser) parseNotify() !NotifyStmt {
+	let pos = p.pos()
+	try p.expect("notify")
+	let ch = try p.parseIdentifier()
+	mut payload ?str = nil
+	if p.eat(",") {
+		let tok = p.take()
+		payload = tok.Text
+	}
+	return NotifyStmt{Pos: pos, Channel: ch, Payload: payload}
+}
+
+fn (p mut Parser) parseUnlisten() !UnlistenStmt {
+	let pos = p.pos()
+	try p.expect("unlisten")
+	mut all = false
+	mut ch ?Identifier = nil
+	if p.eat("*") {
+		all = true
+	} else {
+		let ident = try p.parseIdentifier()
+		ch = ident
+	}
+	return UnlistenStmt{Pos: pos, Channel: ch, All: all}
+}
+
+fn (p mut Parser) parseLock() !LockStmt {
+	let pos = p.pos()
+	try p.expect("lock")
+	p.eat("table")
+	mut tables = []QualifiedName{}
+	for {
+		p.eat("only")
+		let tbl = try p.parseQualifiedName()
+		p.eat("*")
+		tables = append(tables, tbl)
+		if !p.eat(",") {
+			break
+		}
+	}
+	mut mode = "access exclusive"
+	if p.eat("in") {
+		mut words = []str{}
+		for !p.done() && p.text() != "mode" {
+			words = append(words, lowerAscii(p.take().Text))
+		}
+		try p.expect("mode")
+		mut m = ""
+		for i, w in words {
+			if i > 0 {
+				m += " "
+			}
+			m += w
+		}
+		mode = m
+	}
+	mut wait = ""
+	if p.eat("nowait") {
+		wait = "nowait"
+	}
+	return LockStmt{Pos: pos, Tables: tables, Mode: mode, Wait: wait}
+}
+
+fn (p mut Parser) parseDo() !DoStmt {
+	let pos = p.pos()
+	try p.expect("do")
+	mut lang = "plpgsql"
+	if p.eat("language") {
+		lang = lowerAscii(p.take().Text)
+	}
+	let body = p.take().Text
+	return DoStmt{Pos: pos, Body: body, Language: lang}
+}
+
+fn (p mut Parser) parseCall() !CallStmt {
+	let pos = p.pos()
+	try p.expect("call")
+	let name = try p.parseQualifiedName()
+	mut args = []FunctionArgument{}
+	if p.eat("(") {
+		if p.text() != ")" {
+			for {
+				let argPos = p.pos()
+				mut argName ?Identifier = nil
+				if p.canBeIdentifier() && p.At + 1 < len(p.Tokens) && (p.Tokens[p.At + 1].Text == ":=" || p.Tokens[p.At + 1].Text == "=>") {
+					let ident = try p.parseIdentifier()
+					argName = ident
+					p.At += 1
+				}
+				let val = try p.parseExpression(0)
+				args = append(args, FunctionArgument{Pos: argPos, Name: argName, Value: val})
+				if !p.eat(",") {
+					break
+				}
+			}
+		}
+		try p.expect(")")
+	}
+	return CallStmt{Pos: pos, Name: name, Arguments: args}
+}

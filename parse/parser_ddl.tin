@@ -319,6 +319,7 @@ fn (p mut Parser) parseCreateFunctionBody(pos i64, orReplace bool) !CreateFuncti
 
 fn (p mut Parser) parseCreateRoleBody(pos i64) !CreateRoleStmt {
 	let name = try p.parseIdentifier()
+	p.eat("with")
 	mut options = []RoleOption{}
 	for !p.done() {
 		let optionPos = p.pos()
@@ -340,10 +341,88 @@ fn (p mut Parser) parseCreateRoleBody(pos i64) !CreateRoleStmt {
 	return CreateRoleStmt{Pos: pos, Name: name, Options: options}
 }
 
+fn (p mut Parser) parseAlter() !Stmt {
+	let pos = p.Tokens[p.At].Pos
+	try p.expect("alter")
+	if p.eat("table") {
+		let value = try p.parseAlterTableBody(pos)
+		return Stmt.AlterTable(value)
+	}
+	if p.eat("sequence") {
+		let value = try p.parseAlterSequenceBody(pos)
+		return Stmt.AlterSequence(value)
+	}
+	if p.eat("role") || p.eat("user") || p.eat("group") {
+		let value = try p.parseAlterRoleBody(pos)
+		return Stmt.AlterRole(value)
+	}
+	fail unsupportedMessage(p.Source, pos, "ALTER statement")
+}
+
+fn (p mut Parser) parseAlterSequenceBody(pos i64) !AlterSequenceStmt {
+	mut ifExists = false
+	if p.eat("if") {
+		try p.expect("exists")
+		ifExists = true
+	}
+	let name = try p.parseQualifiedName()
+	let options = try p.parseSequenceOptions()
+	return AlterSequenceStmt{Pos: pos, IfExists: ifExists, Name: name, Options: options}
+}
+
+fn (p mut Parser) parseAlterRoleBody(pos i64) !AlterRoleStmt {
+	let name = try p.parseIdentifier()
+	mut db ?Identifier = nil
+	if p.eat("in") {
+		try p.expect("database")
+		let dbIdent = try p.parseIdentifier()
+		db = dbIdent
+	}
+	p.eat("with")
+	mut options = []RoleOption{}
+	for !p.done() {
+		let optionPos = p.pos()
+		let w = lowerAscii(p.text())
+		if w == "login" || w == "nologin" || w == "superuser" || w == "nosuperuser" || w == "createdb" || w == "nocreatedb" || w == "createrole" || w == "nocreaterole" || w == "inherit" || w == "noinherit" || w == "replication" || w == "noreplication" {
+			p.At += 1
+			options = append(options, RoleOption{Pos: optionPos, Name: w})
+		} else if w == "password" || w == "connection" || w == "valid" {
+			p.At += 1
+			if w == "connection" {
+				p.eat("limit")
+			}
+			if w == "valid" {
+				try p.expect("until")
+			}
+			let val = try p.parseExpression(0)
+			options = append(options, RoleOption{Pos: optionPos, Name: w, Value: val})
+		} else if w == "set" || w == "reset" {
+			p.At += 1
+			let varName = p.take().Text
+			mut val ?Expr = nil
+			if w == "set" {
+				if !p.eat("to") {
+					p.eat("=")
+				}
+				let expr = try p.parseExpression(0)
+				val = expr
+			}
+			options = append(options, RoleOption{Pos: optionPos, Name: w + " " + varName, Value: val})
+		} else {
+			break
+		}
+	}
+	return AlterRoleStmt{Pos: pos, Name: name, Database: db, Options: options}
+}
+
 fn (p mut Parser) parseAlterTable() !AlterTableStmt {
 	let pos = p.Tokens[p.At].Pos
 	try p.expect("alter")
 	try p.expect("table")
+	return try p.parseAlterTableBody(pos)
+}
+
+fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 	let ifExists = p.eat("if")
 	if ifExists { try p.expect("exists") }
 	let table = try p.parseQualifiedName()

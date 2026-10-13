@@ -1,19 +1,111 @@
 package plan
 
+import "../types"
+import "../catalog"
+import "../txn"
+import "../store"
+import "../parse"
 import "crucible"
+import "quarry"
 
-fn TestEstimateAndExplain(t mut crucible.T) {
-	let p = Plan{Root: Node{Kind: Kind.Filter, Detail: "(id = 1)", Children: []Node{Node{Kind: Kind.SeqScan, Name: "items"}}}}
-	let rows = Explain(p, false)
-	crucible.Equal(mut t, "two operators", len(rows), 2)
-	t.True("filter printed", rows[0] == "Filter (id = 1) (cost=1000.00..1010.00 rows=333 width=0)")
-	t.True("scan printed", rows[1] == "  Seq Scan on items (cost=0.00..1000.00 rows=1000 width=0)")
-	let analyzeOutput = Explain(p, true)
-	t.True("analyze uses plan estimates", analyzeOutput[0] == rows[0])
+fn TestPlanContractAndTypes(t mut crucible.T) {
+	let constExpr = Expr.Const(ConstExpr{Value: types.FromI64(types.Int4Oid, 42), Type: types.Int4Oid})
+	crucible.Equal(mut t, "const type", constExpr.Type(), u32(types.Int4Oid))
+
+	let colRef = Expr.ColRef(ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.TextOid})
+	crucible.Equal(mut t, "colref type", colRef.Type(), u32(types.TextOid))
+
+	let param = Expr.Param(ParamExpr{N: 1, Type: types.Int8Oid})
+	crucible.Equal(mut t, "param type", param.Type(), u32(types.Int8Oid))
+
+	let boolExpr = Expr.BoolExpr(BoolExpr{Op: BoolOp.And, Args: []Expr{}, Type: types.BoolOid})
+	crucible.Equal(mut t, "bool type", boolExpr.Type(), u32(types.BoolOid))
+
+	let nullTest = Expr.NullTest(NullTestExpr{Arg: colRef, Test: NullTestType.IsNull, Type: types.BoolOid})
+	crucible.Equal(mut t, "null test type", nullTest.Type(), u32(types.BoolOid))
+
+	let castExpr = Expr.Cast(CastExpr{Arg: constExpr, Type: types.Int8Oid, Typmod: -1})
+	crucible.Equal(mut t, "cast type", castExpr.Type(), u32(types.Int8Oid))
 }
 
-fn TestExplicitEstimate(t mut crucible.T) {
-	let root = Node{Kind: Kind.SeqScan, Name: "small", Rows: 7.0, Startup: 0.0, Total: 2.5, HasEstimate: true}
-	let out = Explain(Plan{Root: root}, false)
-	t.True("explicit estimate retained", out[0] == "Seq Scan on small (cost=0.00..2.50 rows=7 width=0)")
+fn TestPhysicalPlanNodes(t mut crucible.T) {
+	let tbl = catalog.Table{
+		Oid: 1001,
+		Schema: "public",
+		Name: "users",
+		Cols: []catalog.Column{
+			catalog.Column{Name: "id", Type: types.Int4Oid, Typmod: -1, Number: 1, Nullable: false},
+			catalog.Column{Name: "name", Type: types.TextOid, Typmod: -1, Number: 2, Nullable: true},
+		},
+		Rel: 1001,
+		Indexes: []catalog.Index{},
+		CreatedBy: 1,
+		CreatedCommand: 0,
+		DroppedBy: 0,
+		DroppedCommand: 0,
+		System: false,
+	}
+
+	let cols = []ColDesc{
+		ColDesc{Name: "id", Oid: types.Int4Oid, Typmod: -1, TableOid: 1001, Attno: 1},
+		ColDesc{Name: "name", Oid: types.TextOid, Typmod: -1, TableOid: 1001, Attno: 2},
+	}
+
+	let scan = Plan.SeqScan(SeqScanNode{
+		Table: tbl,
+		Filter: nil,
+		Projection: []Expr{},
+		Cols: cols,
+		Cost: Cost{Startup: 0.0, Total: 10.5, Rows: 100.0, Width: 36},
+	})
+	crucible.Equal(mut t, "scan cols count", len(scan.Cols()), 2)
+	crucible.Equal(mut t, "scan rows", i64(scan.Cost().Rows), 100)
+
+	let filter = Plan.Filter(FilterNode{
+		Input: scan,
+		Predicate: Expr.BoolExpr(BoolExpr{Op: BoolOp.Not, Args: []Expr{}, Type: types.BoolOid}),
+		Cols: cols,
+		Cost: Cost{Startup: 0.0, Total: 12.0, Rows: 50.0, Width: 36},
+	})
+	crucible.Equal(mut t, "filter children count", len(filter.Children()), 1)
+
+	let prep = Prepared{
+		Stmt: parse.Stmt.Transaction(parse.TransactionStmt{Pos: 1, Kind: "BEGIN", Name: nil, Chain: false, Modes: []parse.TransactionMode{}}),
+		ParamTypes: []u32{},
+		ResultCols: cols,
+		Plan: filter,
+		CatalogVersion: 42,
+	}
+	let lines = Explain(prep, false)
+	t.True("explain non-empty", len(lines) >= 2)
+	t.True("root is filter", lines[0] == "Filter  (cost=0.00..12.00 rows=50 width=36)")
+	t.True("child is scan", lines[1] == "  ->  Seq Scan on users  (cost=0.00..10.50 rows=100 width=36)")
+}
+
+fn TestPrepareAndCatalogVersion(t mut crucible.T) {
+	let dir = quarry.TempDir() + "/tingres-plan-test"
+	quarry.RemoveAll(dir) catch _ { }
+	mut db = store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false}) catch err {
+		t.Error("store open: {err}")
+		return
+	}
+	let m = txn.NewManager(mut db) catch err {
+		t.Error("txn manager: {err}")
+		return
+	}
+	let c = catalog.Open(mut db, m) catch err {
+		t.Error("catalog open failed: " + types.ErrorMessage(err))
+		return
+	}
+	mut txnMgr = m
+	let currentTxn = txnMgr.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin txn: {err}")
+		return
+	}
+	let stmt = parse.Stmt.Transaction(parse.TransactionStmt{Pos: 1, Kind: "BEGIN", Name: nil, Chain: false, Modes: []parse.TransactionMode{}})
+	let prep = Prepare(c, currentTxn, stmt, []u32{}) catch err {
+		t.Error("prepare failed: " + types.ErrorMessage(err))
+		return
+	}
+	t.True("plan valid immediately", prep.Valid(c))
 }

@@ -1,0 +1,466 @@
+package parse
+
+fn deparseAlterTable(v AlterTableStmt) str {
+	mut out = "ALTER TABLE "
+	if v.IfExists { out += "IF EXISTS " }
+	out += nameText(v.Table)
+	for i, cmd in v.Commands {
+		if i > 0 { out += ", " } else { out += " " }
+		if cmd.Kind == "add column" {
+			if let col = cmd.Column { out += "ADD COLUMN " + deparseColumn(col) }
+		} else if cmd.Kind == "add constraint" {
+			if let c = cmd.Constraint { out += "ADD " + deparseConstraint(c) }
+		} else if cmd.Kind == "drop column" {
+			if let name = cmd.Name { out += "DROP COLUMN " + identifierText(name) }
+			if cmd.Behavior != "" { out += " " + upperAscii(cmd.Behavior) }
+		} else if cmd.Kind == "drop constraint" {
+			if let name = cmd.Name { out += "DROP CONSTRAINT " + identifierText(name) }
+			if cmd.Behavior != "" { out += " " + upperAscii(cmd.Behavior) }
+		} else if cmd.Kind == "alter column type" {
+			out += "ALTER COLUMN "
+			if let name = cmd.Name { out += identifierText(name) }
+			out += " TYPE "
+			if let tn = cmd.TypeName { out += deparseType(tn) }
+		} else if cmd.Kind == "set default" {
+			out += "ALTER COLUMN "
+			if let name = cmd.Name { out += identifierText(name) }
+			out += " SET DEFAULT "
+			if let expr = cmd.Expression { out += deparseExpr(expr) }
+		} else if cmd.Kind == "drop default" {
+			out += "ALTER COLUMN "
+			if let name = cmd.Name { out += identifierText(name) }
+			out += " DROP DEFAULT"
+		} else if cmd.Kind == "set not null" {
+			out += "ALTER COLUMN "
+			if let name = cmd.Name { out += identifierText(name) }
+			out += " SET NOT NULL"
+		} else if cmd.Kind == "drop not null" {
+			out += "ALTER COLUMN "
+			if let name = cmd.Name { out += identifierText(name) }
+			out += " DROP NOT NULL"
+		} else if cmd.Kind == "rename column" {
+			out += "RENAME COLUMN "
+			if let name = cmd.Name { out += identifierText(name) }
+			out += " TO "
+			if let newName = cmd.NewName { out += identifierText(newName) }
+		} else if cmd.Kind == "rename table" {
+			out += "RENAME TO "
+			if let newName = cmd.NewName { out += identifierText(newName) }
+		} else if cmd.Kind == "owner to" {
+			out += "OWNER TO "
+			if let newName = cmd.NewName { out += identifierText(newName) }
+		}
+	}
+	if v.Behavior != "" { out += " " + upperAscii(v.Behavior) }
+	return out
+}
+
+fn deparseAlterSequence(v AlterSequenceStmt) str {
+	mut out = "ALTER SEQUENCE "
+	if v.IfExists { out += "IF EXISTS " }
+	out += nameText(v.Name)
+	for opt in v.Options {
+		out += " " + upperAscii(opt.Name)
+		if let val = opt.Value { out += " " + deparseExpr(val) }
+	}
+	return out
+}
+
+fn deparseAlterRole(v AlterRoleStmt) str {
+	mut out = "ALTER ROLE " + identifierText(v.Name)
+	if let db = v.Database { out += " IN DATABASE " + identifierText(db) }
+	for opt in v.Options {
+		out += " " + upperAscii(opt.Name)
+		if let val = opt.Value { out += " " + deparseExpr(val) }
+	}
+	return out
+}
+
+fn deparseCreateIndex(v CreateIndexStmt) str {
+	mut out = "CREATE "
+	if v.Unique { out += "UNIQUE " }
+	out += "INDEX "
+	if v.Concurrently { out += "CONCURRENTLY " }
+	if v.IfNotExists { out += "IF NOT EXISTS " }
+	if let name = v.Name { out += nameText(name) + " " }
+	out += "ON " + nameText(v.Table)
+	if v.Method != "btree" && v.Method != "" { out += " USING " + upperAscii(v.Method) }
+	out += " ("
+	for i, key in v.Keys {
+		if i > 0 { out += ", " }
+		if let name = key.Name {
+			out += identifierText(name)
+		} else if let expr = key.Expression {
+			out += "(" + deparseExpr(expr) + ")"
+		}
+		if let opclass = key.Opclass { out += " " + nameText(opclass) }
+		if key.Direction != "" { out += " " + upperAscii(key.Direction) }
+		if key.Nulls != "" { out += " NULLS " + upperAscii(key.Nulls) }
+	}
+	out += ")"
+	if len(v.Include) > 0 {
+		out += " INCLUDE ("
+		for i, inc in v.Include {
+			if i > 0 { out += ", " }
+			if let name = inc.Name { out += identifierText(name) }
+		}
+		out += ")"
+	}
+	if let whereExpr = v.Where { out += " WHERE " + deparseExpr(whereExpr) }
+	return out
+}
+
+fn deparseCreateView(v CreateViewStmt) str {
+	mut out = "CREATE "
+	if v.OrReplace { out += "OR REPLACE " }
+	if v.Temporary != "" { out += upperAscii(v.Temporary) + " " }
+	out += "VIEW "
+	if v.IfNotExists { out += "IF NOT EXISTS " }
+	out += nameText(v.Name)
+	if len(v.Columns) > 0 { out += " (" + deparseIdentifierList(v.Columns) + ")" }
+	out += " AS " + deparseSelect(v.Query)
+	if v.CheckOption != "" {
+		if v.CheckOption == "local" || v.CheckOption == "cascaded" {
+			out += " WITH " + upperAscii(v.CheckOption) + " CHECK OPTION"
+		} else {
+			out += " WITH CHECK OPTION"
+		}
+	}
+	return out
+}
+
+fn deparseCreateSequence(v CreateSequenceStmt) str {
+	mut out = "CREATE "
+	if v.Temporary { out += "TEMP " }
+	out += "SEQUENCE "
+	if v.IfNotExists { out += "IF NOT EXISTS " }
+	out += nameText(v.Name)
+	for opt in v.Options {
+		out += " " + upperAscii(opt.Name)
+		if let val = opt.Value { out += " " + deparseExpr(val) }
+	}
+	return out
+}
+
+fn deparseCreateSchema(v CreateSchemaStmt) str {
+	mut out = "CREATE SCHEMA "
+	if v.IfNotExists { out += "IF NOT EXISTS " }
+	out += identifierText(v.Name)
+	if let auth = v.Authorization { out += " AUTHORIZATION " + identifierText(auth) }
+	return out
+}
+
+fn deparseCreateType(v CreateTypeStmt) str {
+	mut out = "CREATE TYPE " + nameText(v.Name) + " AS "
+	if v.Kind == "enum" {
+		out += "ENUM ("
+		for i, label in v.Labels {
+			if i > 0 { out += ", " }
+			out += label
+		}
+		out += ")"
+	} else if v.Kind == "composite" {
+		out += "("
+		for i, attr in v.Attributes {
+			if i > 0 { out += ", " }
+			out += identifierText(attr.Name) + " " + deparseType(attr.TypeName)
+		}
+		out += ")"
+	}
+	return out
+}
+
+fn deparseCreateFunction(v CreateFunctionStmt) str {
+	mut out = "CREATE "
+	if v.OrReplace { out += "OR REPLACE " }
+	out += "FUNCTION " + nameText(v.Name) + " ("
+	for i, param in v.Parameters {
+		if i > 0 { out += ", " }
+		if param.Mode != "in" && param.Mode != "" { out += upperAscii(param.Mode) + " " }
+		if let name = param.Name { out += identifierText(name) + " " }
+		out += deparseType(param.TypeName)
+		if let def = param.Default { out += " DEFAULT " + deparseExpr(def) }
+	}
+	out += ") RETURNS "
+	if v.ReturnSet { out += "SETOF " }
+	if let ret = v.Returns { out += deparseType(ret) }
+	if v.Language != "" { out += " LANGUAGE " + upperAscii(v.Language) }
+	if v.Body != "" { out += " AS " + v.Body }
+	for opt in v.Options {
+		if opt.Name != "language" && opt.Name != "as" {
+			out += " " + upperAscii(opt.Name)
+			if opt.Value != "" { out += " " + upperAscii(opt.Value) }
+		}
+	}
+	return out
+}
+
+fn deparseCreateRole(v CreateRoleStmt) str {
+	mut out = "CREATE ROLE " + identifierText(v.Name)
+	for opt in v.Options {
+		out += " " + upperAscii(opt.Name)
+		if let val = opt.Value { out += " " + deparseExpr(val) }
+	}
+	return out
+}
+
+fn deparseDrop(v DropStmt) str {
+	mut out = "DROP " + upperAscii(v.ObjectType) + " "
+	if v.IfExists { out += "IF EXISTS " }
+	for i, name in v.Names {
+		if i > 0 { out += ", " }
+		out += nameText(name)
+		if i < len(v.Arguments) && len(v.Arguments[i]) > 0 {
+			out += " ("
+			for j, arg in v.Arguments[i] {
+				if j > 0 { out += ", " }
+				out += deparseType(arg)
+			}
+			out += ")"
+		}
+	}
+	if v.Behavior != "" { out += " " + upperAscii(v.Behavior) }
+	return out
+}
+
+fn deparseDropRole(v DropRoleStmt) str {
+	mut out = "DROP ROLE "
+	if v.IfExists { out += "IF EXISTS " }
+	for i, role in v.Roles {
+		if i > 0 { out += ", " }
+		out += identifierText(role)
+	}
+	if v.Behavior != "" { out += " " + upperAscii(v.Behavior) }
+	return out
+}
+
+fn deparseTruncate(v TruncateStmt) str {
+	mut out = "TRUNCATE TABLE "
+	for i, table in v.Tables {
+		if i > 0 { out += ", " }
+		out += nameText(table)
+	}
+	if v.RestartIdentity != "" { out += " " + upperAscii(v.RestartIdentity) }
+	if v.Behavior != "" { out += " " + upperAscii(v.Behavior) }
+	return out
+}
+
+fn deparseVariableSet(v VariableSetStmt) str {
+	if v.Kind == "show" {
+		return "SHOW " + upperAscii(v.Name)
+	}
+	if v.Kind == "reset" {
+		return "RESET " + upperAscii(v.Name)
+	}
+	mut out = "SET "
+	if v.Scope != "" { out += upperAscii(v.Scope) + " " }
+	out += v.Name + " = "
+	if v.Default {
+		out += "DEFAULT"
+	} else {
+		for i, val in v.Values {
+			if i > 0 { out += ", " }
+			out += deparseExpr(val)
+		}
+	}
+	return out
+}
+
+fn deparseExplain(v ExplainStmt) str {
+	mut out = "EXPLAIN"
+	if len(v.Options) > 0 {
+		out += " ("
+		for i, opt in v.Options {
+			if i > 0 { out += ", " }
+			out += upperAscii(opt.Name)
+			if let val = opt.Value { out += " " + deparseExpr(val) }
+		}
+		out += ")"
+	}
+	out += " " + deparseStatement(v.Statement)
+	return out
+}
+
+fn deparseCopy(v CopyStmt) str {
+	mut out = "COPY "
+	if let tbl = v.Table {
+		out += nameText(tbl)
+		if len(v.Columns) > 0 { out += " (" + deparseIdentifierList(v.Columns) + ")" }
+	} else if let q = v.Query {
+		out += "(" + deparseSelect(q) + ")"
+	}
+	out += " " + upperAscii(v.Direction) + " "
+	if v.Program {
+		out += "PROGRAM "
+		if let fname = v.Filename { out += fname }
+	} else if v.Source == "stdin" {
+		out += "STDIN"
+	} else if v.Source == "stdout" {
+		out += "STDOUT"
+	} else {
+		if let fname = v.Filename { out += fname }
+	}
+	if len(v.Options) > 0 {
+		out += " WITH ("
+		for i, opt in v.Options {
+			if i > 0 { out += ", " }
+			out += upperAscii(opt.Name)
+			for val in opt.Values { out += " " + val }
+		}
+		out += ")"
+	}
+	return out
+}
+
+fn deparsePrepare(v PrepareStmt) str {
+	mut out = "PREPARE " + identifierText(v.Name)
+	if len(v.ParameterTypes) > 0 {
+		out += " ("
+		for i, pt in v.ParameterTypes {
+			if i > 0 { out += ", " }
+			out += deparseType(pt)
+		}
+		out += ")"
+	}
+	out += " AS " + deparseStatement(v.Statement)
+	return out
+}
+
+fn deparseExecute(v ExecuteStmt) str {
+	mut out = "EXECUTE " + identifierText(v.Name)
+	if len(v.Parameters) > 0 { out += " (" + deparseExprList(v.Parameters) + ")" }
+	return out
+}
+
+fn deparseDeallocate(v DeallocateStmt) str {
+	mut out = "DEALLOCATE "
+	if v.All {
+		out += "ALL"
+	} else if let name = v.Name {
+		out += identifierText(name)
+	}
+	return out
+}
+
+fn deparseVacuum(v VacuumStmt) str {
+	mut out = "VACUUM"
+	if v.Full { out += " FULL" }
+	if v.Freeze { out += " FREEZE" }
+	if v.Verbose { out += " VERBOSE" }
+	if v.Analyze { out += " ANALYZE" }
+	if let tbl = v.Table {
+		out += " " + nameText(tbl)
+		if len(v.Columns) > 0 { out += " (" + deparseIdentifierList(v.Columns) + ")" }
+	}
+	return out
+}
+
+fn deparseAnalyze(v AnalyzeStmt) str {
+	mut out = "ANALYZE"
+	if v.Verbose { out += " VERBOSE" }
+	if let tbl = v.Table {
+		out += " " + nameText(tbl)
+		if len(v.Columns) > 0 { out += " (" + deparseIdentifierList(v.Columns) + ")" }
+	}
+	return out
+}
+
+fn deparseDiscard(v DiscardStmt) str {
+	return "DISCARD " + upperAscii(v.Target)
+}
+
+fn deparseComment(v CommentStmt) str {
+	mut out = "COMMENT ON " + upperAscii(v.ObjectType) + " " + nameText(v.Name) + " IS "
+	if let text = v.Text {
+		out += text
+	} else {
+		out += "NULL"
+	}
+	return out
+}
+
+fn deparseGrant(v GrantStmt) str {
+	mut out = "GRANT "
+	for i, priv in v.Privileges {
+		if i > 0 { out += ", " }
+		out += upperAscii(priv)
+	}
+	out += " ON "
+	if v.ObjectType != "" { out += upperAscii(v.ObjectType) + " " }
+	for i, obj in v.Objects {
+		if i > 0 { out += ", " }
+		out += nameText(obj)
+	}
+	out += " TO "
+	for i, role in v.Roles {
+		if i > 0 { out += ", " }
+		out += identifierText(role)
+	}
+	if v.GrantOption { out += " WITH GRANT OPTION" }
+	return out
+}
+
+fn deparseRevoke(v RevokeStmt) str {
+	mut out = "REVOKE "
+	if v.GrantOptionFor { out += "GRANT OPTION FOR " }
+	for i, priv in v.Privileges {
+		if i > 0 { out += ", " }
+		out += upperAscii(priv)
+	}
+	out += " ON "
+	if v.ObjectType != "" { out += upperAscii(v.ObjectType) + " " }
+	for i, obj in v.Objects {
+		if i > 0 { out += ", " }
+		out += nameText(obj)
+	}
+	out += " FROM "
+	for i, role in v.Roles {
+		if i > 0 { out += ", " }
+		out += identifierText(role)
+	}
+	if v.Behavior != "" { out += " " + upperAscii(v.Behavior) }
+	return out
+}
+
+fn deparseListen(v ListenStmt) str {
+	return "LISTEN " + identifierText(v.Channel)
+}
+
+fn deparseNotify(v NotifyStmt) str {
+	mut out = "NOTIFY " + identifierText(v.Channel)
+	if let payload = v.Payload { out += ", " + payload }
+	return out
+}
+
+fn deparseUnlisten(v UnlistenStmt) str {
+	if v.All { return "UNLISTEN *" }
+	if let ch = v.Channel { return "UNLISTEN " + identifierText(ch) }
+	return "UNLISTEN *"
+}
+
+fn deparseLock(v LockStmt) str {
+	mut out = "LOCK TABLE "
+	for i, tbl in v.Tables {
+		if i > 0 { out += ", " }
+		out += nameText(tbl)
+	}
+	out += " IN " + upperAscii(v.Mode) + " MODE"
+	if v.Wait != "" { out += " " + upperAscii(v.Wait) }
+	return out
+}
+
+fn deparseDo(v DoStmt) str {
+	mut out = "DO "
+	if v.Language != "" { out += "LANGUAGE " + lowerAscii(v.Language) + " " }
+	return out + v.Body
+}
+
+fn deparseCall(v CallStmt) str {
+	mut out = "CALL " + nameText(v.Name) + " ("
+	for i, arg in v.Arguments {
+		if i > 0 { out += ", " }
+		if let name = arg.Name { out += identifierText(name) + " => " }
+		out += deparseExpr(arg.Value)
+	}
+	return out + ")"
+}
