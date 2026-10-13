@@ -6,6 +6,7 @@ fn (p mut Parser) parseExpression(minPrecedence i64) !Expr {
 	mut left = try p.parsePrefix()
 	for !p.done() {
 		let word = lowerAscii(p.text())
+		if p.StopWord != "" && word == p.StopWord { break }
 		if word == "::" {
 			let pos = p.Tokens[p.At].Pos
 			p.At += 1
@@ -174,9 +175,10 @@ fn expressionPrecedence(word str, kind str) i64 {
 	if word == "or" { return 1 }
 	if word == "and" { return 2 }
 	if word == "isnull" || word == "notnull" || word == "is" || word == "in" || word == "not" || word == "between" || word == "like" || word == "ilike" || word == "similar" { return 4 }
-	if word == "=" || word == "!=" || word == "<>" || word == "<" || word == ">" || word == "<=" || word == ">=" { return 4 }
+	if word == "=" || word == "!=" || word == "<>" || word == "<" || word == ">" || word == "<=" || word == ">=" || word == "~" || word == "~*" || word == "!~" || word == "!~*" || word == "@>" || word == "<@" { return 4 }
 	if kind == "operator" {
-		if word == "::" { return 9 }
+		if word == "->" || word == "->>" || word == "#>" || word == "#>>" { return 9 }
+		if word == "::" { return 10 }
 		if word == "^" { return 8 }
 		if word == "*" || word == "/" || word == "%" { return 7 }
 		if word == "+" || word == "-" { return 6 }
@@ -235,7 +237,7 @@ fn (p mut Parser) parsePrefix() !Expr {
 	if word == "position" { return try p.parsePosition(token.Pos) }
 	if word == "trim" { return try p.parseTrim(token.Pos) }
 	if word == "overlay" { return try p.parseOverlay(token.Pos) }
-	if word == "current_date" || word == "current_user" || word == "session_user" || word == "current_role" || word == "current_catalog" || word == "current_schema" || word == "current_timestamp" || word == "current_time" || word == "localtimestamp" || word == "localtime" {
+	if word == "user" || word == "current_date" || word == "current_user" || word == "session_user" || word == "current_role" || word == "current_catalog" || word == "current_schema" || word == "current_timestamp" || word == "current_time" || word == "localtimestamp" || word == "localtime" {
 		mut args = []Expr{}
 		if p.eat("(") {
 			if p.text() != ")" { args = try p.parseExpressionList(")") }
@@ -247,6 +249,7 @@ fn (p mut Parser) parsePrefix() !Expr {
 		let literal = p.take()
 		return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "typed_" + word, Value: literal.Text})
 	}
+	if token.Kind == "word" && token.KeywordClass == "reserved" { fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{token.Text}\"") }
 	if token.Kind == "quoted" || token.Kind == "word" {
 		let first = decodeIdentifier(token.Text)
 		mut parts = []Identifier{Identifier{Pos: token.Pos, Name: first.Name, Quoted: first.Quoted}}
@@ -442,7 +445,10 @@ fn (p mut Parser) parseSortList(end str) ![]SortBy {
 		mut direction = ""
 		mut nulls = ""
 		mut using = ""
-		if p.eat("using") { using = p.take().Text } else if p.eat("asc") { direction = "asc" } else if p.eat("desc") { direction = "desc" }
+		if p.eat("using") {
+			if p.done() { try p.errorHere() }
+			using = p.take().Text
+		} else if p.eat("asc") { direction = "asc" } else if p.eat("desc") { direction = "desc" }
 		if p.eat("nulls") { if p.eat("first") { nulls = "first" } else if p.eat("last") { nulls = "last" } else { try p.errorHere() } }
 		values = append(values, SortBy{Pos: pos, Value: value, Direction: direction, Nulls: nulls, UsingOperator: using})
 		if !p.eat(",") { break }
@@ -505,8 +511,11 @@ fn (p mut Parser) parseFrameBound() !WindowFrameBound {
 		try p.expect("row")
 		return WindowFrameBound{Pos: token.Pos, Kind: "current row"}
 	}
+	p.At -= 1
 	let offset = try p.parseExpression(0)
+	if p.done() { try p.errorHere() }
 	let direction = lowerAscii(p.take().Text)
+	if direction != "preceding" && direction != "following" { try p.errorHere() }
 	return WindowFrameBound{Pos: token.Pos, Kind: direction, Offset: offset}
 }
 
@@ -564,7 +573,10 @@ fn (p mut Parser) parseSubstring(pos i64) !Expr {
 
 fn (p mut Parser) parsePosition(pos i64) !Expr {
 	try p.expect("(")
+	let oldStop = p.StopWord
+	p.StopWord = "in"
 	let first = try p.parseExpression(0)
+	p.StopWord = oldStop
 	try p.expect("in")
 	let second = try p.parseExpression(0)
 	try p.expect(")")

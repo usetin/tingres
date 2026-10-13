@@ -1,0 +1,576 @@
+package parse
+
+fn (p mut Parser) parseCreateStatement() !Stmt {
+	let pos = p.Tokens[p.At].Pos
+	try p.expect("create")
+	mut orReplace = false
+	if p.eat("or") {
+		try p.expect("replace")
+		orReplace = true
+	}
+	mut temporary = ""
+	if p.eat("temp") { temporary = "temp" } else if p.eat("temporary") { temporary = "temporary" } else if p.eat("unlogged") { temporary = "unlogged" }
+	if p.eat("table") {
+		let value = try p.parseCreateTableBody(pos, temporary)
+		return Stmt.CreateTable(value)
+	}
+	mut unique = false
+	if p.eat("unique") { unique = true }
+	if p.eat("index") {
+		let value = try p.parseCreateIndexBody(pos, unique)
+		return Stmt.CreateIndex(value)
+	}
+	if p.eat("view") {
+		let value = try p.parseCreateViewBody(pos, orReplace, temporary)
+		return Stmt.CreateView(value)
+	}
+	if p.eat("sequence") {
+		let value = try p.parseCreateSequenceBody(pos, temporary != "")
+		return Stmt.CreateSequence(value)
+	}
+	if p.eat("schema") {
+		let value = try p.parseCreateSchemaBody(pos)
+		return Stmt.CreateSchema(value)
+	}
+	if p.eat("type") {
+		let value = try p.parseCreateTypeBody(pos)
+		return Stmt.CreateType(value)
+	}
+	if p.eat("function") || p.eat("procedure") {
+		let value = try p.parseCreateFunctionBody(pos, orReplace)
+		return Stmt.CreateFunction(value)
+	}
+	if p.eat("role") || p.eat("user") {
+		let value = try p.parseCreateRoleBody(pos)
+		return Stmt.CreateRole(value)
+	}
+	fail unsupportedMessage(p.Source, p.pos(), "CREATE statement")
+}
+
+fn (p mut Parser) parseCreateTableBody(pos i64, temporary str) !CreateTableStmt {
+	mut ifNotExists = false
+	if p.eat("if") {
+		try p.expect("not")
+		try p.expect("exists")
+		ifNotExists = true
+	}
+	let table = try p.parseQualifiedName()
+	mut elements = []TableElement{}
+	mut likes = []LikeClause{}
+	if p.eat("(") {
+		for {
+			let elementPos = p.pos()
+			if p.eat("like") {
+				let source = try p.parseQualifiedName()
+				mut options = []str{}
+				if p.eat("including") { options = append(options, "including " + lowerAscii(p.take().Text)) } else if p.eat("excluding") { options = append(options, "excluding " + lowerAscii(p.take().Text)) }
+				for p.eat("including") { options = append(options, "including " + lowerAscii(p.take().Text)) }
+				for p.eat("excluding") { options = append(options, "excluding " + lowerAscii(p.take().Text)) }
+				likes = append(likes, LikeClause{Pos: elementPos, Table: source, Options: options})
+			} else if p.eat("constraint") {
+				let name = try p.parseIdentifier()
+				let constraint = try p.parseTableConstraint(elementPos, name)
+				elements = append(elements, TableElement.Constraint(constraint))
+			} else if p.text() == "primary" || p.text() == "unique" || p.text() == "check" || p.text() == "foreign" {
+				let constraint = try p.parseTableConstraint(elementPos, nil)
+				elements = append(elements, TableElement.Constraint(constraint))
+			} else {
+				let column = try p.parseColumnDef()
+				elements = append(elements, TableElement.Column(column))
+			}
+			if !p.eat(",") { break }
+		}
+		try p.expect(")")
+	}
+	mut inherits = []QualifiedName{}
+	if p.eat("inherits") {
+		try p.expect("(")
+		for {
+			let parent = try p.parseQualifiedName()
+			inherits = append(inherits, parent)
+			if !p.eat(",") { break }
+		}
+		try p.expect(")")
+	}
+	mut partition ?PartitionBy = nil
+	if p.eat("partition") {
+		try p.expect("by")
+		let method = lowerAscii(p.take().Text)
+		try p.expect("(")
+		let keys = try p.parseExpressionList(")")
+		try p.expect(")")
+		partition = PartitionBy{Pos: pos, Method: method, Keys: keys}
+	}
+	mut asQuery ?SelectStmt = nil
+	mut withData = true
+	if p.eat("as") {
+		asQuery = try p.parseSelect()
+		if p.eat("with") {
+			if p.eat("no") {
+				try p.expect("data")
+				withData = false
+			} else { try p.expect("data") }
+		}
+	}
+	return CreateTableStmt{Pos: pos, Temporary: temporary, IfNotExists: ifNotExists, Table: table, Elements: elements, Like: likes, Inherits: inherits, PartitionBy: partition, AsQuery: asQuery, WithData: withData}
+}
+
+fn (p mut Parser) parseCreateIndexBody(pos i64, unique bool) !CreateIndexStmt {
+	let concurrently = p.eat("concurrently")
+	mut ifNotExists = false
+	if p.eat("if") {
+		try p.expect("not")
+		try p.expect("exists")
+		ifNotExists = true
+	}
+	mut name ?QualifiedName = nil
+	if p.text() != "on" { name = try p.parseQualifiedName() }
+	try p.expect("on")
+	let table = try p.parseQualifiedName()
+	mut method = "btree"
+	if p.eat("using") { method = lowerAscii(p.take().Text) }
+	try p.expect("(")
+	mut keys = []IndexElement{}
+	for {
+		let keyPos = p.pos()
+		mut keyName ?Identifier = nil
+		mut expression ?Expr = nil
+		if p.eat("(") {
+			expression = try p.parseExpression(0)
+			try p.expect(")")
+		} else { keyName = try p.parseIdentifier() }
+		mut opclass ?QualifiedName = nil
+		if p.canBeIdentifier() && p.text() != "asc" && p.text() != "desc" && p.text() != "nulls" { opclass = try p.parseQualifiedName() }
+		mut direction = ""
+		mut nulls = ""
+		if p.eat("asc") { direction = "asc" } else if p.eat("desc") { direction = "desc" }
+		if p.eat("nulls") { if p.eat("first") { nulls = "first" } else if p.eat("last") { nulls = "last" } else { try p.errorHere() } }
+		keys = append(keys, IndexElement{Pos: keyPos, Name: keyName, Expression: expression, Opclass: opclass, Direction: direction, Nulls: nulls})
+		if !p.eat(",") { break }
+	}
+	try p.expect(")")
+	mut include = []IndexElement{}
+	if p.eat("include") {
+		try p.expect("(")
+		let names = try p.parseIdentifierList(")")
+		try p.expect(")")
+		for item in names { include = append(include, IndexElement{Pos: item.Pos, Name: item}) }
+	}
+	mut where ?Expr = nil
+	if p.eat("where") { where = try p.parseExpression(0) }
+	return CreateIndexStmt{Pos: pos, Unique: unique, Concurrently: concurrently, IfNotExists: ifNotExists, Name: name, Table: table, Method: method, Keys: keys, Include: include, Where: where}
+}
+
+fn (p mut Parser) parseCreateViewBody(pos i64, orReplace bool, temporary str) !CreateViewStmt {
+	mut ifNotExists = false
+	if p.eat("if") {
+		try p.expect("not")
+		try p.expect("exists")
+		ifNotExists = true
+	}
+	let name = try p.parseQualifiedName()
+	mut columns = []Identifier{}
+	if p.eat("(") {
+		columns = try p.parseIdentifierList(")")
+		try p.expect(")")
+	}
+	try p.expect("as")
+	let query = try p.parseSelect()
+	mut checkOption = ""
+	if p.eat("with") {
+		if p.eat("local") { checkOption = "local" } else if p.eat("cascaded") { checkOption = "cascaded" }
+		try p.expect("check")
+		try p.expect("option")
+	}
+	return CreateViewStmt{Pos: pos, OrReplace: orReplace, Temporary: temporary, IfNotExists: ifNotExists, Name: name, Columns: columns, Query: query, CheckOption: checkOption}
+}
+
+fn (p mut Parser) parseCreateSequenceBody(pos i64, temporary bool) !CreateSequenceStmt {
+	mut ifNotExists = false
+	if p.eat("if") {
+		try p.expect("not")
+		try p.expect("exists")
+		ifNotExists = true
+	}
+	let name = try p.parseQualifiedName()
+	let options = try p.parseSequenceOptions()
+	return CreateSequenceStmt{Pos: pos, Temporary: temporary, IfNotExists: ifNotExists, Name: name, Options: options}
+}
+
+fn (p mut Parser) parseSequenceOptions() ![]SequenceOption {
+	mut options = []SequenceOption{}
+	for !p.done() {
+		let optionPos = p.pos()
+		mut option = ""
+		if p.eat("as") { option = "as " + lowerAscii(p.take().Text) } else if p.eat("increment") { p.eat("by")
+			option = "increment" } else if p.eat("minvalue") || p.eat("min") { p.eat("value")
+			option = "minvalue" } else if p.eat("maxvalue") || p.eat("max") { p.eat("value")
+			option = "maxvalue" } else if p.eat("start") { p.eat("with")
+			option = "start" } else if p.eat("restart") { p.eat("with")
+			option = "restart" } else if p.eat("cache") { option = "cache" } else if p.eat("cycle") { option = "cycle" } else if p.eat("no") { if p.eat("minvalue") { option = "no minvalue" } else if p.eat("maxvalue") { option = "no maxvalue" } else { try p.errorHere() } } else if p.eat("owned") { try p.expect("by")
+			option = "owned by" } else { break }
+		mut value ?Expr = nil
+		if option != "cycle" && option != "no minvalue" && option != "no maxvalue" {
+			if option == "owned by" {
+				let owned = try p.parseQualifiedName()
+				value = Expr.ColumnRef(ColumnRefExpr{Pos: owned.Pos, Parts: owned.Parts})
+			} else { value = try p.parseExpression(0) }
+		}
+		options = append(options, SequenceOption{Pos: optionPos, Name: option, Value: value})
+	}
+	return options
+}
+
+fn (p mut Parser) parseCreateSchemaBody(pos i64) !CreateSchemaStmt {
+	mut ifNotExists = false
+	if p.eat("if") {
+		try p.expect("not")
+		try p.expect("exists")
+		ifNotExists = true
+	}
+	mut authorization ?Identifier = nil
+	let name = try p.parseIdentifier()
+	if p.eat("authorization") { authorization = try p.parseIdentifier() }
+	return CreateSchemaStmt{Pos: pos, IfNotExists: ifNotExists, Name: name, Authorization: authorization}
+}
+
+fn (p mut Parser) parseCreateTypeBody(pos i64) !CreateTypeStmt {
+	let name = try p.parseQualifiedName()
+	try p.expect("as")
+	mut kind = ""
+	mut labels = []str{}
+	mut attributes = []CompositeAttribute{}
+	if p.eat("enum") {
+		kind = "enum"
+		try p.expect("(")
+		for {
+			let token = p.take()
+			labels = append(labels, token.Text)
+			if !p.eat(",") { break }
+		}
+		try p.expect(")")
+	} else if p.eat("(") {
+		kind = "composite"
+		for {
+			let attributeName = try p.parseIdentifier()
+			let typeName = try p.parseTypeName()
+			attributes = append(attributes, CompositeAttribute{Pos: attributeName.Pos, Name: attributeName, TypeName: typeName})
+			if !p.eat(",") { break }
+		}
+		try p.expect(")")
+	} else { try p.errorHere() }
+	return CreateTypeStmt{Pos: pos, Name: name, Kind: kind, Labels: labels, Attributes: attributes}
+}
+
+fn (p mut Parser) parseCreateFunctionBody(pos i64, orReplace bool) !CreateFunctionStmt {
+	let name = try p.parseQualifiedName()
+	try p.expect("(")
+	mut parameters = []FunctionParameter{}
+	if p.text() != ")" {
+		for {
+			let parameterPos = p.pos()
+			mut mode = "in"
+			if p.eat("inout") { mode = "inout" } else if p.eat("out") { mode = "out" } else if p.eat("in") { mode = "in" } else if p.eat("variadic") { mode = "variadic" }
+			mut parameterName ?Identifier = nil
+			if p.canBeIdentifier() && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Kind == "word" { parameterName = try p.parseIdentifier() }
+			let typeName = try p.parseTypeName()
+			mut defaultExpr ?Expr = nil
+			if p.eat("default") || p.eat("=") { defaultExpr = try p.parseExpression(0) }
+			parameters = append(parameters, FunctionParameter{Pos: parameterPos, Name: parameterName, Mode: mode, TypeName: typeName, Default: defaultExpr})
+			if !p.eat(",") { break }
+		}
+	}
+	try p.expect(")")
+	try p.expect("returns")
+	let returnSet = p.eat("setof")
+	let returns = try p.parseTypeName()
+	mut body = ""
+	mut language = ""
+	mut options = []FunctionOption{}
+	for !p.done() {
+		let optionPos = p.pos()
+		if p.eat("language") {
+			language = lowerAscii(p.take().Text)
+			options = append(options, FunctionOption{Pos: optionPos, Name: "language", Value: language})
+		} else if p.eat("as") {
+			let token = p.take()
+			body = token.Text
+			options = append(options, FunctionOption{Pos: optionPos, Name: "as", Value: body})
+		} else if p.eat("immutable") || p.eat("stable") || p.eat("volatile") || p.eat("strict") || p.eat("called") || p.eat("security") || p.eat("leakproof") || p.eat("parallel") {
+			let option = lowerAscii(p.Tokens[p.At - 1].Text)
+			mut value = ""
+			if option == "called" {
+				try p.expect("on")
+				try p.expect("null")
+				try p.expect("input")
+				value = "on null input"
+			} else if option == "security" {
+				if p.eat("definer") { value = "definer" } else {
+					try p.expect("invoker")
+					value = "invoker"
+				}
+			} else if option == "parallel" { value = lowerAscii(p.take().Text) }
+			options = append(options, FunctionOption{Pos: optionPos, Name: option, Value: value})
+		} else { break }
+	}
+	mut optionalReturns ?TypeName = returns
+	return CreateFunctionStmt{Pos: pos, OrReplace: orReplace, Name: name, Parameters: parameters, Returns: optionalReturns, ReturnSet: returnSet, Options: options, Body: body, Language: language}
+}
+
+fn (p mut Parser) parseCreateRoleBody(pos i64) !CreateRoleStmt {
+	let name = try p.parseIdentifier()
+	p.eat("with")
+	mut options = []RoleOption{}
+	for !p.done() {
+		let optionPos = p.pos()
+		if p.eat("login") || p.eat("nologin") || p.eat("superuser") || p.eat("nosuperuser") || p.eat("createdb") || p.eat("nocreatedb") || p.eat("createrole") || p.eat("nocreaterole") || p.eat("inherit") || p.eat("noinherit") || p.eat("replication") || p.eat("noreplication") {
+			options = append(options, RoleOption{Pos: optionPos, Name: lowerAscii(p.Tokens[p.At - 1].Text)})
+		} else if p.eat("password") || p.eat("connection") || p.eat("valid") || p.eat("in") {
+			let option = lowerAscii(p.Tokens[p.At - 1].Text)
+			mut value ?Expr = nil
+			if option == "in" {
+				try p.expect("group")
+				value = Expr.Literal(LiteralExpr{Pos: optionPos, Kind: "word", Value: "group " + p.take().Text})
+			} else {
+				p.eat("limit")
+				value = try p.parseExpression(0)
+			}
+			options = append(options, RoleOption{Pos: optionPos, Name: option, Value: value})
+		} else { break }
+	}
+	return CreateRoleStmt{Pos: pos, Name: name, Options: options}
+}
+
+fn (p mut Parser) parseAlter() !Stmt {
+	let pos = p.Tokens[p.At].Pos
+	try p.expect("alter")
+	if p.eat("table") {
+		let value = try p.parseAlterTableBody(pos)
+		return Stmt.AlterTable(value)
+	}
+	if p.eat("sequence") {
+		let value = try p.parseAlterSequenceBody(pos)
+		return Stmt.AlterSequence(value)
+	}
+	if p.eat("role") || p.eat("user") || p.eat("group") {
+		let value = try p.parseAlterRoleBody(pos)
+		return Stmt.AlterRole(value)
+	}
+	fail unsupportedMessage(p.Source, pos, "ALTER statement")
+}
+
+fn (p mut Parser) parseAlterSequenceBody(pos i64) !AlterSequenceStmt {
+	mut ifExists = false
+	if p.eat("if") {
+		try p.expect("exists")
+		ifExists = true
+	}
+	let name = try p.parseQualifiedName()
+	let options = try p.parseSequenceOptions()
+	return AlterSequenceStmt{Pos: pos, IfExists: ifExists, Name: name, Options: options}
+}
+
+fn (p mut Parser) parseAlterRoleBody(pos i64) !AlterRoleStmt {
+	let name = try p.parseIdentifier()
+	mut db ?Identifier = nil
+	if p.eat("in") {
+		try p.expect("database")
+		let dbIdent = try p.parseIdentifier()
+		db = dbIdent
+	}
+	p.eat("with")
+	mut options = []RoleOption{}
+	for !p.done() {
+		let optionPos = p.pos()
+		let w = lowerAscii(p.text())
+		if w == "login" || w == "nologin" || w == "superuser" || w == "nosuperuser" || w == "createdb" || w == "nocreatedb" || w == "createrole" || w == "nocreaterole" || w == "inherit" || w == "noinherit" || w == "replication" || w == "noreplication" {
+			p.At += 1
+			options = append(options, RoleOption{Pos: optionPos, Name: w})
+		} else if w == "password" || w == "connection" || w == "valid" {
+			p.At += 1
+			if w == "connection" {
+				p.eat("limit")
+			}
+			if w == "valid" {
+				try p.expect("until")
+			}
+			let val = try p.parseExpression(0)
+			options = append(options, RoleOption{Pos: optionPos, Name: w, Value: val})
+		} else if w == "set" || w == "reset" {
+			p.At += 1
+			let varName = p.take().Text
+			mut val ?Expr = nil
+			if w == "set" {
+				if !p.eat("to") {
+					p.eat("=")
+				}
+				let expr = try p.parseExpression(0)
+				val = expr
+			}
+			options = append(options, RoleOption{Pos: optionPos, Name: w + " " + varName, Value: val})
+		} else {
+			break
+		}
+	}
+	return AlterRoleStmt{Pos: pos, Name: name, Database: db, Options: options}
+}
+
+fn (p mut Parser) parseAlterTable() !AlterTableStmt {
+	let pos = p.Tokens[p.At].Pos
+	try p.expect("alter")
+	try p.expect("table")
+	return try p.parseAlterTableBody(pos)
+}
+
+fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
+	let ifExists = p.eat("if")
+	if ifExists { try p.expect("exists") }
+	let table = try p.parseQualifiedName()
+	mut commands = []AlterTableCommand{}
+	for {
+		let commandPos = p.pos()
+		mut command = AlterTableCommand{Pos: commandPos}
+		if p.eat("add") {
+			p.eat("column")
+			if p.eat("constraint") {
+				let name = try p.parseIdentifier()
+				let constraint = try p.parseTableConstraint(commandPos, name)
+				command.Kind = "add constraint"
+				command.Constraint = constraint
+			} else if p.text() == "primary" || p.text() == "unique" || p.text() == "check" || p.text() == "foreign" {
+				let constraint = try p.parseTableConstraint(commandPos, nil)
+				command.Kind = "add constraint"
+				command.Constraint = constraint
+			} else {
+				let column = try p.parseColumnDef()
+				command.Kind = "add column"
+				command.Column = column
+			}
+		} else if p.eat("drop") {
+			if p.eat("column") {
+				p.eat("if")
+				let name = try p.parseIdentifier()
+				command.Kind = "drop column"
+				command.Name = name
+				if p.eat("cascade") { command.Behavior = "cascade" } else if p.eat("restrict") { command.Behavior = "restrict" }
+			} else if p.eat("constraint") {
+				p.eat("if")
+				let name = try p.parseIdentifier()
+				command.Kind = "drop constraint"
+				command.Name = name
+				if p.eat("cascade") { command.Behavior = "cascade" } else if p.eat("restrict") { command.Behavior = "restrict" }
+			} else { try p.errorHere() }
+		} else if p.eat("alter") {
+			p.eat("column")
+			let name = try p.parseIdentifier()
+			command.Name = name
+			if p.eat("type") {
+				command.Kind = "alter column type"
+				command.TypeName = try p.parseTypeName()
+			} else if p.eat("set") {
+				if p.eat("default") {
+					command.Kind = "set default"
+					command.Expression = try p.parseExpression(0)
+				} else if p.eat("not") {
+					try p.expect("null")
+					command.Kind = "set not null"
+				} else { try p.errorHere() }
+			} else if p.eat("drop") {
+				if p.eat("default") {
+					command.Kind = "drop default"
+				} else if p.eat("not") {
+					try p.expect("null")
+					command.Kind = "drop not null"
+				} else {
+					try p.errorHere()
+				}
+			} else { try p.errorHere() }
+		} else if p.eat("rename") {
+			if p.eat("column") {
+				command.Kind = "rename column"
+				command.Name = try p.parseIdentifier()
+			} else { command.Kind = "rename table" }
+			try p.expect("to")
+			command.NewName = try p.parseLabelIdentifier()
+		} else if p.eat("owner") {
+			try p.expect("to")
+			command.Kind = "owner to"
+			command.NewName = try p.parseIdentifier()
+		} else { try p.errorHere() }
+		commands = append(commands, command)
+		if !p.eat(",") { break }
+	}
+	mut behavior = ""
+	if p.eat("cascade") { behavior = "cascade" } else if p.eat("restrict") { behavior = "restrict" }
+	return AlterTableStmt{Pos: pos, IfExists: ifExists, Table: table, Commands: commands, Behavior: behavior}
+}
+
+fn (p mut Parser) parseDrop() !Stmt {
+	let pos = p.Tokens[p.At].Pos
+	try p.expect("drop")
+	let objectType = lowerAscii(p.take().Text)
+	mut ifExists = false
+	if p.eat("if") {
+		try p.expect("exists")
+		ifExists = true
+	}
+	if objectType == "role" || objectType == "user" || objectType == "group" {
+		mut roles = []Identifier{}
+		for {
+			let role = try p.parseIdentifier()
+			roles = append(roles, role)
+			if !p.eat(",") { break }
+		}
+		mut behavior = ""
+		if p.eat("cascade") { behavior = "cascade" } else if p.eat("restrict") { behavior = "restrict" }
+		return Stmt.DropRole(DropRoleStmt{Pos: pos, IfExists: ifExists, Roles: roles, Behavior: behavior})
+	}
+	if objectType == "table" || objectType == "index" || objectType == "view" || objectType == "sequence" || objectType == "schema" || objectType == "type" || objectType == "function" {
+		mut names = []QualifiedName{}
+		mut arguments = [][]TypeName{}
+		for {
+			let name = try p.parseQualifiedName()
+			names = append(names, name)
+			mut args = []TypeName{}
+			if objectType == "function" && p.eat("(") {
+				if p.text() != ")" {
+					for {
+						let argType = try p.parseTypeName()
+						args = append(args, argType)
+						if !p.eat(",") { break }
+					}
+				}
+				try p.expect(")")
+			}
+			arguments = append(arguments, args)
+			if !p.eat(",") { break }
+		}
+		mut behavior = ""
+		if p.eat("cascade") { behavior = "cascade" } else if p.eat("restrict") { behavior = "restrict" }
+		return Stmt.Drop(DropStmt{Pos: pos, ObjectType: objectType, IfExists: ifExists, Names: names, Arguments: arguments, Behavior: behavior})
+	}
+	fail unsupportedMessage(p.Source, p.Tokens[p.At - 1].BytePos, "DROP " + objectType)
+}
+
+fn (p mut Parser) parseTruncate() !TruncateStmt {
+	let pos = p.Tokens[p.At].Pos
+	try p.expect("truncate")
+	p.eat("table")
+	mut tables = []QualifiedName{}
+	for {
+		let table = try p.parseQualifiedName()
+		tables = append(tables, table)
+		if !p.eat(",") { break }
+	}
+	mut restart = ""
+	if p.eat("restart") {
+		try p.expect("identity")
+		restart = "restart identity"
+	} else if p.eat("continue") {
+		try p.expect("identity")
+		restart = "continue identity"
+	}
+	mut behavior = ""
+	if p.eat("cascade") { behavior = "cascade" } else if p.eat("restrict") { behavior = "restrict" }
+	return TruncateStmt{Pos: pos, Tables: tables, RestartIdentity: restart, Behavior: behavior}
+}
