@@ -20,9 +20,7 @@ fn CanCast(from Oid, to Oid, implicit bool) bool {
 		if from == Int4Oid || from == Int8Oid || from == Float4Oid || from == Float8Oid || from == NumericOid {
 			if to == Int2Oid || to == Int4Oid || to == Int8Oid || to == OidOid || to == Float4Oid || to == Float8Oid || to == NumericOid { return true }
 		}
-		if from == DateOid || from == TimeOid || from == TimestampOid || from == TimestamptzOid || from == IntervalOid {
-			if to == DateOid || to == TimeOid || to == TimestampOid || to == TimestamptzOid || to == IntervalOid { return true }
-		}
+		if temporal_cast_pair(from, to) { return true }
 	}
 	return false
 }
@@ -33,6 +31,7 @@ fn Cast(d Datum, to Oid) !Datum {
 	if d.oid == to { return d }
 	if !CanCast(d.oid, to, false) { fail ErrorFault(NewError("42846", "cannot cast type {sql_type_name(d.oid)} to {sql_type_name(to)}")) }
 	if is_string_oid(to) { return FromStr(to, d.Text()) }
+	if is_temporal_oid(d.oid) && is_temporal_oid(to) { return try CastTemporal(d, to) }
 	if (d.oid == BoolOid && is_integer_oid(to)) {
 		if d.b { return try Parse(to, "1") }
 		return try Parse(to, "0")
@@ -82,6 +81,15 @@ fn CastTypmod(d Datum, to Oid, typmod i64) !Datum {
 
 fn is_string_oid(oid Oid) bool { return oid == TextOid || oid == VarcharOid || oid == BpcharOid || oid == NameOid }
 fn is_integer_oid(oid Oid) bool { return oid == Int2Oid || oid == Int4Oid || oid == Int8Oid || oid == OidOid }
+fn is_temporal_oid(oid Oid) bool { return oid == DateOid || oid == TimeOid || oid == TimetzOid || oid == TimestampOid || oid == TimestamptzOid || oid == IntervalOid }
+fn temporal_cast_pair(from Oid, to Oid) bool {
+	if from == DateOid { return to == TimestampOid || to == TimestamptzOid }
+	if from == TimestampOid { return to == DateOid || to == TimeOid || to == TimestamptzOid }
+	if from == TimestamptzOid { return to == DateOid || to == TimeOid || to == TimestampOid }
+	if from == TimeOid { return to == TimetzOid }
+	if from == TimetzOid { return to == TimeOid }
+	return false
+}
 
 fn if_float_target(oid Oid, value f64) f64 {
 	if oid == Float4Oid { return f64(f32(value)) }

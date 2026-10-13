@@ -22,6 +22,7 @@ const BpcharOid Oid = 1042
 const NameOid Oid = 19
 const DateOid Oid = 1082
 const TimeOid Oid = 1083
+const TimetzOid Oid = 1266
 const TimestampOid Oid = 1114
 const TimestamptzOid Oid = 1184
 const IntervalOid Oid = 1186
@@ -37,6 +38,9 @@ type Datum value struct {
 	b bool
 	s str
 	bytes []u8
+	months i64
+	days i64
+	offset i64
 }
 
 // Null returns an SQL NULL datum.
@@ -79,6 +83,12 @@ fn (d Datum) Text() str {
 		Int2Oid, Int4Oid, Int8Oid, OidOid => { return mint.Itoa(d.i) }
 		Float4Oid, Float8Oid => { return float_text(d) }
 		NumericOid => { return NumericText(d) }
+		DateOid => { return DateText(d) }
+		TimeOid => { return TimeText(d) }
+		TimetzOid => { return TimetzText(d) }
+		TimestampOid => { return TimestampText(d) }
+		TimestamptzOid => { return TimestamptzText(d) }
+		IntervalOid => { return IntervalText(d) }
 		ByteaOid => { return "\\x" + hex(d.bytes) }
 		BpcharOid => { return twine.TrimRight(d.s, " ") }
 		_ => { return d.s }
@@ -118,10 +128,11 @@ fn Parse(oid Oid, text str) !Datum {
 			return FromF64(oid, f)
 		}
 		NumericOid => { return try ParseNumeric(text) }
-		TextOid, VarcharOid, BpcharOid, NameOid, DateOid, TimeOid, TimestampOid, TimestamptzOid, IntervalOid, UuidOid => {
+		TextOid, VarcharOid, BpcharOid, NameOid, UuidOid => {
 			if oid == UuidOid && !valid_uuid(text) { fail PgFault("22P02", "invalid input syntax for type uuid: \"{text}\"") }
 			return FromStr(oid, text)
 		}
+		DateOid, TimeOid, TimetzOid, TimestampOid, TimestamptzOid, IntervalOid => { return try ParseDateTime(oid, text) }
 		ByteaOid => {
 			let b = parse_bytea(text) catch err { fail PgFault("22P02", ErrorMessage(err)) }
 			return FromBytes(oid, b)
@@ -146,6 +157,7 @@ fn sql_type_name(oid Oid) str {
 		NameOid => { return "name" }
 		DateOid => { return "date" }
 		TimeOid => { return "time without time zone" }
+		TimetzOid => { return "time with time zone" }
 		TimestampOid => { return "timestamp without time zone" }
 		TimestamptzOid => { return "timestamp with time zone" }
 		IntervalOid => { return "interval" }
@@ -208,6 +220,8 @@ fn Compare(a Datum, b Datum) i64 {
 			return compare_float(a.f, b.f)
 		}
 		NumericOid => { return CompareNumeric(a, b) }
+		DateOid, TimeOid, TimetzOid, TimestampOid, TimestamptzOid => { return CompareDateTime(a, b) }
+		IntervalOid => { return CompareInterval(a, b) }
 		ByteaOid => { return compare_bytes(a.bytes, b.bytes) }
 		_ => {
 			if a.s < b.s { return -1 }
@@ -276,6 +290,23 @@ fn EncodeBinary(d Datum, out mut []u8) {
 		Float4Oid => { put_u32(mut out, gauge.F32bits(f32(d.f))) }
 		Float8Oid => { put_u64(mut out, gauge.F64bits(d.f)) }
 		NumericOid => { EncodeNumericBinary(d, mut out) }
+		DateOid => {
+			mut value = i32(d.i)
+			if d.i == pgInfinity { value = 2147483647 }
+			if d.i == 0-pgInfinity { value = -2147483648 }
+			put_u32(mut out, u32(value))
+		}
+		TimeOid => { put_u64(mut out, u64(d.i)) }
+		TimetzOid => {
+			put_u64(mut out, u64(d.i))
+			put_u32(mut out, u32(i32(0-d.offset)))
+		}
+		TimestampOid, TimestamptzOid => { put_u64(mut out, u64(d.i)) }
+		IntervalOid => {
+			put_u64(mut out, u64(d.i))
+			put_u32(mut out, u32(i32(d.days)))
+			put_u32(mut out, u32(i32(d.months)))
+		}
 		ByteaOid => { out = append(out, d.bytes...) }
 		TextOid, VarcharOid, BpcharOid, NameOid => { out = append(out, d.s...) }
 		_ => { }
@@ -314,6 +345,33 @@ fn DecodeBinary(oid Oid, b []u8) !Datum {
 			return FromF64(oid, gauge.F64frombits(read_u64(b, 0)))
 		}
 		NumericOid => { return try DecodeNumericBinary(b) }
+		DateOid => {
+			if len(b) != 4 { fail PgFault("22P03", "invalid binary representation for type date") }
+			let value = i32(read_u32(b, 0))
+			if value == 2147483647 { return FromI64(oid, pgInfinity) }
+			if value == -2147483648 { return FromI64(oid, 0-pgInfinity) }
+			return FromI64(oid, i64(value))
+		}
+		TimeOid => {
+			if len(b) != 8 { fail PgFault("22P03", "invalid binary representation for type time") }
+			let value = i64(read_u64(b, 0))
+			if value < 0 || value > microsPerDay { fail PgFault("22P03", "invalid binary representation for type time") }
+			return FromI64(oid, value)
+		}
+		TimetzOid => {
+			if len(b) != 12 { fail PgFault("22P03", "invalid binary representation for type time with time zone") }
+			let value = i64(read_u64(b, 0))
+			if value < 0 || value > microsPerDay { fail PgFault("22P03", "invalid binary representation for type time with time zone") }
+			return Datum{oid: oid, null: false, i: value, f: 0.0, b: false, s: "", bytes: []u8{}, months: 0, days: 0, offset: 0-i64(i32(read_u32(b, 8)))}
+		}
+		TimestampOid, TimestamptzOid => {
+			if len(b) != 8 { fail PgFault("22P03", "invalid binary representation for type timestamp") }
+			return FromI64(oid, i64(read_u64(b, 0)))
+		}
+		IntervalOid => {
+			if len(b) != 16 { fail PgFault("22P03", "invalid binary representation for type interval") }
+			return Datum{oid: oid, null: false, i: i64(read_u64(b, 0)), f: 0.0, b: false, s: "", bytes: []u8{}, months: i64(i32(read_u32(b, 12))), days: i64(i32(read_u32(b, 8))), offset: 0}
+		}
 		ByteaOid => { return FromBytes(oid, b) }
 		TextOid, VarcharOid, BpcharOid, NameOid => { return FromStr(oid, str(b)) }
 		_ => { fail PgFault("0A000", "binary receive is not implemented for type OID {oid}") }
@@ -423,6 +481,27 @@ fn IndexKey(d Datum) []u8 {
 				if (v & 0x8000000000000000) != 0 { put_u64(mut out, ~v) } else { put_u64(mut out, v ^ 0x8000000000000000) }
 			}
 		}
+		DateOid => {
+			mut raw = i32(d.i)
+			if d.i == pgInfinity { raw = 2147483647 }
+			if d.i == 0-pgInfinity { raw = -2147483648 }
+			let v = u32(raw) ^ 0x80000000
+			put_u32(mut out, v)
+		}
+		TimeOid => {
+			let v = u64(d.i) ^ 0x8000000000000000
+			put_u64(mut out, v)
+		}
+		TimetzOid => {
+			let micros = floor_mod(d.i-d.offset*1000000, microsPerDay)
+			let v = u64(micros) ^ 0x8000000000000000
+			put_u64(mut out, v)
+		}
+		TimestampOid, TimestamptzOid => {
+			let v = u64(d.i) ^ 0x8000000000000000
+			put_u64(mut out, v)
+		}
+		IntervalOid => { out = append(out, NumericIndexKey(interval_sort_numeric(d))...) }
 		NumericOid => { out = append(out, NumericIndexKey(d)...) }
 		ByteaOid => { out = append(out, d.bytes...) }
 		_ => { out = append(out, d.s...) }
