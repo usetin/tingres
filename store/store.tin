@@ -1,6 +1,11 @@
 package store
 
 import "quarry"
+import "lane"
+
+// Package store owns durable relation pages and their WAL. A content latch protects only a short,
+// synchronous page access; callers must release it before any await or wait. Tin lanes stay on one
+// core, and cross-core access to this core-local mutable store must be sent through relay.
 
 type RelId = u32
 type PageNo = u32
@@ -48,6 +53,8 @@ fn (x XidCtx) Cid() u32 {
 
 type Options struct {
 	BufferPages i64
+	SharedBuffersBytes i64
+	WalRingBytes i64
 	SyncOnWrite bool
 }
 
@@ -98,8 +105,17 @@ type Store struct {
 	dir str
 	opts Options
 	files RelationFiles
+	buffers BufferPool
+	walA []u8
+	walB []u8
+	walActive u8
+	walCapacityBytes i64
+	walGate lane.Lane[u8]
+	walFailed bool
+	walWrittenLsn u64
 	closed bool
 	lastLsn u64
+	syncedLsn u64
 	relations map[u32]HeapRelation
 	recordKinds map[u8]str
 }
@@ -148,7 +164,12 @@ fn Open(dir str, opts Options) !Store {
 	}
 	try quarry.RemoveAll(dir + "/base")
 	mut files = try NewRelationFiles(dir)
-	mut s = Store{dir: dir, opts: opts, files: files, relations: map[u32]HeapRelation{}, recordKinds: map[u8]str{}}
+	let capacity = try bufferCapacity(opts)
+	let buffers = try NewBufferPool(capacity)
+	let ringBytes = try walBufferCapacity(opts)
+	mut walGate = lane.New[u8](1)
+	try walGate.Send(1)
+	mut s = Store{dir: dir, opts: opts, files: files, buffers: buffers, walA: make([]u8, 0, ringBytes), walB: make([]u8, 0, ringBytes), walActive: 0, walCapacityBytes: ringBytes, walGate: walGate, walFailed: false, walWrittenLsn: 0, relations: map[u32]HeapRelation{}, recordKinds: map[u8]str{}}
 	if !hasWal {
 		return s
 	}
@@ -174,6 +195,7 @@ fn (s mut Store) CreateHeap(rel RelId) ! {
 		fail "store: relation already exists"
 	}
 	try s.appendWal(1, rel, Tid{page: 0, slot: 0}, TupleHeader{xmin: 0, xmax: 0, cid: 0, infomask: 0, ctid: Tid{page: 0, slot: 0}}, []u8{})
+	try s.Sync(s.CurrentLsn())
 	try s.files.Create(rel)
 	s.relations[u32(rel)] = HeapRelation{Tuples: []HeapTuple{}}
 }
@@ -182,6 +204,7 @@ fn (s mut Store) CreateHeap(rel RelId) ! {
 fn (s mut Store) DropRel(rel RelId) ! {
 	try s.appendWal(2, rel, Tid{page: 0, slot: 0}, TupleHeader{xmin: 0, xmax: 0, cid: 0, infomask: 0, ctid: Tid{page: 0, slot: 0}}, []u8{})
 	try s.Sync(s.CurrentLsn())
+	try s.buffers.InvalidateRel(rel)
 	try s.files.Drop(rel)
 	delete(s.relations, u32(rel))
 }
@@ -191,24 +214,44 @@ fn (s mut Store) HeapInsert(x XidCtx, rel RelId, payload []u8) !Tid {
 	if len(payload) > PageSize-pageHeaderSize-linePointerSize-24 {
 		fail "store: tuple too large"
 	}
-	let (r, ok) = s.relations[u32(rel)]
+	let (_, ok) = s.relations[u32(rel)]
 	if !ok {
 		fail "store: relation does not exist"
 	}
-	let (pageNo, page, slot) = try findTuplePage(s.files, rel, 24+len(payload))
+	let recordBytes = 24+len(payload)
+	let (pageNo, frame, slot) = try s.reserveTupleBufferPage(rel, recordBytes)
 	let tid = Tid{page: pageNo, slot: slot}
 	let h = TupleHeader{xmin: x.xid, xmax: 0, cid: x.cid, infomask: 0, ctid: tid}
 	let tuple = HeapTuple{Header: h, Tid: tid, Payload: copyBytes(payload)}
-	try s.appendWal(3, rel, tid, h, payload)
-	mut p = page
-	let actualSlot = try p.Insert(encodeTupleRecord(h, payload))
-	if actualSlot != slot {
-		fail "store: page line pointer changed during insert"
+	let walErr = s.appendWal(3, rel, tid, h, payload)
+	if walErr != nil {
+		s.cancelTupleReservation(frame, slot, recordBytes) catch _ { }
+		fail walErr
 	}
-	p.SetLsn(s.lastLsn)
-	try s.files.WritePage(rel, pageNo, p)
-	r.Tuples = append(r.Tuples, tuple)
-	s.relations[u32(rel)] = r
+	let record = encodeTupleRecord(h, payload)
+	let lockErr = s.buffers.LockContent(frame)
+	if lockErr != nil {
+		s.buffers.Unpin(frame) catch _ { }
+		fail lockErr
+	}
+	let insertErr = s.buffers.InsertReserved(frame, slot, record)
+	if insertErr != nil {
+		s.buffers.CancelReservation(frame, slot, recordBytes) catch _ { }
+		s.releasePinnedPage(frame) catch _ { }
+		fail insertErr
+	}
+	let dirtyErr = s.buffers.MarkDirty(frame, Lsn(s.lastLsn))
+	let unlockErr = s.buffers.UnlockContent(frame)
+	let unpinErr = s.buffers.Unpin(frame)
+	if dirtyErr != nil { fail dirtyErr }
+	if unlockErr != nil { fail unlockErr }
+	if unpinErr != nil { fail unpinErr }
+	let (current, exists) = s.relations[u32(rel)]
+	if !exists {
+		fail "store: relation disappeared during insert"
+	}
+	current.Tuples = append(current.Tuples, tuple)
+	s.relations[u32(rel)] = current
 	return tid
 }
 
@@ -224,35 +267,65 @@ fn (s mut Store) HeapDelete(x XidCtx, rel RelId, t Tid) ! {
 	}
 	let old = r.Tuples[i]
 	let h = TupleHeader{xmin: old.Header.xmin, xmax: x.xid, cid: old.Header.cid, infomask: old.Header.infomask, ctid: old.Header.ctid}
-	try s.appendWal(4, rel, t, h, []u8{})
-	try replaceTupleFile(mut s.files, rel, t, h, s.lastLsn)
+	let (frame, page) = try s.pinPage(rel, t.page)
+	try s.buffers.LockContent(frame)
+	let walErr = s.appendWal(4, rel, t, h, []u8{})
+	if walErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail walErr
+	}
+	mut p = page
+	let raw = try p.Item(t.slot)
+	let tuple = try decodeTupleRecord(t, raw)
+	let replaceErr = p.SetItem(t.slot, encodeTupleRecord(h, tuple.Payload))
+	if replaceErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail replaceErr
+	}
+	let dirtyErr = s.buffers.MarkDirty(frame, Lsn(s.lastLsn))
+	let unlockErr = s.buffers.UnlockContent(frame)
+	let unpinErr = s.buffers.Unpin(frame)
+	if dirtyErr != nil { fail dirtyErr }
+	if unlockErr != nil { fail unlockErr }
+	if unpinErr != nil { fail unpinErr }
 	r.Tuples[i].Header = h
 	s.relations[u32(rel)] = r
 }
 
 // HeapFetch returns the tuple version at TID. The caller may reuse out as scratch.
-fn (s Store) HeapFetch(rel RelId, t Tid, out []u8) !HeapTuple {
+fn (s mut Store) HeapFetch(rel RelId, t Tid, out []u8) !HeapTuple {
 	let (r, ok) = s.relations[u32(rel)]
 	if !ok {
 		fail "store: invalid tuple id"
 	}
-	let p = try s.files.ReadPage(rel, t.page)
+	let (frame, page) = try s.pinPage(rel, t.page)
+	try s.buffers.LockContent(frame)
+	mut p = page
 	let raw = try p.Item(t.slot)
 	let tuple = try decodeTupleRecord(t, raw)
 	_ = out
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
 	return tuple
 }
 
 // HeapScan returns every tuple version in physical order.
-fn (s Store) HeapScan(rel RelId) HeapScan {
+fn (s mut Store) HeapScan(rel RelId) HeapScan {
 	let (_, ok) = s.relations[u32(rel)]
 	if !ok {
 		return HeapScan{tuples: []HeapTuple{}}
 	}
-	let count = s.files.PageCount(rel) catch _ { 0 }
+	let diskCount = s.files.PageCount(rel) catch _ { 0 }
+	let count = max(diskCount, s.buffers.RelationPageCount(rel))
 	mut tuples = []HeapTuple{}
 	for block in 0..i64(count) {
-		let p = s.files.ReadPage(rel, PageNo(block)) catch _ { continue }
+		let (frame, page) = s.pinPage(rel, PageNo(block)) catch _ { continue }
+		let lockErr = s.buffers.LockContent(frame)
+		if lockErr != nil {
+			s.buffers.Unpin(frame) catch _ { }
+			continue
+		}
+		let p = page
 		let slots = p.Header().Slots
 		for slot in 1..i64(slots)+1 {
 			let tid = Tid{page: PageNo(block), slot: u16(slot)}
@@ -260,6 +333,8 @@ fn (s Store) HeapScan(rel RelId) HeapScan {
 			let tuple = decodeTupleRecord(tid, raw) catch _ { continue }
 			tuples = append(tuples, tuple)
 		}
+		s.buffers.UnlockContent(frame) catch _ { }
+		s.buffers.Unpin(frame) catch _ { }
 	}
 	return HeapScan{tuples: tuples}
 }
@@ -286,8 +361,27 @@ fn (s mut Store) SetHint(rel RelId, t Tid, bits u16) ! {
 	}
 	let old = r.Tuples[i].Header
 	let h = TupleHeader{xmin: old.xmin, xmax: old.xmax, cid: old.cid, infomask: old.infomask | bits, ctid: old.ctid}
-	try s.appendWal(5, rel, t, h, []u8{})
-	try replaceTupleFile(mut s.files, rel, t, h, s.lastLsn)
+	let (frame, page) = try s.pinPage(rel, t.page)
+	try s.buffers.LockContent(frame)
+	let walErr = s.appendWal(5, rel, t, h, []u8{})
+	if walErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail walErr
+	}
+	mut p = page
+	let raw = try p.Item(t.slot)
+	let tuple = try decodeTupleRecord(t, raw)
+	let replaceErr = p.SetItem(t.slot, encodeTupleRecord(h, tuple.Payload))
+	if replaceErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail replaceErr
+	}
+	let dirtyErr = s.buffers.MarkDirty(frame, Lsn(s.lastLsn))
+	let unlockErr = s.buffers.UnlockContent(frame)
+	let unpinErr = s.buffers.Unpin(frame)
+	if dirtyErr != nil { fail dirtyErr }
+	if unlockErr != nil { fail unlockErr }
+	if unpinErr != nil { fail unpinErr }
 	r.Tuples[i].Header = h
 	s.relations[u32(rel)] = r
 }
@@ -305,11 +399,19 @@ fn (s mut Store) RegisterRecordKind(kind u8, name str) ! {
 }
 
 // Sync flushes the WAL through the supplied LSN.
-fn (s Store) Sync(lsn Lsn) ! {
+fn (s mut Store) Sync(lsn Lsn) ! {
 	if lsn > s.lastLsn {
 		fail "store: LSN is beyond end of WAL"
 	}
-	try quarry.Sync(s.dir + "/wal/00000001.wal")
+	let token = try s.walGate.Recv()
+	let syncErr = s.syncWalBatch(lsn)
+	let releaseErr = s.walGate.Send(token)
+	if syncErr != nil {
+		fail syncErr
+	}
+	if releaseErr != nil {
+		fail releaseErr
+	}
 }
 
 // CurrentLsn returns the byte position immediately after the last complete WAL frame.
@@ -330,7 +432,8 @@ fn (s mut Store) LogRecord(kind u8, payload []u8) !Lsn {
 
 // Checkpoint flushes the WAL and persists the current heap image.
 fn (s mut Store) Checkpoint() ! {
-	try quarry.Sync(s.dir + "/wal/00000001.wal")
+	try s.flushBuffers()
+	try s.Sync(s.CurrentLsn())
 }
 
 // CreateIndex creates an empty index. B-tree mutation is added in a later milestone.
@@ -373,30 +476,223 @@ fn (scan mut IndexScan) Next() (IndexItem, bool) {
 }
 
 fn (s mut Store) appendWal(kind u8, rel RelId, tid Tid, h TupleHeader, payload []u8) ! {
-	mut rec = make([]u8, 36+len(payload))
-	rec[0] = kind
-	writeU32(mut rec, 4, u32(rel))
-	writeU32(mut rec, 8, u32(tid.page))
-	writeU16(mut rec, 12, tid.slot)
-	writeU32(mut rec, 16, h.xmin)
-	writeU32(mut rec, 20, h.xmax)
-	writeU32(mut rec, 24, h.cid)
-	writeU16(mut rec, 28, h.infomask)
-	writeU32(mut rec, 30, u32(h.ctid.page))
-	writeU16(mut rec, 34, h.ctid.slot)
-	if len(payload) > 0 {
-		copy(rec[36:], payload)
+	if s.walFailed {
+		fail "store: WAL writer failed; reopen after recovery"
 	}
-	let crc = crc32(rec)
-	mut framed = make([]u8, 8+len(rec))
-	writeU32(mut framed, 0, u32(len(rec)))
-	writeU32(mut framed, 4, crc)
-	copy(framed[8:], rec)
-	try quarry.AppendFile(s.dir + "/wal/00000001.wal", str(framed))
-	s.lastLsn += u64(len(framed))
+	let recordSize = 44+len(payload)
+	if recordSize > s.walCapacityBytes {
+		fail "store: WAL record exceeds configured ring size"
+	}
+	if s.activeWalLength()+recordSize > s.walCapacityBytes {
+		try s.Sync(s.CurrentLsn())
+		if s.activeWalLength()+recordSize > s.walCapacityBytes {
+			fail "store: WAL ring remains full after sync"
+		}
+	}
+	let nextLsn = s.lastLsn+u64(recordSize)
+	if s.walActive == 0 {
+		try appendWalFrame(mut s.walA, s.walCapacityBytes, kind, rel, tid, h, payload)
+	} else {
+		try appendWalFrame(mut s.walB, s.walCapacityBytes, kind, rel, tid, h, payload)
+	}
+	s.lastLsn = nextLsn
 	if s.opts.SyncOnWrite {
-		try quarry.Sync(s.dir + "/wal/00000001.wal")
+		try s.Sync(Lsn(s.lastLsn))
 	}
+}
+
+fn appendWalFrame(buf mut []u8, capacity i64, kind u8, rel RelId, tid Tid, h TupleHeader, payload []u8) ! {
+	let recordLen = 36+len(payload)
+	let frameLen = 8+recordLen
+	if len(buf)+frameLen > capacity {
+		fail "store: WAL ring is full"
+	}
+	let off = len(buf)
+	for _i in 0..frameLen {
+		buf = append(buf, u8(0))
+	}
+	writeU32(mut buf, off, u32(recordLen))
+	buf[off+8] = kind
+	writeU32(mut buf, off+12, u32(rel))
+	writeU32(mut buf, off+16, u32(tid.page))
+	writeU16(mut buf, off+20, tid.slot)
+	writeU32(mut buf, off+24, h.xmin)
+	writeU32(mut buf, off+28, h.xmax)
+	writeU32(mut buf, off+32, h.cid)
+	writeU16(mut buf, off+36, h.infomask)
+	writeU32(mut buf, off+38, u32(h.ctid.page))
+	writeU16(mut buf, off+42, h.ctid.slot)
+	if len(payload) > 0 {
+		copy(buf[off+44:off+44+len(payload)], payload)
+	}
+	let check = crc32(buf[off+8:off+8+recordLen])
+	writeU32(mut buf, off+4, check)
+}
+
+fn (s mut Store) syncWalBatch(lsn Lsn) ! {
+	if s.walFailed {
+		fail "store: WAL writer failed; reopen after recovery"
+	}
+	if u64(lsn) <= s.syncedLsn {
+		return
+	}
+	let batchIndex = s.walActive
+	mut batch = []u8{}
+	if batchIndex == 0 {
+		batch = s.walA
+		s.walA = s.walA[0:0]
+		s.walActive = 1
+	} else {
+		batch = s.walB
+		s.walB = s.walB[0:0]
+		s.walActive = 0
+	}
+	if len(batch) > 0 {
+		let batchEnd = s.walWrittenLsn+u64(len(batch))
+		let appendErr = quarry.AppendFile(s.dir + "/wal/00000001.wal", str(batch))
+		if appendErr != nil {
+			s.walFailed = true
+			if batchIndex == 0 { s.walA = batch } else { s.walB = batch }
+			fail appendErr
+		}
+		s.walWrittenLsn = batchEnd
+	}
+	let syncErr = quarry.Sync(s.dir + "/wal/00000001.wal")
+	if syncErr != nil {
+		s.walFailed = true
+		fail syncErr
+	}
+	s.syncedLsn = s.walWrittenLsn
+	if u64(lsn) > s.syncedLsn {
+		fail "store: requested WAL LSN is not in the sync batch"
+	}
+}
+
+fn (s Store) walCapacity() i64 {
+	return s.walCapacityBytes
+}
+
+fn (s Store) activeWalLength() i64 {
+	if s.walActive == 0 { return len(s.walA) }
+	return len(s.walB)
+}
+
+fn bufferCapacity(opts Options) !u32 {
+	if opts.BufferPages > 0 {
+		if opts.BufferPages > i64(0xffffffff) {
+			fail "store: buffer pool is too large"
+		}
+		return u32(opts.BufferPages)
+	}
+	mut bytes = opts.SharedBuffersBytes
+	if bytes <= 0 {
+		bytes = 16*1024*1024
+	}
+	if bytes < PageSize || bytes%PageSize != 0 || bytes/PageSize > i64(0xffffffff) {
+		fail "store: shared_buffers must be a positive multiple of 8 KiB"
+	}
+	return u32(bytes/PageSize)
+}
+
+fn walBufferCapacity(opts Options) !i64 {
+	mut bytes = opts.WalRingBytes
+	if bytes <= 0 {
+		bytes = 16*1024*1024
+	}
+	if bytes < 65536 {
+		fail "store: wal ring must be at least 64 KiB"
+	}
+	return bytes
+}
+
+// pinPage is the only path from Store operations to relation page bytes.
+fn (s mut Store) pinPage(rel RelId, block PageNo) !(u32, Page) {
+	let key = BufferKey{rel: u32(rel), page: u32(block)}
+	if s.buffers.Contains(key) {
+		let frame = try s.buffers.PinResident(key)
+		let page = try s.buffers.PageAt(frame)
+		return frame, page
+	}
+	let frame = try s.buffers.ChooseVictim()
+	if s.buffers.IsDirty(frame) {
+		try s.flushFrame(frame)
+	}
+	let size = try s.files.Size(rel)
+	let offset = i64(block)*PageSize
+	try s.buffers.Reserve(frame, key)
+	if offset < size {
+		let page = try s.buffers.PageAt(frame)
+		mut bytes = page.Data
+		let loadErr = s.files.ReadPageInto(rel, block, mut bytes)
+		if loadErr != nil {
+			s.buffers.Discard(frame) catch _ { }
+			fail loadErr
+		}
+	}
+	let page = try s.buffers.PageAt(frame)
+	return frame, page
+}
+
+fn (s mut Store) reserveTupleBufferPage(rel RelId, recordSize i64) !(PageNo, u32, u16) {
+	let diskCount = try s.files.PageCount(rel)
+	let count = max(diskCount, s.buffers.RelationPageCount(rel))
+	for i in 0..i64(count) {
+		let block = PageNo(i)
+		let (frame, _) = try s.pinPage(rel, block)
+		try s.buffers.LockContent(frame)
+		let (slot, reserveErr) = s.buffers.ReserveItem(frame, recordSize)
+		if reserveErr == nil {
+			try s.buffers.UnlockContent(frame)
+			return block, frame, slot
+		}
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+	}
+	let block = PageNo(count)
+	let (frame, _) = try s.pinPage(rel, block)
+	try s.buffers.LockContent(frame)
+	let slot = try s.buffers.ReserveItem(frame, recordSize)
+	try s.buffers.UnlockContent(frame)
+	return block, frame, slot
+}
+
+fn (s mut Store) flushFrame(frame u32) ! {
+	if !s.buffers.IsDirty(frame) {
+		return
+	}
+	let key = try s.buffers.Key(frame)
+	let page = try s.buffers.PageAt(frame)
+	let lsn = Lsn(page.Header().Lsn)
+	try s.Sync(lsn)
+	if u64(lsn) > s.syncedLsn {
+		fail "store: refusing page write before WAL sync"
+	}
+	try s.files.WritePage(RelId(key.rel), PageNo(key.page), page)
+	try s.buffers.ClearDirty(frame)
+}
+
+fn (s mut Store) flushBuffers() ! {
+	for i in 0..i64(s.buffers.Capacity()) {
+		let frame = u32(i)
+		if s.buffers.IsDirty(frame) {
+			if s.buffers.framePinned(frame) {
+				fail "store: cannot checkpoint a pinned page"
+			}
+			try s.flushFrame(frame)
+		}
+	}
+}
+
+fn (s mut Store) releasePinnedPage(frame u32) ! {
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+}
+
+fn (s mut Store) cancelTupleReservation(frame u32, slot u16, recordBytes i64) ! {
+	try s.buffers.LockContent(frame)
+	try s.buffers.CancelReservation(frame, slot, recordBytes)
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
 }
 
 fn findTuplePage(files RelationFiles, rel RelId, recordSize i64) !(PageNo, Page, u16) {
@@ -505,6 +801,8 @@ fn recoverWal(s mut Store, data str) !Store {
 		off += 8+n
 	}
 	out.lastLsn = u64(off)
+	out.syncedLsn = u64(off)
+	out.walWrittenLsn = u64(off)
 	return out
 }
 
