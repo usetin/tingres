@@ -63,3 +63,14 @@ fn charPosition(s str, bytePos i64) i64 {
 	}
 	return count
 }
+
+// ToParseError extracts ParseError from a parse fault.
+fn ToParseError(err fault) ParseError {
+	let (pos, _) = ErrorPos(err)
+	let code = ErrorCode(err)
+	mut message = fault.Message(err)
+	let marker = " (position "
+	let at = findText(message, marker)
+	if at >= 0 { message = message[:at] }
+	return ParseError{Pos: pos, Message: message, Code: code}
+}

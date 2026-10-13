@@ -424,3 +424,53 @@ fn TestAllStatementCoverage(t mut crucible.T) {
 		}
 	}
 }
+
+fn TestParseErrorWordingAndCodes(t mut crucible.T) {
+	// 1. Syntax error at end of input
+	let _ = Parse("SELECT 1 +") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code at end of input", pe.Code, "42601")
+		crucible.EqS("msg at end of input", pe.Message, "syntax error at end of input")
+		crucible.EqI("pos at end of input", pe.Pos, 11)
+		[]Stmt{}
+	}
+
+	// 2. Syntax error at or near
+	let _ = Parse("SELECT FROM") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code at or near", pe.Code, "42601")
+		crucible.EqS("msg at or near", pe.Message, "syntax error at or near \"FROM\"")
+		crucible.EqI("pos at or near", pe.Pos, 8)
+		[]Stmt{}
+	}
+
+	// 3. Unterminated quoted string
+	let _ = Parse("SELECT 'unterminated") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code unterminated string", pe.Code, "42601")
+		crucible.True("msg unterminated string", hasText(pe.Message, "unterminated quoted string at or near"))
+		crucible.EqI("pos unterminated string", pe.Pos, 8)
+		[]Stmt{}
+	}
+
+	// 4. Trailing junk after numeric literal
+	let _ = Parse("SELECT 1a") catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code trailing junk", pe.Code, "42601")
+		crucible.True("msg trailing junk", hasText(pe.Message, "trailing junk after numeric literal at or near \"1a\""))
+		crucible.EqI("pos trailing junk", pe.Pos, 8)
+		[]Stmt{}
+	}
+
+	// 5. Stack depth limit exceeded
+	mut deepSql = "SELECT "
+	for i in 0..300 { deepSql += "(" }
+	deepSql += "1"
+	for i in 0..300 { deepSql += ")" }
+	let _ = Parse(deepSql) catch err {
+		let pe = ToParseError(err)
+		crucible.EqS("code stack depth", pe.Code, "54001")
+		crucible.EqS("msg stack depth", pe.Message, "stack depth limit exceeded")
+		[]Stmt{}
+	}
+}
