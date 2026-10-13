@@ -4,6 +4,7 @@ import "gauge"
 import "mint"
 import "fault"
 import "twine"
+import "tide"
 
 // Oid is PostgreSQL's stable type identifier.
 type Oid = u32
@@ -73,75 +74,436 @@ fn FromBytes(oid Oid, v []u8) Datum {
 
 fn (d Datum) Oid() Oid { return d.oid }
 
-fn (d Datum) Text() str {
-	if d.null { return "" }
+
+fn append_str_bytes(out mut []u8, s str) {
+	for i in 0..len(s) {
+		out = append(out, s[i])
+	}
+}
+
+fn append_u64(out mut []u8, u u64) {
+	if u == 0 {
+		out = append(out, '0')
+		return
+	}
+	mut tmp [32]u8 = [32]u8{}
+	mut pos = 31
+	mut v = u
+	for v > 0 {
+		tmp[pos] = u8(48 + v%10)
+		v = v/10
+		pos -= 1
+	}
+	for i in (pos+1)..32 {
+		out = append(out, tmp[i])
+	}
+}
+
+fn append_i64(out mut []u8, v i64) {
+	if v < 0 {
+		out = append(out, '-')
+		append_u64(mut out, u64(0-%v))
+	} else {
+		append_u64(mut out, u64(v))
+	}
+}
+
+fn append_fast_numeric(m i64, scale i64, out mut []u8) {
+	if m < 0 { out = append(out, '-') }
+	let u = fast_abs_u64(m)
+	if scale <= 0 {
+		append_u64(mut out, u)
+		return
+	}
+	mut tmp [32]u8 = [32]u8{}
+	mut pos = 31
+	mut v = u
+	for v > 0 {
+		tmp[pos] = u8(48 + v%10)
+		v = v/10
+		pos -= 1
+	}
+	let numDigits = 31-pos
+	if numDigits == 0 {
+		out = append(out, '0')
+		out = append(out, '.')
+		for idx in 0..scale {
+			out = append(out, '0')
+			_ = idx
+		}
+		return
+	}
+	if numDigits <= scale {
+		out = append(out, '0')
+		out = append(out, '.')
+		for idx in 0..(scale-numDigits) {
+			out = append(out, '0')
+			_ = idx
+		}
+		for i in (pos+1)..32 { out = append(out, tmp[i]) }
+	} else {
+		let cut = numDigits-scale
+		for i in (pos+1)..(pos+1+cut) { out = append(out, tmp[i]) }
+		out = append(out, '.')
+		for i in (pos+1+cut)..32 { out = append(out, tmp[i]) }
+	}
+}
+
+fn append_two_digits(out mut []u8, v i64) {
+	out = append(out, u8(48+(v/10)%10))
+	out = append(out, u8(48+v%10))
+}
+
+fn append_year(out mut []u8, y i64) {
+	mut v = y
+	if y < 0 {
+		out = append(out, '-')
+		v = 0-y
+	}
+	if v < 10 {
+		out = append(out, '0')
+		out = append(out, '0')
+		out = append(out, '0')
+		out = append(out, u8(48+v))
+	} else if v < 100 {
+		out = append(out, '0')
+		out = append(out, '0')
+		out = append(out, u8(48+v/10))
+		out = append(out, u8(48+v%10))
+	} else if v < 1000 {
+		out = append(out, '0')
+		out = append(out, u8(48+v/100))
+		out = append(out, u8(48+(v/10)%10))
+		out = append(out, u8(48+v%10))
+	} else if v < 10000 {
+		out = append(out, u8(48+v/1000))
+		out = append(out, u8(48+(v/100)%10))
+		out = append(out, u8(48+(v/10)%10))
+		out = append(out, u8(48+v%10))
+	} else {
+		append_u64(mut out, u64(v))
+	}
+}
+
+fn append_date_days(days i64, out mut []u8) {
+	let (year, month, day) = tide.CivilFromDays(days+pgEpochDays)
+	append_year(mut out, year)
+	out = append(out, '-')
+	append_two_digits(mut out, month)
+	out = append(out, '-')
+	append_two_digits(mut out, day)
+}
+
+fn append_time_micros(value i64, withZone bool, offset i64, out mut []u8) {
+	if value == microsPerDay {
+		append_str_bytes(mut out, "24:00:00")
+		if withZone { append_zone(offset, mut out) }
+		return
+	}
+	let normalized = floor_mod(value, microsPerDay)
+	let hour = normalized/microsPerHour
+	let minute = (normalized%microsPerHour)/microsPerMinute
+	let second = (normalized%microsPerMinute)/microsPerSecond
+	let micro = normalized%microsPerSecond
+	append_two_digits(mut out, hour)
+	out = append(out, ':')
+	append_two_digits(mut out, minute)
+	out = append(out, ':')
+	append_two_digits(mut out, second)
+	if micro != 0 {
+		out = append(out, '.')
+		mut fracDigits [6]u8 = [6]u8{}
+		mut m = micro
+		for idx in 0..6 {
+			let p = 5-idx
+			fracDigits[p] = u8(48 + m%10)
+			m = m/10
+		}
+		mut end = 6
+		for end > 0 && fracDigits[end-1] == '0' { end -= 1 }
+		for i in 0..end { out = append(out, fracDigits[i]) }
+	}
+	if withZone { append_zone(offset, mut out) }
+}
+
+fn append_zone(offset i64, out mut []u8) {
+	mut value = offset
+	if offset < 0 {
+		out = append(out, '-')
+		value = 0-offset
+	} else {
+		out = append(out, '+')
+	}
+	let hours = value/3600
+	let minutes = (value%3600)/60
+	append_two_digits(mut out, hours)
+	if minutes != 0 {
+		out = append(out, ':')
+		append_two_digits(mut out, minutes)
+	}
+}
+
+fn append_timestamp_micros(micros i64, out mut []u8) {
+	let days = floor_div(micros, microsPerDay)
+	let time = floor_mod(micros, microsPerDay)
+	append_date_days(days, mut out)
+	out = append(out, ' ')
+	append_time_micros(time, false, 0, mut out)
+}
+
+// AppendText appends the exact PostgreSQL text representation of d into out,
+// without intermediate str allocations for numbers, bools, and dates.
+fn AppendText(d Datum, out mut []u8) {
+	if d.null { return }
 	match d.oid {
 		BoolOid => {
-			if d.b { return "true" }
-			return "false"
+			if d.b {
+				append_str_bytes(mut out, "true")
+			} else {
+				append_str_bytes(mut out, "false")
+			}
 		}
-		Int2Oid, Int4Oid, Int8Oid, OidOid => { return mint.Itoa(d.i) }
-		Float4Oid, Float8Oid => { return float_text(d) }
-		NumericOid => { return NumericText(d) }
-		DateOid => { return DateText(d) }
-		TimeOid => { return TimeText(d) }
-		TimetzOid => { return TimetzText(d) }
-		TimestampOid => { return TimestampText(d) }
-		TimestamptzOid => { return TimestamptzText(d) }
-		IntervalOid => { return IntervalText(d) }
-		ByteaOid => { return "\\x" + hex(d.bytes) }
-		BpcharOid => { return twine.TrimRight(d.s, " ") }
-		_ => { return d.s }
+		Int2Oid, Int4Oid, Int8Oid, OidOid => {
+			append_i64(mut out, d.i)
+		}
+		Float4Oid, Float8Oid => {
+			append_str_bytes(mut out, float_text(d))
+		}
+		NumericOid => {
+			let (m, s, ok) = numeric_fast_pair(d)
+			if ok {
+				append_fast_numeric(m, s, mut out)
+			} else {
+				append_str_bytes(mut out, NumericText(d))
+			}
+		}
+		DateOid => {
+			if d.i == pgInfinity {
+				append_str_bytes(mut out, "infinity")
+			} else if d.i == 0-pgInfinity {
+				append_str_bytes(mut out, "-infinity")
+			} else {
+				append_date_days(d.i, mut out)
+			}
+		}
+		TimeOid => {
+			append_time_micros(d.i, false, 0, mut out)
+		}
+		TimetzOid => {
+			append_time_micros(d.i, true, d.offset, mut out)
+		}
+		TimestampOid => {
+			if d.i == pgInfinity {
+				append_str_bytes(mut out, "infinity")
+			} else if d.i == 0-pgInfinity {
+				append_str_bytes(mut out, "-infinity")
+			} else {
+				append_timestamp_micros(d.i, mut out)
+			}
+		}
+		TimestamptzOid => {
+			if d.i == pgInfinity {
+				append_str_bytes(mut out, "infinity")
+			} else if d.i == 0-pgInfinity {
+				append_str_bytes(mut out, "-infinity")
+			} else {
+				let offset = session_offset(d.i)
+				let local = d.i+offset*microsPerSecond
+				append_timestamp_micros(local, mut out)
+				append_zone(offset, mut out)
+			}
+		}
+		IntervalOid => {
+			append_str_bytes(mut out, IntervalText(d))
+		}
+		ByteaOid => {
+			out = append(out, '\\')
+			out = append(out, 'x')
+			let h = hex(d.bytes)
+			append_str_bytes(mut out, h)
+		}
+		BpcharOid => {
+			let trimmed = twine.TrimRight(d.s, " ")
+			append_str_bytes(mut out, trimmed)
+		}
+		_ => {
+			append_str_bytes(mut out, d.s)
+		}
 	}
+}
+
+fn (d Datum) AppendText(out mut []u8) {
+	AppendText(d, mut out)
+}
+
+fn (d Datum) Text() str {
+	if d.null { return "" }
+	mut buf = make([]u8, 0, 32)
+	AppendText(d, mut buf)
+	return str(buf)
+}
+
+fn trim_ascii_spaces(b []u8) []u8 {
+	mut start = 0
+	for start < len(b) && (b[start] == 32 || b[start] == 9 || b[start] == 10 || b[start] == 13) {
+		start += 1
+	}
+	mut end = len(b)
+	for end > start && (b[end-1] == 32 || b[end-1] == 9 || b[end-1] == 10 || b[end-1] == 13) {
+		end -= 1
+	}
+	return b[start:end]
+}
+
+// ParseIntBytes parses a decimal integer from b without allocations.
+fn ParseIntBytes(b []u8, oid Oid) !i64 {
+	let trimmed = trim_ascii_spaces(b)
+	if len(trimmed) == 0 { fail PgFault("22P02", "invalid input syntax for type {sql_type_name(oid)}: \"{str(b)}\"") }
+	mut neg = false
+	mut start = 0
+	if trimmed[0] == '-' {
+		neg = true
+		start = 1
+	} else if trimmed[0] == '+' {
+		start = 1
+	}
+	if start >= len(trimmed) { fail PgFault("22P02", "invalid input syntax for type {sql_type_name(oid)}: \"{str(b)}\"") }
+	mut u = u64(0)
+	for i in start..len(trimmed) {
+		let c = trimmed[i]
+		if c < '0' || c > '9' { fail PgFault("22P02", "invalid input syntax for type {sql_type_name(oid)}: \"{str(b)}\"") }
+		let digit = u64(c-'0')
+		if u > (18446744073709551615-digit)/10 {
+			fail PgFault("22003", "value \"" + str(b) + "\" is out of range for type " + sql_type_name(oid))
+		}
+		u = u*10+digit
+	}
+	if neg {
+		if u > 9223372036854775808 { fail PgFault("22003", "value \"" + str(b) + "\" is out of range for type " + sql_type_name(oid)) }
+		if u == 9223372036854775808 { return -9223372036854775808 }
+		return 0-i64(u)
+	}
+	if u > 9223372036854775807 { fail PgFault("22003", "value \"" + str(b) + "\" is out of range for type " + sql_type_name(oid)) }
+	return i64(u)
+}
+
+// ParseBoolBytes parses boolean text without allocations.
+fn ParseBoolBytes(b []u8) !bool {
+	let s = trim_ascii_spaces(b)
+	if len(s) == 1 {
+		let c = s[0]
+		if c == 't' || c == 'T' || c == '1' || c == 'y' || c == 'Y' { return true }
+		if c == 'f' || c == 'F' || c == '0' || c == 'n' || c == 'N' { return false }
+	} else if len(s) == 2 {
+		if (s[0] == 'o' || s[0] == 'O') && (s[1] == 'n' || s[1] == 'N') { return true }
+		if (s[0] == 'n' || s[0] == 'N') && (s[1] == 'o' || s[1] == 'O') { return false }
+	} else if len(s) == 3 {
+		if (s[0] == 'y' || s[0] == 'Y') && (s[1] == 'e' || s[1] == 'E') && (s[2] == 's' || s[2] == 'S') { return true }
+		if (s[0] == 'o' || s[0] == 'O') && (s[1] == 'f' || s[1] == 'F') && (s[2] == 'f' || s[2] == 'F') { return false }
+	} else if len(s) == 4 {
+		if (s[0] == 't' || s[0] == 'T') && (s[1] == 'r' || s[1] == 'R') && (s[2] == 'u' || s[2] == 'U') && (s[3] == 'e' || s[3] == 'E') { return true }
+	} else if len(s) == 5 {
+		if (s[0] == 'f' || s[0] == 'F') && (s[1] == 'a' || s[1] == 'A') && (s[2] == 'l' || s[2] == 'L') && (s[3] == 's' || s[3] == 'S') && (s[4] == 'e' || s[4] == 'E') { return false }
+	}
+	fail PgFault("22P02", "invalid input syntax for type boolean: \"{str(b)}\"")
+}
+
+// ParseFloatBytes parses floating-point text without allocating for standard numbers.
+fn ParseFloatBytes(b []u8, oid Oid) !f64 {
+	let trimmed = trim_ascii_spaces(b)
+	let text = str(trimmed)
+	let f = mint.ParseFloat(text) catch err {
+		if fault.Is(err, mint.ErrRange) { fail PgFault("22003", "value out of range for type " + sql_type_name(oid)) }
+		fail PgFault("22P02", "invalid input syntax for type {sql_type_name(oid)}: \"{str(b)}\"")
+	}
+	return f
+}
+
+
+fn set_datum(target mut Datum, src Datum) {
+	target.oid = src.oid
+	target.null = src.null
+	target.i = src.i
+	target.f = src.f
+	target.b = src.b
+	target.s = src.s
+	target.bytes = src.bytes
+	target.months = src.months
+	target.days = src.days
+	target.offset = src.offset
+}
+
+// ParseBytes parses a Datum directly from bytes.
+fn ParseBytes(oid Oid, b []u8) !Datum {
+	match oid {
+		BoolOid => {
+			let v = try ParseBoolBytes(b)
+			return FromBool(v)
+		}
+		Int2Oid => {
+			let n = try ParseIntBytes(b, oid)
+			if n < -32768 || n > 32767 { fail PgFault("22003", "value \"" + str(b) + "\" is out of range for type smallint") }
+			return FromI64(Int2Oid, n)
+		}
+		Int4Oid => {
+			let n = try ParseIntBytes(b, oid)
+			if n < -2147483648 || n > 2147483647 { fail PgFault("22003", "value \"" + str(b) + "\" is out of range for type integer") }
+			return FromI64(Int4Oid, n)
+		}
+		Int8Oid => {
+			let n = try ParseIntBytes(b, oid)
+			return FromI64(Int8Oid, n)
+		}
+		OidOid => {
+			let n = try ParseIntBytes(b, oid)
+			if n < 0 || u64(n) > 4294967295 { fail PgFault("22003", "value \"" + str(b) + "\" is out of range for type oid") }
+			return FromI64(OidOid, n)
+		}
+		Float4Oid => {
+			let f = try ParseFloatBytes(b, oid)
+			return FromF64(Float4Oid, f64(f32(f)))
+		}
+		Float8Oid => {
+			let f = try ParseFloatBytes(b, oid)
+			return FromF64(Float8Oid, f)
+		}
+		NumericOid => {
+			return try ParseNumeric(str(b))
+		}
+		TextOid, VarcharOid, BpcharOid, NameOid, UuidOid => {
+			let text = str(b)
+			if oid == UuidOid && !valid_uuid(text) { fail PgFault("22P02", "invalid input syntax for type uuid: \"" + text + "\"") }
+			return FromStr(oid, text)
+		}
+		DateOid, TimeOid, TimetzOid, TimestampOid, TimestamptzOid, IntervalOid => {
+			return try ParseDateTime(oid, str(b))
+		}
+		ByteaOid => {
+			let text = str(b)
+			let parsed = parse_bytea(text) catch err { fail PgFault("22P02", ErrorMessage(err)) }
+			return FromBytes(oid, parsed)
+		}
+		_ => { fail PgFault("0A000", "unsupported input type OID " + mint.Itoa(i64(oid))) }
+	}
+}
+
+// ParseBytesInto parses b directly into out.
+fn ParseBytesInto(oid Oid, b []u8, out mut Datum) ! {
+	let d = try ParseBytes(oid, b)
+	set_datum(mut out, d)
+}
+
+// ParseStrInto parses text into out.
+fn ParseStrInto(oid Oid, text str, out mut Datum) ! {
+	let d = try ParseBytes(oid, []u8(text))
+	set_datum(mut out, d)
 }
 
 fn Parse(oid Oid, text str) !Datum {
-	match oid {
-		BoolOid => {
-			if text == "t" || text == "true" || text == "TRUE" || text == "yes" || text == "on" || text == "1" { return FromBool(true) }
-			if text == "f" || text == "false" || text == "FALSE" || text == "no" || text == "off" || text == "0" { return FromBool(false) }
-			fail PgFault("22P02", "invalid input syntax for type boolean: \"{text}\"")
-		}
-		Int2Oid, Int4Oid, Int8Oid, OidOid => {
-			let n = mint.ParseInt(text, 10) catch err {
-				if fault.Is(err, mint.ErrRange) { fail PgFault("22003", "value \"{text}\" is out of range for type {sql_type_name(oid)}") }
-				fail PgFault("22P02", "invalid input syntax for type {sql_type_name(oid)}: \"{text}\"")
-			}
-			if oid == Int2Oid && (n < -32768 || n > 32767) { fail PgFault("22003", "value \"{text}\" is out of range for type smallint") }
-			if oid == Int4Oid && (n < -2147483648 || n > 2147483647) { fail PgFault("22003", "value \"{text}\" is out of range for type integer") }
-			if oid == OidOid && (n < 0 || u64(n) > 4294967295) { fail PgFault("22003", "value \"{text}\" is out of range for type oid") }
-			return FromI64(oid, n)
-		}
-		Float4Oid => {
-			let f = mint.ParseFloat(text) catch err {
-				if fault.Is(err, mint.ErrRange) { fail PgFault("22003", "value out of range for type real") }
-				fail PgFault("22P02", "invalid input syntax for type real: \"{text}\"")
-			}
-			return FromF64(oid, f64(f32(f)))
-		}
-		Float8Oid => {
-			let f = mint.ParseFloat(text) catch err {
-				if fault.Is(err, mint.ErrRange) { fail PgFault("22003", "value out of range for type double precision") }
-				fail PgFault("22P02", "invalid input syntax for type double precision: \"{text}\"")
-			}
-			return FromF64(oid, f)
-		}
-		NumericOid => { return try ParseNumeric(text) }
-		TextOid, VarcharOid, BpcharOid, NameOid, UuidOid => {
-			if oid == UuidOid && !valid_uuid(text) { fail PgFault("22P02", "invalid input syntax for type uuid: \"{text}\"") }
-			return FromStr(oid, text)
-		}
-		DateOid, TimeOid, TimetzOid, TimestampOid, TimestamptzOid, IntervalOid => { return try ParseDateTime(oid, text) }
-		ByteaOid => {
-			let b = parse_bytea(text) catch err { fail PgFault("22P02", ErrorMessage(err)) }
-			return FromBytes(oid, b)
-		}
-		_ => { fail PgFault("0A000", "unsupported input type OID {oid}") }
-	}
+	return try ParseBytes(oid, []u8(text))
 }
 
-// input_type_name is the name PostgreSQL prints from an input-function error,
-// which is shorter than format_type's name for time and timestamp.
+
 fn input_type_name(oid Oid) str {
 	if oid == TimeOid { return "time" }
 	if oid == TimestampOid { return "timestamp" }
