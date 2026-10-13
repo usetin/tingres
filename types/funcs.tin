@@ -492,8 +492,8 @@ fn numericArithmetic(op str, left Datum, right Datum) !Datum {
 	if op == "+" { return try NumericAdd(left, right) }
 	if op == "-" { return try NumericSub(left, right) }
 	if op == "*" { return try NumericMul(left, right) }
-	if op == "/" { return try NumericDivide(left, right) }
-	if op == "%" { return try NumericModulo(left, right) }
+	if op == "/" { return try NumericDiv(left, right) }
+	if op == "%" { return try NumericMod(left, right) }
 	fail "numeric operator {op} is not supported"
 }
 
@@ -618,6 +618,7 @@ fn callStringSpecial(name str, args []Datum) !Datum {
 
 fn builtinFuncs() []Func {
 	mut funcs = []Func{}
+	RegisterTypeFuncs(mut funcs)
 	registerBasicFuncs(mut funcs)
 	registerMathFuncs(mut funcs)
 	registerStringFuncs(mut funcs)

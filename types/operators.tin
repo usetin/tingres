@@ -5,14 +5,14 @@ import "gauge"
 
 // registerOperators installs comparison, boolean, arithmetic and bit operators.
 fn registerOperators(funcs mut []Func) {
-	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, NumericOid, DateOid, TimeOid, TimetzOid, TimestampOid, TimestamptzOid, IntervalOid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid} {
+	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid} {
 		for _, op in []str{"=", "<>", "<", "<=", ">", ">="} {
 			registerFunc(mut funcs, comparisonOperator(op, oid))
 		}
 	}
 	for _, op in []str{"+", "-", "*", "/", "%", "^"} {
-		for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, NumericOid} {
-			if op == "^" && (isInteger(oid) || oid == NumericOid) { continue }
+		for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
+			if op == "^" && isInteger(oid) { continue }
 			registerFunc(mut funcs, arithmeticOperator(op, oid))
 		}
 	}
@@ -21,11 +21,12 @@ fn registerOperators(funcs mut []Func) {
 			registerFunc(mut funcs, arithmeticOperator(op, oid))
 		}
 	}
-	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, NumericOid} {
+	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
 		registerFunc(mut funcs, function1("+", []Oid{oid}, oid, true, false, fn(a Datum) !Datum { return try callUnary("+", a) }))
 		registerFunc(mut funcs, function1("-", []Oid{oid}, oid, true, false, fn(a Datum) !Datum { return try callUnary("-", a) }))
 		registerFunc(mut funcs, function1("@", []Oid{oid}, oid, true, false, fn(a Datum) !Datum { return try callUnary("@", a) }))
 	}
+	registerFunc(mut funcs, function1("@", []Oid{NumericOid}, NumericOid, true, false, fn(a Datum) !Datum { return try NumericAbs(a) }))
 	registerFunc(mut funcs, function1("NOT", []Oid{BoolOid}, BoolOid, true, false, fn(a Datum) !Datum { return try booleanNot(a) }))
 	registerFunc(mut funcs, function2("AND", []Oid{BoolOid, BoolOid}, BoolOid, false, false, fn(a Datum, b Datum) !Datum { return try booleanValues("AND", a, b) }))
 	registerFunc(mut funcs, function2("OR", []Oid{BoolOid, BoolOid}, BoolOid, false, false, fn(a Datum, b Datum) !Datum { return try booleanValues("OR", a, b) }))

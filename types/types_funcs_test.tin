@@ -347,3 +347,55 @@ fn regexFault(t mut crucible.T, expression str, wantCode str) {
 	}
 	t.Error("{expression}: got {got.Text()}, want SQLSTATE {wantCode}")
 }
+
+// TestBuiltinRegistryHasNoDuplicateSignatures guards the single registry: a
+// duplicate name/argument signature makes overload resolution return nil.
+fn TestBuiltinRegistryHasNoDuplicateSignatures(t mut crucible.T) {
+	let funcs = builtinFuncRegistry
+	for i, a in funcs {
+		for j in i+1..len(funcs) {
+			let b = funcs[j]
+			if a.Name != b.Name || len(a.Args) != len(b.Args) { continue }
+			mut same = true
+			for k in 0..len(a.Args) {
+				if a.Args[k] != b.Args[k] { same = false }
+			}
+			if same { t.Error("duplicate function signature {a.Name}/{a.Args} at {i} and {j}") }
+		}
+	}
+}
+
+// TestTypeRegistryIsUnified checks the numeric/temporal entries are visible
+// through the one registry LookupFunc uses.
+fn TestTypeRegistryIsUnified(t mut crucible.T) {
+	t.True("numeric =", LookupOperator("=", NumericOid, NumericOid) != nil)
+	t.True("numeric +", LookupOperator("+", NumericOid, NumericOid) != nil)
+	t.True("numeric @", LookupOperator("@", NumericOid, NumericOid) == nil)
+	if let f = LookupFunc("@", []Oid{NumericOid}) {
+		let got = f.Call1(FromStr(NumericOid, "-1.5")) catch _ {
+			t.Error("@ numeric failed")
+			return
+		}
+		crucible.Equal(mut t, "numeric @ value", got.Text(), "1.5")
+	} else {
+		t.Error("numeric @ is missing")
+	}
+	t.True("date =", LookupOperator("=", DateOid, DateOid) != nil)
+	t.True("interval <", LookupOperator("<", IntervalOid, IntervalOid) != nil)
+	t.True("numeric div", LookupFunc("div", []Oid{NumericOid, NumericOid}) != nil)
+	t.True("numeric log", LookupFunc("log", []Oid{NumericOid}) != nil)
+	if let f = LookupFunc("div", []Oid{NumericOid, NumericOid}) {
+		let got = f.Call2(FromStr(NumericOid, "5.5"), FromStr(NumericOid, "2")) catch _ {
+			t.Error("numeric div failed")
+			return
+		}
+		crucible.Equal(mut t, "numeric div value", got.Text(), "2")
+	}
+	if let f = LookupOperator("/", NumericOid, NumericOid) {
+		let got = f.Call2(FromStr(NumericOid, "7.5"), FromStr(NumericOid, "2")) catch _ {
+			t.Error("numeric / failed")
+			return
+		}
+		crucible.Equal(mut t, "numeric / value", got.Text(), "3.7500000000000000")
+	}
+}
