@@ -1,166 +1,197 @@
 package plan
 
-// Kind identifies a physical operator.
-type Kind enum {
-	SeqScan
-	IndexScan
-	Filter
-	Project
-	NestLoop
-	HashJoin
-	MergeJoin
-	Sort
-	HashAgg
-	GroupAgg
-	Limit
-	Unique
-	SetOp
-	Values
-	CTE
-	ModifyTable
-}
+import "../types"
+import "../catalog"
+import "../txn"
+import "../parse"
+import "say"
 
-// Node is one immutable operator description in a physical plan.
-type Node struct {
-	Kind       Kind
-	Name       str
-	Detail     str
-	Children   []Node
-	Rows       f64
-	Startup    f64
-	Total      f64
-	HasEstimate bool
-}
-
-// Plan is a physical operator tree.
-type Plan struct {
-	Root Node
-}
-
-// Estimate fills missing row and cost estimates recursively using conservative defaults.
-fn Estimate(node Node) Node {
-	mut childRows = 0.0
-	mut childCost = 0.0
-	for child in node.Children {
-		let estimated = Estimate(child)
-		childRows += estimated.Rows
-		childCost += estimated.Total
-	}
-	if node.HasEstimate {
-		return node
-	}
-	mut rows = 1000.0
-	mut work = 1000.0
-	match node.Kind {
-		SeqScan => {
-			rows = 1000.0
-			work = rows
+// Prepare analyzes and optimizes an AST statement into an executable Prepared plan.
+fn Prepare(c catalog.Catalog, t txn.Txn, s parse.Stmt, paramTypes []u32) !Prepared {
+	match s {
+		Select(sel) => {
+			return try prepareSelect(c, t, sel, paramTypes)
 		}
-		IndexScan => {
-			rows = 100.0
-			work = 3.0 + rows * 0.1
+		Insert(ins) => {
+			return try prepareInsert(c, t, ins, paramTypes)
 		}
-		Filter => {
-			rows = childRows * 0.3333333333333333
-			work = childRows * 0.01
+		Update(upd) => {
+			return try prepareUpdate(c, t, upd, paramTypes)
 		}
-		Project => {
-			rows = childRows
-			work = rows * 0.005
+		Delete(del) => {
+			return try prepareDelete(c, t, del, paramTypes)
 		}
-		NestLoop => {
-			rows = childRows * 0.1
-			work = childRows * 10.0
-		}
-		HashJoin => {
-			rows = childRows * 0.1
-			work = childRows * 1.5
-		}
-		MergeJoin => {
-			rows = childRows * 0.1
-			work = childRows * 1.2
-		}
-		Sort => {
-			rows = childRows
-			work = childRows * 10.0
-		}
-		HashAgg, GroupAgg => {
-			rows = childRows * 0.1
-			work = childRows * 1.5
-		}
-		Limit => {
-			rows = min(100.0, childRows)
-			work = 0.1
-		}
-		Unique => {
-			rows = childRows * 0.5
-			work = childRows * 0.1
-		}
-		SetOp => {
-			rows = childRows * 0.5
-			work = childRows
-		}
-		Values => {
-			rows = 1.0
-			work = 0.01
-		}
-		CTE => {
-			rows = childRows
-			work = childRows
-		}
-		ModifyTable => {
-			rows = childRows
-			work = childRows
+		_ => {
+			return Prepared{
+				Stmt: s,
+				ParamTypes: paramTypes,
+				ResultCols: []ColDesc{},
+				Plan: Plan.Utility(UtilityNode{Stmt: s, Cols: []ColDesc{}}),
+				CatalogVersion: c.Version(),
+			}
 		}
 	}
-	return Node{Kind: node.Kind, Name: node.Name, Detail: node.Detail, Children: node.Children, Rows: rows, Startup: childCost, Total: childCost + work, HasEstimate: true}
 }
 
 // Explain returns a PostgreSQL-style text rendering of a plan.
-fn Explain(p Plan, analyze bool) []str {
+fn Explain(p Prepared, analyze bool) []str {
+	return ExplainPlan(p.Plan, analyze)
+}
+
+// ExplainPlan returns text lines describing the plan tree.
+fn ExplainPlan(p Plan, analyze bool) []str {
 	mut lines = []str{}
-	let root = Estimate(p.Root)
-	_ = analyze
-	writeExplain(root, 0, analyze, mut lines)
+	writeExplain(p, 0, analyze, mut lines)
 	return lines
 }
 
-fn writeExplain(node Node, depth i64, analyze bool, lines mut []str) {
-	mut prefix = ""
+fn writeExplain(p Plan, depth i64, analyze bool, lines mut []str) {
+	mut indent = ""
 	for i in 0..depth {
-		prefix += "  "
+		indent += "  "
 		_ = i
 	}
-	let title = nodeTitle(node)
-	mut detail = ""
-	if node.Detail != "" {
-		detail = " " + node.Detail
+	let title = nodeTitle(p)
+	let cost = p.Cost()
+	mut line = indent
+	if depth > 0 {
+		line += "->  "
 	}
-	let estimateNode = Estimate(node)
-	let estimate = " (cost={estimateNode.Startup:.2}..{estimateNode.Total:.2} rows={i64(estimateNode.Rows)} width=0)"
-	lines = append(lines, prefix + title + detail + estimate)
-	for child in node.Children {
+	let costStr = say.Fmt("%.2f", cost.Startup) + ".." + say.Fmt("%.2f", cost.Total)
+	line += "{title}  (cost={costStr} rows={i64(cost.Rows)} width={cost.Width})"
+	lines = append(lines, line)
+	let detailLines = nodeDetails(p)
+	for d in detailLines {
+		lines = append(lines, indent + "      " + d)
+	}
+	for child in p.Children() {
 		writeExplain(child, depth + 1, analyze, mut lines)
 	}
 }
 
-fn nodeTitle(node Node) str {
-	match node.Kind {
-		SeqScan => { return "Seq Scan on " + node.Name }
-		IndexScan => { return "Index Scan using " + node.Name }
-		Filter => { return "Filter" }
-		Project => { return "Result" }
-		NestLoop => { return "Nested Loop" }
-		HashJoin => { return "Hash Join" }
-		MergeJoin => { return "Merge Join" }
-		Sort => { return "Sort" }
-		HashAgg => { return "HashAggregate" }
-		GroupAgg => { return "GroupAggregate" }
-		Limit => { return "Limit" }
-		Unique => { return "Unique" }
-		SetOp => { return "SetOp" }
-		Values => { return "Values Scan" }
-		CTE => { return "CTE Scan on " + node.Name }
-		ModifyTable => { return "ModifyTable" }
+fn nodeTitle(p Plan) str {
+	match p {
+		SeqScan(n) => { return "Seq Scan on " + n.Table.Name }
+		IndexScan(n) => { return "Index Scan using " + n.Index.Name + " on " + n.Table.Name }
+		IndexOnlyScan(n) => { return "Index Only Scan using " + n.Index.Name + " on " + n.Table.Name }
+		Filter(_) => { return "Filter" }
+		Project(_) => { return "Result" }
+		NestLoop(_) => { return "Nested Loop" }
+		HashJoin(_) => { return "Hash Join" }
+		MergeJoin(_) => { return "Merge Join" }
+		Sort(_) => { return "Sort" }
+		HashAgg(_) => { return "HashAggregate" }
+		GroupAgg(_) => { return "GroupAggregate" }
+		WindowAgg(_) => { return "WindowAgg" }
+		Limit(_) => { return "Limit" }
+		Unique(_) => { return "Unique" }
+		SetOp(n) => {
+			match n.Op {
+				Union => { return "HashSetOp Union" }
+				Intersect => { return "HashSetOp Intersect" }
+				Except => { return "HashSetOp Except" }
+			}
+		}
+		Append(_) => { return "Append" }
+		Values(_) => { return "Values Scan" }
+		Result(_) => { return "Result" }
+		CTEScan(n) => { return "CTE Scan on " + n.CteName }
+		RecursiveUnion(_) => { return "Recursive Union" }
+		SubqueryScan(n) => { return "Subquery Scan on " + n.Alias }
+		FunctionScan(_) => { return "Function Scan" }
+		LockRows(_) => { return "LockRows" }
+		ModifyTable(n) => {
+			match n.Kind {
+				Insert => { return "Insert on " + n.Table.Name }
+				Update => { return "Update on " + n.Table.Name }
+				Delete => { return "Delete on " + n.Table.Name }
+			}
+		}
+		Utility(_) => { return "Utility" }
+	}
+	return "PlanNode"
+}
+
+fn nodeDetails(p Plan) []str {
+	mut details = []str{}
+	match p {
+		SeqScan(n) => {
+			if n.Filter != nil {
+				details = append(details, "Filter: (predicate)")
+			}
+		}
+		IndexScan(n) => {
+			if len(n.Bounds) > 0 {
+				details = append(details, "Index Cond: (bounds)")
+			}
+			if n.Filter != nil {
+				details = append(details, "Filter: (predicate)")
+			}
+		}
+		IndexOnlyScan(n) => {
+			if len(n.Bounds) > 0 {
+				details = append(details, "Index Cond: (bounds)")
+			}
+			if n.Filter != nil {
+				details = append(details, "Filter: (predicate)")
+			}
+		}
+		Sort(n) => {
+			if len(n.Keys) > 0 {
+				details = append(details, "Sort Key: (keys)")
+			}
+		}
+		HashJoin(n) => {
+			if len(n.LeftKeys) > 0 {
+				details = append(details, "Hash Cond: (keys)")
+			}
+		}
+		_ => {}
+	}
+	return details
+}
+
+fn prepareSelect(c catalog.Catalog, t txn.Txn, sel parse.SelectStmt, paramTypes []u32) !Prepared {
+	return Prepared{
+		Stmt: parse.Stmt.Select(sel),
+		ParamTypes: paramTypes,
+		ResultCols: []ColDesc{},
+		Plan: Plan.Result(ResultNode{
+			Exprs: []Expr{},
+			Filter: nil,
+			Cols: []ColDesc{},
+			Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0},
+		}),
+		CatalogVersion: c.Version(),
+	}
+}
+
+fn prepareInsert(c catalog.Catalog, t txn.Txn, ins parse.InsertStmt, paramTypes []u32) !Prepared {
+	return Prepared{
+		Stmt: parse.Stmt.Insert(ins),
+		ParamTypes: paramTypes,
+		ResultCols: []ColDesc{},
+		Plan: Plan.Utility(UtilityNode{Stmt: parse.Stmt.Insert(ins), Cols: []ColDesc{}}),
+		CatalogVersion: c.Version(),
+	}
+}
+
+fn prepareUpdate(c catalog.Catalog, t txn.Txn, upd parse.UpdateStmt, paramTypes []u32) !Prepared {
+	return Prepared{
+		Stmt: parse.Stmt.Update(upd),
+		ParamTypes: paramTypes,
+		ResultCols: []ColDesc{},
+		Plan: Plan.Utility(UtilityNode{Stmt: parse.Stmt.Update(upd), Cols: []ColDesc{}}),
+		CatalogVersion: c.Version(),
+	}
+}
+
+fn prepareDelete(c catalog.Catalog, t txn.Txn, del parse.DeleteStmt, paramTypes []u32) !Prepared {
+	return Prepared{
+		Stmt: parse.Stmt.Delete(del),
+		ParamTypes: paramTypes,
+		ResultCols: []ColDesc{},
+		Plan: Plan.Utility(UtilityNode{Stmt: parse.Stmt.Delete(del), Cols: []ColDesc{}}),
+		CatalogVersion: c.Version(),
 	}
 }

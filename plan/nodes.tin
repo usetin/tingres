@@ -1,0 +1,673 @@
+package plan
+
+import "../types"
+import "../catalog"
+import "../txn"
+import "../parse"
+
+// Oid is a PostgreSQL object identifier.
+type Oid = u32
+
+// ColDesc describes one output column of a plan or result set.
+// Matches RowDescription fields required by the PostgreSQL wire protocol.
+type ColDesc struct {
+	Name str
+	Oid u32
+	Typmod i32
+	TableOid u32
+	Attno i16
+}
+
+// Cost stores startup and total cost, estimated rows, and estimated average tuple width.
+type Cost struct {
+	Startup f64
+	Total f64
+	Rows f64
+	Width i64
+}
+
+// ScanDirection specifies the direction of an index scan.
+type ScanDirection enum {
+	Forward
+	Backward
+}
+
+// IndexBound represents one boundary qualification on an index column.
+type IndexBound struct {
+	Col i64
+	Op str
+	Value Expr
+	Inclusive bool
+}
+
+// JoinType specifies the kind of relational join.
+type JoinType enum {
+	Inner
+	Left
+	Right
+	Full
+	Semi
+	Anti
+}
+
+// SortKey describes an ordering expression and direction.
+type SortKey struct {
+	Expr Expr
+	Descending bool
+	NullsFirst bool
+}
+
+// WindowFrame describes window aggregation framing bounds.
+type WindowFrame struct {
+	Mode str
+	Start str
+	End str
+}
+
+// SetOpType describes set operation combinations.
+type SetOpType enum {
+	Union
+	Intersect
+	Except
+}
+
+// LockStrength specifies table or row lock intensity.
+type LockStrength enum {
+	ForKeyShare
+	ForShare
+	ForNoKeyUpdate
+	ForUpdate
+}
+
+// LockWait specifies behavior when a row lock is unavailable.
+type LockWait enum {
+	Wait
+	NoWait
+	SkipLocked
+}
+
+// ModifyKind identifies the DML operation in ModifyTable.
+type ModifyKind enum {
+	Insert
+	Update
+	Delete
+}
+
+// OnConflictPlan describes ON CONFLICT handling in INSERT.
+type OnConflictPlan struct {
+	ArbiterCols []i16
+	Action ModifyKind
+	UpdateExprs []Expr
+	Where ?Expr
+}
+
+// ConstExpr represents an evaluated literal or constant SQL value.
+type ConstExpr struct {
+	Value types.Datum
+	Type u32
+}
+
+// ColRefExpr references an attribute from an input tuple or scan relation.
+// Slot is the 0-based column index in the executor row buffer.
+// RangeIndex is the range table index (1-based), and AttNo is the 1-based table attribute number.
+type ColRefExpr struct {
+	Slot i64
+	RangeIndex i64
+	AttNo i16
+	Type u32
+}
+
+// ParamExpr references a numbered query parameter (, , ...).
+type ParamExpr struct {
+	N i64
+	Type u32
+}
+
+// FuncCallExpr calls a resolved PostgreSQL function with evaluated arguments.
+type FuncCallExpr struct {
+	Func types.Func
+	Args []Expr
+	Type u32
+}
+
+// OpCallExpr calls a resolved binary or unary operator function.
+type OpCallExpr struct {
+	Op str
+	Func types.Func
+	Args []Expr
+	Type u32
+}
+
+// BoolOp is the boolean logic operator.
+type BoolOp enum {
+	And
+	Or
+	Not
+}
+
+// BoolExpr combines boolean expressions with AND, OR, or negates with NOT.
+type BoolExpr struct {
+	Op BoolOp
+	Args []Expr
+	Type u32
+}
+
+// NullTestType represents IS NULL or IS NOT NULL test kind.
+type NullTestType enum {
+	IsNull
+	IsNotNull
+}
+
+// NullTestExpr evaluates whether an expression yields SQL NULL.
+type NullTestExpr struct {
+	Arg Expr
+	Test NullTestType
+	Type u32
+}
+
+// CaseWhen represents one WHEN condition THEN result arm in a CASE expression.
+type CaseWhen struct {
+	When Expr
+	Then Expr
+}
+
+// CaseExpr evaluates conditional branches in order.
+type CaseExpr struct {
+	Whens []CaseWhen
+	Else ?Expr
+	Type u32
+}
+
+// CoalesceExpr evaluates its arguments in order and returns the first non-null value.
+type CoalesceExpr struct {
+	Args []Expr
+	Type u32
+}
+
+// CastExpr converts an expression result to a target type and typmod.
+type CastExpr struct {
+	Arg Expr
+	Type u32
+	Typmod i32
+}
+
+// SubLinkType represents the query relationship of a subquery expression.
+type SubLinkType enum {
+	Scalar
+	Exists
+	In
+	Any
+	All
+}
+
+// SubLinkExpr represents a subquery embedded in an expression context.
+// OuterRefs lists outer column references correlated into the subquery.
+type SubLinkExpr struct {
+	LinkType SubLinkType
+	SubPlan Plan
+	TestExpr ?Expr
+	OuterRefs []ColRefExpr
+	Type u32
+}
+
+// AggRefExpr references the result of an aggregate function computed by an Agg plan node.
+type AggRefExpr struct {
+	Slot i64
+	Agg types.Agg
+	Args []Expr
+	Distinct bool
+	Type u32
+}
+
+// WindowFuncRefExpr references the result of a window function computed by a WindowAgg node.
+type WindowFuncRefExpr struct {
+	Slot i64
+	Name str
+	Args []Expr
+	WindowIndex i64
+	Type u32
+}
+
+// RowExpr constructs an anonymous composite tuple from multiple expressions.
+type RowExpr struct {
+	Elements []Expr
+	Type u32
+}
+
+// ArrayExpr constructs an SQL array from elements.
+type ArrayExpr struct {
+	Elements []Expr
+	ElemType u32
+	Type u32
+}
+
+// Expr is the closed set of typed physical/executable expressions.
+// Every expression variant carries its result type OID.
+type Expr enum {
+	Const(ConstExpr)
+	ColRef(ColRefExpr)
+	Param(ParamExpr)
+	FuncCall(FuncCallExpr)
+	OpCall(OpCallExpr)
+	BoolExpr(BoolExpr)
+	NullTest(NullTestExpr)
+	Case(CaseExpr)
+	Coalesce(CoalesceExpr)
+	Cast(CastExpr)
+	SubLink(SubLinkExpr)
+	AggRef(AggRefExpr)
+	WindowFuncRef(WindowFuncRefExpr)
+	RowExpr(RowExpr)
+	ArrayExpr(ArrayExpr)
+}
+
+// Type returns the result PostgreSQL type OID of an expression.
+fn (e Expr) Type() u32 {
+	match e {
+		Const(c) => { return c.Type }
+		ColRef(c) => { return c.Type }
+		Param(p) => { return p.Type }
+		FuncCall(f) => { return f.Type }
+		OpCall(o) => { return o.Type }
+		BoolExpr(b) => { return b.Type }
+		NullTest(n) => { return n.Type }
+		Case(c) => { return c.Type }
+		Coalesce(c) => { return c.Type }
+		Cast(c) => { return c.Type }
+		SubLink(s) => { return s.Type }
+		AggRef(a) => { return a.Type }
+		WindowFuncRef(w) => { return w.Type }
+		RowExpr(r) => { return r.Type }
+		ArrayExpr(a) => { return a.Type }
+	}
+}
+
+// SeqScanNode performs a sequential table scan over a relation.
+// Row layout: heap tuple columns in table attribute order (attno 1..N), or projected columns if Projection is non-empty.
+type SeqScanNode struct {
+	Table catalog.Table
+	Filter ?Expr
+	Projection []Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// IndexScanNode scans a table using a B-tree index, fetching heap tuples for matched index entries.
+// Row layout: heap tuple columns in table attribute order.
+type IndexScanNode struct {
+	Table catalog.Table
+	Index catalog.Index
+	Bounds []IndexBound
+	Quals []Expr
+	Direction ScanDirection
+	Filter ?Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// IndexOnlyScanNode scans an index directly without heap access when index covers all needed columns.
+// Row layout: indexed columns in index attribute order.
+type IndexOnlyScanNode struct {
+	Table catalog.Table
+	Index catalog.Index
+	Bounds []IndexBound
+	Quals []Expr
+	Direction ScanDirection
+	Filter ?Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// FilterNode filters input rows using a predicate expression.
+// Row layout: identical to input node.
+type FilterNode struct {
+	Input Plan
+	Predicate Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// ProjectNode evaluates a list of expressions to produce output columns.
+// Row layout: one slot per projected expression in Exprs order.
+type ProjectNode struct {
+	Input Plan
+	Exprs []Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// NestLoopNode joins an outer (left) relation with an inner (right) relation via nested iteration.
+// Row layout: left columns (0..N-1) followed by right columns (N..N+M-1).
+// For outer joins, unmatched sides produce NULL Datums for the other side's columns.
+type NestLoopNode struct {
+	Left Plan
+	Right Plan
+	JoinType JoinType
+	Quals []Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// HashJoinNode builds a hash table on the inner (right) relation and probes it with the outer (left) relation.
+// Row layout: left columns (0..N-1) followed by right columns (N..N+M-1).
+type HashJoinNode struct {
+	Left Plan
+	Right Plan
+	JoinType JoinType
+	LeftKeys []Expr
+	RightKeys []Expr
+	Quals []Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// MergeJoinNode joins two pre-sorted inputs on equality keys.
+// Row layout: left columns (0..N-1) followed by right columns (N..N+M-1).
+type MergeJoinNode struct {
+	Left Plan
+	Right Plan
+	JoinType JoinType
+	LeftKeys []Expr
+	RightKeys []Expr
+	Quals []Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// SortNode sorts input tuples according to SortKeys.
+// If Limit > 0, performs an optimized top-N bounded heapsort.
+// Row layout: identical to input node.
+type SortNode struct {
+	Input Plan
+	Keys []SortKey
+	Limit i64
+	Cols []ColDesc
+	Cost Cost
+}
+
+// HashAggNode groups input tuples in an in-memory hash table and computes aggregates.
+// Row layout: grouping keys first, followed by aggregate values at corresponding slots.
+type HashAggNode struct {
+	Input Plan
+	GroupKeys []Expr
+	Aggs []AggRefExpr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// GroupAggNode computes aggregates over pre-sorted input grouping keys.
+// Row layout: grouping keys first, followed by aggregate values at corresponding slots.
+type GroupAggNode struct {
+	Input Plan
+	GroupKeys []Expr
+	Aggs []AggRefExpr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// WindowAggNode evaluates window functions over partitioned and ordered input rows.
+// Row layout: input tuple columns followed by window function results.
+type WindowAggNode struct {
+	Input Plan
+	Funcs []WindowFuncRefExpr
+	Partitions []Expr
+	OrderKeys []SortKey
+	Frame WindowFrame
+	Cols []ColDesc
+	Cost Cost
+}
+
+// LimitNode limits the number of output tuples and/or skips initial tuples.
+// Row layout: identical to input node.
+type LimitNode struct {
+	Input Plan
+	Count ?Expr
+	Offset ?Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// UniqueNode removes duplicate adjacent rows from a sorted input.
+// Row layout: identical to input node.
+type UniqueNode struct {
+	Input Plan
+	Cols []ColDesc
+	Cost Cost
+}
+
+// SetOpNode combines left and right inputs with UNION, INTERSECT, or EXCEPT.
+// Row layout: matches Left input column layout.
+type SetOpNode struct {
+	Left Plan
+	Right Plan
+	Op SetOpType
+	All bool
+	Cols []ColDesc
+	Cost Cost
+}
+
+// AppendNode concatenates tuples from multiple child plans sequentially.
+// Row layout: unified column layout matching Cols.
+type AppendNode struct {
+	Inputs []Plan
+	Cols []ColDesc
+	Cost Cost
+}
+
+// ValuesNode yields rows of literal or evaluated expressions (e.g. from VALUES (...)).
+// Row layout: one slot per expression in each row slice.
+type ValuesNode struct {
+	Rows [][]Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// ResultNode evaluates a constant expression row or filters a one-row pseudo-scan without table access.
+// Row layout: one slot per expression in Exprs.
+type ResultNode struct {
+	Exprs []Expr
+	Filter ?Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// CTEScanNode reads cached tuples generated by a common table expression (CTE).
+// Row layout: output columns of the CTE query.
+type CTEScanNode struct {
+	CteName str
+	CteID i64
+	Cols []ColDesc
+	Cost Cost
+}
+
+// RecursiveUnionNode executes a recursive CTE by evaluating an anchor plan then repeatedly evaluating a recursive plan.
+// Row layout: unified CTE columns.
+type RecursiveUnionNode struct {
+	Anchor Plan
+	Recursive Plan
+	Cols []ColDesc
+	Cost Cost
+}
+
+// SubqueryScanNode wraps a subquery derived table in the FROM clause.
+// Row layout: matches subplan output columns under the subquery Alias.
+type SubqueryScanNode struct {
+	Subplan Plan
+	Alias str
+	Cols []ColDesc
+	Cost Cost
+}
+
+// FunctionScanNode evaluates a set-returning or table-valued function.
+// Row layout: output attributes returned by the function.
+type FunctionScanNode struct {
+	Expr Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// LockRowsNode applies row-level locking (FOR UPDATE / FOR SHARE / ...) to tuples passing through it.
+// Row layout: identical to input node.
+type LockRowsNode struct {
+	Input Plan
+	Strength LockStrength
+	Wait LockWait
+	Cols []ColDesc
+	Cost Cost
+}
+
+// ModifyTableNode executes DML operations (INSERT, UPDATE, DELETE) against a target relation.
+// Row layout: if Returning is non-empty, row layout matches Cols for RowDescription.
+type ModifyTableNode struct {
+	Kind ModifyKind
+	Table catalog.Table
+	Source Plan
+	TargetCols []i16
+	OnConflict ?OnConflictPlan
+	Returning []Expr
+	Cols []ColDesc
+	Cost Cost
+}
+
+// UtilityNode wraps non-optimizable DDL and utility statements (CREATE, DROP, SET, BEGIN...) for direct executor processing.
+// Row layout: empty result cols unless statement specifies otherwise.
+type UtilityNode struct {
+	Stmt parse.Stmt
+	Cols []ColDesc
+}
+
+// Plan is the closed set of physical plan operators.
+type Plan enum {
+	SeqScan(SeqScanNode)
+	IndexScan(IndexScanNode)
+	IndexOnlyScan(IndexOnlyScanNode)
+	Filter(FilterNode)
+	Project(ProjectNode)
+	NestLoop(NestLoopNode)
+	HashJoin(HashJoinNode)
+	MergeJoin(MergeJoinNode)
+	Sort(SortNode)
+	HashAgg(HashAggNode)
+	GroupAgg(GroupAggNode)
+	WindowAgg(WindowAggNode)
+	Limit(LimitNode)
+	Unique(UniqueNode)
+	SetOp(SetOpNode)
+	Append(AppendNode)
+	Values(ValuesNode)
+	Result(ResultNode)
+	CTEScan(CTEScanNode)
+	RecursiveUnion(RecursiveUnionNode)
+	SubqueryScan(SubqueryScanNode)
+	FunctionScan(FunctionScanNode)
+	LockRows(LockRowsNode)
+	ModifyTable(ModifyTableNode)
+	Utility(UtilityNode)
+}
+
+// Cols returns the output column descriptors of the plan node.
+fn (p Plan) Cols() []ColDesc {
+	match p {
+		SeqScan(n) => { return n.Cols }
+		IndexScan(n) => { return n.Cols }
+		IndexOnlyScan(n) => { return n.Cols }
+		Filter(n) => { return n.Cols }
+		Project(n) => { return n.Cols }
+		NestLoop(n) => { return n.Cols }
+		HashJoin(n) => { return n.Cols }
+		MergeJoin(n) => { return n.Cols }
+		Sort(n) => { return n.Cols }
+		HashAgg(n) => { return n.Cols }
+		GroupAgg(n) => { return n.Cols }
+		WindowAgg(n) => { return n.Cols }
+		Limit(n) => { return n.Cols }
+		Unique(n) => { return n.Cols }
+		SetOp(n) => { return n.Cols }
+		Append(n) => { return n.Cols }
+		Values(n) => { return n.Cols }
+		Result(n) => { return n.Cols }
+		CTEScan(n) => { return n.Cols }
+		RecursiveUnion(n) => { return n.Cols }
+		SubqueryScan(n) => { return n.Cols }
+		FunctionScan(n) => { return n.Cols }
+		LockRows(n) => { return n.Cols }
+		ModifyTable(n) => { return n.Cols }
+		Utility(n) => { return n.Cols }
+	}
+}
+
+// Cost returns the cost and row estimate of the plan node.
+fn (p Plan) Cost() Cost {
+	match p {
+		SeqScan(n) => { return n.Cost }
+		IndexScan(n) => { return n.Cost }
+		IndexOnlyScan(n) => { return n.Cost }
+		Filter(n) => { return n.Cost }
+		Project(n) => { return n.Cost }
+		NestLoop(n) => { return n.Cost }
+		HashJoin(n) => { return n.Cost }
+		MergeJoin(n) => { return n.Cost }
+		Sort(n) => { return n.Cost }
+		HashAgg(n) => { return n.Cost }
+		GroupAgg(n) => { return n.Cost }
+		WindowAgg(n) => { return n.Cost }
+		Limit(n) => { return n.Cost }
+		Unique(n) => { return n.Cost }
+		SetOp(n) => { return n.Cost }
+		Append(n) => { return n.Cost }
+		Values(n) => { return n.Cost }
+		Result(n) => { return n.Cost }
+		CTEScan(n) => { return n.Cost }
+		RecursiveUnion(n) => { return n.Cost }
+		SubqueryScan(n) => { return n.Cost }
+		FunctionScan(n) => { return n.Cost }
+		LockRows(n) => { return n.Cost }
+		ModifyTable(n) => { return n.Cost }
+		Utility(n) => { return Cost{Startup: 0.0, Total: 0.0, Rows: 0.0, Width: 0} }
+	}
+}
+
+// Children returns the direct child plans of this plan node.
+fn (p Plan) Children() []Plan {
+	match p {
+		SeqScan(_) => { return []Plan{} }
+		IndexScan(_) => { return []Plan{} }
+		IndexOnlyScan(_) => { return []Plan{} }
+		Filter(n) => { return []Plan{n.Input} }
+		Project(n) => { return []Plan{n.Input} }
+		NestLoop(n) => { return []Plan{n.Left, n.Right} }
+		HashJoin(n) => { return []Plan{n.Left, n.Right} }
+		MergeJoin(n) => { return []Plan{n.Left, n.Right} }
+		Sort(n) => { return []Plan{n.Input} }
+		HashAgg(n) => { return []Plan{n.Input} }
+		GroupAgg(n) => { return []Plan{n.Input} }
+		WindowAgg(n) => { return []Plan{n.Input} }
+		Limit(n) => { return []Plan{n.Input} }
+		Unique(n) => { return []Plan{n.Input} }
+		SetOp(n) => { return []Plan{n.Left, n.Right} }
+		Append(n) => { return n.Inputs }
+		Values(_) => { return []Plan{} }
+		Result(_) => { return []Plan{} }
+		CTEScan(_) => { return []Plan{} }
+		RecursiveUnion(n) => { return []Plan{n.Anchor, n.Recursive} }
+		SubqueryScan(n) => { return []Plan{n.Subplan} }
+		FunctionScan(_) => { return []Plan{} }
+		LockRows(n) => { return []Plan{n.Input} }
+		ModifyTable(n) => { return []Plan{n.Source} }
+		Utility(_) => { return []Plan{} }
+	}
+}
+
+// Prepared is a fully analyzed and planned statement ready for execution.
+type Prepared struct {
+	Stmt parse.Stmt
+	ParamTypes []u32
+	ResultCols []ColDesc
+	Plan Plan
+	CatalogVersion u64
+}
+
+// Valid reports whether the prepared statement plan remains valid against the catalog version.
+fn (p Prepared) Valid(c catalog.Catalog) bool {
+	return p.CatalogVersion == c.Version()
+}
