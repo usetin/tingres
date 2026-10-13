@@ -21,16 +21,82 @@ type Numeric value struct {
 fn float_text(d Datum) str {
 	if d.f != d.f { return "NaN" }
 	if d.f == 0.0 && gauge.Signbit(d.f) { return "-0" }
-	let raw = mint.FormatFloat(d.f, 'g', -1)
-	if raw == "+Inf" || raw == "Inf" { return "Infinity" }
-	if raw == "-Inf" { return "-Infinity" }
-	if d.oid != Float4Oid { return raw }
-	for precision in 1..10 {
-		let candidate = mint.FormatFloat(d.f, 'g', precision)
-		let parsed = mint.ParseFloat(candidate) catch _ { continue }
-		if f64(f32(parsed)) == d.f { return candidate }
+	if d.f == gauge.Inf(1) { return "Infinity" }
+	if d.f == gauge.Inf(-1) { return "-Infinity" }
+	if d.oid == Float4Oid { return pg_float_text(d.f, true) }
+	return pg_float_text(d.f, false)
+}
+
+// pg_float_text renders a float the way PostgreSQL 17 does: shortest
+// round-trip digits, fixed notation for display exponents in [-4, 14] and
+// scientific notation (d.dd e±NN) otherwise.
+fn pg_float_text(v f64, narrow bool) str {
+	mut digits = ""
+	mut exp = i64(0)
+	if narrow {
+		let (d, e) = shortest_float4_digits(v)
+		digits = d
+		exp = e
+	} else {
+		let (d, e) = parse_float_sci(mint.FormatFloat(v, 'e', -1))
+		digits = d
+		exp = e
 	}
-	return raw
+	if exp >= -4 && exp < 15 { return format_float_fixed(digits, exp) }
+	return format_float_sci(digits, exp)
+}
+
+fn shortest_float4_digits(v f64) (str, i64) {
+	for p in 1..10 {
+		let candidate = mint.FormatFloat(v, 'e', p-1)
+		let parsed = mint.ParseFloat(candidate) catch _ { continue }
+		if f32(parsed) == f32(v) { return parse_float_sci(candidate) }
+	}
+	return parse_float_sci(mint.FormatFloat(v, 'e', -1))
+}
+
+// parse_float_sci splits Go's scientific form (for example "1.25e-01") into
+// its significant digits and the power of ten of the leading digit.
+fn parse_float_sci(s str) (str, i64) {
+	let eAt = find_byte(s, 'e', 0)
+	mut mantissa = s
+	mut exponent = i64(0)
+	if eAt >= 0 {
+		mantissa = s[:eAt]
+		exponent = mint.Atoi(s[eAt+1:]) catch _ { 0 }
+	}
+	mut digits = ""
+	for c in mantissa {
+		if c >= '0' && c <= '9' { digits += str([]u8{u8(c)}) }
+	}
+	digits = strip_leading_zeroes(digits)
+	if len(digits) == 0 { return "0", 0 }
+	return digits, exponent
+}
+
+fn format_float_fixed(digits str, exp i64) str {
+	let nexp = exp+1
+	let n = len(digits)
+	if nexp <= 0 { return "0."+zeroes(0-nexp)+digits }
+	if nexp >= n { return digits+zeroes(nexp-n) }
+	return digits[:nexp]+"."+digits[nexp:]
+}
+
+fn format_float_sci(digits str, exp i64) str {
+	let trimmed = twine.TrimRight(digits, "0")
+	mut mantissa = trimmed
+	if len(trimmed) == 0 { mantissa = "0" }
+	mut body = mantissa
+	if len(mantissa) > 1 { body = mantissa[:1]+"."+mantissa[1:] }
+	mut sign = "+"
+	mut value = exp
+	if exp < 0 {
+		sign = "-"
+		value = 0-exp
+	}
+	mut exponentText = mint.Itoa(value)
+	if len(exponentText) < 2 { exponentText = "0"+exponentText }
+	return body+"e"+sign+exponentText
 }
 
 fn compare_float(a f64, b f64) i64 {
@@ -274,9 +340,10 @@ fn numeric_binary(a Datum, b Datum, op i64) !Datum {
 	if x.special != 0 || y0.special != 0 { return try numeric_special_binary(x, y0, op) }
 	mut y = y0
 	if op == 1 { y = numeric_neg_value(y0) }
-	if x.sign == 0 { return FromStr(NumericOid, format_numeric(y)) }
-	if y.sign == 0 { return FromStr(NumericOid, format_numeric(x)) }
-	let high = max(x.weight, y.weight)
+	if x.sign == 0 && y.sign == 0 { return FromStr(NumericOid, zero_with_scale(max(x.dscale, y.dscale))) }
+	if x.sign == 0 { return FromStr(NumericOid, format_numeric(with_scale(y, max(x.dscale, y.dscale)))) }
+	if y.sign == 0 { return FromStr(NumericOid, format_numeric(with_scale(x, max(x.dscale, y.dscale)))) }
+	mut high = max(x.weight, y.weight)
 	let low = min(numeric_low_exp(x), numeric_low_exp(y))
 	let n = high-low+1
 	mut xs = []i64{}
@@ -304,6 +371,7 @@ fn numeric_binary(a Datum, b Datum, op i64) !Datum {
 			mut shifted = []i64{carry}
 			shifted = append(shifted, digits...)
 			digits = shifted
+			high += 1
 		}
 	} else {
 		let cmp = numeric_abs_compare(x, y)
@@ -374,7 +442,13 @@ fn NumericDiv(a Datum, b Datum) !Datum {
 	if y.sign == 0 && y.special == 0 { fail ErrorFault(NewError("22012", "division by zero")) }
 	if x.special != 0 || y.special != 0 { return FromStr(NumericOid, numeric_special_div(x, y)) }
 	let rscale = select_div_scale(x, y)
-	if x.sign == 0 { return FromStr(NumericOid, zero_with_scale(rscale)) }
+	let value = try numeric_div_at(x, y, rscale)
+	return FromStr(NumericOid, format_numeric(value))
+}
+
+// numeric_div_at divides x by y, rounding to rscale decimal places.
+fn numeric_div_at(x Numeric, y Numeric, rscale i64) !Numeric {
+	if x.sign == 0 { return try parse_numeric_value(zero_with_scale(rscale)) }
 	let numerator = reverse_i64(x.digits)
 	let denominator = reverse_i64(y.digits)
 	let xlow = numeric_low_exp(x)
@@ -401,7 +475,7 @@ fn NumericDiv(a Datum, b Datum) !Datum {
 	digits = append(digits, fracGroups...)
 	let weight = len(q)-1
 	let raw = numeric_from_dense(x.sign*y.sign, weight, fracGroupCount*4, digits)
-	return FromStr(NumericOid, format_numeric(numeric_round_value(raw, rscale)))
+	return numeric_round_value(raw, rscale)
 }
 
 // select_div_scale mirrors PostgreSQL's division result-scale rule (numeric.c).
@@ -481,29 +555,333 @@ fn NumericSign(a Datum) Datum {
 
 // NumericPow raises a numeric value to a numeric exponent.
 fn NumericPow(a Datum, b Datum) !Datum {
-	let x = try mint.ParseFloat(NumericText(a))
-	let y = try mint.ParseFloat(NumericText(b))
-	return try ParseNumeric(mint.FormatFloat(gauge.Pow(x, y), 'f', 20))
+	let base = try parse_numeric_value(NumericText(a))
+	let exp = try parse_numeric_value(NumericText(b))
+	let value = try numeric_pow_value(base, exp)
+	return FromStr(NumericOid, format_numeric(value))
 }
 
 // NumericSqrt returns the square root of a numeric value.
 fn NumericSqrt(a Datum) !Datum {
-	let x = try mint.ParseFloat(NumericText(a))
-	if x < 0.0 { fail ErrorFault(NewError("2201F", "cannot take square root of a negative number")) }
-	return try ParseNumeric(mint.FormatFloat(gauge.Sqrt(x), 'f', 20))
+	let x = try parse_numeric_value(NumericText(a))
+	if x.special == 2 { return FromStr(NumericOid, "NaN") }
+	if x.special == 1 { return FromStr(NumericOid, "Infinity") }
+	if x.special == -1 { fail ErrorFault(NewError("2201F", "cannot take square root of a negative number")) }
+	let value = try numeric_sqrt_value(x, numeric_sqrt_scale(x))
+	return FromStr(NumericOid, format_numeric(value))
 }
 
 // NumericExp returns e raised to a numeric value.
 fn NumericExp(a Datum) !Datum {
-	let x = try mint.ParseFloat(NumericText(a))
-	return try ParseNumeric(mint.FormatFloat(gauge.Exp(x), 'f', 20))
+	let x = try parse_numeric_value(NumericText(a))
+	if x.special == 2 { return FromStr(NumericOid, "NaN") }
+	if x.special == 1 { return FromStr(NumericOid, "Infinity") }
+	if x.special == -1 { return FromStr(NumericOid, "0.0000000000000000") }
+	let value = try numeric_exp_value(x, numeric_exp_scale(x))
+	return FromStr(NumericOid, format_numeric(value))
 }
 
 // NumericLn returns the natural logarithm of a numeric value.
 fn NumericLn(a Datum) !Datum {
-	let x = try mint.ParseFloat(NumericText(a))
-	if x <= 0.0 { fail ErrorFault(NewError("2201E", "cannot take logarithm of zero")) }
-	return try ParseNumeric(mint.FormatFloat(gauge.Log(x), 'f', 20))
+	let x = try parse_numeric_value(NumericText(a))
+	if x.special == 2 { return FromStr(NumericOid, "NaN") }
+	if x.special == 1 { return FromStr(NumericOid, "Infinity") }
+	if x.special == -1 { fail ErrorFault(NewError("2201E", "cannot take logarithm of a negative number")) }
+	if x.sign == 0 { fail ErrorFault(NewError("2201E", "cannot take logarithm of zero")) }
+	if x.sign < 0 { fail ErrorFault(NewError("2201E", "cannot take logarithm of a negative number")) }
+	let value = try numeric_ln_value(x, numeric_ln_scale(x))
+	return FromStr(NumericOid, format_numeric(value))
+}
+
+// The nv_* helpers compute with Numeric values at an explicit working scale.
+fn nv_parse(s str) Numeric { return parse_numeric_value(s) catch _ { return Numeric{sign: 0, weight: 0, dscale: 0, digits: []i64{}, special: 0} } }
+fn nv_from_int(v i64) Numeric { return nv_parse(mint.Itoa(v)) }
+fn nv_neg(a Numeric) Numeric { return numeric_neg_value(a) }
+fn nv_cmp(a Numeric, b Numeric) i64 { return CompareNumeric(FromStr(NumericOid, format_numeric(a)), FromStr(NumericOid, format_numeric(b))) }
+
+fn nv_add(a Numeric, b Numeric, rscale i64) Numeric {
+	let sum = NumericAdd(FromStr(NumericOid, format_numeric(a)), FromStr(NumericOid, format_numeric(b))) catch _ { return a }
+	let v = parse_numeric_value(sum.s) catch _ { return a }
+	return numeric_round_value(v, rscale)
+}
+
+fn nv_sub(a Numeric, b Numeric, rscale i64) Numeric {
+	let diff = NumericSub(FromStr(NumericOid, format_numeric(a)), FromStr(NumericOid, format_numeric(b))) catch _ { return a }
+	let v = parse_numeric_value(diff.s) catch _ { return a }
+	return numeric_round_value(v, rscale)
+}
+
+fn nv_mul(a Numeric, b Numeric, rscale i64) Numeric {
+	let product = NumericMul(FromStr(NumericOid, format_numeric(a)), FromStr(NumericOid, format_numeric(b))) catch _ { return a }
+	let v = parse_numeric_value(product.s) catch _ { return a }
+	return numeric_round_value(v, rscale)
+}
+
+fn nv_div(a Numeric, b Numeric, rscale i64) !Numeric { return try numeric_div_at(a, b, rscale) }
+fn nv_div_int(a Numeric, d i64, rscale i64) !Numeric { return try numeric_div_at(a, nv_from_int(d), rscale) }
+
+fn numeric_sqrt_scale(a Numeric) i64 {
+	let sweight = a.weight*numericDecDigits/2+1
+	mut rscale = minNumericSigDigits-sweight
+	rscale = max(rscale, a.dscale)
+	rscale = max(rscale, 0)
+	rscale = min(rscale, maxNumericDisplayScale)
+	return rscale
+}
+
+fn numeric_exp_scale(a Numeric) i64 {
+	let val = float_of_numeric(a)*0.434294481903252
+	mut rscale = minNumericSigDigits-i64(val)
+	rscale = max(rscale, a.dscale)
+	rscale = max(rscale, 0)
+	rscale = min(rscale, maxNumericDisplayScale)
+	return rscale
+}
+
+fn numeric_ln_scale(a Numeric) i64 {
+	let dweight = estimate_ln_dweight(a)
+	mut rscale = minNumericSigDigits-dweight
+	rscale = max(rscale, a.dscale)
+	rscale = max(rscale, 0)
+	rscale = min(rscale, maxNumericDisplayScale)
+	return rscale
+}
+
+fn float_of_numeric(a Numeric) f64 {
+	return mint.ParseFloat(format_numeric(a)) catch _ { return 0.0 }
+}
+
+fn estimate_ln_dweight(a Numeric) i64 {
+	if a.sign != 1 { return 0 }
+	let nine = nv_parse("0.9")
+	let eleven = nv_parse("1.1")
+	if nv_cmp(a, nine) >= 0 && nv_cmp(a, eleven) <= 0 {
+		let x = nv_sub(a, nv_parse("1"), 30)
+		if len(x.digits) > 0 {
+			return x.weight*numericDecDigits+i64(gauge.Log10(f64(x.digits[0])))
+		}
+		return 0
+	}
+	if len(a.digits) > 0 {
+		mut digits = f64(a.digits[0])
+		mut dweight = a.weight*numericDecDigits
+		if len(a.digits) > 1 {
+			digits = digits*10000.0+f64(a.digits[1])
+			dweight -= numericDecDigits
+		}
+		let ln_var = gauge.Log(digits)+f64(dweight)*2.302585092994046
+		return i64(gauge.Log10(gauge.Abs(ln_var)))
+	}
+	return 0
+}
+
+// numeric_sqrt_value computes sqrt(a) to rscale places with a Newton iteration
+// on base-10000 digits.
+fn numeric_sqrt_value(a Numeric, rscale i64) !Numeric {
+	if a.sign == 0 { return nv_parse(zero_with_scale(rscale)) }
+	let work = max(rscale+12, 20)
+	mut guess = gauge.Sqrt(float_of_numeric(a))
+	if guess != guess { guess = 1.0 }
+	mut x = nv_parse(mint.FormatFloat(guess, 'f', work))
+	if x.sign == 0 { x = nv_parse("1") }
+	for i in 0..80 {
+		let q = try numeric_div_at(a, x, work)
+		let sumv = nv_add(x, q, work+4)
+		let half = try numeric_div_at(sumv, nv_from_int(2), work)
+		if nv_cmp(half, x) == 0 { break }
+		x = half
+		_ = i
+	}
+	return numeric_round_value(x, rscale)
+}
+
+// numeric_exp_value computes exp(a) to rscale places using argument reduction
+// and the exp Taylor series, as PostgreSQL's exp_var does.
+fn numeric_exp_value(a Numeric, rscale i64) !Numeric {
+	if a.sign == 0 { return nv_parse("1"+dot_zeroes(rscale)) }
+	let val = float_of_numeric(a)
+	mut ndiv2 = i64(0)
+	if gauge.Abs(val) > 0.01 {
+		ndiv2 = 1
+		mut v = val/2.0
+		for gauge.Abs(v) > 0.01 {
+			ndiv2 += 1
+			v = v/2.0
+		}
+	}
+	let work = rscale+12+ndiv2
+	mut x = a
+	if ndiv2 > 0 { x = try numeric_div_at(a, nv_from_int(i64(1) << ndiv2), work) }
+	mut total = nv_add(nv_parse("1"), x, work)
+	mut term = x
+	mut i = i64(2)
+	for i < 5000 {
+		term = try numeric_div_at(nv_mul(term, x, work+4), nv_from_int(i), work)
+		if term.sign == 0 { break }
+		total = nv_add(total, term, work)
+		i += 1
+	}
+	for k in 0..ndiv2 {
+		total = nv_mul(total, total, work)
+		_ = k
+	}
+	return numeric_round_value(total, rscale)
+}
+
+// numeric_ln_value computes ln(a) to rscale places using range reduction by
+// repeated square roots and the atanh series, as PostgreSQL's ln_var does.
+fn numeric_ln_value(a Numeric, rscale i64) !Numeric {
+	mut x = a
+	mut nsqrt = i64(0)
+	let nine = nv_parse("0.9")
+	let eleven = nv_parse("1.1")
+	for nv_cmp(x, nine) <= 0 {
+		x = try numeric_sqrt_value(x, rscale-x.weight*numericDecDigits/2+8)
+		nsqrt += 1
+	}
+	for nv_cmp(x, eleven) >= 0 {
+		x = try numeric_sqrt_value(x, rscale-x.weight*numericDecDigits/2+8)
+		nsqrt += 1
+	}
+	let local = rscale+i64(f64(nsqrt+1)*0.301029995663981)+8
+	let one = nv_parse("1")
+	let numv = nv_sub(x, one, local)
+	let denv = nv_add(x, one, local)
+	let z = try numeric_div_at(numv, denv, local)
+	let z2 = nv_mul(z, z, local)
+	mut total = z
+	mut power = z
+	mut k = i64(3)
+	for k < 100000 {
+		power = nv_mul(power, z2, local)
+		let term = try numeric_div_at(power, nv_from_int(k), local)
+		if term.sign == 0 { break }
+		total = nv_add(total, term, local)
+		k += 2
+	}
+	let factor = nv_from_int(i64(1) << (nsqrt+1))
+	return numeric_round_value(nv_mul(total, factor, local), rscale)
+}
+
+fn numeric_pow_value(base Numeric, exp Numeric) !Numeric {
+	if base.special == 2 || exp.special == 2 { return nv_parse("NaN") }
+	if exp.sign == 0 { return nv_parse("1"+dot_zeroes(numeric_pow_int_scale(base, exp, 0))) }
+	if base.sign == 0 {
+		if exp.sign < 0 { fail ErrorFault(NewError("2201F", "zero raised to a negative power is undefined")) }
+		return nv_parse(zero_with_scale(numeric_pow_general_scale(base, exp)))
+	}
+	if let n = numeric_integer_exponent(exp) {
+		return try numeric_pow_int(base, n, exp.dscale)
+	}
+	if base.sign < 0 { fail ErrorFault(NewError("2201F", "a negative number raised to a non-integer power yields a complex result")) }
+	let ln_dweight = estimate_ln_dweight(base)
+	let low = max(8-ln_dweight, 0)
+	let ln_base_low = try numeric_ln_value(base, low)
+	let ln_num_low = nv_mul(ln_base_low, exp, low)
+	let val = float_of_numeric(ln_num_low)*0.434294481903252
+	mut rscale = minNumericSigDigits-i64(val)
+	rscale = max(rscale, base.dscale)
+	rscale = max(rscale, exp.dscale)
+	rscale = max(rscale, 0)
+	rscale = min(rscale, maxNumericDisplayScale)
+	let sig_digits = max(rscale+i64(val), 0)
+	let local_rscale = max(sig_digits-ln_dweight+8, 0)
+	let ln_base = try numeric_ln_value(base, local_rscale)
+	let ln_num = nv_mul(ln_base, exp, local_rscale)
+	return try numeric_exp_value(ln_num, rscale)
+}
+
+fn numeric_pow_general_scale(base Numeric, exp Numeric) i64 {
+	let ln_dweight = estimate_ln_dweight(base)
+	let local = max(8-ln_dweight, 0)
+	let ln_base = numeric_ln_value(base, local) catch _ { return minNumericSigDigits }
+	let ln_num = nv_mul(ln_base, exp, local)
+	let val = float_of_numeric(ln_num)*0.434294481903252
+	mut rscale = minNumericSigDigits-i64(val)
+	rscale = max(rscale, base.dscale)
+	rscale = max(rscale, exp.dscale)
+	rscale = max(rscale, 0)
+	rscale = min(rscale, maxNumericDisplayScale)
+	return rscale
+}
+
+fn numeric_pow_int_scale(base Numeric, exp Numeric, ignored i64) i64 {
+	_ = ignored
+	return numeric_pow_general_scale(base, exp)
+}
+
+// numeric_integer_exponent returns the exponent as an i64 when it is an exact
+// integer that fits, otherwise nil.
+fn numeric_integer_exponent(exp Numeric) ?i64 {
+	if exp.special != 0 { return nil }
+	if len(exp.digits) == 0 { return 0 }
+	if len(exp.digits) > exp.weight+1 { return nil }
+	let text = format_numeric(exp)
+	let value = mint.Atoi(text) catch _ { return nil }
+	return value
+}
+
+// numeric_pow_int raises base to an integer exponent, rounding to the scale
+// PostgreSQL's power_var_int chooses.
+fn numeric_pow_int(base Numeric, exp i64, exp_dscale i64) !Numeric {
+	let rscale = numeric_pow_int_result_scale(base, exp, exp_dscale)
+	if exp == 0 { return nv_parse("1"+dot_zeroes(rscale)) }
+	if base.sign == 0 {
+		if exp < 0 { fail ErrorFault(NewError("22012", "division by zero")) }
+		return nv_parse(zero_with_scale(rscale))
+	}
+	let magnitude = iabs(exp)
+	let work = rscale+30
+	mut result = nv_parse("1")
+	mut factor = base
+	mut mask = magnitude
+	for mask > 0 {
+		if mask%2 == 1 { result = nv_mul(result, factor, work) }
+		mask = mask/2
+		if mask > 0 { factor = nv_mul(factor, factor, work) }
+	}
+	if exp < 0 { return try numeric_div_at(nv_parse("1"), result, rscale) }
+	return numeric_round_value(result, rscale)
+}
+
+fn numeric_pow_int_result_scale(base Numeric, exp i64, exp_dscale i64) i64 {
+	mut f = 0.0
+	if len(base.digits) != 0 {
+		f = f64(base.digits[0])
+		mut p = base.weight*numericDecDigits
+		mut i = i64(1)
+		for i < len(base.digits) && i*numericDecDigits < 16 {
+			f = f*10000.0+f64(base.digits[i])
+			p -= numericDecDigits
+			i += 1
+		}
+		f = f64(exp)*(gauge.Log10(f)+f64(p))
+	}
+	mut rscale = minNumericSigDigits-i64(f)
+	rscale = max(rscale, base.dscale)
+	rscale = max(rscale, exp_dscale)
+	rscale = max(rscale, 0)
+	rscale = min(rscale, maxNumericDisplayScale)
+	return rscale
+}
+
+fn dot_zeroes(n i64) str {
+	if n <= 0 { return "" }
+	return "."+zeroes(n)
+}
+
+// NumericLog10 returns the base-10 logarithm of a numeric value.
+fn NumericLog10(a Datum) !Datum {
+	let ten = FromStr(NumericOid, "10")
+	let numerator = try NumericLn(a)
+	let denominator = try NumericLn(ten)
+	return try NumericDiv(numerator, denominator)
+}
+
+// NumericDivInt returns the integer part of the quotient, truncated toward zero.
+fn NumericDivInt(a Datum, b Datum) !Datum {
+	let quotient = try NumericDiv(a, b)
+	return NumericTrunc(quotient, 0)
 }
 
 // CompareNumeric compares numeric values exactly, including PostgreSQL NaN ordering.
@@ -725,6 +1103,13 @@ fn numeric_add_one(n Numeric, sign i64, scale i64) Numeric {
 fn zero_with_scale(scale i64) str {
 	if scale <= 0 { return "0" }
 	return "0."+zeroes(scale)
+}
+
+// with_scale returns n with its display scale forced to scale.
+fn with_scale(n Numeric, scale i64) Numeric {
+	mut out = n
+	out.dscale = scale
+	return out
 }
 
 fn reverse_i64(values []i64) []i64 {

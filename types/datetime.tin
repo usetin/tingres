@@ -89,7 +89,7 @@ fn ParseDateTime(oid Oid, input str) !Datum {
 		let (local, offset, hasZone, ok, outOfRange) = parse_time_value(raw)
 		if !ok {
 			if outOfRange { fail datetime_range(input) }
-			fail PgFault("22007", "invalid input syntax for type {sql_type_name(oid)}: \"{input}\"")
+			fail PgFault("22007", "invalid input syntax for type {input_type_name(oid)}: \"{input}\"")
 		}
 		mut resolvedOffset = offset
 		if !hasZone { resolvedOffset = session_offset(current_timestamp_micros()) }
@@ -105,7 +105,7 @@ fn ParseDateTime(oid Oid, input str) !Datum {
 		let parts = parse_timestamp_fields(raw)
 		if !parts.ok {
 			if parts.outOfRange { fail datetime_range(input) }
-			fail PgFault("22007", "invalid input syntax for type {sql_type_name(oid)}: \"{input}\"")
+			fail PgFault("22007", "invalid input syntax for type {input_type_name(oid)}: \"{input}\"")
 		}
 		if parts.month < 1 || parts.month > 12 || parts.day < 1 || parts.day > tide.DaysIn(parts.year, parts.month) { fail datetime_range(input) }
 		let local = (tide.DaysFromCivil(parts.year, parts.month, parts.day)-pgEpochDays)*microsPerDay+parts.hour*microsPerHour+parts.minute*microsPerMinute+parts.secondMicros
@@ -388,14 +388,16 @@ fn ParseInterval(raw str) !Datum {
 	mut days = i64(0)
 	mut micros = i64(0)
 	mut at = i64(0)
+	mut ago = false
 	if len(words) > 0 && words[0] == "@" { at = 1 }
 	for at < len(words) {
 		let token = words[at]
-		if twine.HasSuffix(token, ":") || token == "ago" {
+		if ascii_lower(token) == "ago" {
+			ago = true
 			at += 1
 			continue
 		}
-		if at+1 < len(words) && find_byte(token, ':', 0) >= 0 {
+		if find_byte(token, ':', 0) >= 0 {
 			micros += try parse_interval_clock(token)
 			at += 1
 			continue
@@ -405,11 +407,74 @@ fn ParseInterval(raw str) !Datum {
 			micros += i64(number*3600000000.0)
 			break
 		}
-		let unit = ascii_lower(words[at+1])
-		if unit == "year" || unit == "years" || unit == "yr" || unit == "yrs" { months += i64(number*12.0) } else if unit == "mon" || unit == "mons" || unit == "month" || unit == "months" { months += i64(number) } else if unit == "week" || unit == "weeks" { days += i64(number*7.0) } else if unit == "day" || unit == "days" { days += i64(number) } else if unit == "hour" || unit == "hours" || unit == "hr" || unit == "hrs" { micros += i64(number*3600000000.0) } else if unit == "min" || unit == "mins" || unit == "minute" || unit == "minutes" { micros += i64(number*60000000.0) } else if unit == "sec" || unit == "secs" || unit == "second" || unit == "seconds" { micros += i64(number*1000000.0) } else if unit == "msec" || unit == "millisecond" || unit == "milliseconds" { micros += i64(number*1000.0) } else { fail interval_syntax(raw) }
+		let (addMonths, addDays, addMicros) = try interval_unit_delta(number, ascii_lower(words[at+1]), raw)
+		months += addMonths
+		days += addDays
+		micros += addMicros
 		at += 2
 	}
-	return interval_datum(micros, days, months)
+	mut sign = i64(1)
+	if ago { sign = -1 }
+	return interval_datum(sign*micros, sign*days, sign*months)
+}
+
+// interval_unit_delta returns the (months, days, microseconds) contribution of
+// one value/unit pair, cascading a fractional part into the next smaller unit
+// the way PostgreSQL's DecodeInterval does.
+fn interval_unit_delta(number f64, unit str, raw str) !(i64, i64, i64) {
+	let whole = i64(number)
+	let frac = number-f64(whole)
+	if unit == "year" || unit == "years" || unit == "yr" || unit == "yrs" {
+		return whole*12+i64(round_nearest(frac*12.0)), 0, 0
+	}
+	if unit == "mon" || unit == "mons" || unit == "month" || unit == "months" {
+		let (dayPart, microPart) = interval_fract_days(frac, 30.0)
+		return whole, dayPart, microPart
+	}
+	if unit == "week" || unit == "weeks" {
+		let (dayPart, microPart) = interval_fract_days(frac, 7.0)
+		return 0, whole*7+dayPart, microPart
+	}
+	if unit == "day" || unit == "days" {
+		return 0, whole, interval_fract_micros(frac, f64(microsPerDay))
+	}
+	if unit == "hour" || unit == "hours" || unit == "hr" || unit == "hrs" {
+		return 0, 0, whole*microsPerHour+interval_fract_micros(frac, f64(microsPerHour))
+	}
+	if unit == "min" || unit == "mins" || unit == "minute" || unit == "minutes" {
+		return 0, 0, whole*microsPerMinute+interval_fract_micros(frac, f64(microsPerMinute))
+	}
+	if unit == "sec" || unit == "secs" || unit == "second" || unit == "seconds" {
+		return 0, 0, whole*microsPerSecond+interval_fract_micros(frac, f64(microsPerSecond))
+	}
+	if unit == "msec" || unit == "millisecond" || unit == "milliseconds" {
+		return 0, 0, whole*1000+interval_fract_micros(frac, 1000.0)
+	}
+	if unit == "microsecond" || unit == "microseconds" || unit == "us" || unit == "usec" || unit == "usecs" {
+		return 0, 0, whole+interval_fract_micros(frac, 1.0)
+	}
+	fail interval_syntax(raw)
+}
+
+fn interval_fract_days(frac f64, scale f64) (i64, i64) {
+	if frac == 0.0 { return 0, 0 }
+	let scaled = frac*scale
+	let extraDays = i64(scaled)
+	return extraDays, interval_fract_micros(scaled-f64(extraDays), f64(microsPerDay))
+}
+
+fn interval_fract_micros(frac f64, scale f64) i64 {
+	if frac == 0.0 { return 0 }
+	let scaled = frac*scale
+	mut usec = i64(scaled)
+	let residual = scaled-f64(usec)
+	if residual > 0.5 { usec += 1 } else if residual < -0.5 { usec -= 1 }
+	return usec
+}
+
+fn round_nearest(v f64) f64 {
+	if v >= 0.0 { return f64(i64(v+0.5)) }
+	return f64(i64(v-0.5))
 }
 
 fn parse_iso_interval(raw str) !Datum {
@@ -460,33 +525,54 @@ fn interval_datum(micros i64, days i64, months i64) Datum {
 	return Datum{oid: IntervalOid, null: false, i: micros, f: 0.0, b: false, s: "", bytes: []u8{}, months: months, days: days, offset: 0}
 }
 
-// IntervalText returns PostgreSQL's ISO-style default interval output.
+// IntervalText returns PostgreSQL's postgres-style interval output.
 fn IntervalText(d Datum) str {
-	mut parts = []str{}
-	let years = d.months/12
-	let months = d.months%12
-	if years != 0 { parts = append(parts, mint.Itoa(years)+if_plural(years, " year", " years")) }
-	if months != 0 { parts = append(parts, mint.Itoa(months)+if_plural(months, " mon", " mons")) }
-	if d.days != 0 { parts = append(parts, mint.Itoa(d.days)+if_plural(d.days, " day", " days")) }
-	let time = interval_clock_text(d.i)
-	if time != "00:00:00" || len(parts) == 0 { parts = append(parts, time) }
-	return join_words(parts)
+	mut enc = IntervalEncoder{text: "", is_zero: true, is_before: false}
+	enc = add_postgres_int_part(enc, d.months/12, "year")
+	enc = add_postgres_int_part(enc, d.months%12, "mon")
+	enc = add_postgres_int_part(enc, d.days, "day")
+	mut out = enc.text
+	if enc.is_zero || d.i != 0 {
+		let minus = d.i < 0
+		if !enc.is_zero { out += " " }
+		if minus { out += "-" } else if enc.is_before { out += "+" }
+		let hour = d.i/microsPerHour
+		let minute = d.i%microsPerHour/microsPerMinute
+		let second = d.i%microsPerMinute/microsPerSecond
+		let fraction = d.i%microsPerSecond
+		out += two_digit(iabs(hour))+":"+two_digit(iabs(minute))+":"+interval_seconds_text(iabs(second), iabs(fraction))
+	}
+	return out
 }
 
-fn interval_clock_text(micros i64) str {
-	mut sign = ""
-	mut value = micros
-	if micros < 0 {
-		sign = "-"
-		value = 0-micros
-	}
-	let hours = value/microsPerHour
-	let minutes = (value%microsPerHour)/microsPerMinute
-	let seconds = (value%microsPerMinute)/microsPerSecond
-	let fraction = value%microsPerSecond
-	mut out = sign+two_digit(hours)+":"+two_digit(minutes)+":"+two_digit(seconds)
-	if fraction != 0 { out += "."+twine.TrimRight(six_digit(fraction), "0") }
+// IntervalEncoder accumulates PostgreSQL's postgres-style interval fields.
+type IntervalEncoder value struct {
+	text str
+	is_zero bool
+	is_before bool
+}
+
+// add_postgres_int_part appends one nonzero interval field, using PostgreSQL's
+// rule that a field after a negative field carries an explicit '+' sign.
+fn add_postgres_int_part(enc IntervalEncoder, value i64, units str) IntervalEncoder {
+	if value == 0 { return enc }
+	mut out = enc.text
+	if !enc.is_zero { out += " " }
+	if enc.is_before && value > 0 { out += "+" }
+	out += mint.Itoa(value)+" "+units
+	if value != 1 { out += "s" }
+	return IntervalEncoder{text: out, is_zero: false, is_before: value < 0}
+}
+
+fn interval_seconds_text(second i64, micros i64) str {
+	mut out = two_digit(second)
+	if micros != 0 { out += "."+twine.TrimRight(six_digit(micros), "0") }
 	return out
+}
+
+fn iabs(v i64) i64 {
+	if v < 0 { return 0-v }
+	return v
 }
 
 // CompareDateTime compares date/time scalar values, applying PostgreSQL time/timetz ordering.
@@ -566,8 +652,9 @@ fn Extract(field str, d Datum) !Datum {
 	}
 	if normalized == "milliseconds" || normalized == "millisecond" {
 		let seconds = try date_part_value("second", d)
-		let millis = seconds*1000+temporal_fraction(d)/1000
-		return try ParseNumeric(mint.Itoa(millis)+".000")
+		let fraction = temporal_fraction(d)
+		let millis = seconds*1000+fraction/1000
+		return try ParseNumeric(mint.Itoa(millis)+"."+three_digit(fraction%1000))
 	}
 	if normalized == "microseconds" || normalized == "microsecond" {
 		let seconds = try date_part_value("second", d)
@@ -610,6 +697,8 @@ fn micros_seconds_text(micros i64) str {
 
 fn date_part_value(field str, d Datum) !i64 {
 	let f = ascii_lower(field)
+	if !known_date_part_field(f) { fail PgFault("22023", "unit \"{field}\" not recognized for type {sql_type_name(d.oid)}") }
+	if !date_part_supported(f, d.oid) { fail PgFault("22023", "unit \"{field}\" not supported for type {sql_type_name(d.oid)}") }
 	if d.i == pgInfinity || d.i == 0-pgInfinity {
 		if f == "epoch" { return d.i/pgInfinity }
 		fail PgFault("22008", "cannot extract {field} from an infinite value")
@@ -644,6 +733,7 @@ fn date_part_value(field str, d Datum) !i64 {
 		second = time%microsPerMinute/microsPerSecond
 	}
 	if f == "year" || f == "years" { return year }
+	if f == "isoyear" { return iso_year(year, month, day) }
 	if f == "month" || f == "months" { return month }
 	if f == "day" || f == "days" { return day }
 	if f == "hour" || f == "hours" { return hour }
@@ -653,6 +743,8 @@ fn date_part_value(field str, d Datum) !i64 {
 	if f == "century" { return (year+99)/100 }
 	if f == "millennium" { return (year+999)/1000 }
 	if f == "quarter" { return (month+2)/3 }
+	if f == "doy" { return day_of_year(year, month, day) }
+	if f == "week" { return iso_week_number(year, month, day) }
 	if f == "dow" { return floor_mod(tide.DaysFromCivil(year, month, day)+4, 7) }
 	if f == "isodow" { return floor_mod(tide.DaysFromCivil(year, month, day)+3, 7)+1 }
 	if f == "epoch" {
@@ -661,6 +753,71 @@ fn date_part_value(field str, d Datum) !i64 {
 		return tide.DaysFromCivil(year, month, day)*86400+hour*3600+minute*60+second
 	}
 	fail PgFault("22023", "unit \"{field}\" not recognized for type {sql_type_name(d.oid)}")
+}
+
+fn known_date_part_field(f str) bool {
+	for name in []str{"year", "years", "isoyear", "month", "months", "day", "days", "hour", "hours",
+		"minute", "minutes", "second", "seconds", "millisecond", "milliseconds", "microsecond",
+		"microseconds", "decade", "century", "millennium", "quarter", "doy", "week", "dow", "isodow",
+		"epoch", "julian", "timezone", "timezone_hour", "timezone_minute"} {
+		if f == name { return true }
+	}
+	return false
+}
+
+fn date_part_supported(f str, oid Oid) bool {
+	let isCalendar = is_calendar_field(f)
+	let isTime = is_time_field(f)
+	if f == "epoch" { return true }
+	if f == "julian" { return oid == DateOid || oid == TimestampOid || oid == TimestamptzOid }
+	if f == "timezone" || f == "timezone_hour" || f == "timezone_minute" { return oid == TimetzOid || oid == TimestamptzOid }
+	if oid == DateOid { return isCalendar || isTime }
+	if oid == TimeOid || oid == TimetzOid { return isTime }
+	if oid == TimestampOid || oid == TimestamptzOid { return isCalendar || isTime }
+	return false
+}
+
+fn is_calendar_field(f str) bool {
+	for name in []str{"year", "years", "isoyear", "month", "months", "day", "days", "decade", "century",
+		"millennium", "quarter", "doy", "week", "dow", "isodow"} {
+		if f == name { return true }
+	}
+	return false
+}
+
+fn is_time_field(f str) bool {
+	for name in []str{"hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
+		"milliseconds", "microsecond", "microseconds"} {
+		if f == name { return true }
+	}
+	return false
+}
+
+fn day_of_year(year i64, month i64, day i64) i64 {
+	return tide.DaysFromCivil(year, month, day)-tide.DaysFromCivil(year, 1, 1)+1
+}
+
+fn iso_week_number(year i64, month i64, day i64) i64 {
+	let doy = day_of_year(year, month, day)
+	let isodow = floor_mod(tide.DaysFromCivil(year, month, day)+3, 7)+1
+	mut week = (doy-isodow+10)/7
+	if week < 1 { week = iso_weeks_in_year(year-1) } else if week > iso_weeks_in_year(year) { week = 1 }
+	return week
+}
+
+fn iso_year(year i64, month i64, day i64) i64 {
+	let doy = day_of_year(year, month, day)
+	let isodow = floor_mod(tide.DaysFromCivil(year, month, day)+3, 7)+1
+	mut week = (doy-isodow+10)/7
+	if week < 1 { return year-1 }
+	if week > iso_weeks_in_year(year) { return year+1 }
+	return year
+}
+
+fn iso_weeks_in_year(year i64) i64 {
+	let p = floor_mod(year+year/4-year/100+year/400, 7)
+	if p == 4 || p == 3 { return 53 }
+	return 52
 }
 
 // DateTrunc truncates a timestamp to a supported date/time field.
@@ -692,44 +849,94 @@ fn DateTrunc(field str, d Datum) !Datum {
 	return FromI64(d.oid, local)
 }
 
-// Age returns a calendar interval between timestamps.
+// Age returns PostgreSQL's symbolic calendar interval between two timestamps.
 fn Age(a Datum, b Datum) !Datum {
+	if a.i == pgInfinity || a.i == 0-pgInfinity || b.i == pgInfinity || b.i == 0-pgInfinity { fail ErrorFault(NewError("22008", "interval out of range")) }
 	mut localA = a.i
 	mut localB = b.i
 	if a.oid == TimestamptzOid { localA += session_offset(a.i)*microsPerSecond }
 	if b.oid == TimestamptzOid { localB += session_offset(b.i)*microsPerSecond }
 	let dayA = floor_div(localA, microsPerDay)
 	let dayB = floor_div(localB, microsPerDay)
-	let (yearA, monthA, dateA) = tide.CivilFromDays(dayA+pgEpochDays)
-	let (yearB, monthB, dateB) = tide.CivilFromDays(dayB+pgEpochDays)
+	let (yearA, monthA, mdayA) = tide.CivilFromDays(dayA+pgEpochDays)
+	let (yearB, monthB, mdayB) = tide.CivilFromDays(dayB+pgEpochDays)
 	let timeA = floor_mod(localA, microsPerDay)
 	let timeB = floor_mod(localB, microsPerDay)
-	mut months = (yearA-yearB)*12+monthA-monthB
-	mut days = dateA-dateB
-	mut micros = timeA-timeB
-	if micros < 0 {
-		micros += microsPerDay
-		days -= 1
+	mut usec = timeA%microsPerSecond-timeB%microsPerSecond
+	mut second = timeA%microsPerMinute/microsPerSecond-timeB%microsPerMinute/microsPerSecond
+	mut minute = timeA%microsPerHour/microsPerMinute-timeB%microsPerHour/microsPerMinute
+	mut hour = timeA/microsPerHour-timeB/microsPerHour
+	mut mday = mdayA-mdayB
+	mut mon = monthA-monthB
+	mut year = yearA-yearB
+	let negative = localA < localB
+	if negative {
+		usec = 0-usec
+		second = 0-second
+		minute = 0-minute
+		hour = 0-hour
+		mday = 0-mday
+		mon = 0-mon
+		year = 0-year
 	}
-	if days < 0 {
-		months -= 1
-		days += tide.DaysIn(yearA, monthA)
+	for usec < 0 {
+		usec += microsPerSecond
+		second -= 1
 	}
-	return interval_datum(micros, days, months)
+	for second < 0 {
+		second += 60
+		minute -= 1
+	}
+	for minute < 0 {
+		minute += 60
+		hour -= 1
+	}
+	for hour < 0 {
+		hour += 24
+		mday -= 1
+	}
+	for mday < 0 {
+		if negative { mday += tide.DaysIn(yearA, monthA) } else { mday += tide.DaysIn(yearB, monthB) }
+		mon -= 1
+	}
+	for mon < 0 {
+		mon += 12
+		year -= 1
+	}
+	if negative {
+		usec = 0-usec
+		second = 0-second
+		minute = 0-minute
+		hour = 0-hour
+		mday = 0-mday
+		mon = 0-mon
+		year = 0-year
+	}
+	let micros = hour*microsPerHour+minute*microsPerMinute+second*microsPerSecond+usec
+	return interval_datum(micros, mday, year*12+mon)
 }
 
 // MakeDate constructs a date from calendar fields.
 fn MakeDate(year i64, month i64, day i64) !Datum {
-	if month < 1 || month > 12 || day < 1 || day > tide.DaysIn(year, month) { fail ErrorFault(NewError("22008", "date field value out of range: \"{year}-{month}-{day}\"")) }
+	if month < 1 || month > 12 || day < 1 || day > tide.DaysIn(year, month) { fail ErrorFault(NewError("22008", "date field value out of range: {date_field_text(year, month, day)}")) }
 	return FromI64(DateOid, tide.DaysFromCivil(year, month, day)-pgEpochDays)
 }
 
 // MakeTimestamp constructs a timestamp from calendar fields and seconds.
 fn MakeTimestamp(year i64, month i64, day i64, hour i64, minute i64, seconds f64) !Datum {
-	if month < 1 || month > 12 || day < 1 || day > tide.DaysIn(year, month) || hour < 0 || hour > 24 || minute < 0 || minute > 59 || seconds < 0.0 || seconds >= 61.0 { fail ErrorFault(NewError("22008", "timestamp field value out of range")) }
+	if month < 1 || month > 12 || day < 1 || day > tide.DaysIn(year, month) { fail ErrorFault(NewError("22008", "date field value out of range: {date_field_text(year, month, day)}")) }
+	if hour < 0 || hour > 24 || minute < 0 || minute > 59 || seconds < 0.0 || seconds >= 61.0 { fail ErrorFault(NewError("22008", "time field value out of range: {time_field_text(hour, minute, i64(seconds))}")) }
 	let micros = i64(seconds*1000000.0)
-	if hour == 24 && (minute != 0 || micros != 0) { fail ErrorFault(NewError("22008", "timestamp field value out of range")) }
+	if hour == 24 && (minute != 0 || micros != 0) { fail ErrorFault(NewError("22008", "time field value out of range: {time_field_text(hour, minute, i64(seconds))}")) }
 	return FromI64(TimestampOid, (tide.DaysFromCivil(year, month, day)-pgEpochDays)*microsPerDay+hour*microsPerHour+minute*microsPerMinute+micros)
+}
+
+fn date_field_text(year i64, month i64, day i64) str {
+	return mint.Itoa(year)+"-"+two_digit(month)+"-"+two_digit(day)
+}
+
+fn time_field_text(hour i64, minute i64, second i64) str {
+	return two_digit(hour)+":"+two_digit(minute)+":"+two_digit(second)
 }
 
 fn CastTemporal(d Datum, to Oid) !Datum {
@@ -762,47 +969,108 @@ fn CastTemporal(d Datum, to Oid) !Datum {
 	return try ParseDateTime(to, d.Text())
 }
 
-// ToChar formats common PostgreSQL date/time template patterns.
+// ToChar formats a date/time value with PostgreSQL's common template patterns.
 fn ToChar(d Datum, pattern str) str {
-	let text = d.Text()
-	let (year, month, day, hour, minute, seconds, weekday) = temporal_fields(d)
+	let (year, month, day, hour, minute, second, weekday) = temporal_fields(d)
+	let usec = temporal_fraction(d)
 	mut out = ""
 	mut i = i64(0)
 	for i < len(pattern) {
-		if slice_eq(pattern, i, "HH24") {
+		if match_pattern(pattern, i, "HH24") {
 			out += two_digit(hour)
 			i += 4
-		} else if slice_eq(pattern, i, "YYYY") {
+		} else if match_pattern(pattern, i, "HH12") {
+			mut h12 = hour%12
+			if h12 == 0 { h12 = 12 }
+			out += two_digit(h12)
+			i += 4
+		} else if match_pattern(pattern, i, "YYYY") {
 			out += four_digit(year)
 			i += 4
-		} else if slice_eq(pattern, i, "Mon") {
-			out += month_short(month)
+		} else if match_pattern(pattern, i, "MONTH") {
+			out += pad_name(cased_name(month_full_name(month), pattern[i:i+5]), 9)
+			i += 5
+		} else if match_pattern(pattern, i, "Month") {
+			out += pad_name(cased_name(month_full_name(month), pattern[i:i+5]), 9)
+			i += 5
+		} else if match_pattern(pattern, i, "MON") {
+			out += cased_name(month_short(month), pattern[i:i+3])
 			i += 3
-		} else if slice_eq(pattern, i, "Day") {
-			out += weekday_name(weekday)
+		} else if match_pattern(pattern, i, "Mon") {
+			out += cased_name(month_short(month), pattern[i:i+3])
 			i += 3
-		} else if slice_eq(pattern, i, "MM") {
+		} else if match_pattern(pattern, i, "DAY") {
+			out += pad_name(cased_name(weekday_name(weekday), pattern[i:i+3]), 9)
+			i += 3
+		} else if match_pattern(pattern, i, "Day") {
+			out += pad_name(cased_name(weekday_name(weekday), pattern[i:i+3]), 9)
+			i += 3
+		} else if match_pattern(pattern, i, "DY") {
+			out += cased_name(weekday_short(weekday), pattern[i:i+2])
+			i += 2
+		} else if match_pattern(pattern, i, "Dy") {
+			out += cased_name(weekday_short(weekday), pattern[i:i+2])
+			i += 2
+		} else if match_pattern(pattern, i, "MM") {
 			out += two_digit(month)
 			i += 2
-		} else if slice_eq(pattern, i, "DD") {
+		} else if match_pattern(pattern, i, "DD") {
 			out += two_digit(day)
 			i += 2
-		} else if slice_eq(pattern, i, "MI") {
+		} else if match_pattern(pattern, i, "MI") {
 			out += two_digit(minute)
 			i += 2
-		} else if slice_eq(pattern, i, "SS") {
-			out += two_digit(seconds)
+		} else if match_pattern(pattern, i, "SS") {
+			out += two_digit(second)
 			i += 2
-		} else if slice_eq(pattern, i, "MS") {
-			out += three_digit((d.i%microsPerSecond)/1000)
+		} else if match_pattern(pattern, i, "MS") {
+			out += three_digit(usec/1000)
 			i += 2
+		} else if match_pattern(pattern, i, "US") {
+			out += six_digit(usec)
+			i += 2
+		} else if match_pattern(pattern, i, "AM") || match_pattern(pattern, i, "PM") {
+			if hour < 12 { out += "AM" } else { out += "PM" }
+			i += 2
+		} else if match_pattern(pattern, i, "D") {
+			out += mint.Itoa(weekday+1)
+			i += 1
 		} else {
 			out += str([]u8{pattern[i]})
 			i += 1
 		}
 	}
-	_ = text
 	return out
+}
+
+fn match_pattern(pattern str, at i64, token str) bool {
+	if at+len(token) > len(pattern) { return false }
+	return ascii_lower(pattern[at:at+len(token)]) == ascii_lower(token)
+}
+
+fn cased_name(name str, token str) str {
+	if token == "" { return name }
+	if token == twine.ToUpper(token) { return twine.ToUpper(name) }
+	let first = token[0]
+	if first >= 'a' && first <= 'z' { return twine.ToLower(name) }
+	return name
+}
+
+fn pad_name(name str, width i64) str {
+	mut out = name
+	for len(out) < width { out += " " }
+	return out
+}
+
+fn month_full_name(month i64) str {
+	let names = []str{"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"}
+	if month < 1 || month > 12 { return "" }
+	return names[month-1]
+}
+
+fn weekday_short(day i64) str {
+	let names = []str{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+	return names[floor_mod(day, 7)]
 }
 
 fn temporal_fields(d Datum) (i64, i64, i64, i64, i64, i64, i64) {
