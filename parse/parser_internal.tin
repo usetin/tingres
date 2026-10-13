@@ -32,6 +32,9 @@ fn (p Parser) errorHere() ! {
 }
 
 fn (p mut Parser) take() Token {
+	if p.done() {
+		return Token{Text: "", Kind: "eof", BytePos: len(p.Source), EndBytePos: len(p.Source), Pos: charPosition(p.Source, len(p.Source))}
+	}
 	let token = p.Tokens[p.At]
 	p.At += 1
 	return token
