@@ -1,0 +1,22 @@
+package main
+
+type Mode enum {
+	A
+}
+
+type Manager struct {
+	locks map[Key][]Holder
+}
+
+type Key struct {
+	rel u32
+}
+
+type Holder struct {
+	xid u32
+	mode Mode
+}
+
+fn main() {
+	let _m = Manager{locks: make(map[Key][]Holder)}
+}

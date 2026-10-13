@@ -1,0 +1,310 @@
+package txn
+
+// Transaction state is owned by one manager. The M1 implementation is in-memory until
+// the store WAL record registration API is available in this worktree.
+
+// Isolation selects when a statement takes its visibility snapshot.
+type Isolation enum {
+	ReadCommitted
+	RepeatableRead
+	Serializable
+}
+
+// XidState is the durable outcome recorded for a transaction id.
+type XidState enum {
+	InProgress
+	Committed
+	Aborted
+	SubCommitted
+}
+
+// Txn carries the caller-visible identity and statement counter.
+type Txn struct {
+	xid u32
+	iso Isolation
+	cid u32
+	startXmin u32
+	startXmax u32
+	startXip []u32
+	active bool
+}
+
+// Snapshot is the MVCC horizon and active transaction set for one statement.
+type Snapshot struct {
+	Xmin u32
+	Xmax u32
+	Xip []u32
+	Xid u32
+	Cid u32
+}
+
+// LockMode is one of PostgreSQL's eight relation lock modes.
+type LockMode enum {
+	AccessShare
+	RowShare
+	RowExclusive
+	ShareUpdateExclusive
+	Share
+	ShareRowExclusive
+	Exclusive
+	AccessExclusive
+}
+
+// TupleLock is a row-level lock mode.
+type TupleLock enum {
+	ForKeyShare
+	ForShare
+	ForNoKeyUpdate
+	ForUpdate
+}
+
+// LockKey identifies one relation lock table entry.
+type LockKey struct {
+	rel u32
+}
+
+// LockHolder is one transaction's held lock.
+type LockHolder struct {
+	xid u32
+	mode LockMode
+}
+
+// TupleLockKey identifies one tuple lock table entry.
+type TupleLockKey struct {
+	rel u32
+	page u32
+	slot u16
+}
+
+// TupleLockHolder is one transaction's held tuple lock.
+type TupleLockHolder struct {
+	xid u32
+	mode TupleLock
+}
+
+// TupleHeader is the subset of a heap header required for visibility.
+type TupleHeader struct {
+	Xmin u32
+	Xmax u32
+	Cid u32
+	Infomask u16
+}
+
+// Manager owns transaction ids, outcomes, active snapshots and relation locks.
+type Manager struct {
+	nextXid u32
+	states map[u32]XidState
+	active map[u32]bool
+	locks map[LockKey][]LockHolder
+	tupleLocks map[TupleLockKey][]TupleLockHolder
+	version u64
+}
+
+// NewManager creates an empty in-memory transaction manager.
+fn NewManager() !Manager {
+	return Manager{nextXid: 3, states: make(map[u32]XidState), active: make(map[u32]bool), locks: make(map[LockKey][]LockHolder), tupleLocks: make(map[TupleLockKey][]TupleLockHolder), version: 1}
+}
+
+// Begin starts a transaction at the current xid horizon.
+fn (m mut Manager) Begin(iso Isolation) Txn {
+	let xid = m.nextXid
+	m.nextXid += 1
+	let activeXids = m.activeXids()
+	let xmin = m.minimumActive(xid)
+	m.states[xid] = XidState.InProgress
+	m.active[xid] = true
+	m.version += 1
+	return Txn{xid: xid, iso: iso, cid: 0, startXmin: xmin, startXmax: xid, startXip: activeXids, active: true}
+}
+
+// Xid returns the transaction id.
+fn (t Txn) Xid() u32 {
+	return t.xid
+}
+
+// CommandID returns the active command counter.
+fn (t Txn) CommandID() u32 {
+	return t.cid
+}
+
+// CommandCounterIncrement advances the current transaction's command id.
+fn (t mut Txn) CommandCounterIncrement() {
+	t.cid += 1
+}
+
+// Snapshot returns a fresh statement snapshot for read committed and a stable one otherwise.
+fn (m Manager) Snapshot(t Txn) Snapshot {
+	if t.iso != Isolation.ReadCommitted {
+		return Snapshot{Xmin: t.startXmin, Xmax: t.startXmax, Xip: t.startXip, Xid: t.xid, Cid: t.cid}
+	}
+	let activeXids = m.activeXids()
+	return Snapshot{Xmin: m.minimumActive(t.xid), Xmax: m.nextXid, Xip: activeXids, Xid: t.xid, Cid: t.cid}
+}
+
+// Commit records a committed outcome and releases transaction locks.
+fn (m mut Manager) Commit(t mut Txn) ! {
+	if !t.active {
+		fail "25000 transaction is not active"
+	}
+	m.states[t.xid] = XidState.Committed
+	delete(m.active, t.xid)
+	t.active = false
+	m.version += 1
+	m.releaseLocks(t.xid)
+	return
+}
+
+// Abort records an aborted outcome and releases transaction locks.
+fn (m mut Manager) Abort(t mut Txn) {
+	if !t.active {
+		return
+	}
+	m.states[t.xid] = XidState.Aborted
+	delete(m.active, t.xid)
+	t.active = false
+	m.version += 1
+	m.releaseLocks(t.xid)
+}
+
+// State returns the known outcome of xid, treating an unknown id as aborted.
+fn (m Manager) State(xid u32) XidState {
+	let (state, ok) = m.states[xid]
+	if !ok {
+		if xid < 3 {
+			return XidState.Committed
+		}
+		return XidState.Aborted
+	}
+	return state
+}
+
+// Visible applies snapshot visibility to one tuple header.
+fn (m Manager) Visible(snap Snapshot, h TupleHeader) bool {
+	if h.Xmin == snap.Xid {
+		if h.Cid >= snap.Cid {
+			return false
+		}
+	} else if h.Infomask & infXminFrozen != 0 {
+	} else if xidIn(h.Xmin, snap.Xip) || h.Xmin >= snap.Xmax {
+		return false
+	} else if h.Xmin != 0 && m.State(h.Xmin) != XidState.Committed {
+		return false
+	}
+	if h.Xmax == 0 || h.Infomask & infXmaxLockOnly != 0 || h.Infomask & infXmaxInvalid != 0 {
+		return true
+	}
+	if h.Xmax == snap.Xid {
+		return h.Cid >= snap.Cid
+	}
+	if xidIn(h.Xmax, snap.Xip) || h.Xmax >= snap.Xmax {
+		return true
+	}
+	return m.State(h.Xmax) != XidState.Committed
+}
+
+// FinishStatement advances the caller's command counter.
+fn FinishStatement(t mut Txn) {
+	t.cid += 1
+}
+
+const infXminFrozen = 1
+const infXmaxInvalid = 2
+const infXmaxLockOnly = 4
+
+fn (m Manager) activeXids() []u32 {
+	mut out = []u32{}
+	for xid, isActive in m.active {
+		if isActive {
+			out = append(out, xid)
+		}
+	}
+	return out
+}
+
+fn (m Manager) minimumActive(fallback u32) u32 {
+	mut xmin = fallback
+	for xid, isActive in m.active {
+		if isActive && xid < xmin {
+			xmin = xid
+		}
+	}
+	return xmin
+}
+
+fn xidIn(xid u32, xs []u32) bool {
+	for x in xs {
+		if xid == x {
+			return true
+		}
+	}
+	return false
+}
+
+// LockRelation acquires a relation lock if no incompatible holder exists.
+fn (m mut Manager) LockRelation(t Txn, rel u32, mode LockMode) ! {
+	let key = LockKey{rel: rel}
+	let holders = m.locks[key]
+	for h in holders {
+		if h.xid != t.xid && conflicts(mode, h.mode) {
+			fail "55P03 could not obtain lock on relation"
+		}
+	}
+	m.locks[key] = append(holders, LockHolder{xid: t.xid, mode: mode})
+	return
+}
+
+// LockTuple acquires a tuple lock if no incompatible holder owns that tuple.
+fn (m mut Manager) LockTuple(t Txn, rel u32, page u32, slot u16, mode TupleLock) ! {
+	let key = TupleLockKey{rel: rel, page: page, slot: slot}
+	let holders = m.tupleLocks[key]
+	for h in holders {
+		if h.xid != t.xid && tupleConflicts(mode, h.mode) {
+			fail "55P03 could not obtain lock on tuple"
+		}
+	}
+	m.tupleLocks[key] = append(holders, TupleLockHolder{xid: t.xid, mode: mode})
+	return
+}
+
+fn tupleConflicts(a TupleLock, b TupleLock) bool {
+	match a {
+		ForKeyShare => return b == TupleLock.ForUpdate
+		ForShare => return b == TupleLock.ForNoKeyUpdate || b == TupleLock.ForUpdate
+		ForNoKeyUpdate => return b == TupleLock.ForShare || b == TupleLock.ForNoKeyUpdate || b == TupleLock.ForUpdate
+		ForUpdate => return true
+	}
+}
+
+fn conflicts(a LockMode, b LockMode) bool {
+	match a {
+		AccessShare => return b == LockMode.AccessExclusive
+		RowShare => return b == LockMode.Exclusive || b == LockMode.AccessExclusive
+		RowExclusive => return b == LockMode.Share || b == LockMode.ShareRowExclusive || b == LockMode.Exclusive || b == LockMode.AccessExclusive
+		ShareUpdateExclusive => return b == LockMode.ShareUpdateExclusive || b == LockMode.Share || b == LockMode.ShareRowExclusive || b == LockMode.Exclusive || b == LockMode.AccessExclusive
+		Share => return b == LockMode.RowExclusive || b == LockMode.ShareUpdateExclusive || b == LockMode.Share || b == LockMode.ShareRowExclusive || b == LockMode.Exclusive || b == LockMode.AccessExclusive
+		ShareRowExclusive => return b != LockMode.AccessShare
+		Exclusive => return b != LockMode.AccessShare && b != LockMode.RowShare
+		AccessExclusive => return true
+	}
+}
+
+fn (m mut Manager) releaseLocks(xid u32) {
+	for key, holders in m.locks {
+		mut kept = []LockHolder{}
+		for h in holders {
+			if h.xid != xid {
+				kept = append(kept, h)
+			}
+		}
+		m.locks[key] = kept
+	}
+	for key, holders in m.tupleLocks {
+		mut kept = []TupleLockHolder{}
+		for h in holders {
+			if h.xid != xid {
+				kept = append(kept, h)
+			}
+		}
+		m.tupleLocks[key] = kept
+	}
+}

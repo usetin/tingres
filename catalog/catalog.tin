@@ -1,0 +1,306 @@
+package catalog
+
+import "../txn"
+
+// Oid is a PostgreSQL object identifier.
+type Oid = u32
+
+// Column describes one visible attribute of a relation.
+type Column struct {
+	Name str
+	Type Oid
+	Typmod i32
+	Number i16
+	Nullable bool
+}
+
+// ColumnDef is one requested column in a CREATE TABLE.
+type ColumnDef struct {
+	Name str
+	Type Oid
+	Typmod i32
+	Nullable bool
+}
+
+// Index describes an index attached to a table.
+type Index struct {
+	Oid Oid
+	Name str
+	Rel u32
+	Unique bool
+}
+
+// Table is a catalog relation descriptor.
+type Table struct {
+	Oid Oid
+	Schema str
+	Name str
+	Cols []Column
+	Rel u32
+	Indexes []Index
+	CreatedBy u32
+	CreatedCommand u32
+	DroppedBy u32
+	DroppedCommand u32
+	System bool
+}
+
+// TableDef describes a table to create.
+type TableDef struct {
+	Schema str
+	Name str
+	Columns []ColumnDef
+}
+
+// IndexDef describes an index to create.
+type IndexDef struct {
+	Table Table
+	Name str
+	Unique bool
+}
+
+// Catalog stores transactional relation metadata. M1 keeps catalog rows in memory until
+// the store heap tuple encoding and type Datum APIs are present in this worktree.
+type Catalog struct {
+	Manager txn.Manager
+	tables map[Oid]Table
+	names map[str][]Oid
+	searchPaths map[u32][]str
+	nextOid u32
+	nextRel u32
+	version u64
+}
+
+// Open creates the catalog metadata and the M1 pg_catalog relation descriptors.
+fn Open(m txn.Manager) !Catalog {
+	mut c = Catalog{Manager: m, tables: make(map[Oid]Table), names: make(map[str][]Oid), searchPaths: make(map[u32][]str), nextOid: 16384, nextRel: 16384, version: 1}
+	c.addNamespace("pg_catalog", 11)
+	c.addNamespace("public", 2200)
+	c.addSystemTable(1259, "pg_class", 2615, "relname", 25, "relnamespace", 26, "relkind", 18)
+	c.addSystemTable(1249, "pg_attribute", 1249, "attrelid", 26, "attname", 25, "atttypid", 26)
+	c.addSystemTable(1247, "pg_type", 1247, "typname", 25, "typnamespace", 26, "typlen", 21)
+	c.addSystemTable(2615, "pg_namespace", 2615, "nspname", 25, "oid", 26, "nspowner", 26)
+	return c
+}
+
+// LookupTable resolves a visible table by explicit schema or the transaction search path.
+fn (c Catalog) LookupTable(t txn.Txn, schema str, name str) ?Table {
+	let snapshot = c.Manager.Snapshot(t)
+	if schema != "" {
+		return c.lookupInSchema(snapshot, schema, name)
+	}
+	for path in c.SearchPath(t) {
+		let found = c.lookupInSchema(snapshot, path, name)
+		if found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+// CreateTable adds a table visible to its creating transaction and later transactions after commit.
+fn (c mut Catalog) CreateTable(t txn.Txn, def TableDef) !Table {
+	mut schema = def.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	if !c.schemaExists(schema) {
+		fail "3F000 schema does not exist"
+	}
+	if def.Name == "" {
+		fail "42602 relation name must not be empty"
+	}
+	if c.lookupInSchema(c.Manager.Snapshot(t), schema, def.Name) != nil {
+		fail "42P07 relation already exists"
+	}
+	mut cols = []Column{}
+	for i, col in def.Columns {
+		if col.Name == "" {
+			fail "42602 column name must not be empty"
+		}
+		for prior in cols {
+			if prior.Name == col.Name {
+				fail "42701 column specified more than once"
+			}
+		}
+		cols = append(cols, Column{Name: col.Name, Type: col.Type, Typmod: col.Typmod, Number: i16(i + 1), Nullable: col.Nullable})
+	}
+	let oid = c.nextOid
+	c.nextOid += 1
+	let rel = c.nextRel
+	c.nextRel += 1
+	let table = Table{Oid: oid, Schema: schema, Name: def.Name, Cols: cols, Rel: rel, Indexes: []Index{}, CreatedBy: t.Xid(), CreatedCommand: t.CommandID(), DroppedBy: 0, DroppedCommand: 0, System: false}
+	c.tables[oid] = table
+	let key = nameKey(schema, def.Name)
+	mut ids = []u32{}
+	for existing in c.names[key] {
+		ids = append(ids, existing)
+	}
+	ids = append(ids, oid)
+	c.names[key] = ids
+	c.version += 1
+	return table
+}
+
+// DropTable marks a relation dropped in the current transaction.
+fn (c mut Catalog) DropTable(t txn.Txn, tbl Table, cascade bool) ! {
+	if tbl.System {
+		fail "42501 permission denied: cannot drop a system relation"
+	}
+	let (current, ok) = c.tables[tbl.Oid]
+	if !ok || !c.visible(t, current) {
+		fail "42P01 relation does not exist"
+	}
+	if len(current.Indexes) > 0 && !cascade {
+		fail "2BP01 cannot drop relation because dependent objects exist"
+	}
+	current.DroppedBy = t.Xid()
+	current.DroppedCommand = t.CommandID()
+	c.tables[tbl.Oid] = current
+	c.version += 1
+	return
+}
+
+// CreateIndex adds index metadata to its parent table.
+fn (c mut Catalog) CreateIndex(t txn.Txn, def IndexDef) !Index {
+	let (table, ok) = c.tables[def.Table.Oid]
+	if !ok || !c.visible(t, table) {
+		fail "42P01 relation does not exist"
+	}
+	if def.Name == "" {
+		fail "42602 index name must not be empty"
+	}
+	let index = Index{Oid: c.nextOid, Name: def.Name, Rel: c.nextRel, Unique: def.Unique}
+	c.nextOid += 1
+	c.nextRel += 1
+	mut updated = table
+	updated.Indexes = append(updated.Indexes, index)
+	c.tables[table.Oid] = updated
+	c.version += 1
+	return index
+}
+
+// LookupType returns the PostgreSQL OID for an M1 built-in type name.
+fn (c Catalog) LookupType(name str) ?Oid {
+	return match name {
+		"bool" => 16
+		"bytea" => 17
+		"int8" => 20
+		"int2" => 21
+		"int4", "integer", "int" => 23
+		"text" => 25
+		"oid" => 26
+		"json" => 114
+		"float4", "real" => 700
+		"float8", "double precision" => 701
+		"varchar", "character varying" => 1043
+		"date" => 1082
+		"time" => 1083
+		"timestamp" => 1114
+		"timestamptz", "timestamp with time zone" => 1184
+		"interval" => 1186
+		"numeric", "decimal" => 1700
+		"uuid" => 2950
+		"jsonb" => 3802
+		_ => nil
+	}
+}
+
+// SystemTable returns one bootstrapped pg_catalog relation descriptor by name.
+fn (c Catalog) SystemTable(name str) ?Table {
+	let ids = c.names[nameKey("pg_catalog", name)]
+	mut found ?Table = nil
+	for oid in ids {
+		let table = c.tables[oid]
+		if table.System {
+			found = table
+		}
+	}
+	return found
+}
+
+// SetSearchPath sets the transaction-local schema search order.
+fn (c mut Catalog) SetSearchPath(t txn.Txn, path []str) {
+	c.searchPaths[t.Xid()] = path
+	c.version += 1
+}
+
+// SearchPath returns the configured schema order or PostgreSQL's M1 default.
+fn (c Catalog) SearchPath(t txn.Txn) []str {
+	let (path, ok) = c.searchPaths[t.Xid()]
+	if ok {
+		return path
+	}
+	return []str{"pg_catalog", "public"}
+}
+
+// Version returns the catalog version used to invalidate cached plans.
+fn (c Catalog) Version() u64 {
+	return c.version
+}
+
+fn (c Catalog) lookupInSchema(snap txn.Snapshot, schema str, name str) ?Table {
+	let ids = c.names[nameKey(schema, name)]
+	mut found ?Table = nil
+	for oid in ids {
+		let table = c.tables[oid]
+		if c.visibleSnapshot(snap, table) {
+			found = table
+		}
+	}
+	return found
+}
+
+fn (c Catalog) visible(t txn.Txn, table Table) bool {
+	return c.visibleSnapshot(c.Manager.Snapshot(t), table)
+}
+
+fn (c Catalog) visibleSnapshot(snap txn.Snapshot, table Table) bool {
+	if table.CreatedBy == snap.Xid {
+		if table.CreatedCommand >= snap.Cid {
+			return false
+		}
+	} else if xidIn(table.CreatedBy, snap.Xip) || table.CreatedBy >= snap.Xmax || c.Manager.State(table.CreatedBy) != txn.XidState.Committed {
+		return false
+	}
+	if table.DroppedBy == 0 {
+		return true
+	}
+	if table.DroppedBy == snap.Xid {
+		return table.DroppedCommand >= snap.Cid
+	}
+	if xidIn(table.DroppedBy, snap.Xip) || table.DroppedBy >= snap.Xmax {
+		return true
+	}
+	return c.Manager.State(table.DroppedBy) != txn.XidState.Committed
+}
+
+fn (c Catalog) schemaExists(schema str) bool {
+	return schema == "pg_catalog" || schema == "public"
+}
+
+fn (c mut Catalog) addNamespace(name str, oid u32) {
+	let table = Table{Oid: oid, Schema: "pg_catalog", Name: name, Cols: []Column{}, Rel: oid, Indexes: []Index{}, CreatedBy: 2, CreatedCommand: 0, DroppedBy: 0, DroppedCommand: 0, System: true}
+	c.tables[oid] = table
+	c.names[nameKey("pg_catalog", name)] = []u32{oid}
+}
+
+fn (c mut Catalog) addSystemTable(oid u32, name str, rel u32, c1 str, t1 u32, c2 str, t2 u32, c3 str, t3 u32) {
+	let cols = []Column{Column{Name: c1, Type: t1, Typmod: -1, Number: 1, Nullable: false}, Column{Name: c2, Type: t2, Typmod: -1, Number: 2, Nullable: false}, Column{Name: c3, Type: t3, Typmod: -1, Number: 3, Nullable: false}}
+	let table = Table{Oid: oid, Schema: "pg_catalog", Name: name, Cols: cols, Rel: rel, Indexes: []Index{}, CreatedBy: 2, CreatedCommand: 0, DroppedBy: 0, DroppedCommand: 0, System: true}
+	c.tables[oid] = table
+	c.names[nameKey("pg_catalog", name)] = []u32{oid}
+}
+
+fn nameKey(schema str, name str) str {
+	return schema + "\x00" + name
+}
+
+fn xidIn(xid u32, xs []u32) bool {
+	for x in xs {
+		if x == xid {
+			return true
+		}
+	}
+	return false
+}
