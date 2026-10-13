@@ -9,8 +9,8 @@ fn TestLexAndStatements(t mut crucible.T) {
 		return
 	}
 	crucible.EqI("five statements", len(statements), 5)
-	crucible.EqS("create classification", statements[0].Kind(), "create_table")
-	crucible.EqS("select classification", statements[2].Kind(), "select")
+	crucible.EqS("create classification", stmtKind(statements[0]), "create_table")
+	crucible.EqS("select classification", stmtKind(statements[2]), "select")
 	crucible.EqS("deparse select", Deparse(statements[2]), "SELECT id, name FROM t WHERE id = 1 ORDER BY id LIMIT 2")
 }
 
@@ -20,7 +20,7 @@ fn TestLexerQuotesCommentsAndDollarStrings(t mut crucible.T) {
 		return
 	}
 	crucible.EqI("quoted statement count", len(statements), 1)
-	crucible.EqS("quoted select", statements[0].Kind(), "select")
+	crucible.EqS("quoted select", stmtKind(statements[0]), "select")
 }
 
 fn TestExpressionPrecedence(t mut crucible.T) {
@@ -28,8 +28,8 @@ fn TestExpressionPrecedence(t mut crucible.T) {
 		t.Error("expression rejected: {err}")
 		return
 	}
-	crucible.EqS("expression kind", expr.NodeKind(), "binary")
-	crucible.EqS("boolean precedence", expr.Text(), "(((a + (b * 3)) = $2) and notc)")
+	crucible.EqS("expression kind", exprKind(expr), "boolean")
+	crucible.EqS("boolean precedence", DeparseExpr(expr), "(((a + (b * 3)) = $2) AND (NOT c))")
 }
 
 fn TestSyntaxFaultHasPosition(t mut crucible.T) {
@@ -100,4 +100,150 @@ fn hasText(text str, needle str) bool {
 		if text[i:i + len(needle)] == needle { return true }
 	}
 	return false
+}
+
+fn stmtKind(statement Stmt) str {
+	return match statement {
+		Select(_) => "select"
+		Insert(_) => "insert"
+		Update(_) => "update"
+		Delete(_) => "delete"
+		CreateTable(_) => "create_table"
+		Transaction(_) => "transaction"
+		Checkpoint(_) => "checkpoint"
+		_ => "other"
+	}
+}
+
+fn exprKind(value Expr) str {
+	return match value {
+		Binary(_) => "binary"
+		Boolean(_) => "boolean"
+		_ => "other"
+	}
+}
+
+fn TestPostgresKeywordClassesAndLexicalForms(t mut crucible.T) {
+	let tokens = lex("SELECT user AS user, between, int, \"MixedCase\", U&\"d\\0061t\", E'it\\'s', $tag$semi;colon$tag$, $2, 1_000, 1.25e-3, ::, :=, =>, ..") catch err {
+		t.Error("PostgreSQL lexical forms rejected: {err}")
+		return
+	}
+	crucible.EqS("reserved SELECT", tokens[0].KeywordClass, "reserved")
+	crucible.EqS("reserved USER", tokens[1].KeywordClass, "reserved")
+	crucible.EqS("col_name BETWEEN", tokens[5].KeywordClass, "col_name")
+	crucible.EqS("col_name INT", tokens[7].KeywordClass, "col_name")
+	crucible.EqS("quoted identifier", tokens[9].Kind, "quoted")
+	crucible.EqS("Unicode escaped identifier", decodeIdentifier(tokens[11].Text).Name, "dat")
+	crucible.EqS("escaped string", tokens[13].Kind, "string")
+	crucible.EqS("dollar quoted string", tokens[15].Kind, "string")
+	crucible.EqS("numbered parameter", tokens[17].Kind, "param")
+	crucible.EqS("underscore numeric", tokens[19].Kind, "number")
+	crucible.EqI("first token character position", tokens[0].Pos, 1)
+}
+
+fn TestReservedWordColumnLabel(t mut crucible.T) {
+	let statements = Parse("SELECT 1 AS user") catch err {
+		t.Error("reserved column label rejected: {err}")
+		return
+	}
+	crucible.EqI("one statement", len(statements), 1)
+	crucible.EqS("reserved label preserved", Deparse(statements[0]), "SELECT 1 AS user")
+}
+
+fn TestExpressionFormsAndPrecedence(t mut crucible.T) {
+	let expressions = []str{
+		"a IS NOT DISTINCT FROM b",
+		"x NOT BETWEEN SYMMETRIC 1 AND 3",
+		"x NOT IN (1, 2, 3)",
+		"x = ANY(ARRAY[1, 2])",
+		"EXISTS (SELECT 1 WHERE x = 1)",
+		"(SELECT x FROM t)",
+		"ARRAY(SELECT x FROM t)",
+		"arr[1:3]",
+		"ROW(1, 2)",
+		"(a, b)",
+		"CASE WHEN x > 0 THEN y ELSE z END",
+		"COALESCE(NULLIF(a, b), greatest(c, d))",
+		"CAST(x AS numeric(10, 2))",
+		"x::varchar(10)[]",
+		"EXTRACT(year FROM ts)",
+		"SUBSTRING(x FROM 2 FOR 3)",
+		"POSITION('a' IN x)",
+		"TRIM(BOTH 'x' FROM name)",
+		"OVERLAY(x PLACING y FROM 2 FOR 3)",
+		"current_timestamp(3) AT TIME ZONE 'UTC'",
+		"f(DISTINCT x ORDER BY y) FILTER (WHERE x > 0) OVER (PARTITION BY a ORDER BY b ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)",
+	}
+	for expression in expressions {
+		let _ = ParseExpr(expression) catch err {
+			t.Error("expression rejected ({expression}): {err}")
+			return
+		}
+	}
+	crucible.EqI("expression variants", len(expressions), 21)
+}
+
+fn TestSelectClausesAndCtes(t mut crucible.T) {
+	let cases = []str{
+		"SELECT 1 WINDOW w AS (PARTITION BY n ORDER BY n ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)",
+		"SELECT n FROM nums GROUP BY ROLLUP(n) HAVING count(*) > 0",
+		"SELECT n FROM nums ORDER BY n DESC NULLS LAST FETCH FIRST 10 ROWS WITH TIES",
+		"SELECT n FROM nums FOR UPDATE OF nums SKIP LOCKED",
+		"WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 4) SELECT DISTINCT ON (n) n FROM nums LEFT JOIN other USING (n) WHERE n > 0",
+	}
+	mut statements = []Stmt{}
+	for sql in cases {
+		let parsed = Parse(sql) catch err {
+			t.Error("select clauses rejected ({sql}): {err}")
+			return
+		}
+		statements = parsed
+	}
+	crucible.EqI("one select", len(statements), 1)
+	crucible.EqS("select statement class", stmtKind(statements[0]), "select")
+	let rendered = Deparse(statements[0])
+	let reparsed = Parse(rendered) catch err {
+		t.Error("select deparse rejected: {err}")
+		return
+	}
+	crucible.EqS("select round trip", Deparse(reparsed[0]), rendered)
+}
+
+fn TestWindowFrameParsing(t mut crucible.T) {
+	let sql = "PARTITION BY n ORDER BY n ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)"
+	let tokens = lex(sql) catch err {
+		t.Error("window tokens rejected: {err}")
+		return
+	}
+	mut parser = Parser{Source: sql, Tokens: tokens, At: 0, Depth: 0}
+	let _ = parser.expect("partition") catch err {
+		t.Error("partition expected: {err}")
+		return
+	}
+	let _ = parser.expect("by") catch err {
+		t.Error("partition by expected: {err}")
+		return
+	}
+	let _ = parser.parseExpressionListUntilAny("order", "rows", "range", "groups", ")") catch err {
+		t.Error("partition keys rejected: {err}")
+		return
+	}
+	let _ = parser.expect("order") catch err {
+		t.Error("order expected: {err}")
+		return
+	}
+	let _ = parser.expect("by") catch err {
+		t.Error("order by expected: {err}")
+		return
+	}
+	let _ = parser.parseSortListUntilAny("rows", "range", "groups", ")") catch err {
+		t.Error("window order rejected: {err}")
+		return
+	}
+	crucible.EqS("frame starts here", parser.text(), "rows")
+	let _ = parser.parseWindowFrame() catch err {
+		t.Error("window frame rejected: {err}")
+		return
+	}
+	crucible.EqS("window close remains", parser.text(), ")")
 }

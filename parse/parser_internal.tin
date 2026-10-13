@@ -1,0 +1,206 @@
+package parse
+
+type Parser struct {
+	Source str
+	Tokens []Token
+	At i64
+	Depth i64
+	StopWord str
+}
+
+fn (p Parser) done() bool { return p.At >= len(p.Tokens) }
+
+fn (p Parser) text() str {
+	if p.done() { return "" }
+	return p.Tokens[p.At].Text
+}
+
+fn (p Parser) kind() str {
+	if p.done() { return "eof" }
+	return p.Tokens[p.At].Kind
+}
+
+fn (p Parser) pos() i64 {
+	if p.done() { return len(p.Source) }
+	return p.Tokens[p.At].BytePos
+}
+
+fn (p Parser) errorHere() ! {
+	if p.done() { fail syntaxMessage(p.Source, len(p.Source), "syntax error at end of input") }
+	let token = p.Tokens[p.At]
+	fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{token.Text}\"")
+}
+
+fn (p mut Parser) take() Token {
+	let token = p.Tokens[p.At]
+	p.At += 1
+	return token
+}
+
+fn (p mut Parser) eat(text str) bool {
+	if lowerAscii(p.text()) != lowerAscii(text) { return false }
+	p.At += 1
+	return true
+}
+
+fn (p mut Parser) expect(text str) !Token {
+	if !p.eat(text) { try p.errorHere() }
+	return p.Tokens[p.At - 1]
+}
+
+fn (p mut Parser) enter() ! {
+	p.Depth += 1
+	if p.Depth > 256 { fail positionedMessage("54001", charPosition(p.Source, p.pos()), "stack depth limit exceeded") }
+}
+
+fn (p mut Parser) leave() {
+	if p.Depth > 0 { p.Depth -= 1 }
+}
+
+fn (p Parser) canBeIdentifier() bool {
+	if p.done() { return false }
+	if p.kind() == "quoted" { return true }
+	if p.kind() != "word" { return false }
+	return p.Tokens[p.At].KeywordClass != "reserved"
+}
+
+fn (p mut Parser) parseIdentifier() !Identifier {
+	if !p.canBeIdentifier() { try p.errorHere() }
+	let token = p.take()
+	let decoded = decodeIdentifier(token.Text)
+	return Identifier{Pos: token.Pos, Name: decoded.Name, Quoted: decoded.Quoted}
+}
+
+fn (p mut Parser) parseLabelIdentifier() !Identifier {
+	if p.done() || (p.kind() != "quoted" && p.kind() != "word") { try p.errorHere() }
+	let token = p.take()
+	let decoded = decodeIdentifier(token.Text)
+	return Identifier{Pos: token.Pos, Name: decoded.Name, Quoted: decoded.Quoted}
+}
+
+fn (p mut Parser) parseQualifiedName() !QualifiedName {
+	mut start = 0
+	if !p.done() { start = p.Tokens[p.At].Pos }
+	mut parts = []Identifier{}
+	let first = try p.parseIdentifier()
+	parts = append(parts, first)
+	for p.eat(".") {
+		if len(parts) >= 3 { try p.errorHere() }
+		let part = try p.parseIdentifier()
+		parts = append(parts, part)
+	}
+	return QualifiedName{Pos: start, Parts: parts}
+}
+
+fn nameText(name QualifiedName) str {
+	mut out = ""
+	for i, part in name.Parts {
+		if i > 0 { out += "." }
+		out += identifierText(part)
+	}
+	return out
+}
+
+fn identifierText(name Identifier) str {
+	if name.Quoted { return "\"" + replaceAll(name.Name, "\"", "\"\"") + "\"" }
+	return name.Name
+}
+
+fn replaceAll(s str, old str, replacement str) str {
+	if len(old) == 0 { return s }
+	mut out = ""
+	mut at = 0
+	for at < len(s) {
+		let found = findFrom(s, old, at)
+		if found < 0 {
+			out += s[at:]
+			break
+		}
+		out += s[at:found] + replacement
+		at = found + len(old)
+	}
+	return out
+}
+
+fn (p mut Parser) parseTypeName() !TypeName {
+	mut start = 0
+	if !p.done() { start = p.Tokens[p.At].Pos }
+	let first = try p.parseIdentifier()
+	mut parts = []Identifier{first}
+	mut withTimeZone = false
+	mut intervalFields = ""
+	let firstName = lowerAscii(first.Name)
+	if (firstName == "double" || firstName == "character" || firstName == "bit" || firstName == "national" || firstName == "timestamp" || firstName == "time" || firstName == "interval") && p.canBeIdentifier() {
+		let next = lowerAscii(p.text())
+		if (firstName == "double" && next == "precision") || (firstName == "character" && (next == "varying" || next == "large")) || (firstName == "bit" && next == "varying") || (firstName == "national" && (next == "character" || next == "char")) {
+			let part = try p.parseIdentifier()
+			parts = append(parts, part)
+			if firstName == "character" && next == "large" && p.eat("object") { parts = append(parts, Identifier{Name: "object"}) }
+		}
+		if firstName == "timestamp" || firstName == "time" {
+			if p.eat("with") {
+				try p.expect("time")
+				try p.expect("zone")
+				withTimeZone = true
+			} else if p.eat("without") {
+				try p.expect("time")
+				try p.expect("zone")
+			}
+		}
+		if firstName == "interval" && (p.eat("year") || p.eat("month") || p.eat("day") || p.eat("hour") || p.eat("minute") || p.eat("second")) {
+			intervalFields = lowerAscii(p.Tokens[p.At - 1].Text)
+			if p.eat("to") { intervalFields += " to " + lowerAscii(p.take().Text) }
+		}
+	}
+	mut modifiers = []TypeModifier{}
+	if p.eat("(") {
+		for {
+			let value = try p.parseExpression(0)
+			mut modifierPos = valuePos(value)
+			if len(modifiers) == 0 { modifierPos = start }
+			modifiers = append(modifiers, TypeModifier{Pos: modifierPos, Value: value})
+			if !p.eat(",") { break }
+		}
+		try p.expect(")")
+	}
+	mut bounds = []ArrayBound{}
+	for p.eat("[") {
+		mut length ?Expr = nil
+		if !p.eat("]") {
+			length = Expr.Literal(LiteralExpr{Kind: "integer", Value: p.take().Text})
+			try p.expect("]")
+		}
+		bounds = append(bounds, ArrayBound{Pos: start, Length: length})
+	}
+	return TypeName{Pos: start, Name: QualifiedName{Pos: start, Parts: parts}, Modifiers: modifiers, ArrayBounds: bounds, WithTimeZone: withTimeZone, IntervalFields: intervalFields}
+}
+
+fn valuePos(value Expr) i64 {
+	return match value {
+		Literal(v) => v.Pos
+		ColumnRef(v) => v.Pos
+		Param(v) => v.Pos
+		Unary(v) => v.Pos
+		Binary(v) => v.Pos
+		Boolean(v) => v.Pos
+		Is(v) => v.Pos
+		Between(v) => v.Pos
+		In(v) => v.Pos
+		Like(v) => v.Pos
+		Quantified(v) => v.Pos
+		Exists(v) => v.Pos
+		Subquery(v) => v.Pos
+		Array(v) => v.Pos
+		ArraySubquery(v) => v.Pos
+		Subscript(v) => v.Pos
+		Row(v) => v.Pos
+		Field(v) => v.Pos
+		Case(v) => v.Pos
+		Call(v) => v.Pos
+		Special(v) => v.Pos
+		Cast(v) => v.Pos
+		Collate(v) => v.Pos
+		AtTimeZone(v) => v.Pos
+		Default(v) => v.Pos
+	}
+}
