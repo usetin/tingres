@@ -12,9 +12,22 @@ let typeFuncRegistry = buildTypeFuncRegistry()
 
 fn buildTypeFuncRegistry() []Func {
 	mut funcs = []Func{}
-	funcs = append(funcs, builtinFuncRegistry...)
 	RegisterTypeFuncs(mut funcs)
+	for f in builtinFuncRegistry {
+		if !hasFuncSignature(funcs, f) { funcs = append(funcs, f) }
+	}
 	return funcs
+}
+
+// hasFuncSignature reports whether funcs already holds name/argument signature.
+fn hasFuncSignature(funcs []Func, candidate Func) bool {
+	for f in funcs {
+		if f.Name != candidate.Name || len(f.Args) != len(candidate.Args) { continue }
+		mut same = true
+		for i in 0..len(f.Args) { if f.Args[i] != candidate.Args[i] { same = false } }
+		if same { return true }
+	}
+	return false
 }
 
 // RegisterTypeFuncs appends the numeric, temporal and interval operators and

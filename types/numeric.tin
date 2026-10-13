@@ -31,6 +31,8 @@ fn float_text(d Datum) str {
 // round-trip digits, fixed notation for display exponents in [-4, 14] and
 // scientific notation (d.dd e±NN) otherwise.
 fn pg_float_text(v f64, narrow bool) str {
+	mut sign = ""
+	if gauge.Signbit(v) { sign = "-" }
 	mut digits = ""
 	mut exp = i64(0)
 	if narrow {
@@ -42,8 +44,8 @@ fn pg_float_text(v f64, narrow bool) str {
 		digits = d
 		exp = e
 	}
-	if exp >= -4 && exp < 15 { return format_float_fixed(digits, exp) }
-	return format_float_sci(digits, exp)
+	if exp >= -4 && exp < 15 { return sign+format_float_fixed(digits, exp) }
+	return sign+format_float_sci(digits, exp)
 }
 
 fn shortest_float4_digits(v f64) (str, i64) {
