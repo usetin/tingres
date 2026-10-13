@@ -7,8 +7,6 @@ import "lane"
 // synchronous page access; callers must release it before any await or wait. Tin lanes stay on one
 // core, and cross-core access to this core-local mutable store must be sent through relay.
 
-type RelId = u32
-type PageNo = u32
 type Lsn = u64
 
 type Tid struct {

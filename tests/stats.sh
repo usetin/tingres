@@ -62,7 +62,25 @@ INVALID=$(grep -c . parse/testdata/invalid_expected.txt 2>/dev/null || echo 0)
 
 # --- speed: only from a Linux benchmark run ---
 if [ -f bench/results/linux.md ]; then SPEED=$(cat bench/results/linux.md); else
-SPEED="Not measured yet. Speed is only ever reported from a Linux run of tingres and PostgreSQL 17 side by side (interleaved, medians, ratio); there is no end-to-end query path to benchmark yet."; fi
+SPEED=$(cat <<'TABLE'
+**No Linux benchmark has been run yet, so no speed number is claimed.** Every row below is filled in by the Linux benchmark workflow
+(`.github/workflows/bench-linux.yml`, writes `bench/results/linux.md`): tingres and PostgreSQL 17 on the same Linux machine in the same run,
+interleaved, fsync on, medians, with the ratio (above 1.0x means tingres is faster). macOS and Docker-on-Mac numbers are never reported.
+
+| benchmark | tingres | PostgreSQL 17 | ratio | status |
+|---|---:|---:|---:|---|
+| pgbench select-only, 1 client (tps) | — | — | — | pending Linux run |
+| pgbench select-only, 16 clients (tps) | — | — | — | pending Linux run |
+| pgbench select-only, 64 clients (tps) | — | — | — | pending Linux run |
+| pgbench tpcb-like, 16 clients (tps) | — | — | — | pending Linux run |
+| primary-key point lookup, p50 / p99 latency | — | — | — | pending Linux run |
+| scan + aggregate over 10M rows (TPC-H Q1 shape) | — | — | — | pending Linux run |
+| bulk insert via COPY (rows/s) | — | — | — | pending Linux run |
+| single-row INSERT with fsync commit (commits/s, 16 clients) | — | — | — | pending Linux run |
+| connection setup + first query (connections/s) | — | — | — | pending Linux run |
+| SQL parse throughput, simple statements (statements/s) | — | — | — | pending Linux run |
+TABLE
+); fi
 
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 NOW=$(date -u +%Y-%m-%d)
