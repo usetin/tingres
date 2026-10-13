@@ -4,6 +4,7 @@ import "../types"
 import "../catalog"
 import "../txn"
 import "say"
+import "mint"
 
 const SeqPageCost = 1.0
 const RandomPageCost = 4.0
@@ -502,13 +503,29 @@ break } }
 		}
 		let numAggs = i64(len(aggRefs))
 		let aggCost = costAgg(currentPlan.Cost(), currentPlan.Cost().Rows, 1.0, numAggs, currentPlan.Cost().Width)
-		aggregatedPlan = Plan.HashAgg(HashAggNode{
-			Input: currentPlan,
-			GroupKeys: grpKeys,
-			Aggs: aggRefs,
-			Cols: currentPlan.Cols(),
-			Cost: aggCost,
-		})
+		// Sorted aggregation when the input already arrives ordered on the group
+		// keys (single pass, no hash table); otherwise hash aggregation.
+		mut groupSortKeys = []SortKey{}
+		for g in grpKeys {
+			groupSortKeys = append(groupSortKeys, SortKey{Expr: g, Descending: false, NullsFirst: false})
+		}
+		if len(grpKeys) > 0 && planProvidesOrder(currentPlan, groupSortKeys) {
+			aggregatedPlan = Plan.GroupAgg(GroupAggNode{
+				Input: currentPlan,
+				GroupKeys: grpKeys,
+				Aggs: aggRefs,
+				Cols: currentPlan.Cols(),
+				Cost: aggCost,
+			})
+		} else {
+			aggregatedPlan = Plan.HashAgg(HashAggNode{
+				Input: currentPlan,
+				GroupKeys: grpKeys,
+				Aggs: aggRefs,
+				Cols: currentPlan.Cols(),
+				Cost: aggCost,
+			})
+		}
 	}
 
 	// 3. HAVING
@@ -570,7 +587,8 @@ break } }
 		})
 	}
 
-	// 6. ORDER BY
+	// 6. ORDER BY (top-N when a constant LIMIT bounds the sort)
+	let topN = exprConstInt(query.Limit)
 	mut sortedPlan = distinctPlan
 	if len(query.OrderBy) > 0 {
 		mut sortKeys = []SortKey{}
@@ -585,7 +603,7 @@ break } }
 		sortedPlan = Plan.Sort(SortNode{
 			Input: distinctPlan,
 			Keys: sortKeys,
-			Limit: -1,
+			Limit: topN,
 			Cols: outCols,
 			Cost: sCost,
 		})
@@ -608,6 +626,72 @@ break } }
 	}
 
 	return finalPlan
+}
+
+// exprConstInt returns the non-negative integer value of a constant expression,
+// or -1 when it is absent or not a constant integer.
+fn exprConstInt(e ?Expr) i64 {
+	if let x = e {
+		match x {
+			Const(c) => {
+				if types.IsNull(c.Value) { return -1 }
+				let n = mint.Atoi(c.Value.Text()) catch _ { return -1 }
+				if n < 0 { return -1 }
+				return n
+			}
+			_ => { return -1 }
+		}
+	}
+	return -1
+}
+
+// sameSimpleExpr reports whether two expressions are structurally identical for
+// the leaf forms that order-key comparison needs.
+fn sameSimpleExpr(a Expr, b Expr) bool {
+	match a {
+		ColRef(ca) => {
+			match b {
+				ColRef(cb) => { return ca.Slot == cb.Slot && ca.RangeIndex == cb.RangeIndex }
+				_ => { return false }
+			}
+		}
+		Const(ca) => {
+			match b {
+				Const(cb) => { return ca.Value.Oid() == cb.Value.Oid() && ca.Value.Text() == cb.Value.Text() }
+				_ => { return false }
+			}
+		}
+		OpCall(oa) => {
+			match b {
+				OpCall(ob) => {
+					if oa.Op != ob.Op || len(oa.Args) != len(ob.Args) { return false }
+					for i in 0..len(oa.Args) {
+						if !sameSimpleExpr(oa.Args[i], ob.Args[i]) { return false }
+					}
+					return true
+				}
+				_ => { return false }
+			}
+		}
+		_ => { return false }
+	}
+	return false
+}
+
+// planProvidesOrder reports whether a plan's output is already sorted on the
+// requested keys (a prefix match of an existing Sort node's keys).
+fn planProvidesOrder(p Plan, wanted []SortKey) bool {
+	match p {
+		Sort(n) => {
+			if len(n.Keys) < len(wanted) { return false }
+			for i, w in wanted {
+				if n.Keys[i].Descending != w.Descending { return false }
+				if !sameSimpleExpr(n.Keys[i].Expr, w.Expr) { return false }
+			}
+			return true
+		}
+		_ => { return false }
+	}
 }
 
 // isIdentityProjection reports whether exprs is exactly the input columns in order.
