@@ -1,0 +1,86 @@
+package exec
+
+import "../types"
+
+// Notice is an informational message sent to the client.
+type Notice struct {
+	Message str
+	Code str
+	Detail str
+	Hint str
+}
+
+// ColDesc is one column descriptor in a RowDescription message.
+type ColDesc struct {
+	Name str
+	Oid u32
+	Typmod i32
+	TableOid u32
+	Attno i16
+}
+
+// Sink receives executor output events during query execution.
+shape Sink {
+	mut RowDescription(cols []ColDesc, formats []i16)
+	mut DataRow(r types.Row)
+	mut CommandComplete(tag str)
+	mut Notice(n Notice)
+	mut CopyIn(format i8, columnFormats []i16)
+	mut CopyOut(format i8, columnFormats []i16)
+	mut CopyData(d []u8)
+	mut CopyDone()
+}
+
+// NullSink discards all output events.
+type NullSink struct {}
+
+fn (s mut NullSink) RowDescription(cols []ColDesc, formats []i16) {}
+fn (s mut NullSink) DataRow(r types.Row) {}
+fn (s mut NullSink) CommandComplete(tag str) {}
+fn (s mut NullSink) Notice(n Notice) {}
+fn (s mut NullSink) CopyIn(format i8, columnFormats []i16) {}
+fn (s mut NullSink) CopyOut(format i8, columnFormats []i16) {}
+fn (s mut NullSink) CopyData(d []u8) {}
+fn (s mut NullSink) CopyDone() {}
+
+// RecordSink records all output events for testing and assertions.
+type RecordSink struct {
+	Cols []ColDesc
+	Formats []i16
+	Rows [][]types.Datum
+	Tags []str
+	Notices []Notice
+}
+
+// NewRecordSink creates an empty recording sink.
+fn NewRecordSink() RecordSink {
+	return RecordSink{
+		Cols: []ColDesc{},
+		Formats: []i16{},
+		Rows: [][]types.Datum{},
+		Tags: []str{},
+		Notices: []Notice{},
+	}
+}
+
+fn (s mut RecordSink) RowDescription(cols []ColDesc, formats []i16) {
+	s.Cols = cols
+	s.Formats = formats
+}
+
+fn (s mut RecordSink) DataRow(r types.Row) {
+	s.Rows = append(s.Rows, r)
+}
+
+fn (s mut RecordSink) CommandComplete(tag str) {
+	s.Tags = append(s.Tags, tag)
+}
+
+fn (s mut RecordSink) Notice(n Notice) {
+	s.Notices = append(s.Notices, n)
+}
+
+fn (s mut RecordSink) CopyIn(format i8, columnFormats []i16) {}
+fn (s mut RecordSink) CopyOut(format i8, columnFormats []i16) {}
+fn (s mut RecordSink) CopyData(d []u8) {}
+fn (s mut RecordSink) CopyDone() {}

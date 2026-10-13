@@ -1,0 +1,265 @@
+package exec
+
+import "../catalog"
+import "../txn"
+import "../store"
+import "../types"
+import "crucible"
+import "quarry"
+
+fn setupTestSession(name str) !(store.Store, Session) {
+	let dir = quarry.TempDir() + "/tingres-session-test-" + name
+	quarry.RemoveAll(dir) catch _ {}
+	mut db = try store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false})
+	let manager = try txn.NewManager(mut db)
+	let cat = try catalog.Open(mut db, manager)
+	let session = NewSession(cat, manager, "postgres", "postgres")
+	return db, session
+}
+
+fn TestSessionStateTransitions(t mut crucible.T) {
+	let (db, sess) = setupTestSession("transitions") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+	mut s = sess
+	_ = db
+
+	t.True("initial state is Idle", i64(s.State().StatusChar()) == i64('I'))
+
+	mut out = NewRecordSink()
+	s.Simple("BEGIN", mut out) catch err {
+		t.Error("BEGIN failed: {err}")
+	}
+	t.True("state after BEGIN is InTxn", i64(s.State().StatusChar()) == i64('T'))
+	t.True("tag is BEGIN", out.Tags[len(out.Tags)-1] == "BEGIN")
+
+	// Nested BEGIN generates notice and stays in txn
+	s.Simple("BEGIN", mut out) catch err {
+		t.Error("nested BEGIN failed: {err}")
+	}
+	t.True("state after nested BEGIN is still InTxn", i64(s.State().StatusChar()) == i64('T'))
+	t.True("notice was emitted for nested BEGIN", len(out.Notices) > 0)
+
+	// COMMIT
+	s.Simple("COMMIT", mut out) catch err {
+		t.Error("COMMIT failed: {err}")
+	}
+	t.True("state after COMMIT is Idle", i64(s.State().StatusChar()) == i64('I'))
+	t.True("tag is COMMIT", out.Tags[len(out.Tags)-1] == "COMMIT")
+
+	// BEGIN then ROLLBACK
+	s.Simple("BEGIN", mut out) catch err { t.Error("BEGIN failed: {err}") }
+	t.True("state is InTxn", i64(s.State().StatusChar()) == i64('T'))
+
+	s.Simple("ROLLBACK", mut out) catch err { t.Error("ROLLBACK failed: {err}") }
+	t.True("state after ROLLBACK is Idle", i64(s.State().StatusChar()) == i64('I'))
+	t.True("tag is ROLLBACK", out.Tags[len(out.Tags)-1] == "ROLLBACK")
+}
+
+fn TestSessionAbortedState(t mut crucible.T) {
+	let (db, sess) = setupTestSession("aborted") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+	mut s = sess
+	_ = db
+
+	mut out = NewRecordSink()
+	s.Simple("BEGIN", mut out) catch err { t.Error("BEGIN failed: {err}") }
+
+	// Trigger error inside txn
+	mut failed = false
+	s.Simple("SET invalid_guc_foo_bar = 1", mut out) catch err {
+		failed = true
+		let pgErr = types.ErrorFromFault(err)
+		t.True("error code is 42704", pgErr.Code == "42704")
+	}
+	t.True("statement inside txn failed", failed)
+	t.True("state is now Aborted", i64(s.State().StatusChar()) == i64('E'))
+
+	// Subsequent command must fail with 25P02
+	mut blocked = false
+	s.Simple("SHOW DateStyle", mut out) catch err {
+		blocked = true
+		let pgErr = types.ErrorFromFault(err)
+		t.True("error code is 25P02", pgErr.Code == "25P02")
+	}
+	t.True("command was blocked in aborted state", blocked)
+
+	// COMMIT in aborted state rolls back and returns to Idle
+	s.Simple("COMMIT", mut out) catch err { t.Error("COMMIT in aborted state failed: {err}") }
+	t.True("state after COMMIT is Idle", i64(s.State().StatusChar()) == i64('I'))
+	t.True("tag is ROLLBACK", out.Tags[len(out.Tags)-1] == "ROLLBACK")
+}
+
+fn TestSavepointsAndRollback(t mut crucible.T) {
+	let (db, sess) = setupTestSession("savepoints") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+	mut s = sess
+	_ = db
+
+	mut out = NewRecordSink()
+	s.Simple("BEGIN", mut out) catch err { t.Error("BEGIN failed: {err}") }
+
+	s.Simple("SAVEPOINT sp1", mut out) catch err { t.Error("SAVEPOINT failed: {err}") }
+	t.True("tag is SAVEPOINT", out.Tags[len(out.Tags)-1] == "SAVEPOINT")
+
+	s.Simple("SET LOCAL work_mem = '16MB'", mut out) catch err { t.Error("SET LOCAL failed: {err}") }
+	t.True("work_mem is 16MB", s.Guc("work_mem") == "16MB")
+
+	s.Simple("SAVEPOINT sp2", mut out) catch err { t.Error("SAVEPOINT failed: {err}") }
+	s.Simple("SET LOCAL work_mem = '32MB'", mut out) catch err { t.Error("SET LOCAL failed: {err}") }
+	t.True("work_mem is 32MB", s.Guc("work_mem") == "32MB")
+
+	// ROLLBACK TO sp2 reverts to 16MB
+	s.Simple("ROLLBACK TO sp2", mut out) catch err { t.Error("ROLLBACK TO failed: {err}") }
+	t.True("work_mem reverted to 16MB", s.Guc("work_mem") == "16MB")
+	t.True("state is still InTxn", i64(s.State().StatusChar()) == i64('T'))
+
+	// ROLLBACK TO sp1 reverts to default 4MB
+	s.Simple("ROLLBACK TO sp1", mut out) catch err { t.Error("ROLLBACK TO failed: {err}") }
+	t.True("work_mem reverted to 4MB", s.Guc("work_mem") == "4MB")
+
+	s.Simple("RELEASE sp1", mut out) catch err { t.Error("RELEASE failed: {err}") }
+	t.True("tag is RELEASE", out.Tags[len(out.Tags)-1] == "RELEASE")
+
+	s.Simple("COMMIT", mut out) catch err { t.Error("COMMIT failed: {err}") }
+	t.True("state is Idle", i64(s.State().StatusChar()) == i64('I'))
+}
+
+fn TestGucEngine(t mut crucible.T) {
+	let (db, sess) = setupTestSession("guc") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+	mut s = sess
+	_ = db
+
+	// Check default GUC values
+	t.True("default search_path", s.Guc("search_path") == "\"$user\", public")
+	t.True("default DateStyle", s.Guc("DateStyle") == "ISO, MDY")
+	t.True("default TimeZone", s.Guc("TimeZone") == "UTC")
+	t.True("default client_encoding", s.Guc("client_encoding") == "UTF8")
+	t.True("default standard_conforming_strings", s.Guc("standard_conforming_strings") == "on")
+	t.True("default statement_timeout", s.Guc("statement_timeout") == "0")
+	t.True("default lock_timeout", s.Guc("lock_timeout") == "0")
+	t.True("default extra_float_digits", s.Guc("extra_float_digits") == "1")
+	t.True("default work_mem", s.Guc("work_mem") == "4MB")
+
+	mut out = NewRecordSink()
+
+	// SHOW
+	s.Simple("SHOW DateStyle", mut out) catch err { t.Error("SHOW DateStyle failed: {err}") }
+	t.True("SHOW produced a row", len(out.Rows) > 0)
+	t.True("SHOW value", out.Rows[0][0].Text() == "ISO, MDY")
+
+	// SHOW ALL
+	mut outAll = NewRecordSink()
+	s.Simple("SHOW ALL", mut outAll) catch err { t.Error("SHOW ALL failed: {err}") }
+	t.True("SHOW ALL produced multiple rows", len(outAll.Rows) >= 10)
+
+	// SET DateStyle
+	s.Simple("SET DateStyle = 'Postgres, DMY'", mut out) catch err { t.Error("SET DateStyle failed: {err}") }
+	t.True("updated DateStyle", s.Guc("DateStyle") == "Postgres, DMY")
+
+	// RESET DateStyle
+	s.Simple("RESET DateStyle", mut out) catch err { t.Error("RESET DateStyle failed: {err}") }
+	t.True("reset DateStyle", s.Guc("DateStyle") == "ISO, MDY")
+
+	// Transaction-scoped SET LOCAL
+	s.Simple("BEGIN", mut out) catch err { t.Error("BEGIN failed: {err}") }
+	s.Simple("SET LOCAL work_mem = '128MB'", mut out) catch err { t.Error("SET LOCAL failed: {err}") }
+	t.True("in-txn work_mem", s.Guc("work_mem") == "128MB")
+	s.Simple("COMMIT", mut out) catch err { t.Error("COMMIT failed: {err}") }
+	t.True("after-commit work_mem reverted", s.Guc("work_mem") == "4MB")
+
+	// Validation errors
+	mut readOnlyFailed = false
+	s.Simple("SET server_version = '99.0'", mut out) catch err {
+		readOnlyFailed = true
+		let pgErr = types.ErrorFromFault(err)
+		t.True("read-only error code is 55P02", pgErr.Code == "55P02")
+	}
+	t.True("read-only GUC modification rejected", readOnlyFailed)
+
+	mut boolFailed = false
+	s.Simple("SET standard_conforming_strings = 'invalid'", mut out) catch err {
+		boolFailed = true
+		let pgErr = types.ErrorFromFault(err)
+		t.True("bool error code is 22023", pgErr.Code == "22023")
+	}
+	t.True("invalid boolean rejected", boolFailed)
+
+	mut rangeFailed = false
+	s.Simple("SET extra_float_digits = 10", mut out) catch err {
+		rangeFailed = true
+		let pgErr = types.ErrorFromFault(err)
+		t.True("range error code is 22023", pgErr.Code == "22023")
+	}
+	t.True("out-of-range value rejected", rangeFailed)
+
+	// ParameterStatus list
+	let params = s.ParameterStatusList()
+	t.True("ParameterStatus list has entries", len(params) >= 8)
+}
+
+fn TestCancel(t mut crucible.T) {
+	let (db, sess) = setupTestSession("cancel") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+	mut s = sess
+	_ = db
+
+	t.False("initially not canceled", s.IsCanceled())
+	s.Cancel()
+	t.True("canceled flag set", s.IsCanceled())
+
+	mut out = NewRecordSink()
+	mut canceled = false
+	s.Simple("SHOW DateStyle", mut out) catch err {
+		canceled = true
+		let pgErr = types.ErrorFromFault(err)
+		t.True("cancel code is 57014", pgErr.Code == "57014")
+	}
+	t.True("query failed due to cancel", canceled)
+
+	s.ResetCancel()
+	t.False("reset clears cancel flag", s.IsCanceled())
+	s.Simple("SHOW DateStyle", mut out) catch err {
+		t.Error("query after reset failed: {err}")
+	}
+}
+
+fn TestImplicitMultiStatementAtomicity(t mut crucible.T) {
+	let (db, sess) = setupTestSession("atomicity") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+	mut s = sess
+	_ = db
+
+	mut out = NewRecordSink()
+
+	// Both succeed
+	s.Simple("SET work_mem = '16MB'; SET DateStyle = 'Postgres, DMY'", mut out) catch err {
+		t.Error("multi-statement simple query failed: {err}")
+	}
+	t.True("state remains Idle", s.State().StatusChar() == 'I')
+	t.True("first statement took effect", s.Guc("work_mem") == "16MB")
+	t.True("second statement took effect", s.Guc("DateStyle") == "Postgres, DMY")
+
+	// Atomicity: second statement fails, rolling back first statement
+	mut failed = false
+	s.Simple("SET work_mem = '64MB'; SET nonexistent_guc_xyz = 123", mut out) catch err {
+		failed = true
+		let pgErr = types.ErrorFromFault(err)
+		t.True("error code is 42704", pgErr.Code == "42704")
+	}
+	t.True("query failed on invalid statement", failed)
+	t.True("state is still Idle after implicit rollback", s.State().StatusChar() == 'I')
+	t.True("first statement was rolled back", s.Guc("work_mem") == "16MB")
+}
