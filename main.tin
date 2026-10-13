@@ -1,7 +1,27 @@
 package main
 
+import "lever"
+import "mint"
+import "./proto"
+import "quarry"
 import "say"
+import "./server"
 
-fn main() {
-	say.Line("tingres: PostgreSQL in Tin (skeleton)")
+fn main() ! {
+	let data = lever.Str("data", "data", "database data directory")
+	let listen = lever.Str("listen", "127.0.0.1:5432", "PostgreSQL listen address")
+	let maxConnections = lever.Int("max-connections", env_int("TINGRES_MAX_CONNECTIONS", 100), "maximum open client connections")
+	let auth = lever.Str("auth", "trust", "authentication: trust or scram-sha-256")
+	let password = lever.Str("password", quarry.Getenv("TINGRES_PASSWORD"), "SCRAM password")
+	let args = quarry.Args()
+	try lever.Parse(args[1:])
+	_ = data.Val() // M1 has no storage layer yet.
+	say.Line("tingres listening on {listen.Val()}")
+	try server.Serve(listen.Val(), proto.Config{User: "postgres", Database: "postgres", Auth: auth.Val(), Password: password.Val(), MaxConnections: maxConnections.Val()})
+}
+
+fn env_int(name str, fallback i64) i64 {
+	let value = quarry.Getenv(name)
+	if value == "" { return fallback }
+	return mint.Atoi(value) catch _ { fallback }
 }

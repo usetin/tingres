@@ -1,0 +1,449 @@
+// Package proto implements the PostgreSQL v3 server wire protocol.
+package proto
+
+import "mint"
+import "seal"
+import "wire"
+
+const maxMessage = 16777216
+const protocol30 = 196608
+const protocol32 = 196610
+const sslRequest = 80877103
+const cancelRequest = 80877102
+const gssRequest = 80877104
+
+// Config controls startup and authentication.
+type Config struct {
+	User str
+	Database str
+	Auth str // trust or scram-sha-256
+	Password str
+	MaxConnections i64 // 0 selects the server default
+}
+
+// Startup contains the negotiated protocol and startup parameters.
+type Startup struct {
+	Version i64
+	User str
+	Database str
+	Parameters map[str]str
+}
+
+// Message is a frontend protocol message.
+type Message enum {
+	Query(sql str)
+	Parse(name str, sql str, paramOids []u32)
+	Bind(portal str, statement str, params [][]u8, paramFormats []i16, resultFormats []i16)
+	Describe(kind u8, name str)
+	Execute(portal str, maxRows i64)
+	Close(kind u8, name str)
+	Sync
+	Flush
+	Terminate
+	CopyData(data []u8)
+	CopyDone
+	CopyFail(message str)
+	Password(data str)
+	Unknown(kind u8)
+}
+
+// ErrorFields carries fields encoded in ErrorResponse and NoticeResponse.
+type ErrorFields struct {
+	Severity str
+	Code str
+	Message str
+	Detail str
+	Hint str
+	Position i32
+	Where str
+	File str
+	Line str
+	Routine str
+}
+
+// Column describes a field in RowDescription.
+type Column struct {
+	Name str
+	TableOid u32
+	Attribute i16
+	TypeOid u32
+	TypeSize i16
+	TypeMod i32
+	Format i16
+}
+
+// Cell is one text-format DataRow value.
+type Cell struct {
+	Null bool
+	Value str
+}
+
+// Conn is an authenticated PostgreSQL frontend connection.
+type Conn struct {
+	sock wire.Conn
+	startup Startup
+	pid u32
+	secretKey u32
+	closed bool
+}
+
+type Cursor struct { at i64 }
+
+fn be(b []u8, at i64, n i64) i64 {
+	mut v = i64(0)
+	for i in 0..n { v = (v << 8) | i64(b[at+i]) }
+	return v
+}
+
+fn putbe(b mut []u8, v i64, n i64) {
+	for i in 0..n { b = append(b, u8(v >> ((n-i-1)*8))) }
+}
+
+fn cstr(b mut []u8, s str) {
+	for i in 0..len(s) { b = append(b, u8(s[i])) }
+	b = append(b, 0)
+}
+
+fn error_field(b mut []u8, tag u8, value str) {
+	b = append(b, tag)
+	cstr(mut b, value)
+}
+
+fn readc(b []u8, k mut Cursor) !str {
+	let start = k.at
+	for k.at < len(b) && b[k.at] != 0 { k.at += 1 }
+	if k.at == len(b) { fail "proto: unterminated string" }
+	let s = str(b[start:k.at])
+	k.at += 1
+	return s
+}
+
+fn packet(kind u8, payload []u8) []u8 {
+	mut out = []u8{}
+	if kind != 0 { out = append(out, kind) }
+	putbe(mut out, len(payload)+4, 4)
+	out = append(out, payload...)
+	return out
+}
+
+// EncodeFrame encodes one frontend typed message or an untyped startup message when kind is 0.
+fn EncodeFrame(kind u8, payload []u8) []u8 {
+	return packet(kind, payload)
+}
+
+fn (c Conn) send(kind u8, payload []u8) ! {
+	let b = packet(kind, payload)
+	try c.sock.WriteBytes(b)
+}
+
+fn (c Conn) auth_message(code i64, body []u8) ! {
+	mut p = []u8{}
+	putbe(mut p, code, 4)
+	p = append(p, body...)
+	try c.send('R', p)
+}
+
+fn (c Conn) auth_ok() ! {
+	try c.auth_message(0, []u8{})
+}
+
+fn (c Conn) parameter(name str, value str) ! {
+	mut p = []u8{}
+	cstr(mut p, name)
+	cstr(mut p, value)
+	try c.send('S', p)
+}
+
+fn (c Conn) ready(status u8) ! {
+	try c.send('Z', []u8{status})
+}
+
+fn (c Conn) error(fields ErrorFields) ! {
+	mut p = []u8{}
+	error_field(mut p, 'S', fields.Severity)
+	error_field(mut p, 'V', fields.Severity)
+	error_field(mut p, 'C', fields.Code)
+	error_field(mut p, 'M', fields.Message)
+	if fields.Detail != "" { error_field(mut p, 'D', fields.Detail) }
+	if fields.Hint != "" { error_field(mut p, 'H', fields.Hint) }
+	if fields.Position > 0 { error_field(mut p, 'P', mint.Itoa(i64(fields.Position))) }
+	if fields.Where != "" { error_field(mut p, 'W', fields.Where) }
+	if fields.File != "" { error_field(mut p, 'F', fields.File) }
+	if fields.Line != "" { error_field(mut p, 'L', fields.Line) }
+	if fields.Routine != "" { error_field(mut p, 'R', fields.Routine) }
+	p = append(p, 0)
+	try c.send('E', p)
+}
+
+fn bad_request(c Conn, code str, message str) ! {
+	try c.error(ErrorFields{Severity: "FATAL", Code: code, Message: message})
+}
+
+fn startup_packet(sock wire.Conn) !(i64, []u8) {
+	let head = try sock.ReadFull(4)
+	let hb = []u8(head)
+	let n = be(hb, 0, 4)
+	if n < 8 || n > maxMessage { fail "proto: invalid startup packet length" }
+	let raw = try sock.ReadFull(n-4)
+	let body = []u8(raw)
+	if len(body) < 4 { fail "proto: truncated startup packet" }
+	return be(body, 0, 4), body[4:]
+}
+
+fn parse_startup(version i64, body []u8) !Startup {
+	if version != protocol30 && version != protocol32 {
+		fail "proto: unsupported protocol version {version}"
+	}
+	let params = make(map[str]str)
+	mut k = Cursor{at: 0}
+	for k.at < len(body) && body[k.at] != 0 {
+		let key = try readc(body, mut k)
+		let value = try readc(body, mut k)
+		if key == "" { fail "proto: empty startup parameter name" }
+		params[key] = value
+	}
+	if k.at >= len(body) || body[k.at] != 0 { fail "proto: unterminated startup parameters" }
+	k.at += 1
+	if k.at != len(body) { fail "proto: trailing startup packet data" }
+	let user = params["user"]
+	if user == "" { fail "proto: startup packet has no user" }
+	return Startup{Version: version, User: user, Database: params["database"], Parameters: params}
+}
+
+// ParseStartup decodes startup protocol fields while retaining unknown options.
+fn ParseStartup(version i64, body []u8) !Startup {
+	return try parse_startup(version, body)
+}
+
+fn scram_attrs(s str) !map[u8]str {
+	let attrs = make(map[u8]str)
+	mut at = i64(0)
+	for at < len(s) {
+		if at+2 > len(s) || s[at+1] != '=' { fail "proto: malformed SCRAM attribute" }
+		let key = u8(s[at])
+		if key == 'm' { fail "proto: unsupported mandatory SCRAM extension" }
+		let start = at+2
+		mut end = start
+		for end < len(s) && s[end] != ',' { end += 1 }
+		let (_, repeated) = attrs[key]
+		if repeated { fail "proto: repeated SCRAM attribute" }
+		attrs[key] = s[start:end]
+		at = end+1
+	}
+	return attrs
+}
+
+fn (c Conn) scram(password str) ! {
+	mut offered = []u8{}
+	for i in 0..len("SCRAM-SHA-256") { offered = append(offered, u8("SCRAM-SHA-256"[i])) }
+	offered = append(offered, 0, 0)
+	try c.auth_message(10, offered)
+	let first = try c.read_frontend()
+	match first {
+		Password(data) => {
+			let bytes = []u8(data)
+			mut k = Cursor{at: 0}
+			let mech = try readc(bytes, mut k)
+			if mech != "SCRAM-SHA-256" || k.at+4 > len(bytes) { fail "proto: invalid SCRAM initial response" }
+			let n = be(bytes, k.at, 4)
+			k.at += 4
+			if n < 0 || n > 8192 || k.at+n != len(bytes) { fail "proto: invalid SCRAM response length" }
+			let clientFirst = str(bytes[k.at:k.at+n])
+			if len(clientFirst) < 3 || clientFirst[:3] != "n,," { fail "proto: SCRAM channel binding mode not supported" }
+			let bare = clientFirst[3:]
+			let a = try scram_attrs(bare)
+			if a['r'] == "" { fail "proto: SCRAM nonce is required" }
+			let nonce = a['r']
+			for i in 0..len(nonce) { if nonce[i] < 33 || nonce[i] > 126 || nonce[i] == ',' { fail "proto: invalid SCRAM nonce" } }
+			let salt = seal.RandomBytes(16)
+			let serverNonce = nonce + seal.B64(seal.RandomBytes(18))
+			let iterationCount = 4096
+			let serverFirst = "r={serverNonce},s={seal.B64(salt)},i={iterationCount}"
+			let sf = []u8(serverFirst)
+			try c.auth_message(11, sf)
+			let second = try c.read_frontend()
+			match second {
+				Password(response) => {
+					let attrs2 = try scram_attrs(response)
+					if attrs2['r'] != serverNonce || attrs2['c'] != "biws" || attrs2['p'] == "" { fail "proto: invalid SCRAM client-final message" }
+					let proof = try seal.B64Decode(attrs2['p'])
+					if len(proof) != 32 { fail "proto: invalid SCRAM proof length" }
+					let finalNoProof = "c=biws,r={serverNonce}"
+					let authMessage = "{bare},{serverFirst},{finalNoProof}"
+					let salted = try seal.Pbkdf2Sha256(password, str(salt), iterationCount, 32)
+					let clientKey = seal.HmacSha256(str(salted), "Client Key")
+					let storedKey = seal.Sha256(str(clientKey))
+					let clientSignature = seal.HmacSha256(str(storedKey), authMessage)
+					mut recovered = make([]u8, 32)
+					for i in 0..32 { recovered[i] = proof[i]^clientSignature[i] }
+					if !seal.ConstantTimeEq(seal.Sha256(str(recovered)), storedKey) { fail "proto: SCRAM authentication failed" }
+					let serverKey = seal.HmacSha256(str(salted), "Server Key")
+					let signature = seal.HmacSha256(str(serverKey), authMessage)
+					let sf2 = []u8("v={seal.B64(signature)}")
+					try c.auth_message(12, sf2)
+				}
+				_ => { fail "proto: expected SCRAM response" }
+			}
+		}
+		_ => { fail "proto: expected SASL initial response" }
+	}
+}
+
+// Accept performs startup negotiation and authentication on an accepted socket.
+fn Accept(sock wire.Conn, cfg Config) !Conn {
+	let token = seal.RandomBytes(8)
+	let c = Conn{sock: sock, startup: Startup{Parameters: make(map[str]str)}, pid: u32(be(token, 0, 4)), secretKey: u32(be(token, 4, 4))}
+	mut version = i64(0)
+	mut body = []u8{}
+	for {
+		let (v, b) = try startup_packet(sock)
+		if v == sslRequest || v == gssRequest {
+			try sock.Write("N")
+			continue
+		}
+		if v == cancelRequest { fail "proto: cancel request" }
+		version = v
+		body = b
+		break
+	}
+	let startup = try parse_startup(version, body)
+	mut conn = c
+	conn.startup = startup
+	if cfg.User != "" && startup.User != cfg.User {
+		try bad_request(conn, "28000", "role \"{startup.User}\" does not exist")
+		fail "proto: configured role mismatch"
+	}
+	if cfg.Database != "" && startup.Database != "" && startup.Database != cfg.Database {
+		try bad_request(conn, "3D000", "database \"{startup.Database}\" does not exist")
+		fail "proto: configured database mismatch"
+	}
+	let auth = cfg.Auth
+	if auth == "trust" || auth == "" {
+		try conn.auth_ok()
+	} else if auth == "scram-sha-256" {
+		conn.scram(cfg.Password) catch err {
+			bad_request(conn, "28P01", "password authentication failed") catch _ {
+			}
+			fail err
+		}
+		try conn.auth_ok()
+	} else {
+		try bad_request(conn, "0A000", "authentication method is not supported")
+		fail "proto: unsupported authentication method"
+	}
+	try conn.parameter("server_version", "17.0-tingres")
+	try conn.parameter("server_encoding", "UTF8")
+	try conn.parameter("client_encoding", "UTF8")
+	try conn.parameter("DateStyle", "ISO, MDY")
+	try conn.parameter("integer_datetimes", "on")
+	try conn.parameter("standard_conforming_strings", "on")
+	mut key = []u8{}
+	putbe(mut key, i64(conn.pid), 4)
+	putbe(mut key, i64(conn.secretKey), 4)
+	try conn.send('K', key)
+	try conn.ready('I')
+	return conn
+}
+
+fn (c Conn) read_frontend() !Message {
+	let rawHead = try c.sock.ReadFull(5)
+	let head = []u8(rawHead)
+	let kind = head[0]
+	let n = be(head, 1, 4)
+	if n < 4 || n > maxMessage { fail "proto: invalid frontend message length" }
+	let rawBody = try c.sock.ReadFull(n-4)
+	let body = []u8(rawBody)
+	mut k = Cursor{at: 0}
+	match kind {
+		'Q' => { let sql = try readc(body, mut k)
+			if k.at != len(body) { fail "proto: trailing Query bytes" }
+			return Message.Query(sql) }
+		'X' => { if len(body) != 0 { fail "proto: malformed Terminate" }
+			return Message.Terminate }
+		'S' => { if len(body) != 0 { fail "proto: malformed Sync" }
+			return Message.Sync }
+		'H' => { if len(body) != 0 { fail "proto: malformed Flush" }
+			return Message.Flush }
+		'p' => { return Message.Password(str(body)) }
+		'd' => { return Message.CopyData(body) }
+		'c' => { return Message.CopyDone }
+		'f' => { let message = try readc(body, mut k)
+			return Message.CopyFail(message) }
+		_ => { return Message.Unknown(kind) }
+	}
+}
+
+// Next reads and validates the next frontend message.
+fn (c Conn) Next() !Message {
+	return try c.read_frontend()
+}
+
+// Startup returns the authenticated startup parameters.
+fn (c Conn) Startup() Startup {
+	return c.startup
+}
+
+// SendError sends a PostgreSQL ErrorResponse.
+fn (c Conn) SendError(fields ErrorFields) ! {
+	try c.error(fields)
+}
+
+// SendReadyForQuery sends ReadyForQuery with transaction status I, T or E.
+fn (c Conn) SendReadyForQuery(status u8) ! {
+	if status != 'I' && status != 'T' && status != 'E' { fail "proto: invalid transaction status" }
+	try c.ready(status)
+}
+
+// SendCommandComplete sends CommandComplete.
+fn (c Conn) SendCommandComplete(tag str) ! {
+	mut p = []u8{}
+	cstr(mut p, tag)
+	try c.send('C', p)
+}
+
+// SendRowDescription sends a text-format RowDescription.
+fn (c Conn) SendRowDescription(cols []Column) ! {
+	mut p = []u8{}
+	putbe(mut p, len(cols), 2)
+	for col in cols {
+		cstr(mut p, col.Name)
+		putbe(mut p, i64(col.TableOid), 4)
+		putbe(mut p, i64(col.Attribute), 2)
+		putbe(mut p, i64(col.TypeOid), 4)
+		putbe(mut p, i64(col.TypeSize), 2)
+		putbe(mut p, i64(col.TypeMod), 4)
+		putbe(mut p, i64(col.Format), 2)
+	}
+	try c.send('T', p)
+}
+
+// SendDataRow sends one row in text format; NULL cells use length -1.
+fn (c Conn) SendDataRow(cells []Cell) ! {
+	mut p = []u8{}
+	putbe(mut p, len(cells), 2)
+	for cell in cells {
+		if cell.Null { putbe(mut p, -1, 4) } else { putbe(mut p, len(cell.Value), 4)
+			for i in 0..len(cell.Value) { p = append(p, u8(cell.Value[i])) } }
+	}
+	try c.send('D', p)
+}
+
+// SendEmptyQueryResponse sends EmptyQueryResponse.
+fn (c Conn) SendEmptyQueryResponse() ! {
+	try c.send('I', []u8{})
+}
+
+// SendParseComplete sends ParseComplete.
+fn (c Conn) SendParseComplete() ! { try c.send('1', []u8{}) }
+// SendBindComplete sends BindComplete.
+fn (c Conn) SendBindComplete() ! { try c.send('2', []u8{}) }
+// SendCloseComplete sends CloseComplete.
+fn (c Conn) SendCloseComplete() ! { try c.send('3', []u8{}) }
+// SendNoData sends NoData.
+fn (c Conn) SendNoData() ! { try c.send('n', []u8{}) }
+
+// Close closes the network connection.
+fn (c mut Conn) Close() {
+	c.sock.Close()
+	c.closed = true
+}
