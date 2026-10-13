@@ -1,5 +1,8 @@
 # Tin compiler bugs
 
 - `tests/compiler_bugs/forward_map_struct_key.tin`: Tin segfaults when a struct declares a map whose struct key and struct value types are declared later in the package. The transaction manager avoids the compiler bug by declaring `LockMode`, `LockKey` and `LockHolder` before `Manager`.
+- `tests/compiler_bugs/const_slice_str.tin`: a package-level `const` with a composite value (for example `const xs = []str{"a"}`) crashes the compiler with `index out of range [-1] with length 0` in `check_const_value`. Use a function returning the value or a package-level `let` instead; the catalog seed uses a function.
+
+NEEDS-TIN: package-level `const` of a composite (slice/map/struct) value crashes the compiler; minimal repro `tests/compiler_bugs/const_slice_str.tin`; blocked file `catalog/seed.tin` (worked around with a function).
 - `tests/compiler_bugs/inline_value_struct_enum_const.tin`: Tin miscompiles an inline value-struct constructor used as an enum-variant struct field once two such locals are live (`plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), ...})` reads back with `oid == 1` instead of 23). It is stack-layout dependent: construction through a helper that binds the datum to a local first is correct. All constant construction in `plan/` goes through `mkConstExpr`/`mkInt4Const`/`mkBoolConst`/`mkStrConst`/`mkNullConst` to avoid it.
 - NEEDS-TIN: fix the inline value-struct-in-enum-literal miscompile (repro `tests/compiler_bugs/inline_value_struct_enum_const.tin`, expected `a 23 1` / `b 23 2`). Blocked: `plan/analyze.tin` and `plan/planner.tin` constant construction (worked around by always materialising the datum into a local first).
