@@ -69,6 +69,9 @@ casts = [
     "1.1754944e-38::float4", "'Infinity'::float8", "'-Infinity'::float8",
     "'NaN'::float8", "'-0'::float8", "1.0::float8::numeric", "0.1::float8::numeric",
     "1.9::float8::int4", "2.5::float8::int4", "-2.5::numeric::int4",
+    "(-1.5)::float8", "'-2.5'::float8", "(-1e10)::float8", "(-0.5)::float4",
+    "'-1.2345678901234567'::float8", "123456789012345.0::float8", "0.000123::float8",
+    "(-3.4028235e38)::float4", "1e-4::float8", "1e-6::float8", "(-1.1754944e-38)::float4",
 ]
 for e in casts:
     add(numeric, e)
@@ -106,6 +109,15 @@ for v in ["1", "2", "10", "100", "0.5", "0.1", "1000000"]:
 for a, b in [("2", "3"), ("2", "10"), ("2", "-1"), ("9", "0.5"), ("2.5", "3"),
              ("0.5", "2"), ("10", "2"), ("3", "4")]:
     add(numeric, f"power(({a})::numeric, ({b})::numeric)")
+for e in ["100000000000000000000::numeric / 7::numeric",
+          "100000000000000000000::numeric % 7::numeric",
+          "div(100000000000000000000::numeric, 7::numeric)",
+          "(-100000000000000000000::numeric) / 7::numeric",
+          "1::numeric / 100000000000000000000::numeric",
+          "0.1::numeric + 0.2::numeric", "99999999999999999999::numeric + 1::numeric",
+          "1e100::numeric", "1e-30::numeric", "2::numeric ^ 10::numeric",
+          "mod(1.5::numeric, 0.7::numeric)", "3.7::numeric % 1.2::numeric"]:
+    add(numeric, e)
 for e in ["1::numeric/0", "1::numeric%0", "0::numeric - 0::numeric", "(-0)::numeric",
           "'NaN'::numeric + 1::numeric", "'Infinity'::numeric - 1::numeric"]:
     add(numeric, e)

@@ -39,30 +39,33 @@ fn testTypeGoldenFile(t mut crucible.T, group str, contents str) i64 {
 			continue
 		}
 		count += 1
-		let (status, message) = arena { typeGoldenOutcome(fields[0], fields[1]) }
-		if status != 0 && failures < 40 {
-			t.Error("{group} {message}")
-			failures += 1
+		let expression = fields[0]
+		let expected = fields[1]
+		if arena { typeGoldenMatches(expression, expected) } { continue }
+		if failures >= 40 { continue }
+		failures += 1
+		let got = evalTypeGoldenExpression(expression) catch err {
+			t.Error("{group} {expression}: got ERROR: {ErrorMessage(err)}, want {expected}")
+			continue
+		}
+		if expected == "NULL" {
+			t.Error("{group} {expression}: got {got.Text()}, want SQL NULL")
+		} else {
+			t.Error("{group} {expression}: got {got.Text()}, want {expected}")
 		}
 	}
 	return count
 }
 
-// typeGoldenOutcome evaluates one corpus line and returns 0 with no message on
-// a match, or 1 with a description on a mismatch.
-fn typeGoldenOutcome(expression str, expected str) (i64, str) {
+// typeGoldenMatches reports whether one corpus line evaluates to the expected
+// result. It is run inside an arena so the per-expression allocations are freed.
+fn typeGoldenMatches(expression str, expected str) bool {
 	let got = evalTypeGoldenExpression(expression) catch err {
-		let actualError = "ERROR: " + ErrorMessage(err)
-		if actualError == expected { return 0, "" }
-		return 1, "{expression}: got {actualError}, want {expected}"
+		return "ERROR: " + ErrorMessage(err) == expected
 	}
-	if expected == "NULL" {
-		if IsNull(got) { return 0, "" }
-		return 1, "{expression}: got {got.Text()}, want SQL NULL"
-	}
-	if twine.HasPrefix(expected, "ERROR: ") { return 1, "{expression}: got {got.Text()}, want {expected}" }
-	if got.Text() != expected { return 1, "{expression}: got {got.Text()}, want {expected}" }
-	return 0, ""
+	if expected == "NULL" { return IsNull(got) }
+	if twine.HasPrefix(expected, "ERROR: ") { return false }
+	return got.Text() == expected
 }
 
 // TypeGoldenParser evaluates a restricted PostgreSQL expression subset using
@@ -206,8 +209,8 @@ fn (parser mut TypeGoldenParser) readNumber() !Datum {
 	}
 	let text = parser.Source[start:parser.Pos]
 	if decimal { return try ParseNumeric(text) }
-	let value = try Parse(Int8Oid, text)
-	if value.i <= 2147483647 { return FromI64(Int4Oid, value.i) }
+	let value = Parse(Int8Oid, text) catch _ { return try ParseNumeric(text) }
+	if value.i >= -2147483648 && value.i <= 2147483647 { return FromI64(Int4Oid, value.i) }
 	return value
 }
 
@@ -222,7 +225,7 @@ fn (parser mut TypeGoldenParser) readIdentifier() str {
 }
 
 fn (parser mut TypeGoldenParser) binaryOperator() (str, i64, i64) {
-	for op in []str{"<=", ">=", "<>", "!=", "=", "<", ">", "+", "-", "*", "/", "%"} {
+	for op in []str{"<=", ">=", "<>", "!=", "=", "<", ">", "+", "-", "*", "/", "%", "^"} {
 		if parser.starts(op) { return op, typeGoldenPrecedence(op), len(op) }
 	}
 	return "", -1, 0
@@ -231,6 +234,7 @@ fn (parser mut TypeGoldenParser) binaryOperator() (str, i64, i64) {
 fn typeGoldenPrecedence(op str) i64 {
 	if op == "=" || op == "<>" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" { return 3 }
 	if op == "+" || op == "-" { return 4 }
+	if op == "^" { return 6 }
 	return 5
 }
 
