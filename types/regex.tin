@@ -41,10 +41,9 @@ fn registerRegexFuncs(funcs mut []Func) {
 // regexMatchArray implements regexp_match and (scalarised) regexp_matches: the
 // capture groups of the first match, or the whole match when there is no group.
 fn regexMatchArray(name str, text str, pattern str, flags str) !Datum {
-	let global = allowsGlobalFlags(name)
-	if name == "regexp_match" && containsGlobalFlag(flags) { try regexpMatchGlobalFault() }
-	let parsed = try parseRegexFlags(flags, global)
-	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	try rejectGlobalOption(name, flags)
+	let parsed = try parseRegexFlags(flags, allowsGlobalFlags(name))
+	let re = try compileWithFlags(pattern, parsed)
 	let offsets = re.SubmatchIndex(text)
 	if len(offsets) == 0 || offsets[0] < 0 { return Null() }
 	if re.NumSubexp() == 0 {
@@ -64,8 +63,9 @@ fn regexMatchArray(name str, text str, pattern str, flags str) !Datum {
 }
 
 fn regexSplitToArray(text str, pattern str, flags str) !Datum {
+	try rejectGlobalOption("regexp_split_to_array", flags)
 	let parsed = try parseRegexFlags(flags, false)
-	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	let re = try compileWithFlags(pattern, parsed)
 	let pieces = re.Split(text, -1)
 	mut elements = make([]?str, 0, len(pieces))
 	for piece in pieces { elements = append(elements, piece) }
@@ -73,8 +73,9 @@ fn regexSplitToArray(text str, pattern str, flags str) !Datum {
 }
 
 fn regexLike(text str, pattern str, flags str) !Datum {
+	try rejectGlobalOption("regexp_like", flags)
 	let parsed = try parseRegexFlags(flags, false)
-	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	let re = try compileWithFlags(pattern, parsed)
 	return FromBool(re.Match(text))
 }
 
@@ -82,7 +83,7 @@ fn regexLike(text str, pattern str, flags str) !Datum {
 // group, or the whole match when the pattern has no group.
 fn regexSubstring(text str, pattern str, flags str) !Datum {
 	let parsed = try parseRegexFlags(flags, false)
-	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	let re = try compileWithFlags(pattern, parsed)
 	let offsets = re.SubmatchIndex(text)
 	if len(offsets) == 0 || offsets[0] < 0 { return Null() }
 	if re.NumSubexp() == 0 { return FromStr(TextOid, text[offsets[0]:offsets[1]]) }
@@ -91,6 +92,14 @@ fn regexSubstring(text str, pattern str, flags str) !Datum {
 }
 
 fn allowsGlobalFlags(name str) bool { return name == "regexp_matches" }
+
+// rejectGlobalOption gives PostgreSQL's error for a 'g' flag where the function
+// does not accept it.
+fn rejectGlobalOption(name str, flags str) ! {
+	if allowsGlobalFlags(name) || !containsGlobalFlag(flags) { return }
+	if name == "regexp_match" { try regexpMatchGlobalFault() }
+	try pgRaise("22023", "{name}() does not support the \"global\" option")
+}
 
 fn containsGlobalFlag(flags str) bool {
 	for _, flag in flags { if flag == 'g' { return true } }
@@ -137,7 +146,7 @@ fn arrayNeedsQuotes(value str) bool {
 
 fn regexOperator(name str, text str, pattern str) !Datum {
 	let insensitive = name == "~*" || name == "!~*"
-	let re = try compileRegex(pattern, insensitive, false)
+	let re = try compileRegex(pattern, insensitive, true)
 	mut matched = re.Match(text)
 	if name == "!~" || name == "!~*" { matched = !matched }
 	return FromBool(matched)
@@ -145,7 +154,7 @@ fn regexOperator(name str, text str, pattern str) !Datum {
 
 fn regexReplace(text str, pattern str, replacement str, flags str) !Datum {
 	let parsed = try parseRegexFlags(flags, true)
-	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	let re = try compileWithFlags(pattern, parsed)
 	let template = postgresReplacement(replacement)
 	mut out = ""
 	if parsed.Global {
@@ -154,35 +163,57 @@ fn regexReplace(text str, pattern str, replacement str, flags str) !Datum {
 		let (start, _, found) = re.Find(text)
 		if !found { return FromStr(TextOid, text) }
 		let suffix = text[start:]
-		let anchored = try compileRegex("^(?:" + pattern + ")", parsed.Insensitive, parsed.DotAll)
+		let anchored = try compileWithFlags("^(?:"+pattern+")", parsed)
 		out = text[:start] + anchored.Replace(suffix, template)
 	}
 	return FromStr(TextOid, out)
 }
 
+// RegexFlags carries PostgreSQL's regexp function flags. Matching is
+// non-newline-sensitive (dot matches newline) unless 'n' or 'm' asks otherwise.
 type RegexFlags value struct {
 	Global bool
 	Insensitive bool
 	DotAll bool
+	Multiline bool
 }
 
 fn parseRegexFlags(flags str, allowGlobal bool) !RegexFlags {
-	mut out = RegexFlags{Global: false, Insensitive: false, DotAll: false}
+	mut out = RegexFlags{Global: false, Insensitive: false, DotAll: true, Multiline: false}
 	for _, flag in flags {
 		if flag == 'g' && allowGlobal { out.Global = true
 		} else if flag == 'i' { out.Insensitive = true
 		} else if flag == 'c' { out.Insensitive = false
-		} else if flag == 's' { out.DotAll = true
-		} else { try pgRaise("0A000", "regular expression flag is not supported: {str(flag)}") }
+		} else if flag == 's' {
+			out.DotAll = true
+			out.Multiline = false
+		} else if flag == 'n' || flag == 'm' {
+			out.DotAll = false
+			out.Multiline = true
+		} else if isUnsupportedRegexFlag(flag) { try pgRaise("0A000", "regular expression option is not supported: {str(flag)}")
+		} else { try pgRaise("22023", "invalid regular expression option: \"{str(flag)}\"") }
 	}
 	return out
 }
 
+// isUnsupportedRegexFlag names PostgreSQL options this engine does not implement,
+// which are refused with 0A000 rather than silently ignored.
+fn isUnsupportedRegexFlag(flag i32) bool {
+	for _, supported in []i32{'b', 'e', 'p', 'q', 't', 'w', 'x'} {
+		if flag == supported { return true }
+	}
+	return false
+}
+
 fn compileRegex(pattern str, insensitive bool, dotAll bool) !lasso.Regexp {
+	return try compileWithFlags(pattern, RegexFlags{Global: false, Insensitive: insensitive, DotAll: dotAll, Multiline: false})
+}
+
+fn compileWithFlags(pattern str, flags RegexFlags) !lasso.Regexp {
 	try rejectUnsupportedRegex(pattern)
 	mut source = ""
-	if insensitive { source += "(?i)" }
-	if dotAll { source += "(?s)" }
+	if flags.Insensitive { source += "(?i)" }
+	if flags.Multiline { source += "(?m)" } else if flags.DotAll { source += "(?s)" }
 	source += pattern
 	let re = lasso.Compile(source) catch _ {
 		try pgRaise("2201B", "invalid regular expression")
