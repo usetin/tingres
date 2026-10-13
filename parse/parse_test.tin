@@ -1,0 +1,103 @@
+package parse
+
+import "crucible"
+import "fault"
+
+fn TestLexAndStatements(t mut crucible.T) {
+	let statements = Parse("CREATE TABLE t (id int, name text); INSERT INTO t VALUES (1, 'x'); SELECT id, name FROM t WHERE id = 1 ORDER BY id LIMIT 2; BEGIN; COMMIT") catch err {
+		t.Error("valid M1 SQL rejected: {err}")
+		return
+	}
+	crucible.EqI("five statements", len(statements), 5)
+	crucible.EqS("create classification", statements[0].Kind(), "create_table")
+	crucible.EqS("select classification", statements[2].Kind(), "select")
+	crucible.EqS("deparse select", Deparse(statements[2]), "SELECT id, name FROM t WHERE id = 1 ORDER BY id LIMIT 2")
+}
+
+fn TestLexerQuotesCommentsAndDollarStrings(t mut crucible.T) {
+	let statements = Parse("-- lead\nSELECT E'it\\'s', \"MixedCase\", $tag$hello; world$tag$ /* nested /* x */ ok */ FROM t;") catch err {
+		t.Error("quoted SQL rejected: {err}")
+		return
+	}
+	crucible.EqI("quoted statement count", len(statements), 1)
+	crucible.EqS("quoted select", statements[0].Kind(), "select")
+}
+
+fn TestExpressionPrecedence(t mut crucible.T) {
+	let expr = ParseExpr("a + b * 3 = $2 AND NOT c") catch err {
+		t.Error("expression rejected: {err}")
+		return
+	}
+	crucible.EqS("expression kind", expr.NodeKind(), "binary")
+	crucible.EqS("boolean precedence", expr.Text(), "(((a + (b * 3)) = $2) and notc)")
+}
+
+fn TestSyntaxFaultHasPosition(t mut crucible.T) {
+	let _ = Parse("SELECT (1") catch err {
+		crucible.True("position in syntax error", hasText(fault.Message(err), "position 10"))
+		return
+	}
+	t.Error("unclosed paren accepted")
+}
+
+fn TestCorpusFiveHundredStatements(t mut crucible.T) {
+	mut sql = ""
+	for i in 0..512 {
+		sql += "SELECT {i} AS n WHERE {i} >= 0;"
+	}
+	let statements = Parse(sql) catch err {
+		t.Error("generated corpus rejected: {err}")
+		return
+	}
+	crucible.EqI("corpus statement count", len(statements), 512)
+	let reparsed = Parse(Deparse(statements[511])) catch err {
+		t.Error("deparse output rejected: {err}")
+		return
+	}
+	crucible.EqS("last roundtrip", Deparse(reparsed[0]), Deparse(statements[511]))
+}
+
+fn TestMutationInputsDoNotCrash(t mut crucible.T) {
+	let seeds = []str{"", "SELECT", "SELECT '", "/*", "$x$", "SELECT (((", "SELECT 1 +", "INSERT INTO", "\xff\x00;"}
+	for seed in seeds {
+		for cut in 0..len(seed) + 1 {
+			let input = seed[:cut]
+			let parsed = Parse(input) catch _ { []Stmt{} }
+			if len(parsed) > 99 { t.Error("impossible parser output") }
+		}
+	}
+	crucible.True("mutated inputs completed", true)
+}
+
+fn BenchmarkParse100kSimpleStatements(b mut crucible.B) {
+	mut bytes = []u8{}
+	for i in 0..100_000 {
+		for _, c in "SELECT 1;" { bytes = append(bytes, u8(c)) }
+		if i < 0 { continue }
+	}
+	let sql = str(bytes)
+	for i in 0..b.N {
+		let count = arena {
+			let statements = Parse(sql) catch _ { []Stmt{} }
+			len(statements)
+		}
+		if count != 100_000 || i < 0 { continue }
+	}
+}
+
+fn BenchmarkParseSimple(b mut crucible.B) {
+	for i in 0..b.N {
+		let count = arena {
+			let parsed = Parse("SELECT a, b FROM t WHERE a = 7 ORDER BY b LIMIT 5") catch _ { []Stmt{} }
+			len(parsed)
+		}
+		if count != 1 || i < 0 { continue }
+	}
+}
+
+fn hasText(text str, needle str) bool {
+	for i in 0..len(text) - len(needle) + 1 {
+		if text[i:i + len(needle)] == needle { return true }
+	}
+	return false
+}

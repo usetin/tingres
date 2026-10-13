@@ -1,0 +1,153 @@
+package txn
+
+import "crucible"
+import "../store"
+import "quarry"
+
+fn testManager(name str) !(str, store.Store, Manager) {
+	let dir = quarry.TempDir() + "/tingres-txn-" + name
+	quarry.RemoveAll(dir) catch _ { }
+	mut db = try store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false})
+	let manager = try NewManager(mut db)
+	return dir, db, manager
+}
+
+fn beginForTest(t mut crucible.T, m mut Manager, iso Isolation) Txn {
+	return m.Begin(iso) catch err {
+		t.Error("begin: {err}")
+		return Txn{xid: 0, iso: Isolation.ReadCommitted, cid: 0, startXmin: 0, startXmax: 0, startXip: []u32{}, active: false}
+	}
+}
+
+fn abortForTest(t mut crucible.T, m mut Manager, tx mut Txn) {
+	m.Abort(mut tx) catch err { t.Error("abort: {err}") }
+}
+
+fn TestSnapshotAndVisibility(t mut crucible.T) {
+	let (_, _, manager) = testManager("snapshot") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut m = manager
+	mut first = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let snap = m.Snapshot(first)
+	crucible.Equal(mut t, "own insert before next command is invisible", m.Visible(snap, TupleHeader{Xmin: first.xid, Cid: 0}), false)
+	first.CommandCounterIncrement()
+	let next = m.Snapshot(first)
+	crucible.Equal(mut t, "own insert after command is visible", m.Visible(next, TupleHeader{Xmin: first.xid, Cid: 0}), true)
+	mut second = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.Equal(mut t, "uncommitted foreign insert is invisible", m.Visible(m.Snapshot(second), TupleHeader{Xmin: first.xid}), false)
+	crucible.NoFault("commit first", m.Commit(mut first))
+	crucible.Equal(mut t, "committed insert is visible to a later statement", m.Visible(m.Snapshot(second), TupleHeader{Xmin: first.xid}), true)
+	abortForTest(mut t, mut m, mut second)
+}
+
+fn TestDeleteVisibility(t mut crucible.T) {
+	let (_, _, manager) = testManager("delete") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut m = manager
+	mut deleter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let before = m.Snapshot(deleter)
+	let row = TupleHeader{Xmin: 2, Xmax: deleter.xid, Cid: 0}
+	crucible.Equal(mut t, "own delete remains visible in its command", m.Visible(before, row), true)
+	deleter.CommandCounterIncrement()
+	crucible.Equal(mut t, "own delete hides row in the next command", m.Visible(m.Snapshot(deleter), row), false)
+	abortForTest(mut t, mut m, mut deleter)
+	mut other = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.Equal(mut t, "aborted delete leaves row visible", m.Visible(m.Snapshot(other), TupleHeader{Xmin: 2, Xmax: deleter.xid}), true)
+	abortForTest(mut t, mut m, mut other)
+}
+
+fn TestRelationLocks(t mut crucible.T) {
+	let (_, _, manager) = testManager("relation-lock") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut m = manager
+	let first = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	mut second = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("compatible access share locks", m.LockRelation(first, 42, LockMode.AccessShare))
+	crucible.NoFault("row exclusive coexists with access share", m.LockRelation(second, 42, LockMode.RowExclusive))
+	crucible.HasFault("access exclusive conflicts", m.LockRelation(second, 42, LockMode.AccessExclusive))
+	abortForTest(mut t, mut m, mut second)
+}
+
+fn TestTupleLocks(t mut crucible.T) {
+	let (_, _, manager) = testManager("tuple-lock") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut m = manager
+	mut first = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	mut second = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("lock tuple", m.LockTuple(first, 7, 0, 1, TupleLock.ForUpdate))
+	crucible.HasFault("same tuple write lock conflicts", m.LockTuple(second, 7, 0, 1, TupleLock.ForShare))
+	crucible.NoFault("different tuple locks independently", m.LockTuple(second, 7, 0, 2, TupleLock.ForUpdate))
+	abortForTest(mut t, mut m, mut first)
+	abortForTest(mut t, mut m, mut second)
+}
+
+fn TestIsolationSnapshots(t mut crucible.T) {
+	let (_, _, manager) = testManager("isolation") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut m = manager
+	mut repeatable = beginForTest(mut t, mut m, Isolation.RepeatableRead)
+	let readCommitted = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	mut writer = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let inserted = TupleHeader{Xmin: writer.xid, Cid: 0}
+	writer.CommandCounterIncrement()
+	crucible.NoFault("commit writer", m.Commit(mut writer))
+	crucible.Equal(mut t, "repeatable read keeps its original horizon", m.Visible(m.Snapshot(repeatable), inserted), false)
+	crucible.Equal(mut t, "read committed takes a new snapshot", m.Visible(m.Snapshot(readCommitted), inserted), true)
+	abortForTest(mut t, mut m, mut repeatable)
+	mut readCommittedMut = readCommitted
+	abortForTest(mut t, mut m, mut readCommittedMut)
+}
+
+fn TestDurableCommitAbortAndXidReservation(t mut crucible.T) {
+	let (dir, db, manager) = testManager("restart") catch err {
+		t.Error("open manager: {err}")
+		return
+	}
+	mut m = manager
+	mut committed = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let committedXid = committed.Xid()
+	crucible.NoFault("commit flushes WAL", m.Commit(mut committed))
+	mut inFlight = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let inFlightXid = inFlight.Xid()
+	let oldWatermark = m.reservedUntil
+	crucible.NoFault("close store before simulated crash", db.Close())
+	mut reopened = store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false}) catch err {
+		t.Error("reopen store: {err}")
+		return
+	}
+	mut recovered = NewManager(mut reopened) catch err {
+		t.Error("recover manager: {err}")
+		return
+	}
+	crucible.Equal(mut t, "committed xid survives restart", recovered.State(committedXid), XidState.Committed)
+	crucible.Equal(mut t, "in-flight xid is aborted at restart", recovered.State(inFlightXid), XidState.Aborted)
+	let next = beginForTest(mut t, mut recovered, Isolation.ReadCommitted)
+	crucible.True("restart begins at the previous reservation boundary", next.Xid() >= oldWatermark)
+	crucible.NoFault("clean up recovered store", reopened.Close())
+}
+
+fn TestClogUsesTwoBitsPerXid(t mut crucible.T) {
+	let (_, _, manager) = testManager("clog-bits") catch err {
+		t.Error("open manager: {err}")
+		return
+	}
+	mut m = manager
+	mut a = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	mut b = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let page = m.clogPage(a.Xid()/clogPageXids)
+	crucible.Equal(mut t, "fresh xid status occupies two bits", page[i64((a.Xid()%clogPageXids)/4)], u8(0))
+	crucible.NoFault("commit a", m.Commit(mut a))
+	crucible.NoFault("abort b", m.Abort(mut b))
+	crucible.Equal(mut t, "commit state encoded", m.clogState(a.Xid()), XidState.Committed)
+	crucible.Equal(mut t, "abort state encoded", m.clogState(b.Xid()), XidState.Aborted)
+}

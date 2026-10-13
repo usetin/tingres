@@ -1,0 +1,292 @@
+package store
+
+import "flume"
+import "io"
+import "quarry"
+import "say"
+
+// RelationFiles owns one block file per relation. Offset operations are implemented by streaming
+// through a synced replacement file because the public file API has no pwrite handle yet.
+type RelationFiles struct {
+	base str
+	sizes map[u32]i64
+}
+
+// NewRelationFiles opens the relation directory and starts an empty size cache.
+fn NewRelationFiles(dir str) !RelationFiles {
+	let base = dir + "/base"
+	try quarry.MkdirAll(base)
+	return RelationFiles{base: base, sizes: map[u32]i64{}}
+}
+
+// Path is the on-disk path for rel.
+fn (f RelationFiles) Path(rel RelId) str {
+	return f.base + "/" + say.Fmt("%d", u64(rel))
+}
+
+// Size is the cached byte length of a relation file.
+fn (f RelationFiles) Size(rel RelId) !i64 {
+	let (n, ok) = f.sizes[u32(rel)]
+	if ok {
+		return n
+	}
+	let path = f.Path(rel)
+	if !quarry.Exists(path) {
+		fail "store: relation file does not exist"
+	}
+	return try quarry.Size(path)
+}
+
+// Create makes an empty relation file and synchronizes its directory entry.
+fn (f mut RelationFiles) Create(rel RelId) ! {
+	let path = f.Path(rel)
+	try quarry.WriteFile(path, "")
+	try quarry.Sync(path)
+	try quarry.Sync(f.base)
+	f.sizes[u32(rel)] = 0
+}
+
+// ReadAt reads bytes at offset without changing a shared file cursor.
+fn (f RelationFiles) ReadAt(rel RelId, offset i64, out mut []u8) !i64 {
+	if offset < 0 {
+		fail "store: negative file offset"
+	}
+	if len(out) == 0 {
+		return 0
+	}
+	let size = try f.Size(rel)
+	if offset >= size {
+		return 0
+	}
+	let path = f.Path(rel)
+	mut r = try flume.Open(path)
+	defer r.Close()
+	try skipFileBytes(mut r, offset)
+	let want = min(len(out), size-offset)
+	mut got = i64(0)
+	for got < want {
+		let n = try r.Read(mut out[got:want])
+		if n == 0 {
+			break
+		}
+		got += n
+	}
+	return got
+}
+
+// WriteAt replaces bytes at offset, extending the file with zeros when necessary.
+fn (f mut RelationFiles) WriteAt(rel RelId, offset i64, data []u8) ! {
+	if offset < 0 {
+		fail "store: negative file offset"
+	}
+	let oldSize = f.Size(rel) catch err {
+		if !quarry.Exists(f.Path(rel)) {
+			fail err
+		}
+		0
+	}
+	let path = f.Path(rel)
+	let temp = path + ".tmp"
+	let hasOld = quarry.Exists(path)
+	let (writer, createErr) = flume.Create(temp)
+	if createErr != nil {
+		fail createErr
+	}
+	mut w = writer
+	let writeErr = replaceRange(mut w, path, offset, data, oldSize, hasOld)
+	let closeErr = w.Close()
+	if writeErr != nil {
+		if closeErr != nil {
+			fail "store: relation write and close failed"
+		}
+		fail writeErr
+	}
+	if closeErr != nil {
+		fail closeErr
+	}
+	try quarry.Rename(temp, path)
+	let newSize = max(oldSize, offset+len(data))
+	f.sizes[u32(rel)] = newSize
+	try quarry.Sync(f.base)
+}
+
+// Extend grows a relation to size bytes and zero-fills the new range.
+fn (f mut RelationFiles) Extend(rel RelId, size i64) ! {
+	if size < 0 {
+		fail "store: negative relation size"
+	}
+	let oldSize = try f.Size(rel)
+	if size <= oldSize {
+		return
+	}
+	try f.Truncate(rel, size)
+}
+
+// Truncate changes the exact byte length of a relation, zero-filling when size is larger.
+fn (f mut RelationFiles) Truncate(rel RelId, size i64) ! {
+	if size < 0 {
+		fail "store: negative relation size"
+	}
+	let oldSize = try f.Size(rel)
+	let path = f.Path(rel)
+	let temp = path + ".tmp"
+	let (writer, createErr) = flume.Create(temp)
+	if createErr != nil {
+		fail createErr
+	}
+	mut w = writer
+	let truncateErr = rewriteSize(mut w, path, oldSize, size)
+	let closeErr = w.Close()
+	if truncateErr != nil {
+		if closeErr != nil {
+			fail "store: relation truncate and close failed"
+		}
+		fail truncateErr
+	}
+	if closeErr != nil {
+		fail closeErr
+	}
+	try quarry.Rename(temp, path)
+	f.sizes[u32(rel)] = size
+	try quarry.Sync(f.base)
+}
+
+fn replaceRange(w mut flume.Writer, path str, offset i64, data []u8, oldSize i64, hasOld bool) ! {
+	if hasOld {
+		mut r = try flume.Open(path)
+		defer r.Close()
+		let prefix = min(offset, oldSize)
+		try copyFileBytes(mut r, mut w, prefix)
+		if offset > oldSize {
+			try writeFileZeros(mut w, offset-oldSize)
+		}
+		let n = try w.Write(data)
+		if n != len(data) {
+			fail "store: short relation write"
+		}
+		let overwritten = min(i64(len(data)), oldSize-prefix)
+		try skipFileBytes(mut r, overwritten)
+		try copyFileBytes(mut r, mut w, oldSize-prefix-overwritten)
+	} else {
+		if offset > 0 {
+			try writeFileZeros(mut w, offset)
+		}
+		let n = try w.Write(data)
+		if n != len(data) {
+			fail "store: short relation write"
+		}
+	}
+	try w.Sync()
+}
+
+fn rewriteSize(w mut flume.Writer, path str, oldSize i64, size i64) ! {
+	if size < oldSize {
+		mut r = try flume.Open(path)
+		defer r.Close()
+		try copyFileBytes(mut r, mut w, size)
+	} else if size > 0 {
+		mut r = try flume.Open(path)
+		defer r.Close()
+		try copyFileBytes(mut r, mut w, oldSize)
+		try writeFileZeros(mut w, size-oldSize)
+	}
+	try w.Sync()
+}
+
+// Sync flushes one relation file to stable storage.
+fn (f RelationFiles) Sync(rel RelId) ! {
+	try quarry.Sync(f.Path(rel))
+}
+
+// Drop removes a relation file and its stale replacement, then synchronizes the directory.
+fn (f mut RelationFiles) Drop(rel RelId) ! {
+	let path = f.Path(rel)
+	if quarry.Exists(path) {
+		try quarry.Remove(path)
+	}
+	if quarry.Exists(path + ".tmp") {
+		try quarry.Remove(path + ".tmp")
+	}
+	delete(f.sizes, u32(rel))
+	try quarry.Sync(f.base)
+}
+
+// ReadPage reads one complete 8 KiB block from a relation.
+fn (f RelationFiles) ReadPage(rel RelId, block PageNo) !Page {
+	let size = try f.Size(rel)
+	let offset = i64(block) * PageSize
+	if offset+PageSize > size {
+		fail "store: relation block is beyond end of file"
+	}
+	mut p = NewPage()
+	let n = try f.ReadAt(rel, offset, mut p.Data)
+	if n != PageSize || !p.Valid() {
+		fail "store: invalid relation page"
+	}
+	return p
+}
+
+// WritePage writes one complete block and extends the relation when needed.
+fn (f mut RelationFiles) WritePage(rel RelId, block PageNo, p Page) ! {
+	if len(p.Data) != PageSize || !p.Valid() {
+		fail "store: invalid page write"
+	}
+	try f.WriteAt(rel, i64(block)*PageSize, p.Data)
+}
+
+// PageCount is the cached number of complete blocks in a relation.
+fn (f RelationFiles) PageCount(rel RelId) !u32 {
+	let size = try f.Size(rel)
+	if size%PageSize != 0 {
+		fail "store: relation file has a partial block"
+	}
+	return u32(size/PageSize)
+}
+
+// skipFileBytes consumes exactly n bytes from r.
+fn skipFileBytes(r mut flume.Reader, n i64) ! {
+	mut left = n
+	let cap = min(i64(32768), max(i64(1), n))
+	mut buf = make([]u8, cap)
+	for left > 0 {
+		let want = min(left, len(buf))
+		let got = try r.Read(mut buf[0:want])
+		if got == 0 {
+			fail "store: short relation read"
+		}
+		left -= got
+	}
+}
+
+// copyFileBytes copies exactly n bytes between buffered files.
+fn copyFileBytes(r mut flume.Reader, w mut flume.Writer, n i64) ! {
+	mut left = n
+	let cap = min(i64(32768), max(i64(1), n))
+	mut buf = make([]u8, cap)
+	for left > 0 {
+		let want = min(left, len(buf))
+		let got = try r.Read(mut buf[0:want])
+		if got == 0 {
+			fail "store: short relation read"
+		}
+		let put = try w.Write(buf[0:got])
+		if put != got {
+			fail "store: short relation write"
+		}
+		left -= got
+	}
+}
+
+// writeFileZeros extends a file with zero bytes.
+fn writeFileZeros(w mut flume.Writer, n i64) ! {
+	mut left = n
+	let zeros = make([]u8, 4096)
+	for left > 0 {
+		let count = min(left, len(zeros))
+		let put = try w.Write(zeros[0:count])
+		if put != count {
+			fail "store: short relation write"
+		}
+		left -= put
+	}
+}

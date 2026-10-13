@@ -1,0 +1,254 @@
+package exec
+
+// Value is a SQL scalar used by the standalone executor core.
+type Value enum {
+	Null
+	Bool(v bool)
+	Int(v i64)
+	Float(v f64)
+	Text(v str)
+}
+
+// Row is one executor tuple.
+type Row = []Value
+
+// Op identifies one expression instruction.
+type Op enum {
+	PushConst
+	LoadColumn
+	Add
+	Equal
+	Less
+	And
+	Or
+	Not
+	IsNull
+}
+
+// Instruction is one stack-machine expression operation.
+type Instruction struct {
+	Op      Op
+	Value   Value
+	Column  i64
+}
+
+// Cursor is a pull source that returns one row at a time and then end-of-stream.
+shape Cursor {
+	mut Next() !(Row, bool)
+}
+
+// ValuesCursor reads rows from an in-memory source.
+type ValuesCursor struct {
+	Rows  []Row
+	Index i64
+}
+
+// Next returns one row and advances the cursor.
+fn (c mut ValuesCursor) Next() !(Row, bool) {
+	if c.Index >= len(c.Rows) {
+		return []Value{}, false
+	}
+	let row = c.Rows[c.Index]
+	c.Index += 1
+	return row, true
+}
+
+// FilterCursor returns input rows whose predicate evaluates to SQL TRUE.
+type FilterCursor struct {
+	Input dyn Cursor
+	Test  []Instruction
+}
+
+// Next pulls until a row passes the predicate or the input ends.
+fn (c mut FilterCursor) Next() !(Row, bool) {
+	for {
+		let (row, ok) = try c.Input.Next()
+		if !ok {
+			return []Value{}, false
+		}
+		let result = try Eval(c.Test, row)
+		if isTrue(result) {
+			return row, true
+		}
+	}
+}
+
+// ProjectCursor evaluates one expression per output column.
+type ProjectCursor struct {
+	Input dyn Cursor
+	Exprs [][]Instruction
+}
+
+// Next projects one input row.
+fn (c mut ProjectCursor) Next() !(Row, bool) {
+	let (row, ok) = try c.Input.Next()
+	if !ok {
+		return []Value{}, false
+	}
+	mut result = []Value{}
+	for expr in c.Exprs {
+		let value = try Eval(expr, row)
+		result = append(result, value)
+	}
+	return result, true
+}
+
+// LimitCursor stops after a fixed number of rows.
+type LimitCursor struct {
+	Input dyn Cursor
+	Left  i64
+}
+
+// Next returns rows until the limit is exhausted.
+fn (c mut LimitCursor) Next() !(Row, bool) {
+	if c.Left <= 0 {
+		return []Value{}, false
+	}
+	let (row, ok) = try c.Input.Next()
+	if ok {
+		c.Left -= 1
+	}
+	return row, ok
+}
+
+// Eval evaluates a postfix expression with SQL NULL behavior.
+fn Eval(code []Instruction, row Row) !Value {
+	mut stack = []Value{}
+	for instruction in code {
+		match instruction.Op {
+			PushConst => {
+				stack = append(stack, instruction.Value)
+			}
+			LoadColumn => {
+				if instruction.Column < 0 || instruction.Column >= len(row) {
+					fail "XX000 executor column index out of range"
+				}
+				stack = append(stack, row[instruction.Column])
+			}
+			Not, IsNull => {
+				if len(stack) < 1 {
+					fail "XX000 invalid expression stack"
+				}
+				let value = stack[len(stack) - 1]
+				stack = stack[:len(stack) - 1]
+				if instruction.Op == Op.Not {
+					stack = append(stack, notValue(value))
+				} else {
+					stack = append(stack, Value.Bool(isNull(value)))
+				}
+			}
+			Add, Equal, Less, And, Or => {
+				if len(stack) < 2 {
+					fail "XX000 invalid expression stack"
+				}
+				let right = stack[len(stack) - 1]
+				let left = stack[len(stack) - 2]
+				stack = stack[:len(stack) - 2]
+				let value = try binary(instruction.Op, left, right)
+				stack = append(stack, value)
+			}
+		}
+	}
+	if len(stack) != 1 {
+		fail "XX000 invalid expression result"
+	}
+	return stack[0]
+}
+
+fn binary(op Op, left Value, right Value) !Value {
+	if op == Op.And || op == Op.Or {
+		return booleanBinary(op, left, right)
+	}
+	if isNull(left) || isNull(right) {
+		return Value.Null
+	}
+	match op {
+		Add => {
+			match left {
+				Int(a) => {
+					match right {
+						Int(b) => { return Value.Int(a + b) }
+						_ => { fail "42883 operator does not exist: integer + non-integer" }
+					}
+				}
+				Float(a) => {
+					match right {
+						Float(b) => { return Value.Float(a + b) }
+						_ => { fail "42883 operator does not exist: float + non-float" }
+					}
+				}
+				_ => { fail "42883 operator does not exist: non-numeric +" }
+			}
+		}
+		Equal => { return Value.Bool(equalValue(left, right)) }
+		Less => { return Value.Bool(lessValue(left, right)) }
+		_ => { fail "XX000 invalid binary expression operation" }
+	}
+	fail "XX000 invalid binary expression operation"
+}
+
+fn booleanBinary(op Op, left Value, right Value) Value {
+	let leftNull = isNull(left)
+	let rightNull = isNull(right)
+	let leftTrue = isTrue(left)
+	let rightTrue = isTrue(right)
+	let leftFalse = isFalse(left)
+	let rightFalse = isFalse(right)
+	if op == Op.And {
+		if leftFalse || rightFalse {
+			return Value.Bool(false)
+		}
+		if leftNull || rightNull {
+			return Value.Null
+		}
+		return Value.Bool(leftTrue && rightTrue)
+	}
+	if leftTrue || rightTrue {
+		return Value.Bool(true)
+	}
+	if leftNull || rightNull {
+		return Value.Null
+	}
+	return Value.Bool(false)
+}
+
+fn equalValue(left Value, right Value) bool {
+	match left {
+		Bool(a) => { match right { Bool(b) => { return a == b } _ => { return false } } }
+		Int(a) => { match right { Int(b) => { return a == b } _ => { return false } } }
+		Float(a) => { match right { Float(b) => { return a == b } _ => { return false } } }
+		Text(a) => { match right { Text(b) => { return a == b } _ => { return false } } }
+		Null => { return false }
+	}
+	return false
+}
+
+fn lessValue(left Value, right Value) bool {
+	match left {
+		Int(a) => { match right { Int(b) => { return a < b } _ => { return false } } }
+		Float(a) => { match right { Float(b) => { return a < b } _ => { return false } } }
+		Text(a) => { match right { Text(b) => { return a < b } _ => { return false } } }
+		_ => { return false }
+	}
+	return false
+}
+
+fn isNull(v Value) bool {
+	match v { Null => { return true } _ => { return false } }
+}
+
+fn isTrue(v Value) bool {
+	match v { Bool(b) => { return b } _ => { return false } }
+}
+
+fn isFalse(v Value) bool {
+	match v { Bool(b) => { return !b } _ => { return false } }
+}
+
+fn notValue(v Value) Value {
+	match v {
+		Null => { return Value.Null }
+		Bool(b) => { return Value.Bool(!b) }
+		_ => { return Value.Null }
+	}
+}
