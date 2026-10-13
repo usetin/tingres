@@ -1,0 +1,108 @@
+package types
+
+import "mint"
+import "twine"
+
+// CanCast reports whether PostgreSQL permits a cast at the requested context.
+// `implicit` is true for expression/operator resolution and false for an explicit cast.
+fn CanCast(from Oid, to Oid, implicit bool) bool {
+	if from == to { return true }
+	if is_string_oid(from) || is_string_oid(to) { return !implicit || (is_string_oid(from) && is_string_oid(to)) }
+	if from == Int2Oid && (to == Int4Oid || to == Int8Oid || to == Float4Oid || to == Float8Oid || to == NumericOid) { return true }
+	if from == Int4Oid && (to == Int8Oid || to == Float4Oid || to == Float8Oid || to == NumericOid) { return true }
+	if from == Int8Oid && (to == Float8Oid || to == NumericOid) { return true }
+	if from == Float4Oid && to == Float8Oid { return true }
+	if from == NumericOid && (to == Float4Oid || to == Float8Oid) { return true }
+	if from == Int2Oid && to == OidOid { return !implicit }
+	if from == OidOid && (to == Int2Oid || to == Int4Oid || to == Int8Oid) { return !implicit }
+	if (from == BoolOid && is_integer_oid(to)) || (to == BoolOid && is_integer_oid(from)) { return !implicit }
+	if !implicit {
+		if from == Int4Oid || from == Int8Oid || from == Float4Oid || from == Float8Oid || from == NumericOid {
+			if to == Int2Oid || to == Int4Oid || to == Int8Oid || to == OidOid || to == Float4Oid || to == Float8Oid || to == NumericOid { return true }
+		}
+		if from == DateOid || from == TimeOid || from == TimestampOid || from == TimestamptzOid || from == IntervalOid {
+			if to == DateOid || to == TimeOid || to == TimestampOid || to == TimestamptzOid || to == IntervalOid { return true }
+		}
+	}
+	return false
+}
+
+// Cast applies an explicit PostgreSQL cast between supported scalar types.
+fn Cast(d Datum, to Oid) !Datum {
+	if d.null { return Null() }
+	if d.oid == to { return d }
+	if !CanCast(d.oid, to, false) { fail ErrorFault(NewError("42846", "cannot cast type {sql_type_name(d.oid)} to {sql_type_name(to)}")) }
+	if is_string_oid(to) { return FromStr(to, d.Text()) }
+	if (d.oid == BoolOid && is_integer_oid(to)) {
+		if d.b { return try Parse(to, "1") }
+		return try Parse(to, "0")
+	}
+	if (to == BoolOid && is_integer_oid(d.oid)) { return FromBool(d.i != 0) }
+	if to == NumericOid {
+		if d.oid == Float4Oid || d.oid == Float8Oid { return try ParseNumeric(float_text(d)) }
+		return try ParseNumeric(d.Text())
+	}
+	if is_integer_oid(to) && (d.oid == NumericOid || d.oid == Float4Oid || d.oid == Float8Oid) {
+		let n = try ParseNumeric(d.Text())
+		let rounded = try NumericRound(n, 0)
+		return try Parse(to, rounded.Text())
+	}
+	if (to == Float4Oid || to == Float8Oid) && d.oid == NumericOid {
+		let f = mint.ParseFloat(d.Text()) catch _ { fail ErrorFault(NewError("22003", "value out of range for type {sql_type_name(to)}")) }
+		return FromF64(to, if_float_target(to, f))
+	}
+	return try Parse(to, d.Text())
+}
+
+// CastTypmod applies a string cast and a PostgreSQL character-length typmod.
+// typmod is the declared character count, without PostgreSQL's internal +4 encoding.
+fn CastTypmod(d Datum, to Oid, typmod i64) !Datum {
+	let casted = try Cast(d, to)
+	if casted.null || typmod < 0 || !is_string_oid(to) || to == TextOid || to == NameOid { return casted }
+	let text = casted.s
+	let n = utf8_count(text)
+	if to == VarcharOid && n > typmod { fail ErrorFault(NewError("22001", "value too long for type character varying({typmod})")) }
+	if to == BpcharOid && n > typmod {
+		let truncated = utf8_prefix(text, typmod)
+		if twine.TrimSpace(text[len(truncated):]) != "" {
+			fail ErrorFault(NewError("22001", "value too long for type character({typmod})"))
+		}
+		return FromStr(to, truncated)
+	}
+	if to == BpcharOid {
+		mut padded = text
+		for i in n..typmod {
+			padded += " "
+			_ = i
+		}
+		return FromStr(to, padded)
+	}
+	return casted
+}
+
+fn is_string_oid(oid Oid) bool { return oid == TextOid || oid == VarcharOid || oid == BpcharOid || oid == NameOid }
+fn is_integer_oid(oid Oid) bool { return oid == Int2Oid || oid == Int4Oid || oid == Int8Oid || oid == OidOid }
+
+fn if_float_target(oid Oid, value f64) f64 {
+	if oid == Float4Oid { return f64(f32(value)) }
+	return value
+}
+
+fn utf8_count(s str) i64 {
+	mut n = i64(0)
+	for c in s {
+		if (c & 0xc0) != 0x80 { n += 1 }
+	}
+	return n
+}
+
+fn utf8_prefix(s str, chars i64) str {
+	mut n = i64(0)
+	for i, c in s {
+		if (c & 0xc0) != 0x80 {
+			if n == chars { return s[:i] }
+			n += 1
+		}
+	}
+	return s
+}
