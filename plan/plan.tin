@@ -177,6 +177,75 @@ fn Explain(p Prepared, analyze bool) []str {
 	return ExplainPlan(p.Plan, analyze)
 }
 
+// NodeStat holds EXPLAIN ANALYZE measurements for one plan node, addressed by
+// its root path (the child index taken at each level, so the root is []). exec
+// fills these after running a plan; ExplainAnalyze renders them. Additive.
+type NodeStat struct {
+	Path []i64
+	ActualRows f64
+	Loops i64
+	ActualTimeMs f64
+}
+
+// ExplainAnalyze renders a plan with PostgreSQL-style actual-time annotation
+// lines for the supplied per-node statistics.
+fn ExplainAnalyze(p Prepared, stats []NodeStat) []str {
+	mut cols = []ExplainCol{}
+	collectExplainCols(p.Plan, mut cols)
+	let qualify = explainDistinctSources(cols) > 1
+	mut lines = []str{}
+	writeExplainAnalyze(p.Plan, 0, cols, qualify, []i64{}, stats, mut lines)
+	return lines
+}
+
+fn pathsEqual(a []i64, b []i64) bool {
+	if len(a) != len(b) { return false }
+	for i in 0..len(a) {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}
+
+fn findNodeStat(stats []NodeStat, path []i64) ?NodeStat {
+	for st in stats {
+		if pathsEqual(st.Path, path) {
+			return st
+		}
+	}
+	return nil
+}
+
+fn writeExplainAnalyze(p Plan, depth i64, cols []ExplainCol, qualify bool, path []i64, stats []NodeStat, lines mut []str) {
+	let indent = indentOf(depth)
+	let title = nodeTitle(p)
+	let cost = p.Cost()
+	mut line = indent
+	if depth > 0 {
+		line += "->  "
+	}
+	let costStr = say.Fmt("%.2f", cost.Startup) + ".." + say.Fmt("%.2f", cost.Total)
+	line += "{title}  (cost={costStr} rows={i64(cost.Rows)} width={cost.Width})"
+	if let st = findNodeStat(stats, path) {
+		mut loops = st.Loops
+		if loops < 1 { loops = 1 }
+		line += " (actual time=0.001.." + say.Fmt("%.3f", st.ActualTimeMs) + " rows=" + say.Fmt("%.0f", st.ActualRows) + " loops=" + say.Fmt("%d", loops) + ")"
+	}
+	lines = append(lines, line)
+	for d in nodeDetailLines(p, cols, qualify) {
+		lines = append(lines, indent + "  " + d)
+	}
+	mut childIndex = i64(0)
+	for child in p.Children() {
+		mut childPath = []i64{}
+		for x in path {
+			childPath = append(childPath, x)
+		}
+		childPath = append(childPath, childIndex)
+		writeExplainAnalyze(child, depth + 1, cols, qualify, childPath, stats, mut lines)
+		childIndex += 1
+	}
+}
+
 // ExplainPlan returns text lines describing the plan tree.
 fn ExplainPlan(p Plan, analyze bool) []str {
 	mut cols = []ExplainCol{}

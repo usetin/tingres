@@ -76,6 +76,33 @@ fn TestExplainRendering(t mut crucible.T) {
 	cleanupTestEnv(env)
 }
 
+fn TestExplainAnalyze(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "explain_analyze")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	let stmt = parseSql("SELECT * FROM users WHERE age > 21") catch err {
+		t.Error("parse: " + types.ErrorMessage(err))
+		return
+	}
+	let prep = Prepare(env.Cat, env.Txn, stmt, []u32{}) catch err {
+		t.Error("prepare: " + types.ErrorMessage(err))
+		return
+	}
+
+	let stats = []NodeStat{
+		NodeStat{Path: []i64{}, ActualRows: 2.0, Loops: 1, ActualTimeMs: 0.123},
+	}
+	let lines = ExplainAnalyze(prep, stats)
+	t.True("analyze root annotated", containsSub(lines[0], "(actual time=0.001..0.123 rows=2 loops=1)"))
+
+	// Without a stat for a node, no annotation is added.
+	let empty = ExplainAnalyze(prep, []NodeStat{})
+	t.True("no annotation without stats", !containsSub(empty[0], "actual time"))
+
+	cleanupTestEnv(env)
+}
+
 // containsSub reports whether s contains sub.
 fn containsSub(s str, sub str) bool {
 	if len(sub) == 0 { return true }
