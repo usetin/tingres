@@ -27,7 +27,7 @@ fn (c mut SeqScanCursor) Next() !([]types.Datum, bool) {
 			return []types.Datum{}, false
 		}
 		let h = tuple.Header
-		let vis = c.Manager.Visible(c.Snapshot, txn.TupleHeader{Xmin: h.Xmin(), Xmax: h.Xmax(), Cid: h.Cid()})
+		let vis = c.Manager.Visible(c.Snapshot, h)
 		if !vis {
 			continue
 		}
