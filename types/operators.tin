@@ -1,0 +1,66 @@
+package types
+
+// registerOperators installs comparison, boolean, arithmetic and bit operators.
+fn registerOperators(funcs mut []Func) {
+	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid} {
+		for _, op in []str{"=", "<>", "<", "<=", ">", ">="} {
+			registerFunc(mut funcs, function(op, []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try comparisonFunc(op, args) }))
+		}
+	}
+	for _, op in []str{"+", "-", "*", "/", "%", "^"} {
+		for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
+			if op == "^" && isInteger(oid) { continue }
+			registerFunc(mut funcs, function(op, []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc(op, args) }))
+		}
+	}
+	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid} {
+		for _, op in []str{"&", "|", "#", "<<", ">>"} {
+			registerFunc(mut funcs, function(op, []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc(op, args) }))
+		}
+	}
+	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
+		registerFunc(mut funcs, function("+", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try callUnary("+", args[0]) }))
+		registerFunc(mut funcs, function("-", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try callUnary("-", args[0]) }))
+	}
+	registerFunc(mut funcs, function("NOT", []Oid{BoolOid}, BoolOid, true, false, fn(args []Datum) !Datum { return try booleanFunc("NOT", args) }))
+	registerFunc(mut funcs, function("AND", []Oid{BoolOid, BoolOid}, BoolOid, false, false, fn(args []Datum) !Datum { return try booleanFunc("AND", args) }))
+	registerFunc(mut funcs, function("OR", []Oid{BoolOid, BoolOid}, BoolOid, false, false, fn(args []Datum) !Datum { return try booleanFunc("OR", args) }))
+	for _, oid in []Oid{BoolOid} {
+		for _, op in []str{"IS TRUE", "IS FALSE", "IS UNKNOWN", "IS NOT TRUE", "IS NOT FALSE", "IS NOT UNKNOWN"} {
+			registerFunc(mut funcs, function(op, []Oid{oid}, BoolOid, false, false, fn(args []Datum) !Datum { return try callIs(op, args[0]) }))
+		}
+	}
+	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid} {
+		registerFunc(mut funcs, function("IS DISTINCT FROM", []Oid{oid, oid}, BoolOid, false, false, fn(args []Datum) !Datum { return try callDistinct("IS DISTINCT FROM", args[0], args[1]) }))
+		registerFunc(mut funcs, function("IS NOT DISTINCT FROM", []Oid{oid, oid}, BoolOid, false, false, fn(args []Datum) !Datum { return try callDistinct("IS NOT DISTINCT FROM", args[0], args[1]) }))
+	}
+}
+
+fn callUnary(op str, arg Datum) !Datum {
+	if op == "+" { return arg }
+	if isInteger(arg.Oid()) { return try numericFromInt(arg.Oid(), 0-arg.i) }
+	return numericFromFloat(arg.Oid(), -arg.f)
+}
+
+fn callIs(op str, arg Datum) !Datum {
+	let isNull = IsNull(arg)
+	let isTrue = !isNull && arg.b
+	let isFalse = !isNull && !arg.b
+	let result = match op {
+		"IS TRUE" => isTrue
+		"IS FALSE" => isFalse
+		"IS UNKNOWN" => isNull
+		"IS NOT TRUE" => !isTrue
+		"IS NOT FALSE" => !isFalse
+		"IS NOT UNKNOWN" => !isNull
+		_ => false
+	}
+	return FromBool(result)
+}
+
+fn callDistinct(name str, a Datum, b Datum) !Datum {
+	mut different = false
+	if IsNull(a) { different = !IsNull(b) } else if IsNull(b) { different = true } else { different = Compare(a, b) != 0 }
+	if name == "IS DISTINCT FROM" { return FromBool(different) }
+	return FromBool(!different)
+}

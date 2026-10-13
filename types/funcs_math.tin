@@ -1,0 +1,120 @@
+package types
+
+import "gauge"
+import "dice"
+import "mint"
+
+const VoidOid Oid = 2278
+
+fn registerMathFuncs(funcs mut []Func) {
+	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
+		registerFunc(mut funcs, function("abs", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try mathUnary("abs", args[0]) }))
+		registerFunc(mut funcs, function("sign", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try mathUnary("sign", args[0]) }))
+	}
+	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid} {
+		registerFunc(mut funcs, function("mod", []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc("%", args) }))
+		registerFunc(mut funcs, function("div", []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc("/", args) }))
+		registerFunc(mut funcs, function("to_hex", []Oid{oid}, TextOid, true, false, fn(args []Datum) !Datum { return try toHex(args[0].i) }))
+	}
+	for _, oid in []Oid{Float4Oid, Float8Oid} {
+		registerFunc(mut funcs, function("mod", []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc("%", args) }))
+	}
+	for _, name in []str{"sqrt", "cbrt", "exp", "ln", "log", "ceil", "ceiling", "floor", "round", "trunc", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "degrees", "radians"} {
+		if name == "log" { continue }
+		registerFunc(mut funcs, function(name, []Oid{Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathUnary(name, args[0]) }))
+	}
+	registerFunc(mut funcs, function("log", []Oid{Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathUnary("log10", args[0]) }))
+	registerFunc(mut funcs, function("log", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathBinary("log", args[0], args[1]) }))
+	registerFunc(mut funcs, function("power", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathBinary("power", args[0], args[1]) }))
+	registerFunc(mut funcs, function("atan2", []Oid{Float8Oid, Float8Oid}, Float8Oid, true, false, fn(args []Datum) !Datum { return try mathBinary("atan2", args[0], args[1]) }))
+	registerFunc(mut funcs, function("pi", []Oid{}, Float8Oid, false, false, fn(args []Datum) !Datum { return try mathConstant("pi") }))
+	registerFunc(mut funcs, function("random", []Oid{}, Float8Oid, false, true, fn(args []Datum) !Datum { return try mathConstant("random") }))
+	registerFunc(mut funcs, function("setseed", []Oid{Float8Oid}, VoidOid, true, true, fn(args []Datum) !Datum { return try mathSeed(args[0]) }))
+}
+
+fn mathUnary(name str, arg Datum) !Datum {
+	let oid = arg.Oid()
+	if isInteger(oid) {
+		let v = arg.i
+		if name == "sign" {
+			if v < 0 { return FromI64(oid, -1) }
+			if v > 0 { return FromI64(oid, 1) }
+			return FromI64(oid, 0)
+		}
+		if name == "abs" {
+			if v == minInt(oid) { fail "integer out of range" }
+			if v < 0 { return FromI64(oid, -v) }
+			return arg
+		}
+	}
+	let x = numericAsFloat(arg)
+	if name == "abs" { return numericFromFloat(oid, gauge.Abs(x)) }
+	if name == "sign" {
+		if x < 0 { return numericFromFloat(oid, -1.0) }
+		if x > 0 { return numericFromFloat(oid, 1.0) }
+		return numericFromFloat(oid, x)
+	}
+	if name == "sqrt" && x < 0.0 { fail "cannot take square root of a negative number" }
+	if (name == "ln" || name == "log10") && x < 0.0 { fail "cannot take logarithm of a negative number" }
+	if (name == "ln" || name == "log10") && x == 0.0 { fail "cannot take logarithm of zero" }
+	let y = match name {
+		"sqrt" => gauge.Sqrt(x)
+		"cbrt" => gauge.Cbrt(x)
+		"exp" => gauge.Exp(x)
+		"ln" => gauge.Log(x)
+		"log10" => gauge.Log10(x)
+		"ceil", "ceiling" => gauge.Ceil(x)
+		"floor" => gauge.Floor(x)
+		"round" => gauge.Round(x)
+		"trunc" => gauge.Trunc(x)
+		"sin" => gauge.Sin(x)
+		"cos" => gauge.Cos(x)
+		"tan" => gauge.Tan(x)
+		"asin" => gauge.Asin(x)
+		"acos" => gauge.Acos(x)
+		"atan" => gauge.Atan(x)
+		"sinh" => gauge.Sinh(x)
+		"cosh" => gauge.Cosh(x)
+		"tanh" => gauge.Tanh(x)
+		"asinh" => gauge.Asinh(x)
+		"acosh" => gauge.Acosh(x)
+		"atanh" => gauge.Atanh(x)
+		"degrees" => x*180.0/gauge.Pi
+		"radians" => x*gauge.Pi/180.0
+		_ => x
+	}
+	return numericFromFloat(oid, y)
+}
+
+fn mathBinary(name str, left Datum, right Datum) !Datum {
+	let a = numericAsFloat(left)
+	let b = numericAsFloat(right)
+	if name == "power" && a < 0.0 && b != gauge.Trunc(b) { fail "cannot take power of a negative number" }
+	if name == "log" && (a <= 0.0 || b <= 0.0 || b == 1.0) { fail "cannot take logarithm of a value less than or equal to zero" }
+	mut y = gauge.Log(a)/gauge.Log(b)
+	if name == "power" { y = gauge.Pow(a, b) } else if name == "atan2" { y = gauge.Atan2(a, b) }
+	return FromF64(Float8Oid, y)
+}
+
+fn mathConstant(name str) !Datum {
+	if name == "pi" { return FromF64(Float8Oid, gauge.Pi) }
+	return FromF64(Float8Oid, dice.F64())
+}
+
+fn mathSeed(seed Datum) !Datum {
+	let bits = gauge.F64bits(seed.f)
+	dice.Seed(bits)
+	return Null()
+}
+
+fn toHex(v i64) !Datum {
+	let digits = "0123456789abcdef"
+	if v == 0 { return FromStr(TextOid, "0") }
+	mut x = u64(v)
+	mut out = ""
+	for x > 0 {
+		out = str(digits[i64(x&15)]) + out
+		x >>= 4
+	}
+	return FromStr(TextOid, out)
+}
