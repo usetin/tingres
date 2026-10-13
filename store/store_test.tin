@@ -237,3 +237,92 @@ fn TestClockSweepReusesUnpinnedFrame(t mut crucible.T) {
 	}
 	crucible.Equal(mut t, "same one-frame slot reused", frame, reused)
 }
+
+fn TestBufferPoolPreallocatesAndRetainsPageBytes(t mut crucible.T) {
+	let (poolValue, poolErr) = NewBufferPool(2)
+	if poolErr != nil {
+		t.Error("pool allocation failed")
+		return
+	}
+	mut pool = poolValue
+	crucible.Equal(mut t, "two resident frames", pool.Capacity(), u32(2))
+	let key = BufferKey{rel: 31, page: 4}
+	let (frame, page, pinErr) = pool.Pin(key)
+	if pinErr != nil {
+		t.Error("initial buffer pin failed")
+		return
+	}
+	let lockErr = pool.LockContent(frame)
+	if lockErr != nil {
+		t.Error("content latch acquisition failed")
+		return
+	}
+	mut changed = page
+	let (slot, insertErr) = changed.Insert([]u8{0x53, 0x54})
+	if insertErr != nil {
+		t.Error("page mutation failed")
+		return
+	}
+	let unlockErr = pool.UnlockContent(frame)
+	if unlockErr != nil {
+		t.Error("content latch release failed")
+		return
+	}
+	let unpinErr = pool.Unpin(frame)
+	if unpinErr != nil {
+		t.Error("page unpin failed")
+		return
+	}
+	let (same, resident, secondPinErr) = pool.Pin(key)
+	if secondPinErr != nil {
+		t.Error("resident page pin failed")
+		return
+	}
+	crucible.Equal(mut t, "page table returned same frame", same, frame)
+	let stored = resident.Item(slot) catch _ { []u8{} }
+	crucible.Equal(mut t, "resident item length", len(stored), 2)
+	crucible.True("preallocated page bytes survive another pin", stored[0] == 0x53 && stored[1] == 0x54)
+	pool.Unpin(same) catch _ { }
+}
+
+fn TestDirtyEvictionSyncsWalBeforePageWrite(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-buffer-wal-order-test"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 1, SyncOnWrite: false})
+	if openErr != nil {
+		t.Error("open with one buffer frame failed")
+		return
+	}
+	mut db = opened
+	let createErr = db.CreateHeap(62)
+	if createErr != nil {
+		t.Error("heap creation failed")
+		return
+	}
+	let payload = make([]u8, 4500)
+	let (firstTid, firstErr) = db.HeapInsert(NewXidCtx(4, 1), 62, payload)
+	if firstErr != nil {
+		t.Error("first page insert failed")
+		return
+	}
+	let (secondTid, secondErr) = db.HeapInsert(NewXidCtx(4, 2), 62, payload)
+	if secondErr != nil {
+		t.Error("second page insert failed")
+		return
+	}
+	_ = firstTid
+	_ = secondTid
+	let count = db.files.PageCount(62) catch _ { 0 }
+	crucible.True("one-frame eviction wrote the old page", count >= 1)
+	let (page, readErr) = db.files.ReadPage(62, 0)
+	if readErr != nil {
+		t.Error("evicted page is not readable")
+		return
+	}
+	crucible.True("page LSN was synced before page data", page.Header().Lsn <= db.syncedLsn)
+	let cleanupErr = db.Close()
+	if cleanupErr != nil {
+		t.Error("store close failed")
+	}
+	quarry.RemoveAll(dir) catch _ { }
+}

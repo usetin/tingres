@@ -42,7 +42,7 @@ fn mathUnary(name str, arg Datum) !Datum {
 			return FromI64(oid, 0)
 		}
 		if name == "abs" {
-			if v == minInt(oid) { fail "integer out of range" }
+			if v == minInt(oid) { try pgRaise("22003", integerRangeMessage(oid)) }
 			if v < 0 { return FromI64(oid, -v) }
 			return arg
 		}
@@ -54,9 +54,9 @@ fn mathUnary(name str, arg Datum) !Datum {
 		if x > 0 { return numericFromFloat(oid, 1.0) }
 		return numericFromFloat(oid, x)
 	}
-	if name == "sqrt" && x < 0.0 { fail "cannot take square root of a negative number" }
-	if (name == "ln" || name == "log10") && x < 0.0 { fail "cannot take logarithm of a negative number" }
-	if (name == "ln" || name == "log10") && x == 0.0 { fail "cannot take logarithm of zero" }
+	if name == "sqrt" && x < 0.0 { try pgRaise("2201F", "cannot take square root of a negative number") }
+	if (name == "ln" || name == "log10") && x < 0.0 { try pgRaise("2201E", "cannot take logarithm of a negative number") }
+	if (name == "ln" || name == "log10") && x == 0.0 { try pgRaise("2201E", "cannot take logarithm of zero") }
 	let y = match name {
 		"sqrt" => gauge.Sqrt(x)
 		"cbrt" => gauge.Cbrt(x)
@@ -89,8 +89,8 @@ fn mathUnary(name str, arg Datum) !Datum {
 fn mathBinary(name str, left Datum, right Datum) !Datum {
 	let a = numericAsFloat(left)
 	let b = numericAsFloat(right)
-	if name == "power" && a < 0.0 && b != gauge.Trunc(b) { fail "cannot take power of a negative number" }
-	if name == "log" && (a <= 0.0 || b <= 0.0 || b == 1.0) { fail "cannot take logarithm of a value less than or equal to zero" }
+	if name == "power" && a < 0.0 && b != gauge.Trunc(b) { try pgRaise("2201F", "a negative number raised to a non-integer power yields a complex result") }
+	if name == "log" && (a <= 0.0 || b <= 0.0 || b == 1.0) { try pgRaise("2201E", "cannot take logarithm of a value less than or equal to zero") }
 	mut y = gauge.Log(a)/gauge.Log(b)
 	if name == "power" { y = gauge.Pow(a, b) } else if name == "atan2" { y = gauge.Atan2(a, b) }
 	return FromF64(Float8Oid, y)

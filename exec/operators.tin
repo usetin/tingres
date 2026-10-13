@@ -35,7 +35,7 @@ fn (c mut SeqScanCursor) Next() !([]types.Datum, bool) {
 		mut evalCtx = c.Ctx
 		evalCtx.Row = row
 		if let f = c.Filter {
-			let pass = try EvalExpr(f, evalCtx)
+			let pass = try EvalExpr(f, mut evalCtx)
 			if !isTrue(pass) {
 				continue
 			}
@@ -43,7 +43,7 @@ fn (c mut SeqScanCursor) Next() !([]types.Datum, bool) {
 		if len(c.Projection) > 0 {
 			mut proj = []types.Datum{}
 			for expr in c.Projection {
-				let val = try EvalExpr(expr, evalCtx)
+				let val = try EvalExpr(expr, mut evalCtx)
 				proj = append(proj, val)
 			}
 			return proj, true
@@ -67,7 +67,7 @@ fn (c mut PlanFilterCursor) Next() !([]types.Datum, bool) {
 		}
 		mut evalCtx = c.Ctx
 		evalCtx.Row = row
-		let pass = try EvalExpr(c.Predicate, evalCtx)
+		let pass = try EvalExpr(c.Predicate, mut evalCtx)
 		if isTrue(pass) {
 			return row, true
 		}
@@ -90,7 +90,7 @@ fn (c mut PlanProjectCursor) Next() !([]types.Datum, bool) {
 	evalCtx.Row = row
 	mut res = []types.Datum{}
 	for expr in c.Exprs {
-		let val = try EvalExpr(expr, evalCtx)
+		let val = try EvalExpr(expr, mut evalCtx)
 		res = append(res, val)
 	}
 	return res, true
@@ -196,14 +196,16 @@ fn (c mut ResultCursor) Next() !([]types.Datum, bool) {
 	}
 	c.Done = true
 	if let f = c.Filter {
-		let pass = try EvalExpr(f, c.Ctx)
+		mut evalCtx = c.Ctx
+			let pass = try EvalExpr(f, mut evalCtx)
 		if !isTrue(pass) {
 			return []types.Datum{}, false
 		}
 	}
 	mut res = []types.Datum{}
 	for expr in c.Exprs {
-		let val = try EvalExpr(expr, c.Ctx)
+		mut evalCtx = c.Ctx
+			let val = try EvalExpr(expr, mut evalCtx)
 		res = append(res, val)
 	}
 	return res, true
@@ -245,12 +247,12 @@ fn (c mut SortCursor) Next() !([]types.Datum, bool) {
 	return row, true
 }
 
-fn (c SortCursor) sortRows(rows mut [][]types.Datum) {
+fn (c mut SortCursor) sortRows(rows mut [][]types.Datum) {
 	// Simple in-place insertion sort
 	let n = len(rows)
 	for i in 1..n {
 		mut j = i
-		for j > 0 && c.compare(rows[j], rows[j-1]) < 0 {
+		for j > 0 && c.compare(mut rows[j], mut rows[j-1]) < 0 {
 			let tmp = rows[j]
 			rows[j] = rows[j-1]
 			rows[j-1] = tmp
@@ -259,14 +261,14 @@ fn (c SortCursor) sortRows(rows mut [][]types.Datum) {
 	}
 }
 
-fn (c SortCursor) compare(a []types.Datum, b []types.Datum) i64 {
+fn (c mut SortCursor) compare(a mut []types.Datum, b mut []types.Datum) i64 {
 	mut ctxA = c.Ctx
 	ctxA.Row = a
 	mut ctxB = c.Ctx
 	ctxB.Row = b
 	for key in c.Keys {
-		let valA = EvalExpr(key.Expr, ctxA) catch _ { types.Null() }
-		let valB = EvalExpr(key.Expr, ctxB) catch _ { types.Null() }
+		let valA = EvalExpr(key.Expr, mut ctxA) catch _ { types.Null() }
+		let valB = EvalExpr(key.Expr, mut ctxB) catch _ { types.Null() }
 		if types.IsNull(valA) && types.IsNull(valB) {
 			continue
 		}
@@ -308,7 +310,9 @@ type NestLoopCursor struct {
 fn (c mut NestLoopCursor) Next() !([]types.Datum, bool) {
 	if !c.RightLoaded {
 		c.RightLoaded = true
-		mut rCur = try BuildCursor(c.RightPlan, c.Ctx)
+		mut rPlan = c.RightPlan
+		mut ctxMut = c.Ctx
+		mut rCur = try BuildCursor(mut rPlan, mut ctxMut)
 		mut rows = [][]types.Datum{}
 		for {
 			let (row, ok) = try rCur.Next()
@@ -345,7 +349,7 @@ fn (c mut NestLoopCursor) Next() !([]types.Datum, bool) {
 				mut evalCtx = c.Ctx
 				evalCtx.Row = joined
 				for q in c.Quals {
-					let pass = try EvalExpr(q, evalCtx)
+					let pass = try EvalExpr(q, mut evalCtx)
 					if !isTrue(pass) {
 						qualsPass = false
 						break
@@ -415,7 +419,7 @@ fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
 			c.RightWidth = i64(len(rRow))
 			mut rCtx = c.Ctx
 			rCtx.Row = rRow
-			let key = try evalKey(c.RightKeys, rCtx)
+			let key = try evalKey(c.RightKeys, mut rCtx)
 			let (list, exists) = c.Buckets[key]
 			if exists {
 				c.Buckets[key] = append(list, rRow)
@@ -434,7 +438,7 @@ fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
 			c.Matched = false
 			mut lCtx = c.Ctx
 			lCtx.Row = leftRow
-			let key = try evalKey(c.LeftKeys, lCtx)
+			let key = try evalKey(c.LeftKeys, mut lCtx)
 			let (list, exists) = c.Buckets[key]
 			if exists {
 				c.CurrentBucket = list
@@ -454,7 +458,7 @@ fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
 				mut evalCtx = c.Ctx
 				evalCtx.Row = joined
 				for q in c.Quals {
-					let pass = try EvalExpr(q, evalCtx)
+					let pass = try EvalExpr(q, mut evalCtx)
 					if !isTrue(pass) {
 						qualsPass = false
 						break
@@ -494,11 +498,11 @@ fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
 	}
 }
 
-fn evalKey(keys []plan.Expr, ctx ExprContext) !str {
+fn evalKey(keys []plan.Expr, ctx mut ExprContext) !str {
 	mut key = ""
 	for i, k in keys {
 		if i > 0 { key += "|" }
-		let val = try EvalExpr(k, ctx)
+		let val = try EvalExpr(k, mut ctx)
 		if types.IsNull(val) {
 			key += "NULL"
 		} else {
@@ -534,13 +538,13 @@ fn (c mut HashAggCursor) Next() !([]types.Datum, bool) {
 			hasRows = true
 			mut evalCtx = c.Ctx
 			evalCtx.Row = row
-			let gKey = try evalKey(c.GroupKeys, evalCtx)
+			let gKey = try evalKey(c.GroupKeys, mut evalCtx)
 			let (states, exists) = groupAggStates[gKey]
 			if !exists {
 				groupKeysList = append(groupKeysList, gKey)
 				mut groupRow = []types.Datum{}
 				for k in c.GroupKeys {
-					let val = try EvalExpr(k, evalCtx)
+					let val = try EvalExpr(k, mut evalCtx)
 					groupRow = append(groupRow, val)
 				}
 				groupRowMap[gKey] = groupRow
@@ -556,7 +560,7 @@ fn (c mut HashAggCursor) Next() !([]types.Datum, bool) {
 				let state = curStates[i]
 				mut aggArgs = []types.Datum{}
 				for argExpr in a.Args {
-					let argVal = try EvalExpr(argExpr, evalCtx)
+					let argVal = try EvalExpr(argExpr, mut evalCtx)
 					aggArgs = append(aggArgs, argVal)
 				}
 				let nextState = try a.Agg.Step(state, aggArgs)
@@ -613,11 +617,14 @@ fn (c mut FunctionScanCursor) Next() !([]types.Datum, bool) {
 		match c.Expr {
 			FuncCall(f) => {
 				if f.Func.Name == "generate_series" && len(f.Args) >= 2 {
-					let startVal = try EvalExpr(f.Args[0], c.Ctx)
-					let stopVal = try EvalExpr(f.Args[1], c.Ctx)
+					mut ctx1 = c.Ctx
+				let startVal = try EvalExpr(f.Args[0], mut ctx1)
+					mut ctx2 = c.Ctx
+				let stopVal = try EvalExpr(f.Args[1], mut ctx2)
 					mut step = i64(1)
 					if len(f.Args) >= 3 {
-						let stepVal = try EvalExpr(f.Args[2], c.Ctx)
+						mut ctx3 = c.Ctx
+				let stepVal = try EvalExpr(f.Args[2], mut ctx3)
 						step = mint.ParseInt(stepVal.Text(), 10) catch _ { i64(1) }
 					}
 					let start = mint.ParseInt(startVal.Text(), 10) catch _ { i64(0) }
@@ -722,14 +729,14 @@ fn (c mut WindowAggCursor) Next() !([]types.Datum, bool) {
 }
 
 // BuildCursor creates an executable cursor for any plan node.
-fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
+fn BuildCursor(p mut plan.Plan, ctx mut ExprContext) !dyn Cursor {
 	match p {
 		Values(v) => {
 			mut rows = [][]types.Datum{}
 			for r in v.Rows {
 				mut row = []types.Datum{}
 				for expr in r {
-					let val = try EvalExpr(expr, ctx)
+					let val = try EvalExpr(expr, mut ctx)
 					row = append(row, val)
 				}
 				rows = append(rows, row)
@@ -770,7 +777,7 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			return ValuesCursor{Rows: [][]types.Datum{}, Index: 0}
 		}
 		Filter(f) => {
-			let inCur = try BuildCursor(f.Input, ctx)
+			let inCur = try BuildCursor(mut f.Input, mut ctx)
 			return PlanFilterCursor{
 				Input: inCur,
 				Predicate: f.Predicate,
@@ -778,7 +785,7 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		Project(pr) => {
-			let inCur = try BuildCursor(pr.Input, ctx)
+			let inCur = try BuildCursor(mut pr.Input, mut ctx)
 			return PlanProjectCursor{
 				Input: inCur,
 				Exprs: pr.Exprs,
@@ -786,15 +793,15 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		Limit(l) => {
-			let inCur = try BuildCursor(l.Input, ctx)
+			let inCur = try BuildCursor(mut l.Input, mut ctx)
 			mut count = i64(-1)
 			mut offset = i64(0)
 			if let cExpr = l.Count {
-				let cVal = try EvalExpr(cExpr, ctx)
+				let cVal = try EvalExpr(cExpr, mut ctx)
 				count = mint.ParseInt(cVal.Text(), 10) catch _ { i64(-1) }
 			}
 			if let oExpr = l.Offset {
-				let oVal = try EvalExpr(oExpr, ctx)
+				let oVal = try EvalExpr(oExpr, mut ctx)
 				offset = mint.ParseInt(oVal.Text(), 10) catch _ { i64(0) }
 			}
 			return PlanLimitCursor{
@@ -805,7 +812,7 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		Sort(s) => {
-			let inCur = try BuildCursor(s.Input, ctx)
+			let inCur = try BuildCursor(mut s.Input, mut ctx)
 			return SortCursor{
 				Input: inCur,
 				Keys: s.Keys,
@@ -817,7 +824,7 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		Unique(u) => {
-			let inCur = try BuildCursor(u.Input, ctx)
+			let inCur = try BuildCursor(mut u.Input, mut ctx)
 			return UniqueCursor{
 				Input: inCur,
 				LastRow: []types.Datum{},
@@ -825,7 +832,8 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		NestLoop(n) => {
-			let leftCur = try BuildCursor(n.Left, ctx)
+			mut nLeft = n.Left
+			let leftCur = try BuildCursor(mut nLeft, mut ctx)
 			return NestLoopCursor{
 				Left: leftCur,
 				RightPlan: n.Right,
@@ -842,8 +850,10 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		HashJoin(h) => {
-			let leftCur = try BuildCursor(h.Left, ctx)
-			let rightCur = try BuildCursor(h.Right, ctx)
+			mut hLeft = h.Left
+			let leftCur = try BuildCursor(mut hLeft, mut ctx)
+			mut hRight = h.Right
+			let rightCur = try BuildCursor(mut hRight, mut ctx)
 			return HashJoinCursor{
 				Left: leftCur,
 				Right: rightCur,
@@ -863,8 +873,10 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 		}
 		MergeJoin(m) => {
 			// MergeJoin can be processed via HashJoin
-			let leftCur = try BuildCursor(m.Left, ctx)
-			let rightCur = try BuildCursor(m.Right, ctx)
+			mut mLeft = m.Left
+			let leftCur = try BuildCursor(mut mLeft, mut ctx)
+			mut mRight = m.Right
+			let rightCur = try BuildCursor(mut mRight, mut ctx)
 			return HashJoinCursor{
 				Left: leftCur,
 				Right: rightCur,
@@ -883,7 +895,7 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		HashAgg(ha) => {
-			let inCur = try BuildCursor(ha.Input, ctx)
+			let inCur = try BuildCursor(mut ha.Input, mut ctx)
 			return HashAggCursor{
 				Input: inCur,
 				GroupKeys: ha.GroupKeys,
@@ -895,7 +907,8 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		GroupAgg(ga) => {
-			let inCur = try BuildCursor(ga.Input, ctx)
+			mut gaIn = ga.Input
+			let inCur = try BuildCursor(mut gaIn, mut ctx)
 			return HashAggCursor{
 				Input: inCur,
 				GroupKeys: ga.GroupKeys,
@@ -907,7 +920,8 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		WindowAgg(wa) => {
-			let inCur = try BuildCursor(wa.Input, ctx)
+			mut waIn = wa.Input
+			let inCur = try BuildCursor(mut waIn, mut ctx)
 			return WindowAggCursor{
 				Input: inCur,
 				Funcs: wa.Funcs,
@@ -923,7 +937,8 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 		Append(ap) => {
 			mut curs = []dyn Cursor{}
 			for inp in ap.Inputs {
-				let cur = try BuildCursor(inp, ctx)
+				mut inpPlan = inp
+				let cur = try BuildCursor(mut inpPlan, mut ctx)
 				curs = append(curs, cur)
 			}
 			return AppendCursor{
@@ -941,10 +956,11 @@ fn BuildCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
 			}
 		}
 		SubqueryScan(sq) => {
-			return try BuildCursor(sq.Subplan, ctx)
+			mut sqSub = sq.Subplan
+			return try BuildCursor(mut sqSub, mut ctx)
 		}
 		LockRows(lr) => {
-			let inCur = try BuildCursor(lr.Input, ctx)
+			let inCur = try BuildCursor(mut lr.Input, mut ctx)
 			if let cat = ctx.Catalog {
 				return LockRowsCursor{
 					Input: inCur,

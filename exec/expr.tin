@@ -24,7 +24,7 @@ fn NewExprContext(row []types.Datum, params []types.Datum) ExprContext {
 }
 
 // EvalExpr evaluates a typed physical plan.Expr against an execution context.
-fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
+fn EvalExpr(e plan.Expr, ctx mut ExprContext) !types.Datum {
 	match e {
 		Const(c) => {
 			return c.Value
@@ -46,7 +46,7 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 			mut args = []types.Datum{}
 			mut hasNull = false
 			for argExpr in f.Args {
-				let val = try EvalExpr(argExpr, ctx)
+				let val = try EvalExpr(argExpr, mut ctx)
 				if types.IsNull(val) {
 					hasNull = true
 				}
@@ -65,7 +65,7 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 			mut args = []types.Datum{}
 			mut hasNull = false
 			for argExpr in o.Args {
-				let val = try EvalExpr(argExpr, ctx)
+				let val = try EvalExpr(argExpr, mut ctx)
 				if types.IsNull(val) {
 					hasNull = true
 				}
@@ -85,7 +85,7 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 				And => {
 					mut hasNull = false
 					for argExpr in b.Args {
-						let val = try EvalExpr(argExpr, ctx)
+						let val = try EvalExpr(argExpr, mut ctx)
 						if isFalse(val) {
 							return types.FromBool(false)
 						}
@@ -101,7 +101,7 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 				Or => {
 					mut hasNull = false
 					for argExpr in b.Args {
-						let val = try EvalExpr(argExpr, ctx)
+						let val = try EvalExpr(argExpr, mut ctx)
 						if isTrue(val) {
 							return types.FromBool(true)
 						}
@@ -118,7 +118,7 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 					if len(b.Args) == 0 {
 						return types.Null()
 					}
-					let val = try EvalExpr(b.Args[0], ctx)
+					let val = try EvalExpr(b.Args[0], mut ctx)
 					if types.IsNull(val) {
 						return types.Null()
 					}
@@ -127,7 +127,7 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 			}
 		}
 		NullTest(n) => {
-			let val = try EvalExpr(n.Arg, ctx)
+			let val = try EvalExpr(n.Arg, mut ctx)
 			let isNull = types.IsNull(val)
 			match n.Test {
 				IsNull => { return types.FromBool(isNull) }
@@ -136,9 +136,9 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 		}
 		Case(c) => {
 			for w in c.Whens {
-				let cond = try EvalExpr(w.When, ctx)
+				let cond = try EvalExpr(w.When, mut ctx)
 				if isTrue(cond) {
-					let thenVal = try EvalExpr(w.Then, ctx)
+					let thenVal = try EvalExpr(w.Then, mut ctx)
 					if c.Type != 0 && !types.IsNull(thenVal) && thenVal.Oid() != c.Type {
 						return try types.Cast(thenVal, c.Type)
 					}
@@ -146,7 +146,7 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 				}
 			}
 			if let elseExpr = c.Else {
-				let elseVal = try EvalExpr(elseExpr, ctx)
+				let elseVal = try EvalExpr(elseExpr, mut ctx)
 				if c.Type != 0 && !types.IsNull(elseVal) && elseVal.Oid() != c.Type {
 					return try types.Cast(elseVal, c.Type)
 				}
@@ -156,7 +156,7 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 		}
 		Coalesce(c) => {
 			for argExpr in c.Args {
-				let val = try EvalExpr(argExpr, ctx)
+				let val = try EvalExpr(argExpr, mut ctx)
 				if !types.IsNull(val) {
 					if c.Type != 0 && val.Oid() != c.Type {
 						return try types.Cast(val, c.Type)
@@ -167,20 +167,21 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 			return types.Null()
 		}
 		Cast(c) => {
-			let val = try EvalExpr(c.Arg, ctx)
+			let val = try EvalExpr(c.Arg, mut ctx)
 			if types.IsNull(val) {
 				return types.Null()
 			}
 			return try types.Cast(val, c.Type)
 		}
 		SubLink(s) => {
-			return try evalSubLink(s, ctx)
+			mut sMut = s
+			return try evalSubLink(mut sMut, mut ctx)
 		}
 		RowExpr(r) => {
 			mut rowStr = "("
 			for i, elem in r.Elements {
 				if i > 0 { rowStr += "," }
-				let val = try EvalExpr(elem, ctx)
+				let val = try EvalExpr(elem, mut ctx)
 				if !types.IsNull(val) {
 					rowStr += val.Text()
 				}
@@ -192,7 +193,7 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 			mut arrStr = "{{"
 			for i, elem in a.Elements {
 				if i > 0 { arrStr += "," }
-				let val = try EvalExpr(elem, ctx)
+				let val = try EvalExpr(elem, mut ctx)
 				if types.IsNull(val) {
 					arrStr += "NULL"
 				} else {
@@ -218,15 +219,15 @@ fn EvalExpr(e plan.Expr, ctx ExprContext) !types.Datum {
 	return types.Null()
 }
 
-fn evalSubLink(s plan.SubLinkExpr, ctx ExprContext) !types.Datum {
+fn evalSubLink(s mut plan.SubLinkExpr, ctx mut ExprContext) !types.Datum {
 	match s.LinkType {
 		Exists => {
-			mut cur = try buildPlanCursor(s.SubPlan, ctx)
+			mut cur = try buildPlanCursor(mut s.SubPlan, mut ctx)
 			let (_, ok) = try cur.Next()
 			return types.FromBool(ok)
 		}
 		Scalar => {
-			mut cur = try buildPlanCursor(s.SubPlan, ctx)
+			mut cur = try buildPlanCursor(mut s.SubPlan, mut ctx)
 			let (row, ok) = try cur.Next()
 			if !ok || len(row) == 0 {
 				return types.Null()
@@ -235,8 +236,8 @@ fn evalSubLink(s plan.SubLinkExpr, ctx ExprContext) !types.Datum {
 		}
 		In, Any => {
 			if let test = s.TestExpr {
-				let testVal = try EvalExpr(test, ctx)
-				mut cur = try buildPlanCursor(s.SubPlan, ctx)
+				let testVal = try EvalExpr(test, mut ctx)
+				mut cur = try buildPlanCursor(mut s.SubPlan, mut ctx)
 				mut anyNull = types.IsNull(testVal)
 				for {
 					let (row, ok) = try cur.Next()
@@ -259,8 +260,8 @@ fn evalSubLink(s plan.SubLinkExpr, ctx ExprContext) !types.Datum {
 		}
 		All => {
 			if let test = s.TestExpr {
-				let testVal = try EvalExpr(test, ctx)
-				mut cur = try buildPlanCursor(s.SubPlan, ctx)
+				let testVal = try EvalExpr(test, mut ctx)
+				mut cur = try buildPlanCursor(mut s.SubPlan, mut ctx)
 				mut allTrue = true
 				mut anyNull = types.IsNull(testVal)
 				for {
@@ -290,8 +291,8 @@ fn evalSubLink(s plan.SubLinkExpr, ctx ExprContext) !types.Datum {
 }
 
 // buildPlanCursor creates a cursor for subquery plan execution
-fn buildPlanCursor(p plan.Plan, ctx ExprContext) !dyn Cursor {
-	let c = try BuildCursor(p, ctx)
+fn buildPlanCursor(p mut plan.Plan, ctx mut ExprContext) !dyn Cursor {
+	let c = try BuildCursor(mut p, mut ctx)
 	return c
 }
 

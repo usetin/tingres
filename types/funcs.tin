@@ -12,6 +12,16 @@ type Func value struct {
 	Strict bool
 	Volatile bool
 	Call fn([]Datum) !Datum
+	Call1 fn(Datum) !Datum
+	Call2 fn(Datum, Datum) !Datum
+	Call3 fn(Datum, Datum, Datum) !Datum
+	Int4Binary fn(i32, i32) !i32
+	Int8Binary fn(i64, i64) !i64
+	Float8Binary fn(f64, f64) !f64
+	Int4Compare fn(i32, i32) !bool
+	Int8Compare fn(i64, i64) !bool
+	Float8Compare fn(f64, f64) !bool
+	TextCompare fn(str, str) !bool
 }
 
 // pgFault is the PostgreSQL error payload constructor used by scalar functions.
@@ -19,8 +29,49 @@ fn pgFault(code str, message str) PgError {
 	return NewError(code, message)
 }
 
+fn pgRaise(code str, message str) ! { try PgFault(code, message) }
+
 fn function(name str, args []Oid, ret Oid, strict bool, volatile bool, call fn([]Datum) !Datum) Func {
-	return Func{Name: name, Args: args, Ret: ret, Strict: strict, Volatile: volatile, Call: call}
+	return Func{
+		Name: name, Args: args, Ret: ret, Strict: strict, Volatile: volatile, Call: call,
+		Call1: fn(a Datum) !Datum { return try call([]Datum{a}) },
+		Call2: fn(a Datum, b Datum) !Datum { return try call([]Datum{a, b}) },
+		Call3: fn(a Datum, b Datum, c Datum) !Datum { return try call([]Datum{a, b, c}) },
+		Int4Binary: fn(a i32, b i32) !i32 { fail "function has no int4 fast path" },
+		Int8Binary: fn(a i64, b i64) !i64 { fail "function has no int8 fast path" },
+		Float8Binary: fn(a f64, b f64) !f64 { fail "function has no float8 fast path" },
+		Int4Compare: fn(a i32, b i32) !bool { fail "function has no int4 compare fast path" },
+		Int8Compare: fn(a i64, b i64) !bool { fail "function has no int8 compare fast path" },
+		Float8Compare: fn(a f64, b f64) !bool { fail "function has no float8 compare fast path" },
+		TextCompare: fn(a str, b str) !bool { fail "function has no text compare fast path" },
+	}
+}
+
+fn function1(name str, args []Oid, ret Oid, strict bool, volatile bool, call1 fn(Datum) !Datum) Func {
+	mut f = function(name, args, ret, strict, volatile, fn(values []Datum) !Datum {
+		if len(values) != 1 { fail "wrong number of arguments to {name}" }
+		return try call1(values[0])
+	})
+	f.Call1 = call1
+	return f
+}
+
+fn function2(name str, args []Oid, ret Oid, strict bool, volatile bool, call2 fn(Datum, Datum) !Datum) Func {
+	mut f = function(name, args, ret, strict, volatile, fn(values []Datum) !Datum {
+		if len(values) != 2 { fail "wrong number of arguments to {name}" }
+		return try call2(values[0], values[1])
+	})
+	f.Call2 = call2
+	return f
+}
+
+fn function3(name str, args []Oid, ret Oid, strict bool, volatile bool, call3 fn(Datum, Datum, Datum) !Datum) Func {
+	mut f = function(name, args, ret, strict, volatile, fn(values []Datum) !Datum {
+		if len(values) != 3 { fail "wrong number of arguments to {name}" }
+		return try call3(values[0], values[1], values[2])
+	})
+	f.Call3 = call3
+	return f
 }
 
 fn registerFunc(funcs mut []Func, f Func) {
@@ -28,23 +79,52 @@ fn registerFunc(funcs mut []Func, f Func) {
 }
 
 fn bindFunc(f Func) Func {
-	return Func{Name: f.Name, Args: f.Args, Ret: f.Ret, Strict: f.Strict, Volatile: f.Volatile, Call: fn(args []Datum) !Datum {
+	return Func{
+		Name: f.Name, Args: f.Args, Ret: f.Ret, Strict: f.Strict, Volatile: f.Volatile,
+		Call: fn(args []Datum) !Datum {
 		if f.Strict {
 			for _, arg in args {
 				if IsNull(arg) { return Null() }
 			}
 		}
-		if len(args) != len(f.Args) { fail "wrong number of arguments to {f.Name}" }
-		mut converted = make([]Datum, 0, len(args))
-		for i, arg in args {
-			if IsNull(arg) { converted = append(converted, arg) } else if arg.Oid() == Oid(f.Args[i]) { converted = append(converted, arg) } else {
-				mut casted = Null()
-				if arg.Oid() == UnknownLiteralOid { casted = try Parse(Oid(f.Args[i]), arg.Text()) } else { casted = try Cast(arg, Oid(f.Args[i])) }
-				converted = append(converted, casted)
-			}
+			if len(args) != len(f.Args) { fail "wrong number of arguments to {f.Name}" }
+			mut converted = make([]Datum, 0, len(args))
+			for i, arg in args {
+				let value = try bindArgument(arg, Oid(f.Args[i]))
+				converted = append(converted, value)
 		}
 		return try f.Call(converted)
-	}}
+		},
+		Call1: fn(a Datum) !Datum {
+			if len(f.Args) != 1 { fail "wrong number of arguments to {f.Name}" }
+			if f.Strict && IsNull(a) { return Null() }
+			let aa = try bindArgument(a, Oid(f.Args[0]))
+			return try f.Call1(aa)
+		},
+		Call2: fn(a Datum, b Datum) !Datum {
+			if len(f.Args) != 2 { fail "wrong number of arguments to {f.Name}" }
+			if f.Strict && (IsNull(a) || IsNull(b)) { return Null() }
+			let aa = try bindArgument(a, Oid(f.Args[0]))
+			let bb = try bindArgument(b, Oid(f.Args[1]))
+			return try f.Call2(aa, bb)
+		},
+		Call3: fn(a Datum, b Datum, c Datum) !Datum {
+			if len(f.Args) != 3 { fail "wrong number of arguments to {f.Name}" }
+			if f.Strict && (IsNull(a) || IsNull(b) || IsNull(c)) { return Null() }
+			let aa = try bindArgument(a, Oid(f.Args[0]))
+			let bb = try bindArgument(b, Oid(f.Args[1]))
+			let cc = try bindArgument(c, Oid(f.Args[2]))
+			return try f.Call3(aa, bb, cc)
+		},
+		Int4Binary: f.Int4Binary, Int8Binary: f.Int8Binary, Float8Binary: f.Float8Binary,
+		Int4Compare: f.Int4Compare, Int8Compare: f.Int8Compare, Float8Compare: f.Float8Compare, TextCompare: f.TextCompare,
+	}
+}
+
+fn bindArgument(arg Datum, target Oid) !Datum {
+	if IsNull(arg) || arg.Oid() == target { return arg }
+	if arg.Oid() == UnknownLiteralOid { return try Parse(target, arg.Text()) }
+	return try Cast(arg, target)
 }
 
 fn isInteger(oid Oid) bool {
@@ -241,7 +321,7 @@ fn implicitFunctionCastCost(from Oid, to Oid) i64 {
 
 fn LookupFunc(name str, argOids []Oid) ?Func {
 	if let f = lookupSpecial(name, argOids) { return f }
-	let funcs = builtinFuncs()
+	let funcs = builtinFuncRegistry
 	let unknownCategory = resolveUnknownCategory(name, funcs, argOids)
 	if hasOnlyUnknowns(argOids) && unknownCategory == 2 && isOperatorName(name) {
 		mut distinct = []Oid{}
@@ -302,20 +382,6 @@ fn CanCompare(a Oid, b Oid) bool {
 	return a == b && (isNumericType(a) || isStringType(a) || a == BoolOid || a == ByteaOid || a == UuidOid)
 }
 
-fn comparisonFunc(op str, args []Datum) !Datum {
-	let c = Compare(args[0], args[1])
-	let result = match op {
-		"=" => c == 0
-		"<>" => c != 0
-		"<" => c < 0
-		"<=" => c <= 0
-		">" => c > 0
-		">=" => c >= 0
-		_ => false
-	}
-	return FromBool(result)
-}
-
 fn numericAsFloat(d Datum) f64 {
 	if isInteger(d.Oid()) { return f64(d.i) }
 	return d.f
@@ -327,8 +393,8 @@ fn numericFromFloat(oid Oid, x f64) Datum {
 }
 
 fn numericFromInt(oid Oid, x i64) !Datum {
-	if oid == Int2Oid && (x < -32768 || x > 32767) { fail "smallint out of range" }
-	if oid == Int4Oid && (x < -2147483648 || x > 2147483647) { fail "integer out of range" }
+	if oid == Int2Oid && (x < -32768 || x > 32767) { try pgRaise("22003", "smallint out of range") }
+	if oid == Int4Oid && (x < -2147483648 || x > 2147483647) { try pgRaise("22003", "integer out of range") }
 	return FromI64(oid, x)
 }
 
@@ -345,25 +411,29 @@ fn minInt(oid Oid) i64 {
 }
 
 fn checkedInteger(op str, a i64, b i64, oid Oid) !Datum {
+	let value = try checkedIntegerValue(op, a, b, oid)
+	return FromI64(oid, value)
+}
+
+fn checkedIntegerValue(op str, a i64, b i64, oid Oid) !i64 {
 	let hi = maxInt(oid)
 	let lo = minInt(oid)
 	mut result = i64(0)
 	if op == "+" {
-		if (b > 0 && a > hi-b) || (b < 0 && a < lo-b) { fail "integer out of range" }
+		if (b > 0 && a > hi-b) || (b < 0 && a < lo-b) { try pgRaise("22003", integerRangeMessage(oid)) }
 		result = a+b
 	} else if op == "-" {
-		if (b < 0 && a > hi+b) || (b > 0 && a < lo+b) { fail "integer out of range" }
+		if (b < 0 && a > hi+b) || (b > 0 && a < lo+b) { try pgRaise("22003", integerRangeMessage(oid)) }
 		result = a-b
 	} else if op == "*" {
 		if a != 0 && b != 0 {
-			if a == -1 && b == lo || b == -1 && a == lo { fail "integer out of range" }
+			if (a == -1 && b == lo) || (b == -1 && a == lo) || (a > 0 && b > 0 && a > hi/b) || (a > 0 && b < 0 && b < lo/a) || (a < 0 && b > 0 && a < lo/b) || (a < 0 && b < 0 && a < hi/b) { try pgRaise("22003", integerRangeMessage(oid)) }
 			result = a*b
-			if result / b != a { fail "integer out of range" }
 		} else { result = 0 }
 	} else if op == "/" || op == "%" {
-		if b == 0 { fail "division by zero" }
+		if b == 0 { try pgRaise("22012", "division by zero") }
 		if a == lo && b == -1 {
-			if op == "%" { result = 0 } else { fail "integer out of range" }
+			if op == "%" { result = 0 } else { try pgRaise("22003", integerRangeMessage(oid)) }
 		} else if op == "/" { result = a/b } else { result = a%b }
 	} else if op == "&" { result = a & b
 	} else if op == "|" { result = a | b
@@ -371,15 +441,32 @@ fn checkedInteger(op str, a i64, b i64, oid Oid) !Datum {
 	} else if op == "<<" || op == ">>" {
 		if b < 0 || b >= 64 { result = 0 } else if op == "<<" { result = a << b } else { result = a >> b }
 	}
-	return try numericFromInt(oid, result)
+	return result
+}
+
+fn integerRangeMessage(oid Oid) str {
+	if oid == Int2Oid { return "smallint out of range" }
+	if oid == Int4Oid { return "integer out of range" }
+	if oid == OidOid { return "value out of range for type oid" }
+	return "bigint out of range"
 }
 
 fn arithmeticFunc(op str, args []Datum) !Datum {
-	let oid = args[0].Oid()
-	if isInteger(oid) { return try checkedInteger(op, args[0].i, args[1].i, oid) }
-	let a = numericAsFloat(args[0])
-	let b = numericAsFloat(args[1])
-	if op == "/" && b == 0.0 { fail "division by zero" }
+	return try arithmeticValues(op, args[0], args[1])
+}
+
+fn arithmeticValues(op str, left Datum, right Datum) !Datum {
+	let oid = left.Oid()
+	if isInteger(oid) {
+		let value = try checkedIntegerValue(op, left.i, right.i, oid)
+		return FromI64(oid, value)
+	}
+	let value = try arithmeticFloat(op, numericAsFloat(left), numericAsFloat(right))
+	return numericFromFloat(oid, value)
+}
+
+fn arithmeticFloat(op str, a f64, b f64) !f64 {
+	if op == "/" && b == 0.0 { try pgRaise("22012", "division by zero") }
 	let value = match op {
 		"+" => a+b
 		"-" => a-b
@@ -389,24 +476,7 @@ fn arithmeticFunc(op str, args []Datum) !Datum {
 		"^" => gauge.Pow(a,b)
 		_ => 0.0
 	}
-	return numericFromFloat(oid, value)
-}
-
-fn booleanFunc(op str, args []Datum) !Datum {
-	let a = args[0]
-	if op == "NOT" {
-		if IsNull(a) { return Null() }
-		return FromBool(!a.b)
-	}
-	let b = args[1]
-	if op == "AND" {
-		if !IsNull(a) && !a.b || !IsNull(b) && !b.b { return FromBool(false) }
-		if IsNull(a) || IsNull(b) { return Null() }
-		return FromBool(true)
-	}
-	if !IsNull(a) && a.b || !IsNull(b) && b.b { return FromBool(true) }
-	if IsNull(a) || IsNull(b) { return Null() }
-	return FromBool(false)
+	return value
 }
 
 fn callSpecial(name str, ret Oid, args []Datum) !Datum {
@@ -521,8 +591,11 @@ fn builtinFuncs() []Func {
 	registerStringFuncs(mut funcs)
 	registerByteaUuidFuncs(mut funcs)
 	registerLikeFuncs(mut funcs)
+	registerRegexFuncs(mut funcs)
 	return funcs
 }
+
+let builtinFuncRegistry = builtinFuncs()
 
 fn registerBasicFuncs(funcs mut []Func) {
 	registerOperators(mut funcs)

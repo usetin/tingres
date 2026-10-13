@@ -1,0 +1,186 @@
+package exec
+
+import "../types"
+import "../plan"
+import "../catalog"
+import "../txn"
+import "../store"
+import "crucible"
+import "quarry"
+
+fn createSharedStore(name str) !(store.Store, txn.Manager, catalog.Catalog) {
+	let dir = quarry.TempDir() + "/tingres-mvcc-" + name
+	quarry.RemoveAll(dir) catch _ { }
+	mut db = try store.Open(dir, store.Options{BufferPages: 16, SyncOnWrite: false})
+	mut m = try txn.NewManager(mut db)
+	let c = try catalog.Open(mut db, m)
+	return db, m, c
+}
+
+fn TestMvccTwoSessionUncommittedIsolation(t mut crucible.T) {
+	let (_, m, c) = createSharedStore("uncommitted") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+
+	mut s1 = NewSession(c, m, "postgres", "postgres")
+	mut s2 = NewSession(c, m, "postgres", "postgres")
+	mut sink1 = NewRecordSink()
+	mut sink2 = NewRecordSink()
+
+	// Setup table
+	s1.Simple("CREATE TABLE accounts (id int, balance int);", mut sink1) catch err {
+		t.Error("create table failed: {err}")
+		return
+	}
+
+	// Session 1 begins transaction and inserts a row
+	s1.Simple("BEGIN;", mut sink1) catch err {
+		t.Error("s1 begin failed: {err}")
+		return
+	}
+	s1.Simple("INSERT INTO accounts VALUES (1, 100);", mut sink1) catch err {
+		t.Error("s1 insert failed: {err}")
+		return
+	}
+
+	// Session 2 in ReadCommitted must NOT see uncommitted row from Session 1
+	mut s2Sink = NewRecordSink()
+	s2.Simple("SELECT id, balance FROM accounts;", mut s2Sink) catch err {
+		t.Error("s2 select failed: {err}")
+		return
+	}
+	t.True("s2 sees 0 rows while s1 uncommitted", len(s2Sink.Rows) == 0)
+
+	// Session 1 commits
+	s1.Simple("COMMIT;", mut sink1) catch err {
+		t.Error("s1 commit failed: {err}")
+		return
+	}
+
+	// Session 2 now sees the committed row
+	mut s2SinkAfter = NewRecordSink()
+	s2.Simple("SELECT id, balance FROM accounts;", mut s2SinkAfter) catch err {
+		t.Error("s2 select after commit failed: {err}")
+		return
+	}
+	t.True("s2 sees 1 row after s1 commit", len(s2SinkAfter.Rows) == 1)
+	if len(s2SinkAfter.Rows) == 1 {
+		t.True("balance is 100", s2SinkAfter.Rows[0][1].Text() == "100")
+	}
+}
+
+fn TestMvccRepeatableReadSnapshotIsolation(t mut crucible.T) {
+	let (_, m, c) = createSharedStore("repeatable_read") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+
+	mut s1 = NewSession(c, m, "postgres", "postgres")
+	mut s2 = NewSession(c, m, "postgres", "postgres")
+	mut sink1 = NewRecordSink()
+	mut sink2 = NewRecordSink()
+
+	s1.Simple("CREATE TABLE items (id int, val int);", mut sink1) catch err {
+		t.Error("create table failed: {err}")
+		return
+	}
+	s1.Simple("INSERT INTO items VALUES (1, 10);", mut sink1) catch err {
+		t.Error("initial insert failed: {err}")
+		return
+	}
+
+	// Session 2 begins repeatable read transaction
+	s2.Simple("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;", mut sink2) catch err {
+		t.Error("s2 begin repeatable read failed: {err}")
+		return
+	}
+
+	// Session 2 reads initial state
+	mut s2Initial = NewRecordSink()
+	s2.Simple("SELECT id, val FROM items;", mut s2Initial) catch err {
+		t.Error("s2 initial select failed: {err}")
+		return
+	}
+	t.True("s2 initial count is 1", len(s2Initial.Rows) == 1)
+
+	// Session 1 inserts a new row and commits
+	s1.Simple("INSERT INTO items VALUES (2, 20);", mut sink1) catch err {
+		t.Error("s1 insert 2 failed: {err}")
+		return
+	}
+
+	// Session 2 in Repeatable Read must NOT see row 2 even after Session 1 committed
+	mut s2Repeat = NewRecordSink()
+	s2.Simple("SELECT id, val FROM items;", mut s2Repeat) catch err {
+		t.Error("s2 repeated select failed: {err}")
+		return
+	}
+	t.True("s2 snapshot isolation retains 1 row", len(s2Repeat.Rows) == 1)
+
+	// Session 2 commits
+	s2.Simple("COMMIT;", mut sink2) catch err {
+		t.Error("s2 commit failed: {err}")
+		return
+	}
+
+	// A new transaction in Session 2 sees both rows
+	mut s2NewTx = NewRecordSink()
+	s2.Simple("SELECT id, val FROM items;", mut s2NewTx) catch err {
+		t.Error("s2 new tx select failed: {err}")
+		return
+	}
+	t.True("s2 new tx sees 2 rows", len(s2NewTx.Rows) == 2)
+}
+
+fn TestMvccRollbackAndSavepointIsolation(t mut crucible.T) {
+	let (_, m, c) = createSharedStore("rollback_sp") catch err {
+		t.Error("setup failed: {err}")
+		return
+	}
+
+	mut s = NewSession(c, m, "postgres", "postgres")
+	mut sink = NewRecordSink()
+
+	s.Simple("CREATE TABLE ledger (id int, amount int);", mut sink) catch err {
+		t.Error("create table failed: {err}")
+		return
+	}
+
+	// Transaction with savepoint rollback
+	s.Simple("BEGIN;", mut sink) catch err {
+		t.Error("begin failed: {err}")
+		return
+	}
+	s.Simple("INSERT INTO ledger VALUES (1, 100);", mut sink) catch err {
+		t.Error("insert 1 failed: {err}")
+		return
+	}
+	s.Simple("SAVEPOINT sp1;", mut sink) catch err {
+		t.Error("savepoint failed: {err}")
+		return
+	}
+	s.Simple("INSERT INTO ledger VALUES (2, 200);", mut sink) catch err {
+		t.Error("insert 2 failed: {err}")
+		return
+	}
+	s.Simple("ROLLBACK TO SAVEPOINT sp1;", mut sink) catch err {
+		t.Error("rollback to sp1 failed: {err}")
+		return
+	}
+	s.Simple("COMMIT;", mut sink) catch err {
+		t.Error("commit failed: {err}")
+		return
+	}
+
+	// Verify only row 1 exists
+	mut checkSink = NewRecordSink()
+	s.Simple("SELECT id, amount FROM ledger;", mut checkSink) catch err {
+		t.Error("select ledger failed: {err}")
+		return
+	}
+	t.True("only 1 row in ledger after rollback to savepoint", len(checkSink.Rows) == 1)
+	if len(checkSink.Rows) == 1 {
+		t.True("surviving row is id 1", checkSink.Rows[0][0].Text() == "1")
+	}
+}

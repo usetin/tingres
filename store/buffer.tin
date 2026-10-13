@@ -1,5 +1,9 @@
 package store
 
+import "atomic"
+
+const bufferTableShards = 16
+
 type BufferKey struct {
 	rel u32
 	page u32
@@ -7,15 +11,22 @@ type BufferKey struct {
 
 type Buffer struct {
 	key BufferKey
-	page Page
 	valid bool
 	pins u32
 	dirty bool
+	usage u8
+	reservedBytes u32
+	latch atomic.Bool
 }
 
-// BufferPool is a fixed-size clock-sweep pool. Calls must stay on one lane; callers must not wait while pinned.
+// BufferPool owns one preallocated contiguous region of page memory. Its sharded page table and
+// frame metadata are core-local; Tin tasks on a core share them cooperatively, while cross-core
+// callers must route requests to the owning core through relay. Content latches are held only for
+// synchronous page access and must never be held across an await or wait.
 type BufferPool struct {
+	region []u8
 	frames []Buffer
+	shards []map[u64]u32
 	hand u32
 }
 
@@ -24,30 +35,144 @@ fn NewBufferPool(capacity u32) !BufferPool {
 	if capacity == 0 {
 		fail "store: buffer pool must have at least one frame"
 	}
+	mut region = make([]u8, i64(capacity)*PageSize)
 	mut frames = make([]Buffer, 0, i64(capacity))
-	for _i in 0..i64(capacity) {
-		frames = append(frames, Buffer{key: BufferKey{rel: 0, page: 0}, page: NewPage(), valid: false, pins: 0, dirty: false})
+	for i in 0..i64(capacity) {
+		let page = NewPage()
+		copy(region[i*PageSize:(i+1)*PageSize], page.Data)
+		frames = append(frames, Buffer{key: BufferKey{rel: 0, page: 0}, valid: false, pins: 0, dirty: false, usage: 0, reservedBytes: 0, latch: atomic.NewBool(false)})
 	}
-	return BufferPool{frames: frames, hand: 0}
+	mut shards = make([]map[u64]u32, 0, bufferTableShards)
+	for i in 0..bufferTableShards {
+		shards = append(shards, map[u64]u32{})
+	}
+	return BufferPool{region: region, frames: frames, shards: shards, hand: 0}
 }
 
-// Pin returns a pinned resident page, loading a blank page on a miss.
+// Capacity returns the number of preallocated frames.
+fn (pool BufferPool) Capacity() u32 {
+	return u32(len(pool.frames))
+}
+
+// Contains reports whether key is resident.
+fn (pool BufferPool) Contains(key BufferKey) bool {
+	let (_, ok) = pool.shards[shardFor(key)][packedKey(key)]
+	return ok
+}
+
+// Pin returns a pinned resident page, loading a blank page on a miss. Dirty frames cannot be
+// evicted by this low-level API; Store flushes them through WAL before installing a replacement.
 fn (pool mut BufferPool) Pin(key BufferKey) !(u32, Page) {
-	for i, frame in pool.frames {
-		if frame.valid && frame.key == key {
-			pool.frames[i].pins += 1
-			return u32(i), pool.frames[i].page
+	let packed = packedKey(key)
+	let shard = shardFor(key)
+	let (found, ok) = pool.shards[shard][packed]
+	if ok {
+		pool.frames[found].pins += 1
+		pool.frames[found].usage = 2
+		return found, pool.pageAt(found)
+	}
+	let victim = try pool.ChooseVictim()
+	if pool.frames[victim].valid && pool.frames[victim].dirty {
+		fail "store: dirty frame must be flushed before eviction"
+	}
+	try pool.Reserve(victim, key)
+	return victim, pool.pageAt(victim)
+}
+
+// PinResident pins a key that is already in the page table.
+fn (pool mut BufferPool) PinResident(key BufferKey) !u32 {
+	let (frame, ok) = pool.shards[shardFor(key)][packedKey(key)]
+	if !ok {
+		fail "store: buffer page is not resident"
+	}
+	pool.frames[frame].pins += 1
+	pool.frames[frame].usage = 2
+	return frame
+}
+
+// ChooseVictim runs clock-sweep and returns an unpinned frame without changing its identity.
+fn (pool mut BufferPool) ChooseVictim() !u32 {
+	let n = u32(len(pool.frames))
+	for _round in 0..(i64(n)*4) {
+		let i = pool.hand % n
+		pool.hand = (pool.hand+1) % n
+		if pool.frames[i].pins != 0 {
+			continue
 		}
+		if !pool.frames[i].valid {
+			return i
+		}
+		if pool.frames[i].usage != 0 {
+			pool.frames[i].usage -= 1
+			continue
+		}
+		return i
 	}
-	let victim = pool.chooseVictim() catch err {
-		fail err
+	fail "store: all buffer frames are pinned"
+}
+
+// Install replaces an unpinned, clean frame with page under key.
+fn (pool mut BufferPool) Install(frame u32, key BufferKey, page Page) ! {
+	if i64(frame) >= len(pool.frames) || pool.frames[frame].pins != 0 {
+		fail "store: cannot install into a pinned buffer frame"
 	}
-	pool.frames[victim].key = key
-	pool.frames[victim].page = NewPage()
-	pool.frames[victim].valid = true
-	pool.frames[victim].pins = 1
-	pool.frames[victim].dirty = false
-	return victim, pool.frames[victim].page
+	if len(page.Data) != PageSize || !page.Valid() {
+		fail "store: invalid buffer page"
+	}
+	let old = pool.frames[frame]
+	if old.valid {
+		if old.dirty {
+			fail "store: dirty frame must be flushed before eviction"
+		}
+		delete(pool.shards[shardFor(old.key)], packedKey(old.key))
+	}
+	let off = i64(frame)*PageSize
+	copy(pool.region[off:off+PageSize], page.Data)
+	pool.frames[frame].key = key
+	pool.frames[frame].valid = true
+	pool.frames[frame].pins = 1
+	pool.frames[frame].dirty = false
+	pool.frames[frame].usage = 2
+	pool.frames[frame].reservedBytes = 0
+	pool.frames[frame].latch.Store(false)
+	pool.shards[shardFor(key)][packedKey(key)] = frame
+}
+
+// Reserve recycles a clean, unpinned frame as a new empty page without allocating page memory.
+fn (pool mut BufferPool) Reserve(frame u32, key BufferKey) ! {
+	if i64(frame) >= len(pool.frames) || pool.frames[frame].pins != 0 {
+		fail "store: cannot reserve a pinned buffer frame"
+	}
+	let old = pool.frames[frame]
+	if old.valid {
+		if old.dirty {
+			fail "store: dirty frame must be flushed before eviction"
+		}
+		delete(pool.shards[shardFor(old.key)], packedKey(old.key))
+	}
+	mut page = pool.pageAt(frame)
+	page.Reset()
+	pool.frames[frame].key = key
+	pool.frames[frame].valid = true
+	pool.frames[frame].pins = 1
+	pool.frames[frame].dirty = false
+	pool.frames[frame].usage = 2
+	pool.frames[frame].reservedBytes = 0
+	pool.frames[frame].latch.Store(false)
+	pool.shards[shardFor(key)][packedKey(key)] = frame
+}
+
+// Discard removes a newly reserved clean frame when loading its backing block fails.
+fn (pool mut BufferPool) Discard(frame u32) ! {
+	if i64(frame) >= len(pool.frames) || !pool.frames[frame].valid || pool.frames[frame].pins != 1 || pool.frames[frame].dirty {
+		fail "store: cannot discard this buffer frame"
+	}
+	let key = pool.frames[frame].key
+	delete(pool.shards[shardFor(key)], packedKey(key))
+	pool.frames[frame].valid = false
+	pool.frames[frame].pins = 0
+	pool.frames[frame].usage = 0
+	pool.frames[frame].reservedBytes = 0
 }
 
 // Unpin releases a previously pinned frame.
@@ -58,31 +183,136 @@ fn (pool mut BufferPool) Unpin(frame u32) ! {
 	pool.frames[frame].pins -= 1
 }
 
+// LockContent acquires a frame's synchronous content latch.
+fn (pool BufferPool) LockContent(frame u32) ! {
+	if i64(frame) >= len(pool.frames) || !pool.frames[frame].valid {
+		fail "store: invalid buffer frame"
+	}
+	for !pool.frames[frame].latch.CompareSwap(false, true) {
+	}
+}
+
+// UnlockContent releases a frame's content latch.
+fn (pool BufferPool) UnlockContent(frame u32) ! {
+	if i64(frame) >= len(pool.frames) || !pool.frames[frame].valid || !pool.frames[frame].latch.Swap(false) {
+		fail "store: buffer content latch is not held"
+	}
+}
+
 // MarkDirty records that a pinned page needs WAL-safe persistence.
 fn (pool mut BufferPool) MarkDirty(frame u32, lsn Lsn) ! {
 	if i64(frame) >= len(pool.frames) || pool.frames[frame].pins == 0 {
 		fail "store: buffer is not pinned"
 	}
-	pool.frames[frame].page.SetLsn(u64(lsn))
+	mut page = pool.pageAt(frame)
+	let oldLsn = page.Header().Lsn
+	if u64(lsn) > oldLsn {
+		page.SetLsn(u64(lsn))
+	} else {
+		page.SetLsn(oldLsn)
+	}
 	pool.frames[frame].dirty = true
+}
+
+// ReserveItem owns enough space and a line pointer for an insert across a WAL wait.
+fn (pool mut BufferPool) ReserveItem(frame u32, itemBytes i64) !u16 {
+	if i64(frame) >= len(pool.frames) || pool.frames[frame].pins == 0 || !pool.frames[frame].latch.Load() {
+		fail "store: tuple reservation needs a pinned, latched page"
+	}
+	mut page = pool.pageAt(frame)
+	let slot = try page.ReserveSlot(itemBytes, i64(pool.frames[frame].reservedBytes))
+	pool.frames[frame].reservedBytes += u32(itemBytes)
+	return slot
+}
+
+// InsertReserved installs tuple bytes and releases that reservation's space accounting.
+fn (pool mut BufferPool) InsertReserved(frame u32, slot u16, value []u8) ! {
+	if i64(frame) >= len(pool.frames) || pool.frames[frame].pins == 0 || !pool.frames[frame].latch.Load() || len(value) > i64(pool.frames[frame].reservedBytes) {
+		fail "store: invalid pinned tuple reservation"
+	}
+	mut page = pool.pageAt(frame)
+	try page.InsertReserved(slot, value, i64(pool.frames[frame].reservedBytes))
+	pool.frames[frame].reservedBytes -= u32(len(value))
+}
+
+// CancelReservation releases a line pointer and space after a WAL append fault.
+fn (pool mut BufferPool) CancelReservation(frame u32, slot u16, itemBytes i64) ! {
+	if i64(frame) >= len(pool.frames) || pool.frames[frame].pins == 0 || !pool.frames[frame].latch.Load() || itemBytes < 0 || u32(itemBytes) > pool.frames[frame].reservedBytes {
+		fail "store: invalid pinned tuple reservation"
+	}
+	mut page = pool.pageAt(frame)
+	try page.Unreserve(slot)
+	pool.frames[frame].reservedBytes -= u32(itemBytes)
+}
+
+// ClearDirty records that the frame has been written after its page LSN was synced.
+fn (pool mut BufferPool) ClearDirty(frame u32) ! {
+	if i64(frame) >= len(pool.frames) || !pool.frames[frame].valid {
+		fail "store: invalid buffer frame"
+	}
+	pool.frames[frame].dirty = false
 }
 
 // IsDirty reports whether a frame needs a page write.
 fn (pool BufferPool) IsDirty(frame u32) bool {
-	if i64(frame) >= len(pool.frames) {
-		return false
-	}
-	return pool.frames[frame].dirty
+	return i64(frame) < len(pool.frames) && pool.frames[frame].valid && pool.frames[frame].dirty
 }
 
-fn (pool mut BufferPool) chooseVictim() !u32 {
-	let n = u32(len(pool.frames))
-	for _round in 0..(i64(n)*2) {
-		let i = pool.hand % n
-		pool.hand = (pool.hand+1) % n
-		if !pool.frames[i].valid || pool.frames[i].pins == 0 {
-			return i
+fn (pool BufferPool) framePinned(frame u32) bool {
+	return i64(frame) < len(pool.frames) && pool.frames[frame].pins != 0
+}
+
+// RelationPageCount includes resident blocks that have not reached the relation file yet.
+fn (pool BufferPool) RelationPageCount(rel RelId) u32 {
+	mut count = u32(0)
+	for frame in pool.frames {
+		if frame.valid && frame.key.rel == u32(rel) && frame.key.page >= count {
+			count = frame.key.page + 1
 		}
 	}
-	fail "store: all buffer frames are pinned"
+	return count
+}
+
+// Key returns the relation and block assigned to a valid frame.
+fn (pool BufferPool) Key(frame u32) !BufferKey {
+	if i64(frame) >= len(pool.frames) || !pool.frames[frame].valid {
+		fail "store: invalid buffer frame"
+	}
+	return pool.frames[frame].key
+}
+
+// PageAt returns a view of the frame's preallocated page bytes. Call only while its latch is held.
+fn (pool BufferPool) PageAt(frame u32) !Page {
+	if i64(frame) >= len(pool.frames) || !pool.frames[frame].valid {
+		fail "store: invalid buffer frame"
+	}
+	return pool.pageAt(frame)
+}
+
+// InvalidateRel removes every cached block for a relation after its drop record is durable.
+fn (pool mut BufferPool) InvalidateRel(rel RelId) ! {
+	for i, frame in pool.frames {
+		if frame.valid && frame.key.rel == u32(rel) {
+			if frame.pins != 0 {
+				fail "store: cannot drop a pinned relation page"
+			}
+			delete(pool.shards[shardFor(frame.key)], packedKey(frame.key))
+			pool.frames[i].valid = false
+			pool.frames[i].dirty = false
+			pool.frames[i].usage = 0
+		}
+	}
+}
+
+fn (pool BufferPool) pageAt(frame u32) Page {
+	let off = i64(frame)*PageSize
+	return Page{Data: pool.region[off:off+PageSize]}
+}
+
+fn packedKey(key BufferKey) u64 {
+	return (u64(key.rel) << 32) | u64(key.page)
+}
+
+fn shardFor(key BufferKey) i64 {
+	return i64((key.rel ^ key.page) % u32(bufferTableShards))
 }
