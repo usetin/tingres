@@ -293,6 +293,58 @@ fn TestPlannerPhysicalPlans(t mut crucible.T) {
 	cleanupTestEnv(env)
 }
 
+fn TestIndexSelection(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "index_selection")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	if let tbl = env.Cat.LookupTable(env.Txn, "public", "users") {
+		_ = env.Cat.CreateIndex(env.Txn, catalog.IndexDef{Table: tbl, Name: "users_pkey", Unique: true}) catch _ { return }
+		_ = env.Cat.CreateIndex(env.Txn, catalog.IndexDef{Table: tbl, Name: "users_age_idx", Unique: false}) catch _ { return }
+		env.Txn.CommandCounterIncrement()
+	}
+
+	// Unique index with the whole key matched by equality: primary-key fast path.
+	let stmt1 = parseSql("SELECT * FROM users WHERE id = 7") catch err {
+		t.Error("parse pk: " + types.ErrorMessage(err))
+		return
+	}
+	let prep1 = Prepare(env.Cat, env.Txn, stmt1, []u32{}) catch err {
+		t.Error("prepare pk: " + types.ErrorMessage(err))
+		return
+	}
+	match prep1.Plan {
+		IndexScan(idx) => {
+			crucible.Equal(mut t, "pk index name", idx.Index.Name, "users_pkey")
+			crucible.Equal(mut t, "pk one bound", len(idx.Bounds), 1)
+			crucible.Equal(mut t, "pk estimated rows", i64(idx.Cost.Rows), 1)
+		}
+		_ => { t.Error("expected IndexScan for unique equality") }
+	}
+
+	// A non-unique range qual on a tiny table: sequential scan is cheaper.
+	let stmt2 = parseSql("SELECT * FROM users WHERE age > 21") catch err {
+		t.Error("parse range: " + types.ErrorMessage(err))
+		return
+	}
+	let prep2 = Prepare(env.Cat, env.Txn, stmt2, []u32{}) catch err {
+		t.Error("prepare range: " + types.ErrorMessage(err))
+		return
+	}
+	match prep2.Plan {
+		SeqScan(_) => {}
+		_ => { t.Error("expected SeqScan for non-selective range on a small table") }
+	}
+
+	// Index name column inference.
+	if let tbl = env.Cat.LookupTable(env.Txn, "public", "users") {
+		crucible.Equal(mut t, "pkey columns", inferIndexColumns(tbl.Indexes[0], tbl)[0], "id")
+		crucible.Equal(mut t, "age idx columns", inferIndexColumns(tbl.Indexes[1], tbl)[0], "age")
+	}
+
+	cleanupTestEnv(env)
+}
+
 fn TestPlannerAdditionalQueryShapes(t mut crucible.T) {
 	let envOpt = setupTestEnv(mut t, "planner_shapes")
 	if envOpt == nil { return }
