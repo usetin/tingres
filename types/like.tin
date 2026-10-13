@@ -132,7 +132,7 @@ fn textRunes(s str) []i32 {
 
 fn parseLike(pattern str, escape str) ![]LikeToken {
 	let esc = textRunes(escape)
-	if len(esc) > 1 { try pgRaise("22025", "LIKE escape must be a single character") }
+	if len(esc) > 1 { try pgRaiseHint("22025", "invalid escape string", "Escape string must be empty or one character.") }
 	let chars = textRunes(pattern)
 	mut out = make([]LikeToken, 0, len(chars))
 	mut i = i64(0)
