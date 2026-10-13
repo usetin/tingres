@@ -32,6 +32,12 @@ fn (p Page) Header() PageHeader {
 	return PageHeader{Lsn: readU64(p.Data, 0), Checksum: readU32(p.Data, 8), Lower: readU16(p.Data, 16), Upper: readU16(p.Data, 18), Slots: readU16(p.Data, 20)}
 }
 
+// FreeSpace is the number of bytes available to another line pointer and item.
+fn (p Page) FreeSpace() i64 {
+	let h = p.Header()
+	return i64(h.Upper) - i64(h.Lower)
+}
+
 // SetLsn updates the page LSN and checksum.
 fn (p mut Page) SetLsn(lsn u64) {
 	writeU64(mut p.Data, 0, lsn)
@@ -79,6 +85,22 @@ fn (p mut Page) Insert(value []u8) !u16 {
 	writeU16(mut p.Data, 20, slot+1)
 	p.Seal()
 	return slot + 1
+}
+
+// SetItem replaces a live item's bytes without changing its line pointer.
+fn (p mut Page) SetItem(slot u16, value []u8) ! {
+	let h = p.Header()
+	if len(p.Data) != PageSize || slot == 0 || slot > h.Slots {
+		fail "store: invalid tuple id"
+	}
+	let lp = pageHeaderSize + i64(slot-1)*linePointerSize
+	let off = i64(readU16(p.Data, lp))
+	let n = i64(readU16(p.Data, lp+2))
+	if n == 0 || off < pageHeaderSize || off+n > PageSize || len(value) != n {
+		fail "store: invalid replacement item"
+	}
+	copy(p.Data[off:off+n], value)
+	p.Seal()
 }
 
 // Item returns a copy of a live line-pointer item.

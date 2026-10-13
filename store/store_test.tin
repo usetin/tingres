@@ -24,6 +24,72 @@ fn TestSlottedPage(t mut crucible.T) {
 	crucible.Equal(mut t, "header slot count", p.Header().Slots, u16(1))
 }
 
+fn TestRelationFilesBlockOperations(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-files-test"
+	let cleanupErr = quarry.RemoveAll(dir)
+	if cleanupErr != nil {
+		crucible.True("stale relation directory can be absent", true)
+	}
+	let (filesValue, createErr) = NewRelationFiles(dir)
+	if createErr != nil {
+		t.Error("relation file manager creation failed")
+		return
+	}
+	mut files = filesValue
+	let fileErr = files.Create(77)
+	if fileErr != nil {
+		t.Error("relation file creation failed")
+		return
+	}
+	mut p = NewPage()
+	let writeErr = files.WritePage(77, 0, p)
+	if writeErr != nil {
+		t.Error("relation block write failed")
+		return
+	}
+	crucible.Equal(mut t, "one relation block is 8 KiB", trySize(files, 77), i64(PageSize))
+	crucible.Equal(mut t, "cached block count", tryPageCount(files, 77), u32(1))
+	let (readPage, readErr) = files.ReadPage(77, 0)
+	if readErr != nil {
+		t.Error("relation block read failed")
+		return
+	}
+	crucible.True("read page checksum", readPage.Valid())
+	let patchErr = files.WriteAt(77, 20, []u8{0x34})
+	if patchErr != nil {
+		t.Error("positional relation write failed")
+		return
+	}
+	let (raw, readAtErr) = readFileByte(files, 77, 20)
+	if readAtErr != nil {
+		t.Error("positional relation read failed")
+		return
+	}
+	crucible.Equal(mut t, "positional byte", raw, u8(0x34))
+	let truncateErr = files.Truncate(77, 16)
+	if truncateErr != nil {
+		t.Error("relation truncate failed")
+		return
+	}
+	crucible.Equal(mut t, "truncated byte length", trySize(files, 77), i64(16))
+	let extendErr = files.Extend(77, PageSize*2)
+	if extendErr != nil {
+		t.Error("relation extend failed")
+		return
+	}
+	crucible.Equal(mut t, "extended byte length", trySize(files, 77), i64(PageSize*2))
+	let dropErr = files.Drop(77)
+	if dropErr != nil {
+		t.Error("relation file drop failed")
+		return
+	}
+	crucible.True("relation file removed", !quarry.Exists(files.Path(77)))
+	let finalCleanupErr = quarry.RemoveAll(dir)
+	if finalCleanupErr != nil {
+		t.Error("relation file test cleanup failed")
+	}
+}
+
 fn TestPageFullDoesNotCorrupt(t mut crucible.T) {
 	mut p = NewPage()
 	let tooBig = make([]u8, PageSize)
@@ -81,6 +147,68 @@ fn TestWalRecoveryReplaysHeap(t mut crucible.T) {
 	if finalCleanupErr != nil {
 		t.Error("cleanup failed")
 	}
+}
+
+fn TestDropRelIsReplayed(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-drop-test"
+	let cleanupErr = quarry.RemoveAll(dir)
+	if cleanupErr != nil {
+		crucible.True("stale drop directory can be absent", true)
+	}
+	let (opened, openErr) = Open(dir, Options{BufferPages: 8, SyncOnWrite: false})
+	if openErr != nil {
+		t.Error("open failed")
+		return
+	}
+	mut db = opened
+	let createErr = db.CreateHeap(91)
+	if createErr != nil {
+		t.Error("create heap failed")
+		return
+	}
+	let (tid, insertErr) = db.HeapInsert(NewXidCtx(2, 1), 91, []u8{4, 3, 2, 1})
+	if insertErr != nil {
+		t.Error("insert before drop failed")
+		return
+	}
+	_ = tid
+	let dropErr = db.DropRel(91)
+	if dropErr != nil {
+		t.Error("drop relation failed")
+		return
+	}
+	crucible.True("drop removes the relation file", !quarry.Exists(dir + "/base/91"))
+	let (reopened, reopenErr) = Open(dir, Options{BufferPages: 8, SyncOnWrite: false})
+	if reopenErr != nil {
+		t.Error("reopen failed")
+		return
+	}
+	crucible.True("WAL replay keeps the dropped relation absent", !quarry.Exists(dir + "/base/91"))
+	let cleanupAgainErr = reopened.Close()
+	if cleanupAgainErr != nil {
+		t.Error("close after drop replay failed")
+	}
+	let finalCleanupErr = quarry.RemoveAll(dir)
+	if finalCleanupErr != nil {
+		t.Error("drop test cleanup failed")
+	}
+}
+
+fn trySize(files RelationFiles, rel RelId) i64 {
+	return files.Size(rel) catch _ { -1 }
+}
+
+fn tryPageCount(files RelationFiles, rel RelId) u32 {
+	return files.PageCount(rel) catch _ { 0 }
+}
+
+fn readFileByte(files RelationFiles, rel RelId, offset i64) !u8 {
+	mut b = make([]u8, 1)
+	let n = try files.ReadAt(rel, offset, mut b)
+	if n != 1 {
+		fail "short read"
+	}
+	return b[0]
 }
 
 fn TestClockSweepReusesUnpinnedFrame(t mut crucible.T) {
