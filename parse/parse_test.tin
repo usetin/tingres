@@ -572,28 +572,11 @@ fn TestValidCorpus(t mut crucible.T) {
 	crucible.True("valid corpus >= 1500 stmts", len(stmts) >= 1500)
 
 	mut roundtripFailures = 0
-	for i in 0..len(stmts) {
-		let deparsed = Deparse(stmts[i])
-		if len(deparsed) == 0 {
-			roundtripFailures += 1
-			continue
-		}
-		let reparsed = Parse(deparsed) catch _ {
-			roundtripFailures += 1
-			[]Stmt{}
-		}
-		if len(reparsed) != 1 {
-			roundtripFailures += 1
-			continue
-		}
-		if stmtKind(reparsed[0]) != stmtKind(stmts[i]) {
-			roundtripFailures += 1
-			continue
-		}
-		let deparsedAgain = Deparse(reparsed[0])
-		if deparsedAgain != deparsed {
-			roundtripFailures += 1
-		}
+	mut at = 0
+	for at < len(stmts) {
+		let end = min(at + 100, len(stmts))
+		roundtripFailures += checkRoundtripBatch(stmts, at, end)
+		at += 100
 	}
 	crucible.EqI("deparse roundtrip failures", roundtripFailures, 0)
 }
@@ -656,4 +639,20 @@ fn splitLines(s str) []str {
 fn trimRightCarriage(s str) str {
 	if len(s) > 0 && s[len(s) - 1] == 13 { return s[:len(s) - 1] }
 	return s
+}
+
+fn checkRoundtripBatch(stmts []Stmt, start i64, end i64) i64 {
+	mut failures = 0
+	for i in start..end {
+		let deparsed = Deparse(stmts[i])
+		if len(deparsed) == 0 {
+			failures += 1
+			continue
+		}
+		let reparsed = Parse(deparsed) catch _ { []Stmt{} }
+		if len(reparsed) != 1 || stmtKind(reparsed[0]) != stmtKind(stmts[i]) || Deparse(reparsed[0]) != deparsed {
+			failures += 1
+		}
+	}
+	return failures
 }
