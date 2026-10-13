@@ -27,7 +27,7 @@ fn (c mut SeqScanCursor) Next() !([]types.Datum, bool) {
 			return []types.Datum{}, false
 		}
 		let h = tuple.Header
-		let vis = c.Manager.Visible(c.Snapshot, txn.TupleHeader{Xmin: h.Xmin(), Xmax: h.Xmax(), Cid: h.Cid()})
+		let vis = c.Manager.Visible(c.Snapshot, h)
 		if !vis {
 			continue
 		}
@@ -35,7 +35,8 @@ fn (c mut SeqScanCursor) Next() !([]types.Datum, bool) {
 		mut evalCtx = c.Ctx
 		evalCtx.Row = row
 		if let f = c.Filter {
-			let pass = try EvalExpr(f, mut evalCtx)
+			mut fMut = f
+			let pass = try EvalExpr(mut fMut, mut evalCtx)
 			if !isTrue(pass) {
 				continue
 			}
@@ -43,7 +44,8 @@ fn (c mut SeqScanCursor) Next() !([]types.Datum, bool) {
 		if len(c.Projection) > 0 {
 			mut proj = []types.Datum{}
 			for expr in c.Projection {
-				let val = try EvalExpr(expr, mut evalCtx)
+				mut eMut = expr
+				let val = try EvalExpr(mut eMut, mut evalCtx)
 				proj = append(proj, val)
 			}
 			return proj, true
@@ -67,7 +69,8 @@ fn (c mut PlanFilterCursor) Next() !([]types.Datum, bool) {
 		}
 		mut evalCtx = c.Ctx
 		evalCtx.Row = row
-		let pass = try EvalExpr(c.Predicate, mut evalCtx)
+		mut pred = c.Predicate
+		let pass = try EvalExpr(mut pred, mut evalCtx)
 		if isTrue(pass) {
 			return row, true
 		}
@@ -90,7 +93,8 @@ fn (c mut PlanProjectCursor) Next() !([]types.Datum, bool) {
 	evalCtx.Row = row
 	mut res = []types.Datum{}
 	for expr in c.Exprs {
-		let val = try EvalExpr(expr, mut evalCtx)
+		mut eMut = expr
+		let val = try EvalExpr(mut eMut, mut evalCtx)
 		res = append(res, val)
 	}
 	return res, true
@@ -197,7 +201,8 @@ fn (c mut ResultCursor) Next() !([]types.Datum, bool) {
 	c.Done = true
 	if let f = c.Filter {
 		mut evalCtx = c.Ctx
-			let pass = try EvalExpr(f, mut evalCtx)
+		mut fMut = f
+		let pass = try EvalExpr(mut fMut, mut evalCtx)
 		if !isTrue(pass) {
 			return []types.Datum{}, false
 		}
@@ -205,7 +210,8 @@ fn (c mut ResultCursor) Next() !([]types.Datum, bool) {
 	mut res = []types.Datum{}
 	for expr in c.Exprs {
 		mut evalCtx = c.Ctx
-			let val = try EvalExpr(expr, mut evalCtx)
+		mut eMut = expr
+		let val = try EvalExpr(mut eMut, mut evalCtx)
 		res = append(res, val)
 	}
 	return res, true
@@ -267,8 +273,10 @@ fn (c mut SortCursor) compare(a mut []types.Datum, b mut []types.Datum) i64 {
 	mut ctxB = c.Ctx
 	ctxB.Row = b
 	for key in c.Keys {
-		let valA = EvalExpr(key.Expr, mut ctxA) catch _ { types.Null() }
-		let valB = EvalExpr(key.Expr, mut ctxB) catch _ { types.Null() }
+		mut kA = key.Expr
+		mut kB = key.Expr
+		let valA = EvalExpr(mut kA, mut ctxA) catch _ { types.Null() }
+		let valB = EvalExpr(mut kB, mut ctxB) catch _ { types.Null() }
 		if types.IsNull(valA) && types.IsNull(valB) {
 			continue
 		}
@@ -349,7 +357,8 @@ fn (c mut NestLoopCursor) Next() !([]types.Datum, bool) {
 				mut evalCtx = c.Ctx
 				evalCtx.Row = joined
 				for q in c.Quals {
-					let pass = try EvalExpr(q, mut evalCtx)
+					mut qMut = q
+					let pass = try EvalExpr(mut qMut, mut evalCtx)
 					if !isTrue(pass) {
 						qualsPass = false
 						break
@@ -419,7 +428,8 @@ fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
 			c.RightWidth = i64(len(rRow))
 			mut rCtx = c.Ctx
 			rCtx.Row = rRow
-			let key = try evalKey(c.RightKeys, mut rCtx)
+			mut rKeys = c.RightKeys
+			let key = try evalKey(mut rKeys, mut rCtx)
 			let (list, exists) = c.Buckets[key]
 			if exists {
 				c.Buckets[key] = append(list, rRow)
@@ -438,7 +448,8 @@ fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
 			c.Matched = false
 			mut lCtx = c.Ctx
 			lCtx.Row = leftRow
-			let key = try evalKey(c.LeftKeys, mut lCtx)
+			mut lKeys = c.LeftKeys
+			let key = try evalKey(mut lKeys, mut lCtx)
 			let (list, exists) = c.Buckets[key]
 			if exists {
 				c.CurrentBucket = list
@@ -458,7 +469,8 @@ fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
 				mut evalCtx = c.Ctx
 				evalCtx.Row = joined
 				for q in c.Quals {
-					let pass = try EvalExpr(q, mut evalCtx)
+					mut qMut = q
+					let pass = try EvalExpr(mut qMut, mut evalCtx)
 					if !isTrue(pass) {
 						qualsPass = false
 						break
@@ -498,11 +510,12 @@ fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
 	}
 }
 
-fn evalKey(keys []plan.Expr, ctx mut ExprContext) !str {
+fn evalKey(keys mut []plan.Expr, ctx mut ExprContext) !str {
 	mut key = ""
 	for i, k in keys {
 		if i > 0 { key += "|" }
-		let val = try EvalExpr(k, mut ctx)
+		mut kMut = k
+		let val = try EvalExpr(mut kMut, mut ctx)
 		if types.IsNull(val) {
 			key += "NULL"
 		} else {
@@ -538,13 +551,15 @@ fn (c mut HashAggCursor) Next() !([]types.Datum, bool) {
 			hasRows = true
 			mut evalCtx = c.Ctx
 			evalCtx.Row = row
-			let gKey = try evalKey(c.GroupKeys, mut evalCtx)
+			mut gKeys = c.GroupKeys
+			let gKey = try evalKey(mut gKeys, mut evalCtx)
 			let (states, exists) = groupAggStates[gKey]
 			if !exists {
 				groupKeysList = append(groupKeysList, gKey)
 				mut groupRow = []types.Datum{}
 				for k in c.GroupKeys {
-					let val = try EvalExpr(k, mut evalCtx)
+					mut kMut = k
+					let val = try EvalExpr(mut kMut, mut evalCtx)
 					groupRow = append(groupRow, val)
 				}
 				groupRowMap[gKey] = groupRow
@@ -560,7 +575,8 @@ fn (c mut HashAggCursor) Next() !([]types.Datum, bool) {
 				let state = curStates[i]
 				mut aggArgs = []types.Datum{}
 				for argExpr in a.Args {
-					let argVal = try EvalExpr(argExpr, mut evalCtx)
+					mut aMut = argExpr
+					let argVal = try EvalExpr(mut aMut, mut evalCtx)
 					aggArgs = append(aggArgs, argVal)
 				}
 				let nextState = try a.Agg.Step(state, aggArgs)
@@ -618,13 +634,16 @@ fn (c mut FunctionScanCursor) Next() !([]types.Datum, bool) {
 			FuncCall(f) => {
 				if f.Func.Name == "generate_series" && len(f.Args) >= 2 {
 					mut ctx1 = c.Ctx
-				let startVal = try EvalExpr(f.Args[0], mut ctx1)
+				mut a0 = f.Args[0]
+				let startVal = try EvalExpr(mut a0, mut ctx1)
 					mut ctx2 = c.Ctx
-				let stopVal = try EvalExpr(f.Args[1], mut ctx2)
+				mut a1 = f.Args[1]
+				let stopVal = try EvalExpr(mut a1, mut ctx2)
 					mut step = i64(1)
 					if len(f.Args) >= 3 {
 						mut ctx3 = c.Ctx
-				let stepVal = try EvalExpr(f.Args[2], mut ctx3)
+				mut a2 = f.Args[2]
+				let stepVal = try EvalExpr(mut a2, mut ctx3)
 						step = mint.ParseInt(stepVal.Text(), 10) catch _ { i64(1) }
 					}
 					let start = mint.ParseInt(startVal.Text(), 10) catch _ { i64(0) }
@@ -736,7 +755,8 @@ fn BuildCursor(p mut plan.Plan, ctx mut ExprContext) !dyn Cursor {
 			for r in v.Rows {
 				mut row = []types.Datum{}
 				for expr in r {
-					let val = try EvalExpr(expr, mut ctx)
+					mut eMut = expr
+					let val = try EvalExpr(mut eMut, mut ctx)
 					row = append(row, val)
 				}
 				rows = append(rows, row)
@@ -797,11 +817,13 @@ fn BuildCursor(p mut plan.Plan, ctx mut ExprContext) !dyn Cursor {
 			mut count = i64(-1)
 			mut offset = i64(0)
 			if let cExpr = l.Count {
-				let cVal = try EvalExpr(cExpr, mut ctx)
+				mut cMut = cExpr
+				let cVal = try EvalExpr(mut cMut, mut ctx)
 				count = mint.ParseInt(cVal.Text(), 10) catch _ { i64(-1) }
 			}
 			if let oExpr = l.Offset {
-				let oVal = try EvalExpr(oExpr, mut ctx)
+				mut oMut = oExpr
+				let oVal = try EvalExpr(mut oMut, mut ctx)
 				offset = mint.ParseInt(oVal.Text(), 10) catch _ { i64(0) }
 			}
 			return PlanLimitCursor{

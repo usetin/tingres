@@ -87,3 +87,14 @@ fn tableOid(t mut crucible.T, label str, table ?Table) Oid {
 fn isMissing(table ?Table) bool {
 	return table == nil
 }
+
+fn BenchmarkCatalogLookup(b mut crucible.B) {
+	let (_, manager0, catalog0) = testCatalog("bench-lookup") catch _ { return }
+	mut manager = manager0
+	let catalog = catalog0
+	let tx = manager.Begin(txn.Isolation.ReadCommitted) catch _ { return }
+	for i in 0..b.N {
+		let table = arena { catalog.LookupTable(tx, "pg_catalog", "pg_class") }
+		if table == nil || i < 0 { continue }
+	}
+}

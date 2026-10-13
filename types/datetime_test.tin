@@ -1,0 +1,163 @@
+package types
+
+import "crucible"
+
+fn TestDateTimeParseAndPostgresText(t mut crucible.T) {
+	SetTimeZone("UTC") catch err {
+		t.Error("set UTC: {ErrorMessage(err)}")
+		return
+	}
+	let date = Parse(DateOid, "2024-01-31") catch err {
+		t.Error("date parse: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "ISO date", date.Text(), "2024-01-31")
+	let monthName = Parse(DateOid, "Jan 31, 2024") catch err {
+		t.Error("month date parse: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "month-name date", monthName.Text(), "2024-01-31")
+	let clock = Parse(TimeOid, "12:34:56.789000") catch err {
+		t.Error("time parse: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "time strips zero fractional digits", clock.Text(), "12:34:56.789")
+	let dayEnd = Parse(TimeOid, "24:00:00") catch err {
+		t.Error("24 hour time parse: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "24 hour time", dayEnd.Text(), "24:00:00")
+	let zoneClock = Parse(TimetzOid, "12:34:56.789+02") catch err {
+		t.Error("timetz parse: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "timetz text", zoneClock.Text(), "12:34:56.789+02")
+	let stamp = Parse(TimestampOid, "2024-01-31 12:34:56.789") catch err {
+		t.Error("timestamp parse: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "timestamp text", stamp.Text(), "2024-01-31 12:34:56.789")
+	let zoneStamp = Parse(TimestamptzOid, "2024-01-31 12:34:56.789+02") catch err {
+		t.Error("timestamptz parse: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "timestamptz UTC output", zoneStamp.Text(), "2024-01-31 10:34:56.789+00")
+	crucible.Equal(mut t, "date infinity", must_parse(DateOid, "infinity"), "infinity")
+}
+
+fn TestDateTimeErrorsAndClock(t mut crucible.T) {
+	let invalid = Parse(DateOid, "bogus") catch err {
+		crucible.Equal(mut t, "date syntax code", ErrorCode(err), "22007")
+		crucible.Equal(mut t, "date syntax message", ErrorMessage(err), "invalid input syntax for type date: \"bogus\"")
+		return
+	}
+	_ = invalid
+	t.Error("invalid date succeeded")
+	let outOfRange = Parse(DateOid, "2024-13-40") catch err {
+		crucible.Equal(mut t, "date range code", ErrorCode(err), "22008")
+		crucible.Equal(mut t, "date range message", ErrorMessage(err), "date/time field value out of range: \"2024-13-40\"")
+		return
+	}
+	_ = outOfRange
+	t.Error("out-of-range date succeeded")
+	SetTimeZone("UTC") catch _ { return }
+	SetClockUnixMicros(1704067200000000)
+	crucible.Equal(mut t, "settable now", Now().Text(), "2024-01-01 00:00:00+00")
+	crucible.Equal(mut t, "current timestamp", CurrentTimestamp().Text(), Now().Text())
+	ResetClock()
+}
+
+fn TestIntervalParseArithmeticAndFunctions(t mut crucible.T) {
+	let dayHours = Parse(IntervalOid, "1 day 2 hours") catch err {
+		t.Error("interval units: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "interval unit output", dayHours.Text(), "1 day 02:00:00")
+	let yearMonth = Parse(IntervalOid, "1-2") catch err {
+		t.Error("year-month interval: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "year-month interval output", yearMonth.Text(), "1 year 2 mons")
+	let minutes = Parse(IntervalOid, "@ 5 min") catch err {
+		t.Error("@ interval: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "@ minute interval", minutes.Text(), "00:05:00")
+	let iso = Parse(IntervalOid, "P1Y2M3DT4H5M6S") catch err {
+		t.Error("ISO interval: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "ISO interval output", iso.Text(), "1 year 2 mons 3 days 04:05:06")
+	let base = Parse(TimestampOid, "2024-01-31 12:00:00") catch _ { return }
+	let monthLater = Parse(IntervalOid, "1 month") catch _ { return }
+	let added = TimestampAddInterval(base, monthLater) catch err {
+		t.Error("timestamp + interval: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "month addition clamps", added.Text(), "2024-02-29 12:00:00")
+	let day = Parse(DateOid, "2024-01-31") catch _ { return }
+	let dayLater = DateAddDays(day, 1) catch _ { return }
+	crucible.Equal(mut t, "date plus integer", dayLater.Text(), "2024-02-01")
+	let start = Parse(TimestampOid, "2024-01-01 01:02:03") catch _ { return }
+	let finish = Parse(TimestampOid, "2024-01-02 03:04:05") catch _ { return }
+	let difference = TimestampSubtract(finish, start) catch _ { return }
+	crucible.Equal(mut t, "timestamp difference", difference.Text(), "1 day 02:02:02")
+	let truncated = DateTrunc("week", finish) catch _ { return }
+	crucible.Equal(mut t, "week truncation", truncated.Text(), "2024-01-01 00:00:00")
+	let timeVal = Parse(TimeOid, "12:34:56.789") catch _ { return }
+	let seconds = Extract("second", timeVal) catch _ { return }
+	crucible.Equal(mut t, "extract second scale", seconds.Text(), "56.789000")
+	let stampVal = Parse(TimestampOid, "2000-01-02 03:04:05.006") catch _ { return }
+	let epoch = Extract("epoch", stampVal) catch _ { return }
+	crucible.Equal(mut t, "extract epoch", epoch.Text(), "946782245.006000")
+	let ms = Extract("milliseconds", timeVal) catch _ { return }
+	crucible.Equal(mut t, "extract milliseconds", ms.Text(), "56789.000")
+	let madeDate = MakeDate(2024, 1, 31) catch _ { return }
+	crucible.Equal(mut t, "make_date", madeDate.Text(), "2024-01-31")
+	let madeStamp = MakeTimestamp(2024, 1, 31, 12, 34, 56.789) catch _ { return }
+	crucible.Equal(mut t, "make_timestamp", madeStamp.Text(), "2024-01-31 12:34:56.789")
+	crucible.Equal(mut t, "to_char fields", ToChar(madeStamp, "YYYY-MM-DD HH24:MI:SS.MS Mon Day"), "2024-01-31 12:34:56.789 Jan Wednesday")
+}
+
+fn TestTimeZoneBinaryAndCast(t mut crucible.T) {
+	SetTimeZone("America/New_York") catch err {
+		t.Error("load IANA zone: {ErrorMessage(err)}")
+		return
+	}
+	let local = Parse(TimestamptzOid, "2024-07-01 12:00:00") catch err {
+		t.Error("local zone parse: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "IANA timezone output", local.Text(), "2024-07-01 12:00:00-04")
+	SetTimeZone("UTC") catch _ { return }
+	let stampToCast = Parse(TimestampOid, "2024-01-01 12:00:00") catch _ { return }
+	let casted = Cast(stampToCast, TimestamptzOid) catch _ { return }
+	crucible.Equal(mut t, "timestamp to timestamptz", casted.Text(), "2024-01-01 12:00:00+00")
+	let date = Parse(DateOid, "2000-01-02") catch _ { return }
+	mut bytes = []u8{}
+	EncodeBinary(date, mut bytes)
+	crucible.Equal(mut t, "date binary bytes", hex(bytes), "00000001")
+	let dateRoundTrip = DecodeBinary(DateOid, bytes) catch err {
+		t.Error("date binary decode: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "date binary roundtrip", dateRoundTrip.Text(), date.Text())
+	let time = Parse(TimeOid, "12:34:56.789") catch _ { return }
+	bytes = []u8{}
+	EncodeBinary(time, mut bytes)
+	crucible.Equal(mut t, "time binary bytes", hex(bytes), "0000000a8be62608")
+	let interval = Parse(IntervalOid, "1 day 2 hours") catch _ { return }
+	bytes = []u8{}
+	EncodeBinary(interval, mut bytes)
+	crucible.Equal(mut t, "interval binary bytes", hex(bytes), "00000001ad2748000000000100000000")
+	let decoded = DecodeBinary(IntervalOid, bytes) catch err {
+		t.Error("interval binary decode: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "interval binary text", decoded.Text(), interval.Text())
+}
+
+fn must_parse(oid Oid, input str) str {
+	let value = Parse(oid, input) catch _ { return "parse-error" }
+	return value.Text()
+}

@@ -86,7 +86,8 @@ fn TestExtendedProtocolParseBindExecuteDescribe(t mut crucible.T) {
 
 	// 3. Bind to portal
 	mut bindParams = []types.Datum{}
-	s.Bind("p1", "s1", mut bindParams, []i16{0}) catch err {
+	mut rf = []i16{0}
+	s.Bind("p1", "s1", mut bindParams, mut rf) catch err {
 		t.Error("Bind failed: {err}")
 		return
 	}
