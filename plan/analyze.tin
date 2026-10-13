@@ -539,7 +539,7 @@ fn analyzeSelectCore(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes [
 		GroupBy: groupByExprs,
 		Having: havingExpr,
 		Windows: []AnalyzedWindow{},
-		Distinct: core.Distinct != "",
+		Distinct: core.Distinct == "distinct" || core.Distinct == "distinct on",
 		OrderBy: orderKeys,
 		Limit: limitExpr,
 		Offset: offsetExpr,
@@ -903,7 +903,7 @@ fn analyzeExpr(c catalog.Catalog, tx txn.Txn, scopes []Scope, ctes []CteInfo, fl
 			return Expr.SubLink(SubLinkExpr{LinkType: SubLinkType.Exists, SubPlan: Plan.Utility(UtilityNode{Stmt: parse.Stmt.Select(exists.Query), Cols: []ColDesc{}}), TestExpr: nil, OuterRefs: []ColRefExpr{}, Type: u32(types.BoolOid)})
 		}
 		_ => {
-			return Expr.Const(ConstExpr{Value: types.Null(), Type: u32(types.UnknownLiteralOid)})
+			return mkNullConst(u32(types.UnknownLiteralOid))
 		}
 	}
 }
@@ -914,30 +914,31 @@ fn analyzeLiteral(lit parse.LiteralExpr, targetType u32) !Expr {
 			let val = mint.Atoi(lit.Value) catch _ {
 				fail types.ErrorFault(types.NewError("22003", "integer out of range"))
 			}
-			return Expr.Const(ConstExpr{Value: types.FromI64(types.Int4Oid, val), Type: u32(types.Int4Oid)})
+			return mkInt4Const(types.Int4Oid, val)
 		}
 		"float" => {
-			return Expr.Const(ConstExpr{Value: types.FromStr(types.Float8Oid, lit.Value), Type: u32(types.Float8Oid)})
+			return mkStrConst(types.Float8Oid, lit.Value)
 		}
 		"bool" => {
 			let bVal = lit.Value == "true" || lit.Value == "t"
-			return Expr.Const(ConstExpr{Value: types.FromBool(bVal), Type: u32(types.BoolOid)})
+			return mkBoolConst(bVal)
 		}
 		"null" => {
 			mut typ = u32(types.UnknownLiteralOid)
 			if targetType != 0 {
 				typ = targetType
 			}
-			return Expr.Const(ConstExpr{Value: types.Null(), Type: typ})
+			return mkNullConst(typ)
 		}
 		_ => {
 			if targetType != 0 && targetType != u32(types.UnknownLiteralOid) {
 				let parsed = types.Parse(types.Oid(targetType), lit.Value) catch _ {
 					fail types.ErrorFault(types.NewError("22P02", "invalid input syntax for type " + typeName(targetType) + ": \"" + lit.Value + "\""))
 				}
-				return Expr.Const(ConstExpr{Value: parsed, Type: targetType})
+				return mkConstExpr(parsed, targetType)
 			}
-			return Expr.Const(ConstExpr{Value: types.FromStr(types.TextOid, lit.Value), Type: u32(types.UnknownLiteralOid)})
+			let textD = types.FromStr(types.TextOid, lit.Value)
+			return mkConstExpr(textD, u32(types.UnknownLiteralOid))
 		}
 	}
 }
