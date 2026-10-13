@@ -1,0 +1,298 @@
+package exec
+
+import "../types"
+import "../plan"
+import "../catalog"
+import "../txn"
+
+// ExprContext supplies execution context to scalar expression evaluation.
+type ExprContext struct {
+	Row []types.Datum
+	Params []types.Datum
+	Txn ?txn.Txn
+	Catalog ?catalog.Catalog
+}
+
+// NewExprContext creates an expression evaluation context.
+fn NewExprContext(row []types.Datum, params []types.Datum) ExprContext {
+	return ExprContext{
+		Row: row,
+		Params: params,
+		Txn: nil,
+		Catalog: nil,
+	}
+}
+
+// EvalExpr evaluates a typed physical plan.Expr against an execution context.
+fn EvalExpr(e plan.Expr, ctx mut ExprContext) !types.Datum {
+	match e {
+		Const(c) => {
+			return c.Value
+		}
+		ColRef(c) => {
+			if c.Slot < 0 || c.Slot >= len(ctx.Row) {
+				return types.Null()
+			}
+			return ctx.Row[c.Slot]
+		}
+		Param(p) => {
+			let idx = p.N - 1
+			if idx < 0 || idx >= len(ctx.Params) {
+				try expressionError("42P02", "there is no parameter ${p.N}")
+			}
+			return ctx.Params[idx]
+		}
+		FuncCall(f) => {
+			mut args = []types.Datum{}
+			mut hasNull = false
+			for argExpr in f.Args {
+				let val = try EvalExpr(argExpr, mut ctx)
+				if types.IsNull(val) {
+					hasNull = true
+				}
+				args = append(args, val)
+			}
+			if f.Func.Strict && hasNull {
+				return types.Null()
+			}
+			let res = try f.Func.Call(args)
+			if f.Type != 0 && !types.IsNull(res) && res.Oid() != f.Type {
+				return try types.Cast(res, f.Type)
+			}
+			return res
+		}
+		OpCall(o) => {
+			mut args = []types.Datum{}
+			mut hasNull = false
+			for argExpr in o.Args {
+				let val = try EvalExpr(argExpr, mut ctx)
+				if types.IsNull(val) {
+					hasNull = true
+				}
+				args = append(args, val)
+			}
+			if o.Func.Strict && hasNull {
+				return types.Null()
+			}
+			let res = try o.Func.Call(args)
+			if o.Type != 0 && !types.IsNull(res) && res.Oid() != o.Type {
+				return try types.Cast(res, o.Type)
+			}
+			return res
+		}
+		BoolExpr(b) => {
+			match b.Op {
+				And => {
+					mut hasNull = false
+					for argExpr in b.Args {
+						let val = try EvalExpr(argExpr, mut ctx)
+						if isFalse(val) {
+							return types.FromBool(false)
+						}
+						if types.IsNull(val) {
+							hasNull = true
+						}
+					}
+					if hasNull {
+						return types.Null()
+					}
+					return types.FromBool(true)
+				}
+				Or => {
+					mut hasNull = false
+					for argExpr in b.Args {
+						let val = try EvalExpr(argExpr, mut ctx)
+						if isTrue(val) {
+							return types.FromBool(true)
+						}
+						if types.IsNull(val) {
+							hasNull = true
+						}
+					}
+					if hasNull {
+						return types.Null()
+					}
+					return types.FromBool(false)
+				}
+				Not => {
+					if len(b.Args) == 0 {
+						return types.Null()
+					}
+					let val = try EvalExpr(b.Args[0], mut ctx)
+					if types.IsNull(val) {
+						return types.Null()
+					}
+					return types.FromBool(!isTrue(val))
+				}
+			}
+		}
+		NullTest(n) => {
+			let val = try EvalExpr(n.Arg, mut ctx)
+			let isNull = types.IsNull(val)
+			match n.Test {
+				IsNull => { return types.FromBool(isNull) }
+				IsNotNull => { return types.FromBool(!isNull) }
+			}
+		}
+		Case(c) => {
+			for w in c.Whens {
+				let cond = try EvalExpr(w.When, mut ctx)
+				if isTrue(cond) {
+					let thenVal = try EvalExpr(w.Then, mut ctx)
+					if c.Type != 0 && !types.IsNull(thenVal) && thenVal.Oid() != c.Type {
+						return try types.Cast(thenVal, c.Type)
+					}
+					return thenVal
+				}
+			}
+			if let elseExpr = c.Else {
+				let elseVal = try EvalExpr(elseExpr, mut ctx)
+				if c.Type != 0 && !types.IsNull(elseVal) && elseVal.Oid() != c.Type {
+					return try types.Cast(elseVal, c.Type)
+				}
+				return elseVal
+			}
+			return types.Null()
+		}
+		Coalesce(c) => {
+			for argExpr in c.Args {
+				let val = try EvalExpr(argExpr, mut ctx)
+				if !types.IsNull(val) {
+					if c.Type != 0 && val.Oid() != c.Type {
+						return try types.Cast(val, c.Type)
+					}
+					return val
+				}
+			}
+			return types.Null()
+		}
+		Cast(c) => {
+			let val = try EvalExpr(c.Arg, mut ctx)
+			if types.IsNull(val) {
+				return types.Null()
+			}
+			return try types.Cast(val, c.Type)
+		}
+		SubLink(s) => {
+			mut sMut = s
+			return try evalSubLink(mut sMut, mut ctx)
+		}
+		RowExpr(r) => {
+			mut rowStr = "("
+			for i, elem in r.Elements {
+				if i > 0 { rowStr += "," }
+				let val = try EvalExpr(elem, mut ctx)
+				if !types.IsNull(val) {
+					rowStr += val.Text()
+				}
+			}
+			rowStr += ")"
+			return types.FromStr(r.Type, rowStr)
+		}
+		ArrayExpr(a) => {
+			mut arrStr = "{{"
+			for i, elem in a.Elements {
+				if i > 0 { arrStr += "," }
+				let val = try EvalExpr(elem, mut ctx)
+				if types.IsNull(val) {
+					arrStr += "NULL"
+				} else {
+					arrStr += val.Text()
+				}
+			}
+			arrStr += "}}"
+			return types.FromStr(a.Type, arrStr)
+		}
+		AggRef(a) => {
+			if a.Slot >= 0 && a.Slot < len(ctx.Row) {
+				return ctx.Row[a.Slot]
+			}
+			return types.Null()
+		}
+		WindowFuncRef(w) => {
+			if w.Slot >= 0 && w.Slot < len(ctx.Row) {
+				return ctx.Row[w.Slot]
+			}
+			return types.Null()
+		}
+	}
+	return types.Null()
+}
+
+fn evalSubLink(s mut plan.SubLinkExpr, ctx mut ExprContext) !types.Datum {
+	match s.LinkType {
+		Exists => {
+			mut cur = try buildPlanCursor(mut s.SubPlan, mut ctx)
+			let (_, ok) = try cur.Next()
+			return types.FromBool(ok)
+		}
+		Scalar => {
+			mut cur = try buildPlanCursor(mut s.SubPlan, mut ctx)
+			let (row, ok) = try cur.Next()
+			if !ok || len(row) == 0 {
+				return types.Null()
+			}
+			return row[0]
+		}
+		In, Any => {
+			if let test = s.TestExpr {
+				let testVal = try EvalExpr(test, mut ctx)
+				mut cur = try buildPlanCursor(mut s.SubPlan, mut ctx)
+				mut anyNull = types.IsNull(testVal)
+				for {
+					let (row, ok) = try cur.Next()
+					if !ok { break }
+					if len(row) > 0 {
+						let item = row[0]
+						if types.IsNull(item) {
+							anyNull = true
+						} else if !types.IsNull(testVal) && types.Compare(testVal, item) == 0 {
+							return types.FromBool(true)
+						}
+					}
+				}
+				if anyNull {
+					return types.Null()
+				}
+				return types.FromBool(false)
+			}
+			return types.FromBool(false)
+		}
+		All => {
+			if let test = s.TestExpr {
+				let testVal = try EvalExpr(test, mut ctx)
+				mut cur = try buildPlanCursor(mut s.SubPlan, mut ctx)
+				mut allTrue = true
+				mut anyNull = types.IsNull(testVal)
+				for {
+					let (row, ok) = try cur.Next()
+					if !ok { break }
+					if len(row) > 0 {
+						let item = row[0]
+						if types.IsNull(item) {
+							anyNull = true
+						} else if !types.IsNull(testVal) && types.Compare(testVal, item) != 0 {
+							allTrue = false
+							break
+						}
+					}
+				}
+				if !allTrue {
+					return types.FromBool(false)
+				}
+				if anyNull {
+					return types.Null()
+				}
+				return types.FromBool(true)
+			}
+			return types.FromBool(true)
+		}
+	}
+}
+
+// buildPlanCursor creates a cursor for subquery plan execution
+fn buildPlanCursor(p mut plan.Plan, ctx mut ExprContext) !dyn Cursor {
+	let c = try BuildCursor(mut p, mut ctx)
+	return c
+}
+

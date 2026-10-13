@@ -1,435 +1,50 @@
 package parse
 
-shape Statement {
-	Kind() str
-	SQL() str
-}
-
-shape Expression {
-	NodeKind() str
-	Text() str
-}
-
-type Stmt = dyn Statement
-type Expr = dyn Expression
-
-type Token struct {
-	text str
-	kind str
-	pos i64
-}
-
-type ParseError struct {
-	pos i64
-	message str
-}
-
-type SelectStmt struct { sql str }
-type InsertStmt struct { sql str }
-type UpdateStmt struct { sql str }
-type DeleteStmt struct { sql str }
-type CreateTableStmt struct { sql str }
-type DropStmt struct { sql str }
-type TransactionStmt struct { sql str }
-type UtilityStmt struct { sql str }
-
-type Literal struct {
-	value str
-	literalKind str
-}
-type ColumnRef struct {
-	schema str
-	table str
-	name str
-}
-type Param struct { n i64 }
-type UnaryExpr struct {
-	op str
-	right Expr
-}
-type BinaryExpr struct {
-	left Expr
-	op str
-	right Expr
-}
-type CallExpr struct {
-	name str
-	args []Expr
-}
-type RawExpr struct { text str }
-
-type Lexer struct {
-	sql str
-	at i64
-	tokens []Token
-}
-type Parser struct {
-	tokens []Token
-	at i64
-}
-
-// Kind reports the statement category used by planning.
-fn (s SelectStmt) Kind() str { return "select" }
-// SQL returns the source SQL for this statement.
-fn (s SelectStmt) SQL() str { return s.sql }
-// Kind reports the statement category used by planning.
-fn (s InsertStmt) Kind() str { return "insert" }
-// SQL returns the source SQL for this statement.
-fn (s InsertStmt) SQL() str { return s.sql }
-// Kind reports the statement category used by planning.
-fn (s UpdateStmt) Kind() str { return "update" }
-// SQL returns the source SQL for this statement.
-fn (s UpdateStmt) SQL() str { return s.sql }
-// Kind reports the statement category used by planning.
-fn (s DeleteStmt) Kind() str { return "delete" }
-// SQL returns the source SQL for this statement.
-fn (s DeleteStmt) SQL() str { return s.sql }
-// Kind reports the statement category used by planning.
-fn (s CreateTableStmt) Kind() str { return "create_table" }
-// SQL returns the source SQL for this statement.
-fn (s CreateTableStmt) SQL() str { return s.sql }
-// Kind reports the statement category used by planning.
-fn (s DropStmt) Kind() str { return "drop" }
-// SQL returns the source SQL for this statement.
-fn (s DropStmt) SQL() str { return s.sql }
-// Kind reports the statement category used by planning.
-fn (s TransactionStmt) Kind() str { return "transaction" }
-// SQL returns the source SQL for this statement.
-fn (s TransactionStmt) SQL() str { return s.sql }
-// Kind reports the statement category used by planning.
-fn (s UtilityStmt) Kind() str { return "utility" }
-// SQL returns the source SQL for this statement.
-fn (s UtilityStmt) SQL() str { return s.sql }
-
-// NodeKind identifies a literal expression.
-fn (e Literal) NodeKind() str { return e.literalKind }
-// Text renders a literal expression.
-fn (e Literal) Text() str { return e.value }
-// NodeKind identifies a column reference.
-fn (e ColumnRef) NodeKind() str { return "column" }
-// Text renders a qualified column reference.
-fn (e ColumnRef) Text() str {
-	if e.schema != "" { return e.schema + "." + e.table + "." + e.name }
-	if e.table != "" { return e.table + "." + e.name }
-	return e.name
-}
-// NodeKind identifies a positional parameter.
-fn (e Param) NodeKind() str { return "param" }
-// Text renders a positional parameter.
-fn (e Param) Text() str { return "$" + itoa(e.n) }
-// NodeKind identifies a unary expression.
-fn (e UnaryExpr) NodeKind() str { return "unary" }
-// Text renders a unary expression.
-fn (e UnaryExpr) Text() str {
-	if e.op == "not" { return "not " + e.right.Text() }
-	return e.op + e.right.Text()
-}
-// NodeKind identifies a binary expression.
-fn (e BinaryExpr) NodeKind() str { return "binary" }
-// Text renders a binary expression.
-fn (e BinaryExpr) Text() str { return "(" + e.left.Text() + " " + e.op + " " + e.right.Text() + ")" }
-// NodeKind identifies a function call.
-fn (e CallExpr) NodeKind() str { return "call" }
-// Text renders a function call.
-fn (e CallExpr) Text() str {
-	mut out = e.name + "("
-	for i, arg in e.args {
-		if i > 0 { out += ", " }
-		out += arg.Text()
-	}
-	return out + ")"
-}
-// NodeKind identifies an expression preserved as syntax.
-fn (e RawExpr) NodeKind() str { return "raw" }
-// Text returns the original expression text.
-fn (e RawExpr) Text() str { return e.text }
-
-fn itoa(v i64) str {
-	if v == 0 { return "0" }
-	mut n = v
-	mut out = ""
-	if n < 0 { n = -n }
-	for n > 0 {
-		let d = n % 10
-		out = str(u8(d) + 48) + out
-		n = n / 10
-	}
-	if v < 0 { return "-" + out }
-	return out
-}
-
-fn lower(s str) str {
-	mut out = ""
-	for _, c in s {
-		if c >= 'A' && c <= 'Z' { out += str(c + 32) } else { out += str(c) }
-	}
-	return out
-}
-
-fn is_space(c u8) bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 }
-fn is_letter(c u8) bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 128 }
-fn is_digit(c u8) bool { return c >= 48 && c <= 57 }
-
-fn lex(sql str) ![]Token {
-	mut l = Lexer{sql: sql, at: 0, tokens: []Token{}}
-	let n = len(sql)
-	for l.at < n {
-		let c = sql[l.at]
-		if is_space(c) { l.at += 1
-			continue }
-		if c == 45 && l.at + 1 < n && sql[l.at + 1] == 45 {
-			l.at += 2
-			for l.at < n && sql[l.at] != 10 { l.at += 1 }
-			continue
-		}
-		if c == 47 && l.at + 1 < n && sql[l.at + 1] == 42 {
-			let start = l.at
-			l.at += 2
-			mut depth = 1
-			for l.at < n && depth > 0 {
-				if l.at + 1 < n && sql[l.at] == 47 && sql[l.at + 1] == 42 {
-					depth += 1
-					l.at += 2
-				} else if l.at + 1 < n && sql[l.at] == 42 && sql[l.at + 1] == 47 {
-					depth -= 1
-					l.at += 2
-				} else {
-					l.at += 1
-				}
-			}
-			if depth > 0 { fail syntax_error(sql, start + 1, "") }
-			continue
-		}
-		let start = l.at
-		if is_letter(c) {
-			l.at += 1
-			for l.at < n && (is_letter(sql[l.at]) || is_digit(sql[l.at]) || sql[l.at] == 36) { l.at += 1 }
-			l.tokens = append(l.tokens, Token{text: sql[start:l.at], kind: "word", pos: start + 1})
-			continue
-		}
-		if is_digit(c) {
-			l.at += 1
-			for l.at < n && (is_digit(sql[l.at]) || sql[l.at] == 95) { l.at += 1 }
-			if l.at + 1 < n && sql[l.at] == 46 && sql[l.at + 1] != 46 {
-				l.at += 1
-				for l.at < n && (is_digit(sql[l.at]) || sql[l.at] == 95) { l.at += 1 }
-			}
-			if l.at < n && (sql[l.at] == 101 || sql[l.at] == 69) {
-				l.at += 1
-				if l.at < n && (sql[l.at] == 43 || sql[l.at] == 45) { l.at += 1 }
-				for l.at < n && (is_digit(sql[l.at]) || sql[l.at] == 95) { l.at += 1 }
-			}
-			l.tokens = append(l.tokens, Token{text: sql[start:l.at], kind: "number", pos: start + 1})
-			continue
-		}
-		if c == 39 || c == 34 {
-			let quote = c
-			l.at += 1
-			mut closed = false
-			for l.at < n {
-				if sql[l.at] == quote {
-					if l.at + 1 < n && sql[l.at + 1] == quote {
-						l.at += 2
-					} else {
-						l.at += 1
-						closed = true
-						break
-					}
-				} else if sql[l.at] == 92 && quote == 39 && start > 0 && (sql[start - 1] == 69 || sql[start - 1] == 101) {
-					l.at += min(2, n - l.at)
-				} else {
-					l.at += 1
-				}
-			}
-			if !closed { fail syntax_error(sql, start + 1, "") }
-			mut kind = "quoted"
-			if quote == 39 { kind = "string" }
-			l.tokens = append(l.tokens, Token{text: sql[start:l.at], kind: kind, pos: start + 1})
-			continue
-		}
-		if c == 36 {
-			l.at += 1
-			mut tagEnd = l.at
-			for tagEnd < n && (is_letter(sql[tagEnd]) || is_digit(sql[tagEnd]) || sql[tagEnd] == 95) { tagEnd += 1 }
-			if tagEnd < n && sql[tagEnd] == 36 {
-				let marker = sql[start:tagEnd + 1]
-				l.at = tagEnd + 1
-				let close = find_from(sql, marker, l.at)
-				if close < 0 { fail syntax_error(sql, start + 1, "") }
-				l.at = close + len(marker)
-				l.tokens = append(l.tokens, Token{text: sql[start:l.at], kind: "string", pos: start + 1})
-			} else {
-				for l.at < n && is_digit(sql[l.at]) { l.at += 1 }
-				if l.at == start + 1 { l.tokens = append(l.tokens, Token{text: "$", kind: "symbol", pos: start + 1}) } else { l.tokens = append(l.tokens, Token{text: sql[start:l.at], kind: "param", pos: start + 1}) }
-			}
-			continue
-		}
-		mut width = 1
-		if l.at + 2 < n && (sql[l.at:l.at + 3] == "->>" || sql[l.at:l.at + 3] == "#>>") { width = 3 } else if l.at + 1 < n {
-			let two = sql[l.at:l.at + 2]
-			if two == "::" || two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "->" || two == "#>" || two == ".." { width = 2 }
-		}
-		l.at += width
-		l.tokens = append(l.tokens, Token{text: sql[start:l.at], kind: "symbol", pos: start + 1})
-	}
-	return l.tokens
-}
-
-fn decimal(s str) i64 {
-	mut n = 0
-	for _, c in s {
-		if c >= '0' && c <= '9' { n = n * 10 + i64(c - '0') }
-	}
-	return n
-}
-
-fn find_from(s str, needle str, from i64) i64 {
-	if len(needle) == 0 { return from }
-	for i in from..len(s) - len(needle) + 1 {
-		if s[i:i + len(needle)] == needle { return i }
-	}
-	return -1
-}
-
-fn syntax_error(sql str, pos i64, near str) str {
-	mut token = near
-	if token == "" && pos > 0 && pos <= len(sql) { token = str(sql[pos - 1]) }
-	if token == "" { return "syntax error at end of input" }
-	return "syntax error at or near \"{token}\" (position {pos})"
-}
-
-// Parse splits a simple-query string into typed statement nodes.
+// Parse parses every non-empty statement in a simple-query string.
 fn Parse(sql str) ![]Stmt {
-	let toks = try lex(sql)
+	let tokens = try lex(sql)
 	mut statements = []Stmt{}
-	mut begin = 0
-	mut depth = 0
-	for i, tok in toks {
-		if tok.text == "(" { depth += 1 }
-		if tok.text == ")" { depth -= 1
-			if depth < 0 { fail syntax_error(sql, tok.pos, tok.text) } }
-		if tok.text == ";" && depth == 0 {
-			if i > begin { statements = append(statements, make_stmt(tokens_sql(toks[begin:i]), toks[begin].text)) }
-			begin = i + 1
+	mut start = 0
+	mut parens = 0
+	mut brackets = 0
+	for i, token in tokens {
+		if token.Text == "(" { parens += 1 }
+		if token.Text == ")" {
+			parens -= 1
+			if parens < 0 { fail syntaxMessage(sql, token.BytePos, "syntax error at or near \")\"") }
+		}
+		if token.Text == "[" { brackets += 1 }
+		if token.Text == "]" {
+			brackets -= 1
+			if brackets < 0 { fail syntaxMessage(sql, token.BytePos, "syntax error at or near \"]\"") }
+		}
+		if token.Text == ";" && parens == 0 && brackets == 0 {
+			if i > start {
+				let statement = try parseStatement(sql, tokens[start:i])
+				statements = append(statements, statement)
+			}
+			start = i + 1
 		}
 	}
-	if depth != 0 { fail syntax_error(sql, len(sql) + 1, "") }
-	if begin < len(toks) { statements = append(statements, make_stmt(tokens_sql(toks[begin:]), toks[begin].text)) }
+	if parens != 0 || brackets != 0 { fail syntaxMessage(sql, len(sql), "syntax error at end of input") }
+	if start < len(tokens) {
+		let statement = try parseStatement(sql, tokens[start:])
+		statements = append(statements, statement)
+	}
 	return statements
 }
 
-fn tokens_sql(toks []Token) str {
-	mut out = ""
-	for i, t in toks {
-		if i > 0 && needs_space(toks[i - 1], t) { out += " " }
-		out += t.text
-	}
-	return out
-}
-fn needs_space(a Token, b Token) bool {
-	if b.text == ")" || b.text == "]" || b.text == "," || b.text == "." || b.text == ";" { return false }
-	if a.text == "(" || a.text == "[" || a.text == "." || a.text == "::" { return false }
-	return true
-}
-fn make_stmt(sql str, first str) Stmt {
-	let k = lower(first)
-	if k == "select" || k == "with" || k == "values" || k == "(" { return SelectStmt{sql: sql} }
-	if k == "insert" { return InsertStmt{sql: sql} }
-	if k == "update" { return UpdateStmt{sql: sql} }
-	if k == "delete" { return DeleteStmt{sql: sql} }
-	if k == "create" && find_from(lower(sql), "table", 0) >= 0 { return CreateTableStmt{sql: sql} }
-	if k == "drop" { return DropStmt{sql: sql} }
-	if k == "begin" || k == "start" || k == "commit" || k == "rollback" || k == "savepoint" || k == "release" { return TransactionStmt{sql: sql} }
-	return UtilityStmt{sql: sql}
-}
-
-// ParseExpr parses one expression using PostgreSQL operator precedence.
+// ParseExpr parses exactly one PostgreSQL expression.
 fn ParseExpr(sql str) !Expr {
 	let tokens = try lex(sql)
-	if len(tokens) == 0 { fail syntax_error(sql, 1, "") }
-	mut p = Parser{tokens: tokens, at: 0}
-	let e = try p.parse_binary(0)
-	if p.at != len(p.tokens) { fail syntax_error(sql, p.tokens[p.at].pos, p.tokens[p.at].text) }
-	return e
+	if len(tokens) == 0 { fail syntaxMessage(sql, len(sql), "syntax error at end of input") }
+	mut p = Parser{Source: sql, Tokens: tokens, At: 0, Depth: 0}
+	let expression = try p.parseExpression(0)
+	if !p.done() { try p.errorHere() }
+	return expression
 }
 
-fn (p mut Parser) parse_binary(minPrec i64) !Expr {
-	mut left = try p.parse_primary()
-	for p.at < len(p.tokens) {
-		let op = lower(p.tokens[p.at].text)
-		let prec = precedence(op)
-		if prec < minPrec || prec == 0 { break }
-		p.at += 1
-		let right = try p.parse_binary(prec + 1)
-		left = BinaryExpr{left: left, op: op, right: right}
-	}
-	return left
+// Deparse returns canonical SQL for a typed statement.
+fn Deparse(statement Stmt) str {
+	return deparseStatement(statement)
 }
-fn precedence(op str) i64 {
-	if op == "or" { return 1 }
-	if op == "and" { return 2 }
-	if op == "=" || op == "!=" || op == "<>" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "like" || op == "ilike" || op == "is" || op == "in" || op == "between" { return 3 }
-	if op == "||" { return 4 }
-	if op == "+" || op == "-" { return 5 }
-	if op == "*" || op == "/" || op == "%" { return 6 }
-	if op == "^" { return 7 }
-	return 0
-}
-fn (p mut Parser) parse_primary() !Expr {
-	if p.at >= len(p.tokens) { fail "syntax error at end of input" }
-	let t = p.tokens[p.at]
-	p.at += 1
-	let w = lower(t.text)
-	if t.kind == "number" || t.kind == "string" { return Literal{value: t.text, literalKind: t.kind} }
-	if t.kind == "param" { return Param{n: decimal(t.text[1:])} }
-	if w == "null" || w == "true" || w == "false" { return Literal{value: w, literalKind: "keyword"} }
-	if w == "not" || t.text == "+" || t.text == "-" || t.text == "~" {
-		let right = try p.parse_binary(8)
-		return UnaryExpr{op: w, right: right}
-	}
-	if t.text == "(" {
-		let inside = try p.parse_binary(0)
-		if p.at >= len(p.tokens) || p.tokens[p.at].text != ")" { fail syntax_error("", t.pos, "(") }
-		p.at += 1
-		return inside
-	}
-	if t.kind == "word" || t.kind == "quoted" {
-		mut name = t.text
-		if p.at < len(p.tokens) && p.tokens[p.at].text == "(" {
-			p.at += 1
-			mut args = []Expr{}
-			if p.at < len(p.tokens) && p.tokens[p.at].text != ")" {
-				for {
-					let arg = try p.parse_binary(0)
-					args = append(args, arg)
-					if p.at >= len(p.tokens) || p.tokens[p.at].text != "," { break }
-					p.at += 1
-				}
-			}
-			if p.at >= len(p.tokens) || p.tokens[p.at].text != ")" { fail syntax_error("", t.pos, name) }
-			p.at += 1
-			return CallExpr{name: name, args: args}
-		}
-		mut schema = ""
-		mut table = ""
-		if p.at < len(p.tokens) && p.tokens[p.at].text == "." {
-			p.at += 1
-			if p.at >= len(p.tokens) { fail "syntax error at end of input" }
-			table = name
-			name = p.tokens[p.at].text
-			p.at += 1
-			if p.at < len(p.tokens) && p.tokens[p.at].text == "." {
-				p.at += 1
-				schema = table
-				table = name
-				name = p.tokens[p.at].text
-				p.at += 1
-			}
-		}
-		return ColumnRef{schema: schema, table: table, name: name}
-	}
-	fail syntax_error("", t.pos, t.text)
-}
-
-// Deparse returns SQL for any statement node.
-fn Deparse(s Stmt) str { return s.SQL() }

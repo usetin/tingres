@@ -188,6 +188,10 @@ type Sink shape {
 	DataRow(r types.Row)
 	CommandComplete(tag str)                       // "SELECT 5", "INSERT 0 1", ...
 	Notice(n Notice)
+	CopyIn(format i8, columnFormats []i16)
+	CopyOut(format i8, columnFormats []i16)
+	CopyData(d []u8)
+	CopyDone()
 }
 ```
 

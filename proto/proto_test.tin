@@ -36,3 +36,21 @@ fn TestScramAttributes(t mut crucible.T) {
 	let (_, err2) = scram_attrs("m=mandatory")
 	t.HasFault("mandatory extension is rejected", err2)
 }
+
+fn TestBufferedRowEncoders(t mut crucible.T) {
+	mut out = make([]u8, 0, 128)
+	encode_data_row(mut out, []Cell{Cell{Value: "1"}})
+	t.True("DataRow tag", out[0] == 'D')
+	crucible.Equal(mut t, "DataRow frame length", be(out, 1, 4), 11)
+	crucible.Equal(mut t, "DataRow field count", be(out, 5, 2), 1)
+	crucible.Equal(mut t, "DataRow value length", be(out, 7, 4), 1)
+	t.True("DataRow value bytes", out[11] == '1')
+
+	out = out[:0]
+	encode_row_description(mut out, []Column{Column{Name: "x", TypeOid: 23, TypeSize: 4, TypeMod: -1}})
+	t.True("RowDescription tag", out[0] == 'T')
+	crucible.Equal(mut t, "RowDescription frame length", be(out, 1, 4), 26)
+	crucible.Equal(mut t, "RowDescription field count", be(out, 5, 2), 1)
+	t.True("RowDescription column name", out[7] == 'x' && out[8] == 0)
+	crucible.Equal(mut t, "RowDescription type oid", be(out, 15, 4), 23)
+}

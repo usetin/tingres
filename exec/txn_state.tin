@@ -1,0 +1,24 @@
+package exec
+
+// TxnState represents the session's transaction block state.
+type TxnState enum {
+	Idle
+	InTxn
+	Aborted
+}
+
+// Savepoint tracks the state at a named savepoint in a transaction block.
+type Savepoint struct {
+	Name str
+	Cid u32
+	LocalGucCount i64
+}
+
+// TxnStatusChar returns the PostgreSQL protocol status character ('I', 'T', 'E').
+fn (s TxnState) StatusChar() u8 {
+	match s {
+		Idle => return 'I'
+		InTxn => return 'T'
+		Aborted => return 'E'
+	}
+}
