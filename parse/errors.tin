@@ -1,0 +1,65 @@
+package parse
+
+import "fault"
+
+fn positionedMessage(code str, pos i64, message str) str {
+	mut prefix = ""
+	if code == "0A000" { prefix = "feature not supported: " }
+	return "{prefix}{message} (position {pos})"
+}
+
+// ErrorPos extracts the 1-based SQL character position from a parse fault.
+fn ErrorPos(err fault) (i64, bool) {
+	let message = fault.Message(err)
+	let marker = " (position "
+	let at = findText(message, marker)
+	if at < 0 { return 0, false }
+	let end = findText(message[at + len(marker):], ")")
+	if end < 0 { return 0, false }
+	let digits = message[at + len(marker):at + len(marker) + end]
+	if len(digits) == 0 { return 0, false }
+	mut value = 0
+	for _, c in digits {
+		if c < '0' || c > '9' { return 0, false }
+		value = value * 10 + i64(c - '0')
+	}
+	return value, true
+}
+
+// ErrorCode identifies the SQLSTATE carried by a parse fault.
+fn ErrorCode(err fault) str {
+	let message = fault.Message(err)
+	if hasPrefix(message, "stack depth limit exceeded") { return "54001" }
+	if hasPrefix(message, "feature not supported:") { return "0A000" }
+	return "42601"
+}
+
+fn syntaxMessage(sql str, bytePos i64, message str) str {
+	return positionedMessage("42601", charPosition(sql, bytePos), message)
+}
+
+fn unsupportedMessage(sql str, bytePos i64, feature str) str {
+	return positionedMessage("0A000", charPosition(sql, bytePos), feature)
+}
+
+fn findText(s str, needle str) i64 {
+	if len(needle) == 0 { return 0 }
+	if len(s) < len(needle) { return -1 }
+	for i in 0..len(s) - len(needle) + 1 {
+		if s[i:i + len(needle)] == needle { return i }
+	}
+	return -1
+}
+
+fn hasPrefix(s str, prefix str) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+fn charPosition(s str, bytePos i64) i64 {
+	let end = min(max(bytePos, 0), len(s))
+	mut count = 1
+	for i in 0..end {
+		if (s[i] & 0xc0) != 0x80 { count += 1 }
+	}
+	return count
+}
