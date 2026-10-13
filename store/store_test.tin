@@ -1,0 +1,111 @@
+package store
+
+import "crucible"
+import "quarry"
+
+fn TestSlottedPage(t mut crucible.T) {
+	mut p = NewPage()
+	let (slot, err) = p.Insert([]u8{1, 2, 3})
+	if err != nil {
+		t.Error("insert failed")
+		return
+	}
+	crucible.Equal(mut t, "first slot", slot, u16(1))
+	let (item, itemErr) = p.Item(slot)
+	if itemErr != nil {
+		t.Error("item lookup failed")
+		return
+	}
+	crucible.Equal(mut t, "stored length", len(item), 3)
+	crucible.True("first byte", item[0] == 1)
+	crucible.True("second byte", item[1] == 2)
+	crucible.True("third byte", item[2] == 3)
+	crucible.True("checksum valid", p.Valid())
+	crucible.Equal(mut t, "header slot count", p.Header().Slots, u16(1))
+}
+
+fn TestPageFullDoesNotCorrupt(t mut crucible.T) {
+	mut p = NewPage()
+	let tooBig = make([]u8, PageSize)
+	let (_, err) = p.Insert(tooBig)
+	crucible.HasFault("page full", err)
+	crucible.True("unchanged checksum remains valid", p.Valid())
+}
+
+fn TestWalRecoveryReplaysHeap(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-recovery-test"
+	let cleanupErr = quarry.RemoveAll(dir)
+	if cleanupErr != nil {
+		crucible.True("stale test directory can be absent", true)
+	}
+	let (s, openErr) = Open(dir, Options{BufferPages: 8, SyncOnWrite: false})
+	if openErr != nil {
+		t.Error("open failed")
+		return
+	}
+	mut db = s
+	let createErr = db.CreateHeap(41)
+	if createErr != nil {
+		t.Error("create heap failed")
+		return
+	}
+	let (tid, insertErr) = db.HeapInsert(NewXidCtx(7, 2), 41, []u8{9, 8, 7})
+	if insertErr != nil {
+		t.Error("insert failed")
+		return
+	}
+	let closeErr = db.Close()
+	if closeErr != nil {
+		t.Error("close failed")
+		return
+	}
+	let tornErr = quarry.AppendFile(dir + "/wal/00000001.wal", str([]u8{1, 2, 3}))
+	if tornErr != nil {
+		t.Error("could not append torn WAL suffix")
+		return
+	}
+	let (reopened, reopenErr) = Open(dir, Options{BufferPages: 8, SyncOnWrite: false})
+	if reopenErr != nil {
+		t.Error("reopen failed")
+		return
+	}
+	let (tuple, fetchErr) = reopened.HeapFetch(41, tid, []u8{})
+	if fetchErr != nil {
+		t.Error("fetch after recovery failed")
+		return
+	}
+	crucible.Equal(mut t, "recovered xmin", tuple.Header.Xmin(), u32(7))
+	crucible.Equal(mut t, "recovered payload size", len(tuple.Payload), 3)
+	crucible.True("recovered payload", tuple.Payload[0] == 9 && tuple.Payload[1] == 8 && tuple.Payload[2] == 7)
+	let finalCleanupErr = quarry.RemoveAll(dir)
+	if finalCleanupErr != nil {
+		t.Error("cleanup failed")
+	}
+}
+
+fn TestClockSweepReusesUnpinnedFrame(t mut crucible.T) {
+	let (poolValue, poolErr) = NewBufferPool(1)
+	if poolErr != nil {
+		t.Error("pool creation failed")
+		return
+	}
+	mut pool = poolValue
+	let (frame, _, pinErr) = pool.Pin(BufferKey{rel: 5, page: 0})
+	if pinErr != nil {
+		t.Error("first pin failed")
+		return
+	}
+	let (_, _, fullErr) = pool.Pin(BufferKey{rel: 6, page: 0})
+	crucible.HasFault("pinned frames block eviction", fullErr)
+	let unpinErr = pool.Unpin(frame)
+	if unpinErr != nil {
+		t.Error("unpin failed")
+		return
+	}
+	let (reused, _, secondErr) = pool.Pin(BufferKey{rel: 6, page: 0})
+	if secondErr != nil {
+		t.Error("clock sweep failed")
+		return
+	}
+	crucible.Equal(mut t, "same one-frame slot reused", frame, reused)
+}
