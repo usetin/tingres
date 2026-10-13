@@ -9,8 +9,8 @@ fn TestLexAndStatements(t mut crucible.T) {
 		return
 	}
 	crucible.EqI("five statements", len(statements), 5)
-	crucible.EqS("create classification", statements[0].Kind(), "create_table")
-	crucible.EqS("select classification", statements[2].Kind(), "select")
+	crucible.EqS("create classification", stmtKind(statements[0]), "create_table")
+	crucible.EqS("select classification", stmtKind(statements[2]), "select")
 	crucible.EqS("deparse select", Deparse(statements[2]), "SELECT id, name FROM t WHERE id = 1 ORDER BY id LIMIT 2")
 }
 
@@ -20,7 +20,7 @@ fn TestLexerQuotesCommentsAndDollarStrings(t mut crucible.T) {
 		return
 	}
 	crucible.EqI("quoted statement count", len(statements), 1)
-	crucible.EqS("quoted select", statements[0].Kind(), "select")
+	crucible.EqS("quoted select", stmtKind(statements[0]), "select")
 }
 
 fn TestExpressionPrecedence(t mut crucible.T) {
@@ -28,8 +28,8 @@ fn TestExpressionPrecedence(t mut crucible.T) {
 		t.Error("expression rejected: {err}")
 		return
 	}
-	crucible.EqS("expression kind", expr.NodeKind(), "binary")
-	crucible.EqS("boolean precedence", expr.Text(), "(((a + (b * 3)) = $2) and notc)")
+	crucible.EqS("expression kind", exprKind(expr), "boolean")
+	crucible.EqS("boolean precedence", DeparseExpr(expr), "(((a + (b * 3)) = $2) AND (NOT c))")
 }
 
 fn TestSyntaxFaultHasPosition(t mut crucible.T) {
@@ -100,4 +100,25 @@ fn hasText(text str, needle str) bool {
 		if text[i:i + len(needle)] == needle { return true }
 	}
 	return false
+}
+
+fn stmtKind(statement Stmt) str {
+	return match statement {
+		Select(_) => "select"
+		Insert(_) => "insert"
+		Update(_) => "update"
+		Delete(_) => "delete"
+		CreateTable(_) => "create_table"
+		Transaction(_) => "transaction"
+		Checkpoint(_) => "checkpoint"
+		_ => "other"
+	}
+}
+
+fn exprKind(value Expr) str {
+	return match value {
+		Binary(_) => "binary"
+		Boolean(_) => "boolean"
+		_ => "other"
+	}
 }

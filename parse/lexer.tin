@@ -1,0 +1,293 @@
+package parse
+
+// Token is one SQL token; positions are 1-based character offsets and byte spans index the source.
+type Token struct {
+	Text str
+	Kind str
+	KeywordClass str
+	Pos i64
+	BytePos i64
+	EndBytePos i64
+}
+
+fn isSpace(c u8) bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 }
+fn isDigit(c u8) bool { return c >= 48 && c <= 57 }
+fn isHexDigit(c u8) bool { return isDigit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102) }
+fn isLetter(c u8) bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 128 }
+fn isIdentContinue(c u8) bool { return isLetter(c) || isDigit(c) || c == 36 }
+fn isOperatorChar(c u8) bool {
+	return c == 126 || c == 33 || c == 64 || c == 35 || c == 37 || c == 94 || c == 38 || c == 124 || c == 96 || c == 63 || c == 43 || c == 45 || c == 42 || c == 47 || c == 60 || c == 62 || c == 61
+}
+
+fn lowerAscii(s str) str {
+	mut out = ""
+	for _, c in s {
+		if c >= 'A' && c <= 'Z' { out += str(c + 32) } else { out += str(c) }
+	}
+	return out
+}
+
+fn keywordClass(word str) str {
+	if inWords(word, "all analyse analyze and any array as asc asymmetric both case cast check collate column constraint create current_catalog current_date current_role current_time current_timestamp current_user default deferrable desc distinct do else end except false fetch for foreign from grant group having in initially intersect into lateral leading limit localtime localtimestamp not null offset on only or order placing primary references returning select session_user some symmetric table then to trailing true union unique user using variadic when where window with") { return "reserved" }
+	if inWords(word, "authorization binary cross current_schema freeze full ilike inner is isnull join left like natural notnull outer overlaps placing right similar tablesample verbose") { return "type_func" }
+	if inWords(word, "between bigserial bit boolean char character coalesce dec decimal exists extract float greatest groups json json_array json_object least national nchar none normalize nullif numeric overlay position precision real row smallserial serial substring time timestamp treat trim values varchar xml") { return "type_func" }
+	if inWords(word, "array_avg array_max array_min array_sum bool_and bool_or count every max min stddev stddev_pop stddev_samp sum variance var_pop var_samp") { return "type_func" }
+	if inWords(word, "abort absolute access action add admin after aggregate also alter always assert_asymmetric assertion assignment at attach attribute backward before begin by cache call called cascade cascaded catalog chain char_length characteristics check_point checkpoint class close cluster coalesce collations collate column columns comment comments commit committed completion concurrent concurrently configuration connection constraint constraints content continue conversion convert copy cost cpu cursor cycle data database day deallocate dec declare default defaults deferred definer delete delimiter delimiters depends depth dereference describe descriptor detach dictionary disable discard disconnect document domain double drop each element enable encoding encrypted enum escape event exclude exclude first following force force_generic_plan forward generated global granted greatest handler header hold hour identity if immediate immutable implicit index indexes inherit inherits inheritance initially inline input insensitive insert instead invoker is nothing key label language large last lateral leading least level listen load local location lock locked logged mapping match materialized maxvalue method minute minvalue mode month names national nchar new next no none normalize notify nowait nullif nulls object of off oids old operator option options ordinality others out output over overriding owned owner parallel parameter parser partial partition passing password plans preceding preserve prepare prepared primary prior privileges procedural procedure procedures program publication quote range read reassign recheck recursive ref refresh reindex relative release rename repeatable replica reset restart restrict role rollback rollup routine row rows rule savepoint schema scroll search second security sequence sequences serializable server session set sets setof share show similar simple skip snapshot sql stable standalone start statement statistics stdin stdout storage strict strip subscription support symmetric sysid system tables temp template temporary text ties time timestamp to transaction transform treat trigger truncate trusted type types unbounded uncommitted unencrypted unknown unlisten unlogged until update vacuum valid validate validator value values variable verbose version view views volatile whitelist within without work wrapper write xml year zone") { return "unreserved" }
+	if inWords(word, "authorization boolean char character coalesce dec decimal exists extract float greatest int integer json least national nchar numeric overlay position precision real row smallint substring time timestamp trim varchar") { return "type_func" }
+	if inWords(word, "between bigserial bit boolean char character coalesce dec decimal exists extract float greatest int integer json least national nchar numeric overlay position precision real row smallint substring time timestamp trim varchar") { return "col_name" }
+	return ""
+}
+
+fn inWords(word str, words str) bool {
+	let needle = " {word} "
+	return findText(" {words} ", needle) >= 0
+}
+
+fn findFrom(s str, needle str, from i64) i64 {
+	if len(needle) == 0 { return from }
+	if from < 0 || from + len(needle) > len(s) { return -1 }
+	for i in from..len(s) - len(needle) + 1 {
+		if s[i:i + len(needle)] == needle { return i }
+	}
+	return -1
+}
+
+fn countCharacters(s str, start i64, end i64) i64 {
+	mut count = 0
+	for i in start..end {
+		if (s[i] & 0xc0) != 0x80 { count += 1 }
+	}
+	return count
+}
+
+// lex tokenizes SQL while retaining source byte spans and PostgreSQL keyword classes.
+fn lex(sql str) ![]Token {
+	let n = len(sql)
+	mut at = 0
+	mut tokens = []Token{}
+	for at < n {
+		let c = sql[at]
+		if isSpace(c) { at += 1
+			continue }
+		if c == 45 && at + 1 < n && sql[at + 1] == 45 {
+			at += 2
+			for at < n && sql[at] != 10 { at += 1 }
+			continue
+		}
+		if c == 47 && at + 1 < n && sql[at + 1] == 42 {
+			let start = at
+			at += 2
+			mut depth = 1
+			for at < n && depth > 0 {
+				if at + 1 < n && sql[at] == 47 && sql[at + 1] == 42 {
+					depth += 1
+					if depth > 1000 { fail syntaxMessage(sql, start, "stack depth limit exceeded") }
+					at += 2
+				} else if at + 1 < n && sql[at] == 42 && sql[at + 1] == 47 {
+					depth -= 1
+					at += 2
+				} else { at += 1 }
+			}
+			if depth > 0 { fail syntaxMessage(sql, start, "unterminated /* comment" ) }
+			continue
+		}
+		let start = at
+		if isLetter(c) && !((c == 69 || c == 101 || c == 66 || c == 98 || c == 88 || c == 120) && at + 1 < n && sql[at + 1] == 39) && !((c == 85 || c == 117) && at + 2 < n && sql[at + 1] == 38 && (sql[at + 2] == 34 || sql[at + 2] == 39)) {
+			at += 1
+			for at < n && isIdentContinue(sql[at]) { at += 1 }
+			let raw = sql[start:at]
+			let word = lowerAscii(raw)
+			tokens = append(tokens, Token{Text: word, Kind: "word", KeywordClass: keywordClass(word), BytePos: start, EndBytePos: at})
+			continue
+		}
+		if isDigit(c) || (c == 46 && at + 1 < n && isDigit(sql[at + 1])) {
+			at = scanNumber(sql, at)
+			let raw = sql[start:at]
+			if at < n && isLetter(sql[at]) { fail syntaxMessage(sql, start, "trailing junk after numeric literal at or near \"{raw}{str(sql[at])}\"") }
+			tokens = append(tokens, Token{Text: raw, Kind: "number", BytePos: start, EndBytePos: at})
+			continue
+		}
+		if (c == 69 || c == 101 || c == 66 || c == 98 || c == 88 || c == 120) && at + 1 < n && sql[at + 1] == 39 {
+			let prefix = lowerAscii(sql[start:start + 1])
+			let quoteEnd = scanQuoted(sql, start + 1, 39, prefix == "e")
+			if quoteEnd < 0 { fail syntaxMessage(sql, start, "unterminated quoted string at or near \"{sql[start:]}\"") }
+			at = quoteEnd
+			let kind = match prefix { "b" => "bit" "x" => "hex" _ => "string" }
+			tokens = append(tokens, Token{Text: sql[start:at], Kind: kind, BytePos: start, EndBytePos: at})
+			continue
+		}
+		if (c == 85 || c == 117) && at + 2 < n && sql[at + 1] == 38 && (sql[at + 2] == 34 || sql[at + 2] == 39) {
+			let quote = sql[at + 2]
+			let quoteEnd = scanQuoted(sql, at + 2, quote, false)
+			if quoteEnd < 0 { fail syntaxMessage(sql, start, "unterminated quoted string at or near \"{sql[start:]}\"") }
+			at = quoteEnd
+			mut kind = "string"
+			if quote == 34 { kind = "quoted" }
+			tokens = append(tokens, Token{Text: sql[start:at], Kind: kind, BytePos: start, EndBytePos: at})
+			continue
+		}
+		if c == 39 || c == 34 {
+			let quoteEnd = scanQuoted(sql, start, c, false)
+			if quoteEnd < 0 {
+				mut message = "unterminated quoted identifier at or near \"{sql[start:]}\""
+				if c == 39 { message = "unterminated quoted string at or near \"{sql[start:]}\"" }
+				fail syntaxMessage(sql, start, message)
+			}
+			at = quoteEnd
+			mut kind = "quoted"
+			if c == 39 { kind = "string" }
+			tokens = append(tokens, Token{Text: sql[start:at], Kind: kind, BytePos: start, EndBytePos: at})
+			continue
+		}
+		if c == 36 && at + 1 < n && isDigit(sql[at + 1]) {
+			at += 1
+			for at < n && isDigit(sql[at]) { at += 1 }
+			let raw = sql[start:at]
+			tokens = append(tokens, Token{Text: raw, Kind: "param", BytePos: start, EndBytePos: at})
+			continue
+		}
+		if c == 36 {
+			let dollarEnd = scanDollar(sql, start)
+			if dollarEnd > start {
+				at = dollarEnd
+				let raw = sql[start:at]
+				mut kind = "string"
+				if isParamText(raw) { kind = "param" }
+				tokens = append(tokens, Token{Text: raw, Kind: kind, BytePos: start, EndBytePos: at})
+				continue
+			}
+		}
+		if c == 46 && at + 1 < n && sql[at + 1] == 46 {
+			at += 2
+			tokens = append(tokens, Token{Text: "..", Kind: "symbol", BytePos: start, EndBytePos: at})
+			continue
+		}
+		if c == 58 && at + 1 < n && (sql[at + 1] == 58 || sql[at + 1] == 61) {
+			at += 2
+			let raw = sql[start:at]
+			tokens = append(tokens, Token{Text: raw, Kind: "symbol", BytePos: start, EndBytePos: at})
+			continue
+		}
+		if c == 61 && at + 1 < n && sql[at + 1] == 62 {
+			at += 2
+			tokens = append(tokens, Token{Text: "=>", Kind: "symbol", BytePos: start, EndBytePos: at})
+			continue
+		}
+		if isOperatorChar(c) {
+			at = scanOperator(sql, start)
+			let raw = sql[start:at]
+			tokens = append(tokens, Token{Text: raw, Kind: "operator", BytePos: start, EndBytePos: at})
+			continue
+		}
+		at += 1
+		tokens = append(tokens, Token{Text: sql[start:at], Kind: "symbol", BytePos: start, EndBytePos: at})
+	}
+	mut charPos = 1
+	mut previousByte = 0
+	for i in 0..len(tokens) {
+		charPos += countCharacters(sql, previousByte, tokens[i].BytePos)
+		tokens[i].Pos = charPos
+		previousByte = tokens[i].EndBytePos
+	}
+	return tokens
+}
+
+fn scanNumber(sql str, start i64) i64 {
+	let n = len(sql)
+	mut at = start
+	if sql[at] == 46 {
+		at += 1
+		for at < n && (isDigit(sql[at]) || sql[at] == 95) { at += 1 }
+	} else {
+		at += 1
+		for at < n && (isDigit(sql[at]) || sql[at] == 95) { at += 1 }
+		if at + 1 < n && sql[at] == 46 && sql[at + 1] != 46 {
+			at += 1
+			for at < n && (isDigit(sql[at]) || sql[at] == 95) { at += 1 }
+		}
+	}
+	if at < n && (sql[at] == 101 || sql[at] == 69) {
+		let exponent = at
+		at += 1
+		if at < n && (sql[at] == 43 || sql[at] == 45) { at += 1 }
+		let firstDigit = at
+		for at < n && (isDigit(sql[at]) || sql[at] == 95) { at += 1 }
+		if at == firstDigit { at = exponent }
+	}
+	return at
+}
+
+fn scanQuoted(sql str, start i64, quote u8, escapes bool) i64 {
+	let n = len(sql)
+	mut at = start + 1
+	for at < n {
+		if escapes && sql[at] == 92 { at += min(2, n - at)
+			continue }
+		if sql[at] == quote {
+			if at + 1 < n && sql[at + 1] == quote { at += 2
+				continue }
+			return at + 1
+		}
+		at += 1
+	}
+	return -1
+}
+
+fn scanDollar(sql str, start i64) i64 {
+	let n = len(sql)
+	mut tagEnd = start + 1
+	for tagEnd < n && (isLetter(sql[tagEnd]) || isDigit(sql[tagEnd])) { tagEnd += 1 }
+	if tagEnd >= n || sql[tagEnd] != 36 { return -1 }
+	let marker = sql[start:tagEnd + 1]
+	let contentStart = tagEnd + 1
+	let close = findFrom(sql, marker, contentStart)
+	if close < 0 { return -2 }
+	return close + len(marker)
+}
+
+fn isParamText(raw str) bool {
+	if len(raw) < 2 || raw[0] != 36 { return false }
+	for i in 1..len(raw) { if !isDigit(raw[i]) { return false } }
+	return true
+}
+
+fn scanOperator(sql str, start i64) i64 {
+	let n = len(sql)
+	mut at = start
+	for at < n && isOperatorChar(sql[at]) {
+		if at + 1 < n && ((sql[at] == 45 && sql[at + 1] == 45) || (sql[at] == 47 && sql[at + 1] == 42)) { break }
+		at += 1
+	}
+	if at - start > 1 && (sql[at - 1] == 43 || sql[at - 1] == 45) {
+		let raw = sql[start:at]
+		if findText(raw, "~") < 0 && findText(raw, "!") < 0 && findText(raw, "@") < 0 && findText(raw, "#") < 0 && findText(raw, "%") < 0 && findText(raw, "^") < 0 && findText(raw, "&") < 0 && findText(raw, "|") < 0 { at -= 1 }
+	}
+	return at
+}
+
+fn decodeIdentifier(raw str) Identifier {
+	if len(raw) >= 2 && raw[0] == 34 {
+		let body = raw[1:len(raw) - 1]
+		mut value = ""
+		mut at = 0
+		for at < len(body) {
+			if body[at] == 34 && at + 1 < len(body) && body[at + 1] == 34 {
+				value += "\""
+				at += 2
+			} else {
+				value += str(body[at])
+				at += 1
+			}
+		}
+		return Identifier{Name: value, Quoted: true}
+	}
+	return Identifier{Name: lowerAscii(raw), Quoted: false}
+}
+
+fn upperAscii(s str) str {
+	mut out = ""
+	for _, c in s {
+		if c >= 'a' && c <= 'z' { out += str(c - 32) } else { out += str(c) }
+	}
+	return out
+}

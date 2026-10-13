@@ -1,0 +1,514 @@
+package parse
+
+// DeparseExpr returns a canonical SQL rendering of a typed expression.
+fn DeparseExpr(value Expr) str {
+	return deparseExpr(value)
+}
+
+fn deparseExpr(value Expr) str {
+	return match value {
+		Literal(v) => deparseLiteral(v)
+		ColumnRef(v) => deparseColumnRef(v)
+		Param(v) => "$" + intText(v.N)
+		Unary(v) => deparseUnary(v)
+		Binary(v) => "(" + deparseExpr(v.Left) + " " + upperAscii(v.Op) + " " + deparseExpr(v.Right) + ")"
+		Boolean(v) => deparseBoolean(v)
+		Is(v) => deparseIs(v)
+		Between(v) => deparseBetween(v)
+		In(v) => deparseIn(v)
+		Like(v) => deparseLike(v)
+		Quantified(v) => "(" + deparseExpr(v.Left) + " " + v.Op + " " + upperAscii(v.Quantifier) + " (" + deparseExpr(v.Array) + "))"
+		Exists(v) => "EXISTS (" + deparseSelect(v.Query) + ")"
+		Subquery(v) => "(" + deparseSelect(v.Query) + ")"
+		Array(v) => "ARRAY[" + deparseExprList(v.Elements) + "]"
+		ArraySubquery(v) => "ARRAY(" + deparseSelect(v.Query) + ")"
+		Subscript(v) => deparseSubscript(v)
+		Row(v) => deparseRow(v)
+		Field(v) => deparseExpr(v.Value) + "." + identifierText(v.Field)
+		Case(v) => deparseCase(v)
+		Call(v) => deparseFunction(v)
+		Special(v) => deparseSpecial(v)
+		Cast(v) => deparseCast(v)
+		Collate(v) => "(" + deparseExpr(v.Value) + " COLLATE " + nameText(v.Collation) + ")"
+		AtTimeZone(v) => "(" + deparseExpr(v.Value) + " AT TIME ZONE " + deparseExpr(v.Zone) + ")"
+		Default(_) => "DEFAULT"
+	}
+}
+
+fn deparseLiteral(v LiteralExpr) str {
+	if v.Kind == "null" { return "NULL" }
+	if v.Kind == "true" { return "TRUE" }
+	if v.Kind == "false" { return "FALSE" }
+	if v.Kind == "unknown" { return "UNKNOWN" }
+	return v.Value
+}
+
+fn deparseColumnRef(v ColumnRefExpr) str {
+	mut out = ""
+	for i, part in v.Parts {
+		if i > 0 { out += "." }
+		out += identifierText(part)
+	}
+	if v.Star {
+		if len(v.Parts) > 0 { out += "." }
+		out += "*"
+	}
+	return out
+}
+
+fn deparseUnary(v UnaryExpr) str {
+	if v.Op == "not" { return "(NOT " + deparseExpr(v.Operand) + ")" }
+	return "(" + v.Op + deparseExpr(v.Operand) + ")"
+}
+
+fn deparseBoolean(v BooleanExpr) str {
+	mut out = "("
+	for i, arg in v.Args {
+		if i > 0 { out += " " + upperAscii(v.Op) + " " }
+		out += deparseExpr(arg)
+	}
+	return out + ")"
+}
+
+fn deparseIs(v IsExpr) str {
+	let neg = match v.Negated { true => " NOT" false => "" }
+	if let right = v.Right { return "(" + deparseExpr(v.Operand) + " IS" + neg + " DISTINCT FROM " + deparseExpr(right) + ")" }
+	return "(" + deparseExpr(v.Operand) + " IS" + neg + " " + upperAscii(v.Test) + ")"
+}
+
+fn deparseBetween(v BetweenExpr) str {
+	let neg = match v.Negated { true => " NOT" false => "" }
+	let sym = match v.Symmetric { true => " SYMMETRIC" false => "" }
+	return "(" + deparseExpr(v.Operand) + neg + " BETWEEN" + sym + " " + deparseExpr(v.Lower) + " AND " + deparseExpr(v.Upper) + ")"
+}
+
+fn deparseIn(v InExpr) str {
+	let neg = match v.Negated { true => " NOT" false => "" }
+	mut inside = deparseExprList(v.Items)
+	if let query = v.Query { inside = deparseSelect(query) }
+	return "(" + deparseExpr(v.Operand) + neg + " IN (" + inside + "))"
+}
+
+fn deparseLike(v LikeExpr) str {
+	let neg = match v.Negated { true => " NOT" false => "" }
+	mut out = "(" + deparseExpr(v.Operand) + neg + " " + upperAscii(v.Kind) + " " + deparseExpr(v.Pattern)
+	if let escape = v.Escape { out += " ESCAPE " + deparseExpr(escape) }
+	return out + ")"
+}
+
+fn deparseSubscript(v SubscriptExpr) str {
+	mut out = deparseExpr(v.Array)
+	for index in v.Indices {
+		out += "["
+		if index.Slice {
+			if let lower = index.Lower { out += deparseExpr(lower) }
+			out += ":"
+			if let upper = index.Upper { out += deparseExpr(upper) }
+		} else if let lower = index.Lower { out += deparseExpr(lower) }
+		out += "]"
+	}
+	return out
+}
+
+fn deparseRow(v RowExpr) str {
+	let prefix = match v.Explicit { true => "ROW" false => "" }
+	return prefix + "(" + deparseExprList(v.Fields) + ")"
+}
+
+fn deparseCase(v CaseExpr) str {
+	mut out = "CASE"
+	if let operand = v.Operand { out += " " + deparseExpr(operand) }
+	for arm in v.Whens { out += " WHEN " + deparseExpr(arm.Condition) + " THEN " + deparseExpr(arm.Result) }
+	if let otherwise = v.ElseExpr { out += " ELSE " + deparseExpr(otherwise) }
+	return out + " END"
+}
+
+fn deparseFunction(v FunctionCallExpr) str {
+	mut out = nameText(v.Name) + "("
+	if v.Distinct { out += "DISTINCT " } else if v.All { out += "ALL " }
+	for i, arg in v.Args {
+		if i > 0 { out += ", " }
+		if arg.Variadic { out += "VARIADIC " }
+		if let name = arg.Name { out += identifierText(name) + " => " }
+		out += deparseExpr(arg.Value)
+	}
+	if len(v.OrderBy) > 0 {
+		if len(v.Args) > 0 { out += " " }
+		out += "ORDER BY " + deparseSortList(v.OrderBy)
+	}
+	out += ")"
+	if let filter = v.Filter { out += " FILTER (WHERE " + deparseExpr(filter) + ")" }
+	if len(v.WithinGroup) > 0 { out += " WITHIN GROUP (ORDER BY " + deparseSortList(v.WithinGroup) + ")" }
+	if let over = v.Over { out += " OVER " + deparseWindow(over) }
+	return out
+}
+
+fn deparseSpecial(v SpecialExpr) str {
+	mut out = upperAscii(v.Name)
+	if len(v.Args) > 0 { out += "(" + deparseExprList(v.Args) + ")" }
+	return out
+}
+
+fn deparseCast(v CastExpr) str {
+	let typeName = deparseType(v.TypeName)
+	if v.Syntax == "::" { return "(" + deparseExpr(v.Value) + "::" + typeName + ")" }
+	return "CAST(" + deparseExpr(v.Value) + " AS " + typeName + ")"
+}
+
+fn deparseType(v TypeName) str {
+	mut out = nameText(v.Name)
+	if len(v.Name.Parts) > 0 { out = upperAscii(out) }
+	if len(v.Modifiers) > 0 {
+		out += "("
+		for i, modifier in v.Modifiers {
+			if i > 0 { out += ", " }
+			out += deparseExpr(modifier.Value)
+		}
+		out += ")"
+	}
+	if v.WithTimeZone { out += " WITH TIME ZONE" }
+	if v.IntervalFields != "" { out += " " + upperAscii(v.IntervalFields) }
+	for _ in v.ArrayBounds { out += "[]" }
+	return out
+}
+
+fn deparseExprList(values []Expr) str {
+	mut out = ""
+	for i, value in values {
+		if i > 0 { out += ", " }
+		out += deparseExpr(value)
+	}
+	return out
+}
+
+fn deparseSortList(values []SortBy) str {
+	mut out = ""
+	for i, value in values {
+		if i > 0 { out += ", " }
+		out += deparseExpr(value.Value)
+		if value.UsingOperator != "" { out += " USING " + value.UsingOperator }
+		if value.Direction != "" { out += " " + upperAscii(value.Direction) }
+		if value.Nulls != "" { out += " NULLS " + upperAscii(value.Nulls) }
+	}
+	return out
+}
+
+fn deparseWindow(v WindowSpec) str {
+	if let name = v.Name { return identifierText(name) }
+	mut out = "("
+	if len(v.PartitionBy) > 0 { out += "PARTITION BY " + deparseExprList(v.PartitionBy) }
+	if len(v.OrderBy) > 0 {
+		if len(v.PartitionBy) > 0 { out += " " }
+		out += "ORDER BY " + deparseSortList(v.OrderBy)
+	}
+	return out + ")"
+}
+
+fn deparseStatement(statement Stmt) str {
+	return match statement {
+		Select(v) => deparseSelect(v)
+		Insert(v) => deparseInsert(v)
+		Update(v) => deparseUpdate(v)
+		Delete(v) => deparseDelete(v)
+		CreateTable(v) => deparseCreateTable(v)
+		Transaction(v) => deparseTransaction(v)
+		Checkpoint(_) => "CHECKPOINT"
+		_ => ""
+	}
+}
+
+fn deparseSelect(v SelectStmt) str {
+	mut out = ""
+	if let withClause = v.With { out += deparseWith(withClause) + " " }
+	out += deparseQueryBody(v.Body)
+	if len(v.OrderBy) > 0 { out += " ORDER BY " + deparseSortList(v.OrderBy) }
+	if let limitExpr = v.Limit { out += " LIMIT " + deparseExpr(limitExpr) } else if v.Fetch == "limit all" { out += " LIMIT ALL" }
+	if let offset = v.Offset { out += " OFFSET " + deparseExpr(offset) }
+	if v.Fetch != "" && v.Fetch != "limit all" {
+		out += " FETCH " + upperAscii(v.Fetch)
+		if let fetchCount = v.FetchCount { out = replaceAll(out, " ONLY", " " + deparseExpr(fetchCount) + " ROWS ONLY") }
+	}
+	for lock in v.Locking {
+		out += " FOR " + upperAscii(lock.Strength)
+		if len(lock.Of) > 0 {
+			out += " OF "
+			for i, name in lock.Of {
+				if i > 0 { out += ", " }
+				out += nameText(name)
+			}
+		}
+		if lock.Wait != "" { out += " " + upperAscii(lock.Wait) }
+	}
+	return out
+}
+
+fn deparseWith(v WithClause) str {
+	mut out = "WITH"
+	if v.Recursive { out += " RECURSIVE" }
+	out += " "
+	for i, cte in v.Ctes {
+		if i > 0 { out += ", " }
+		out += identifierText(cte.Name)
+		if len(cte.Columns) > 0 { out += " (" + deparseIdentifierList(cte.Columns) + ")" }
+		out += " AS"
+		if cte.Materialized != "default" { out += " " + upperAscii(cte.Materialized) }
+		out += " (" + deparseSelect(cte.Query) + ")"
+	}
+	return out
+}
+
+fn deparseQueryBody(v QueryBody) str {
+	return match v {
+		Core(core) => deparseCore(core)
+		Values(values) => deparseValues(values)
+		Set(set) => deparseSet(set)
+	}
+}
+
+fn deparseCore(v SelectCore) str {
+	mut out = "SELECT"
+	if v.Distinct == "distinct" { out += " DISTINCT" }
+	if v.Distinct == "distinct on" { out += " DISTINCT ON (" + deparseExprList(v.DistinctOn) + ")" }
+	out += " "
+	for i, target in v.Targets {
+		if i > 0 { out += ", " }
+		out += deparseExpr(target.Value)
+		if let alias = target.Alias { out += " AS " + identifierText(alias) }
+	}
+	if len(v.From) > 0 {
+		out += " FROM "
+		for i, item in v.From {
+			if i > 0 { out += ", " }
+			out += deparseFrom(item)
+		}
+	}
+	if let whereExpr = v.Where { out += " WHERE " + deparseExpr(whereExpr) }
+	if len(v.GroupBy) > 0 { out += " GROUP BY " + deparseGroupingList(v.GroupBy) }
+	if let having = v.Having { out += " HAVING " + deparseExpr(having) }
+	return out
+}
+
+fn deparseGroupingList(values []GroupingElement) str {
+	mut out = ""
+	for i, value in values {
+		if i > 0 { out += ", " }
+		if let groupValue = value.Value { out += deparseExpr(groupValue) } else { out += upperAscii(value.Kind) + " (" + deparseGroupingList(value.Items) + ")" }
+	}
+	return out
+}
+
+fn deparseValues(v ValuesQuery) str {
+	mut out = "VALUES "
+	for i, row in v.Rows {
+		if i > 0 { out += ", " }
+		out += "(" + deparseExprList(row) + ")"
+	}
+	return out
+}
+
+fn deparseFrom(v FromItem) str {
+	return match v {
+		Table(item) => nameText(item.Name) + deparseAlias(item.Alias)
+		Subquery(item) => "(" + deparseSelect(item.Query) + ")" + deparseAlias(item.Alias)
+		Values(item) => deparseValues(item.Values) + deparseAlias(item.Alias)
+		Function(item) => deparseExpr(item.Function) + deparseAlias(item.Alias)
+		Join(item) => deparseJoin(item)
+	}
+}
+
+fn deparseAlias(alias ?AliasClause) str {
+	if let value = alias {
+		mut out = " AS " + identifierText(value.Name)
+		if len(value.Columns) > 0 { out += " (" + deparseIdentifierList(value.Columns) + ")" }
+		return out
+	}
+	return ""
+}
+
+fn deparseJoin(v JoinExpr) str {
+	mut out = deparseFrom(v.Left) + " "
+	if v.Natural { out += "NATURAL " }
+	if v.JoinType != "inner" { out += upperAscii(v.JoinType) + " " }
+	out += "JOIN " + deparseFrom(v.Right)
+	if let condition = v.Condition {
+		out += match condition {
+			On(on) => " ON " + deparseExpr(on.Value)
+			Using(using) => " USING (" + deparseIdentifierList(using.Columns) + ")"
+		}
+	}
+	return out + deparseAlias(v.Alias)
+}
+
+fn deparseIdentifierList(values []Identifier) str {
+	mut out = ""
+	for i, value in values {
+		if i > 0 { out += ", " }
+		out += identifierText(value)
+	}
+	return out
+}
+
+fn deparseInsert(v InsertStmt) str {
+	mut out = ""
+	if let withClause = v.With { out += deparseWith(withClause) + " " }
+	out += "INSERT INTO " + nameText(v.Table)
+	if len(v.Columns) > 0 { out += " (" + deparseIdentifierList(v.Columns) + ")" }
+	if v.Overriding != "" { out += " OVERRIDING " + upperAscii(v.Overriding) }
+	out += match v.Source {
+		Values(values) => " " + deparseValues(values)
+		DefaultValues(_) => " DEFAULT VALUES"
+		Query(query) => " " + deparseSelect(query)
+	}
+	if let conflict = v.Conflict { out += deparseConflict(conflict) }
+	if len(v.Returning) > 0 { out += " RETURNING " + deparseTargets(v.Returning) }
+	return out
+}
+
+fn deparseConflict(v OnConflictClause) str {
+	mut out = " ON CONFLICT"
+	if let target = v.Target {
+		if let constraint = target.Constraint { out += " ON CONSTRAINT " + identifierText(constraint) } else if len(target.Columns) > 0 { out += " (" + deparseExprList(target.Columns) + ")" }
+		if let targetWhere = target.Where { out += " WHERE " + deparseExpr(targetWhere) }
+	}
+	out += " DO " + upperAscii(v.Action.Kind)
+	if v.Action.Kind == "update" {
+		out += " SET " + deparseAssignments(v.Action.Assignments)
+		if let actionWhere = v.Action.Where { out += " WHERE " + deparseExpr(actionWhere) }
+	}
+	return out
+}
+
+fn deparseUpdate(v UpdateStmt) str {
+	mut out = ""
+	if let withClause = v.With { out += deparseWith(withClause) + " " }
+	out += "UPDATE " + nameText(v.Table) + deparseAlias(v.Alias) + " SET " + deparseAssignments(v.Assignments)
+	if len(v.From) > 0 { out += " FROM " + deparseFromList(v.From) }
+	if let whereExpr = v.Where { out += " WHERE " + deparseExpr(whereExpr) }
+	if let cursor = v.WhereCurrentOf { out += " WHERE CURRENT OF " + identifierText(cursor) }
+	if len(v.Returning) > 0 { out += " RETURNING " + deparseTargets(v.Returning) }
+	return out
+}
+
+fn deparseDelete(v DeleteStmt) str {
+	mut out = ""
+	if let withClause = v.With { out += deparseWith(withClause) + " " }
+	out += "DELETE FROM " + nameText(v.Table) + deparseAlias(v.Alias)
+	if len(v.Using) > 0 { out += " USING " + deparseFromList(v.Using) }
+	if let whereExpr = v.Where { out += " WHERE " + deparseExpr(whereExpr) }
+	if let cursor = v.WhereCurrentOf { out += " WHERE CURRENT OF " + identifierText(cursor) }
+	if len(v.Returning) > 0 { out += " RETURNING " + deparseTargets(v.Returning) }
+	return out
+}
+
+fn deparseFromList(values []FromItem) str {
+	mut out = ""
+	for i, value in values {
+		if i > 0 { out += ", " }
+		out += deparseFrom(value)
+	}
+	return out
+}
+
+fn deparseAssignments(values []Assignment) str {
+	mut out = ""
+	for i, value in values {
+		if i > 0 { out += ", " }
+		if len(value.Columns) > 1 { out += "(" + deparseIdentifierList(value.Columns) + ")" } else { out += deparseIdentifierList(value.Columns) }
+		out += " = " + deparseExpr(value.Value)
+	}
+	return out
+}
+
+fn deparseTargets(values []TargetEntry) str {
+	mut out = ""
+	for i, value in values {
+		if i > 0 { out += ", " }
+		out += deparseExpr(value.Value)
+		if let alias = value.Alias { out += " AS " + identifierText(alias) }
+	}
+	return out
+}
+
+fn deparseCreateTable(v CreateTableStmt) str {
+	mut out = "CREATE "
+	if v.Temporary != "" { out += upperAscii(v.Temporary) + " " }
+	out += "TABLE "
+	if v.IfNotExists { out += "IF NOT EXISTS " }
+	out += nameText(v.Table)
+	if len(v.Elements) > 0 {
+		out += " ("
+		for i, element in v.Elements {
+			if i > 0 { out += ", " }
+			out += match element {
+				Column(column) => deparseColumn(column)
+				Constraint(constraint) => deparseConstraint(constraint)
+			}
+		}
+		out += ")"
+	}
+	if len(v.Inherits) > 0 {
+		out += " INHERITS ("
+		for i, parent in v.Inherits {
+			if i > 0 { out += ", " }
+			out += nameText(parent)
+		}
+		out += ")"
+	}
+	if let asQuery = v.AsQuery {
+		out += " AS " + deparseSelect(asQuery)
+		if !v.WithData { out += " WITH NO DATA" }
+	}
+	return out
+}
+
+fn deparseColumn(v ColumnDef) str {
+	mut out = identifierText(v.Name) + " " + deparseType(v.TypeName)
+	if let defaultExpr = v.Default { out += " DEFAULT " + deparseExpr(defaultExpr) }
+	if v.Nullability == "not null" { out += " NOT NULL" } else if v.Nullability == "null" { out += " NULL" }
+	for constraint in v.Constraints { out += " " + deparseConstraint(constraint) }
+	return out
+}
+
+fn deparseConstraint(v TableConstraint) str {
+	mut out = ""
+	if let name = v.Name { out = "CONSTRAINT " + identifierText(name) + " " }
+	out += upperAscii(v.Kind)
+	if len(v.Columns) > 0 { out += " (" + deparseIdentifierList(v.Columns) + ")" }
+	if len(v.Expressions) > 0 { out += " (" + deparseExpr(v.Expressions[0]) + ")" }
+	if let references = v.References {
+		out += " REFERENCES " + nameText(references)
+		if len(v.ReferenceColumns) > 0 { out += " (" + deparseIdentifierList(v.ReferenceColumns) + ")" }
+	}
+	return out
+}
+
+fn deparseTransaction(v TransactionStmt) str {
+	mut out = upperAscii(v.Kind)
+	if let name = v.Name { out += " " + identifierText(name) }
+	for i, mode in v.Modes {
+		if i == 0 { out += " " } else { out += ", " }
+		if mode.Kind == "isolation level" { out += "ISOLATION LEVEL " + upperAscii(mode.Value) } else if mode.Kind == "read" { out += "READ " + upperAscii(mode.Value) } else { out += upperAscii(mode.Value + " " + mode.Kind) }
+	}
+	if v.Chain { out += " AND CHAIN" }
+	return out
+}
+
+fn intText(value i64) str {
+	let negative = value < 0
+	mut n = value
+	if negative { n = -value }
+	if n == 0 { return "0" }
+	mut out = ""
+	for n > 0 {
+		out = str(i32(n % 10 + 48)) + out
+		n /= 10
+	}
+	if negative { return "-" + out }
+	return out
+}
+
+fn deparseSet(v SetOperation) str {
+	mut out = "(" + deparseQueryBody(v.Left) + " " + upperAscii(v.Op)
+	if v.All { out += " ALL" }
+	return out + " " + deparseQueryBody(v.Right) + ")"
+}
