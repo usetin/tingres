@@ -1,0 +1,73 @@
+// Package server connects PostgreSQL protocol sessions to the query executor.
+package server
+
+import "../proto"
+import "say"
+import "twine"
+import "wire"
+
+// Serve starts the TCP listener and handles connections until an accept error occurs.
+// The initial M1 executor is deliberately small; unsupported statements return 0A000.
+fn Serve(addr str, cfg proto.Config) ! {
+	let listener = try wire.Listen(addr)
+	for {
+		let sock = listener.Accept() catch _ { continue }
+		let conn = proto.Accept(sock, cfg) catch err {
+			say.Line("tingres startup failed: {err}")
+			mut dropped = sock
+			dropped.Close()
+			continue
+		}
+		mut c = conn
+		serve_connection(mut c, false) catch err {
+			say.Line("tingres connection closed: {err}")
+			c.Close()
+		}
+	}
+}
+
+// ServeOne accepts and answers one client connection, for conformance tests and probes.
+fn ServeOne(listener wire.Listener, cfg proto.Config) ! {
+	let sock = try listener.Accept()
+	let conn = try proto.Accept(sock, cfg)
+	mut c = conn
+	try serve_connection(mut c, true)
+}
+
+fn serve_connection(c mut proto.Conn, oneShot bool) ! {
+	for {
+		let message = try c.Next()
+		match message {
+			proto.Message.Query(sql) => {
+				let query = twine.ToLower(twine.TrimSpace(twine.Trim(sql, " \t\r\n;")))
+				if query == "" {
+					try c.SendEmptyQueryResponse()
+				} else if query == "select 1" || query == "select 1 as answer" {
+					mut colName = "?column?"
+					if query == "select 1 as answer" { colName = "answer" }
+					try c.SendRowDescription([]proto.Column{proto.Column{Name: colName, TypeOid: 23, TypeSize: 4, TypeMod: -1}})
+					try c.SendDataRow([]proto.Cell{proto.Cell{Value: "1"}})
+					try c.SendCommandComplete("SELECT 1")
+				} else {
+					try c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "0A000", Message: "feature not supported by the M1 executor"})
+				}
+				try c.SendReadyForQuery('I')
+				if oneShot { c.Close()
+					return }
+			}
+			proto.Message.Terminate => { c.Close()
+				return }
+			proto.Message.Flush => {
+			}
+			_ => {
+				try c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "0A000", Message: "frontend message is not supported by the M1 executor"})
+				try c.SendReadyForQuery('I')
+			}
+		}
+	}
+}
+
+fn supported_query(sql str) bool {
+	let q = twine.ToLower(twine.TrimSpace(twine.Trim(sql, " \t\r\n;")))
+	return q == "select 1" || q == "select 1 as answer"
+}

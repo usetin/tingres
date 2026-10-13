@@ -1,0 +1,38 @@
+package proto
+
+import "crucible"
+
+fn TestStartupParsing(t mut crucible.T) {
+	let body = []u8("user\x00ada\x00database\x00shop\x00application_name\x00test\x00\x00")
+	let s = parse_startup(protocol30, body) catch err {
+		t.Error("valid startup packet rejected: {err}")
+		return
+	}
+	crucible.Equal(mut t, "user", s.User, "ada")
+	crucible.Equal(mut t, "database", s.Database, "shop")
+	crucible.Equal(mut t, "unknown startup options are retained", s.Parameters["application_name"], "test")
+	let (_, err) = parse_startup(protocol30, []u8("user\x00ada\x00"))
+	t.HasFault("startup packet needs its terminating empty option", err)
+	let (_, err2) = parse_startup(196609, []u8{0})
+	t.HasFault("unsupported protocol version is rejected", err2)
+}
+
+fn TestFrontendFrames(t mut crucible.T) {
+	let p = packet('Q', []u8("select 1\x00"))
+	crucible.Equal(mut t, "type byte", p[0], u8('Q'))
+	crucible.Equal(mut t, "network message length", be(p, 1, 4), len(p)-1)
+	crucible.Equal(mut t, "startup packet omits type byte", len(packet(0, []u8{0, 3, 0, 0})), 8)
+}
+
+fn TestScramAttributes(t mut crucible.T) {
+	let attrs = scram_attrs("r=nonce,s=c2FsdA==,i=4096") catch err {
+		t.Error("valid SCRAM attributes rejected: {err}")
+		return
+	}
+	crucible.Equal(mut t, "nonce", attrs[u8('r')], "nonce")
+	crucible.Equal(mut t, "iteration count", attrs[u8('i')], "4096")
+	let (_, err) = scram_attrs("r=one,r=two")
+	t.HasFault("duplicate SCRAM attribute is rejected", err)
+	let (_, err2) = scram_attrs("m=mandatory")
+	t.HasFault("mandatory extension is rejected", err2)
+}

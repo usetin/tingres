@@ -1,0 +1,19 @@
+package plan
+
+import "crucible"
+
+fn TestEstimateAndExplain(t mut crucible.T) {
+	let p = Plan{Root: Node{Kind: Kind.Filter, Detail: "(id = 1)", Children: []Node{Node{Kind: Kind.SeqScan, Name: "items"}}}}
+	let rows = Explain(p, false)
+	crucible.Equal(mut t, "two operators", len(rows), 2)
+	t.True("filter printed", rows[0] == "Filter (id = 1) (cost=1000.00..1010.00 rows=333 width=0)")
+	t.True("scan printed", rows[1] == "  Seq Scan on items (cost=0.00..1000.00 rows=1000 width=0)")
+	let analyzeOutput = Explain(p, true)
+	t.True("analyze uses plan estimates", analyzeOutput[0] == rows[0])
+}
+
+fn TestExplicitEstimate(t mut crucible.T) {
+	let root = Node{Kind: Kind.SeqScan, Name: "small", Rows: 7.0, Startup: 0.0, Total: 2.5, HasEstimate: true}
+	let out = Explain(Plan{Root: root}, false)
+	t.True("explicit estimate retained", out[0] == "Seq Scan on small (cost=0.00..2.50 rows=7 width=0)")
+}
