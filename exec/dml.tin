@@ -1,0 +1,266 @@
+package exec
+
+import "../types"
+import "../plan"
+import "../catalog"
+import "../txn"
+import "../store"
+
+// ExecuteModifyTable executes an INSERT, UPDATE, or DELETE plan node against the store.
+fn ExecuteModifyTable(node plan.ModifyTableNode, ctx ExprContext, out mut dyn Sink) !str {
+	if let cat = ctx.Catalog {
+		if let t = ctx.Txn {
+			mut sourceCur = try BuildCursor(node.Source, ctx)
+			let rel = store.RelId(node.Table.Rel)
+			let x = store.NewXidCtx(t.Xid(), t.CommandID())
+
+			mut colTypes = []u32{}
+			for col in node.Table.Cols {
+				colTypes = append(colTypes, col.Type)
+			}
+
+			if len(node.Returning) > 0 && len(node.Cols) > 0 {
+				mut sinkCols = []ColDesc{}
+				mut formats = []i16{}
+				for c in node.Cols {
+					sinkCols = append(sinkCols, ColDesc{
+						Name: c.Name,
+						Oid: c.Oid,
+						Typmod: c.Typmod,
+						TableOid: c.TableOid,
+						Attno: c.Attno,
+					})
+					formats = append(formats, 0)
+				}
+				out.RowDescription(sinkCols, formats)
+			}
+
+			mut affected = i64(0)
+
+			match node.Kind {
+				Insert => {
+					for {
+						let (sourceRow, ok) = try sourceCur.Next()
+						if !ok {
+							break
+						}
+						// Build target row mapped to table columns
+						mut targetRow = []types.Datum{}
+						for i, col in node.Table.Cols {
+							mut mapped = false
+							mut val = types.Null()
+							if len(node.TargetCols) > 0 {
+								for targetIdx, attno in node.TargetCols {
+									if i64(attno) == i64(col.Number) && targetIdx < len(sourceRow) {
+										val = sourceRow[targetIdx]
+										mapped = true
+										break
+									}
+								}
+							} else if i < len(sourceRow) {
+								val = sourceRow[i]
+								mapped = true
+							}
+							if !mapped {
+								val = types.Null()
+							}
+							// NOT NULL constraint check
+							if !col.Nullable && types.IsNull(val) {
+								try types.ErrorFault(types.NewPgError("23502", "null value in column \"" + col.Name + "\" of relation \"" + node.Table.Name + "\" violates not-null constraint", "", "", 0))
+							}
+							targetRow = append(targetRow, val)
+						}
+
+						// Check UNIQUE / PRIMARY KEY constraints
+						mut conflict = false
+						for idx in node.Table.Indexes {
+							if idx.Unique {
+								let existingScan = cat.Store.HeapScan(rel)
+								mut scan = existingScan
+								for {
+									let (hTuple, hOk) = scan.Next()
+									if !hOk {
+										break
+									}
+									let h = hTuple.Header
+									let snap = cat.Manager.Snapshot(t)
+									if cat.Manager.Visible(snap, txn.TupleHeader{Xmin: h.Xmin(), Xmax: h.Xmax(), Cid: h.Cid()}) {
+										let decoded = types.DecodeRow(colTypes, hTuple.Payload) catch _ { []types.Datum{} }
+										if len(decoded) > 0 && len(targetRow) > 0 && !types.IsNull(targetRow[0]) && !types.IsNull(decoded[0]) {
+											if types.Compare(targetRow[0], decoded[0]) == 0 {
+												conflict = true
+												break
+											}
+										}
+									}
+								}
+							}
+							if conflict {
+								break
+							}
+						}
+
+						if conflict {
+							if let onConflict = node.OnConflict {
+								if onConflict.Action == plan.ModifyKind.Insert {
+									// DO NOTHING
+									continue
+								}
+							}
+							try types.ErrorFault(types.NewPgError("23505", "duplicate key value violates unique constraint", "", "", 0))
+						}
+
+						// Encode and insert
+						mut payload = []u8{}
+						types.EncodeRow(colTypes, targetRow, mut payload)
+						try cat.Store.HeapInsert(x, rel, payload)
+						affected += 1
+
+						if len(node.Returning) > 0 {
+							mut retCtx = ctx
+							retCtx.Row = targetRow
+							mut retRow = []types.Datum{}
+							for expr in node.Returning {
+								let retVal = try EvalExpr(expr, retCtx)
+								retRow = append(retRow, retVal)
+							}
+							out.DataRow(retRow)
+						}
+					}
+					let tag = "INSERT 0 {affected}"
+					out.CommandComplete(tag)
+					return tag
+				}
+				Delete => {
+					for {
+						let (sourceRow, ok) = try sourceCur.Next()
+						if !ok {
+							break
+						}
+						// Identify matching tuple in store
+						let scan = cat.Store.HeapScan(rel)
+						mut hScan = scan
+						mut targetTid = store.Tid{}
+						mut found = false
+						let snap = cat.Manager.Snapshot(t)
+						for {
+							let (hTuple, hOk) = hScan.Next()
+							if !hOk {
+								break
+							}
+							let h = hTuple.Header
+							if cat.Manager.Visible(snap, txn.TupleHeader{Xmin: h.Xmin(), Xmax: h.Xmax(), Cid: h.Cid()}) {
+								let decoded = types.DecodeRow(colTypes, hTuple.Payload) catch _ { []types.Datum{} }
+								if rowsMatch(decoded, sourceRow) {
+									targetTid = hTuple.Tid
+									found = true
+									break
+								}
+							}
+						}
+						if found {
+							try cat.Store.HeapDelete(x, rel, targetTid)
+							affected += 1
+							if len(node.Returning) > 0 {
+								mut retCtx = ctx
+								retCtx.Row = sourceRow
+								mut retRow = []types.Datum{}
+								for expr in node.Returning {
+									let retVal = try EvalExpr(expr, retCtx)
+									retRow = append(retRow, retVal)
+								}
+								out.DataRow(retRow)
+							}
+						}
+					}
+					let tag = "DELETE {affected}"
+					out.CommandComplete(tag)
+					return tag
+				}
+				Update => {
+					for {
+						let (sourceRow, ok) = try sourceCur.Next()
+						if !ok {
+							break
+						}
+						let scan = cat.Store.HeapScan(rel)
+						mut hScan = scan
+						mut targetTid = store.Tid{}
+						mut found = false
+						let snap = cat.Manager.Snapshot(t)
+						for {
+							let (hTuple, hOk) = hScan.Next()
+							if !hOk {
+								break
+							}
+							let h = hTuple.Header
+							if cat.Manager.Visible(snap, txn.TupleHeader{Xmin: h.Xmin(), Xmax: h.Xmax(), Cid: h.Cid()}) {
+								let decoded = types.DecodeRow(colTypes, hTuple.Payload) catch _ { []types.Datum{} }
+								if rowsMatch(decoded, sourceRow) {
+									targetTid = hTuple.Tid
+									found = true
+									break
+								}
+							}
+						}
+						if found {
+							try cat.Store.HeapDelete(x, rel, targetTid)
+							mut updatedRow = []types.Datum{}
+							for i, col in node.Table.Cols {
+								if i < len(sourceRow) {
+									updatedRow = append(updatedRow, sourceRow[i])
+								} else {
+									updatedRow = append(updatedRow, types.Null())
+								}
+								if !col.Nullable && types.IsNull(updatedRow[i]) {
+									try types.ErrorFault(types.NewPgError("23502", "null value in column \"" + col.Name + "\" of relation \"" + node.Table.Name + "\" violates not-null constraint", "", "", 0))
+								}
+							}
+							mut payload = []u8{}
+							types.EncodeRow(colTypes, updatedRow, mut payload)
+							try cat.Store.HeapInsert(x, rel, payload)
+							affected += 1
+							if len(node.Returning) > 0 {
+								mut retCtx = ctx
+								retCtx.Row = updatedRow
+								mut retRow = []types.Datum{}
+								for expr in node.Returning {
+									let retVal = try EvalExpr(expr, retCtx)
+									retRow = append(retRow, retVal)
+								}
+								out.DataRow(retRow)
+							}
+						}
+					}
+					let tag = "UPDATE {affected}"
+					out.CommandComplete(tag)
+					return tag
+				}
+			}
+		}
+	}
+	try types.ErrorFault(types.NewPgError("XX000", "catalog and transaction required for DML", "", "", 0))
+	return ""
+}
+
+fn rowsMatch(a []types.Datum, b []types.Datum) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	let minLen = match len(a) < len(b) {
+		true => len(a)
+		_ => len(b)
+	}
+	for i in 0..minLen {
+		let da = a[i]
+		let db = b[i]
+		if types.IsNull(da) || types.IsNull(db) {
+			if types.IsNull(da) != types.IsNull(db) {
+				return false
+			}
+		} else if types.Compare(da, db) != 0 {
+			return false
+		}
+	}
+	return true
+}
