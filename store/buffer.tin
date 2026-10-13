@@ -1,0 +1,88 @@
+package store
+
+type BufferKey struct {
+	rel u32
+	page u32
+}
+
+type Buffer struct {
+	key BufferKey
+	page Page
+	valid bool
+	pins u32
+	dirty bool
+}
+
+// BufferPool is a fixed-size clock-sweep pool. Calls must stay on one lane; callers must not wait while pinned.
+type BufferPool struct {
+	frames []Buffer
+	hand u32
+}
+
+// NewBufferPool reserves capacity frames before database work begins.
+fn NewBufferPool(capacity u32) !BufferPool {
+	if capacity == 0 {
+		fail "store: buffer pool must have at least one frame"
+	}
+	mut frames = make([]Buffer, 0, i64(capacity))
+	for _i in 0..i64(capacity) {
+		frames = append(frames, Buffer{key: BufferKey{rel: 0, page: 0}, page: NewPage(), valid: false, pins: 0, dirty: false})
+	}
+	return BufferPool{frames: frames, hand: 0}
+}
+
+// Pin returns a pinned resident page, loading a blank page on a miss.
+fn (pool mut BufferPool) Pin(key BufferKey) !(u32, Page) {
+	for i, frame in pool.frames {
+		if frame.valid && frame.key == key {
+			pool.frames[i].pins += 1
+			return u32(i), pool.frames[i].page
+		}
+	}
+	let victim = pool.chooseVictim() catch err {
+		fail err
+	}
+	pool.frames[victim].key = key
+	pool.frames[victim].page = NewPage()
+	pool.frames[victim].valid = true
+	pool.frames[victim].pins = 1
+	pool.frames[victim].dirty = false
+	return victim, pool.frames[victim].page
+}
+
+// Unpin releases a previously pinned frame.
+fn (pool mut BufferPool) Unpin(frame u32) ! {
+	if i64(frame) >= len(pool.frames) || pool.frames[frame].pins == 0 {
+		fail "store: buffer is not pinned"
+	}
+	pool.frames[frame].pins -= 1
+}
+
+// MarkDirty records that a pinned page needs WAL-safe persistence.
+fn (pool mut BufferPool) MarkDirty(frame u32, lsn Lsn) ! {
+	if i64(frame) >= len(pool.frames) || pool.frames[frame].pins == 0 {
+		fail "store: buffer is not pinned"
+	}
+	pool.frames[frame].page.SetLsn(u64(lsn))
+	pool.frames[frame].dirty = true
+}
+
+// IsDirty reports whether a frame needs a page write.
+fn (pool BufferPool) IsDirty(frame u32) bool {
+	if i64(frame) >= len(pool.frames) {
+		return false
+	}
+	return pool.frames[frame].dirty
+}
+
+fn (pool mut BufferPool) chooseVictim() !u32 {
+	let n = u32(len(pool.frames))
+	for _round in 0..(i64(n)*2) {
+		let i = pool.hand % n
+		pool.hand = (pool.hand+1) % n
+		if !pool.frames[i].valid || pool.frames[i].pins == 0 {
+			return i
+		}
+	}
+	fail "store: all buffer frames are pinned"
+}

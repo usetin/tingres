@@ -1,0 +1,89 @@
+package catalog
+
+import "../txn"
+import "../store"
+import "crucible"
+import "quarry"
+
+fn testCatalog(name str) !(store.Store, txn.Manager, Catalog) {
+	let dir = quarry.TempDir() + "/tingres-catalog-" + name
+	quarry.RemoveAll(dir) catch _ { }
+	mut db = try store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false})
+	let manager = try txn.NewManager(mut db)
+	let c = try Open(mut db, manager)
+	return db, manager, c
+}
+
+fn beginCatalogTest(m mut txn.Manager, iso txn.Isolation) !txn.Txn {
+	return try m.Begin(iso)
+}
+
+fn abortCatalogTest(t mut crucible.T, m mut txn.Manager, tx mut txn.Txn) {
+	m.Abort(mut tx) catch err { t.Error("abort: {err}") }
+}
+
+fn TestBootstrapAndTypeOids(t mut crucible.T) {
+	let (_, _, c) = testCatalog("bootstrap") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	crucible.Equal(mut t, "pg_namespace oid", tableOid(mut t, "pg_namespace", c.SystemTable("pg_namespace")), u32(2615))
+	crucible.Equal(mut t, "public namespace oid", c.tables[2200].Oid, u32(2200))
+	if let intOid = c.LookupType("integer") {
+		crucible.Equal(mut t, "int alias oid", intOid, u32(23))
+	} else {
+		t.Error("integer type is not registered")
+	}
+	crucible.Equal(mut t, "unknown type", c.LookupType("made_up") == nil, true)
+}
+
+fn TestTransactionalTableVisibility(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("visibility") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut creator = beginCatalogTest(mut m, txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin creator: {err}")
+		return
+	}
+	let beforeVersion = c.Version()
+	let table = c.CreateTable(creator, TableDef{Schema: "public", Name: "accounts", Columns: []ColumnDef{ColumnDef{Name: "id", Type: 23, Typmod: -1, Nullable: false}}}) catch err {
+		t.Error("create table: {err}")
+		return
+	}
+	crucible.Equal(mut t, "catalog version advances", c.Version() > beforeVersion, true)
+	crucible.Equal(mut t, "new relation is hidden in its create command", isMissing(c.LookupTable(creator, "public", "accounts")), true)
+	creator.CommandCounterIncrement()
+	crucible.Equal(mut t, "new relation appears next command", tableOid(mut t, "next command", c.LookupTable(creator, "public", "accounts")), table.Oid)
+	crucible.NoFault("commit create", m.Commit(mut creator))
+	mut reader = beginCatalogTest(mut m, txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin reader: {err}")
+		return
+	}
+	crucible.Equal(mut t, "committed relation appears to other transaction", tableOid(mut t, "committed lookup", c.LookupTable(reader, "", "accounts")), table.Oid)
+	mut dropper = beginCatalogTest(mut m, txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin dropper: {err}")
+		return
+	}
+	crucible.NoFault("drop relation", c.DropTable(dropper, table, false))
+	crucible.Equal(mut t, "drop stays visible within its command", tableOid(mut t, "same command", c.LookupTable(dropper, "public", "accounts")), table.Oid)
+	dropper.CommandCounterIncrement()
+	crucible.Equal(mut t, "drop hides relation next command", isMissing(c.LookupTable(dropper, "public", "accounts")), true)
+	abortCatalogTest(mut t, mut m, mut dropper)
+	crucible.Equal(mut t, "aborted drop restores relation", tableOid(mut t, "after abort", c.LookupTable(reader, "public", "accounts")), table.Oid)
+	abortCatalogTest(mut t, mut m, mut reader)
+}
+
+fn tableOid(t mut crucible.T, label str, table ?Table) Oid {
+	if let value = table {
+		return value.Oid
+	}
+	t.Error("{label}: relation not found")
+	return 0
+}
+
+fn isMissing(table ?Table) bool {
+	return table == nil
+}

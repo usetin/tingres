@@ -1,0 +1,18 @@
+package main
+
+import "postgres"
+import "quarry"
+import "say"
+
+fn main() ! {
+	let db = postgres.Open(postgres.Options{
+		Addr: quarry.Getenv("TINGRES_ADDR"),
+		User: "postgres",
+		Password: quarry.Getenv("TINGRES_PASSWORD"),
+		Database: "postgres",
+		Timeout: 5s,
+	})
+	let rows = try db.Query("SELECT 1")
+	if len(rows.Rows) != 1 || rows.Rows[0][0].Text() != "1" { fail "postgres client received an unexpected result" }
+	say.Line(rows.Rows[0][0].Text())
+}

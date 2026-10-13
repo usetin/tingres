@@ -1,0 +1,397 @@
+package types
+
+import "gauge"
+import "mint"
+
+// Oid is PostgreSQL's stable type identifier.
+type Oid = u32
+
+const BoolOid Oid = 16
+const ByteaOid Oid = 17
+const Int8Oid Oid = 20
+const Int2Oid Oid = 21
+const Int4Oid Oid = 23
+const TextOid Oid = 25
+const OidOid Oid = 26
+const Float4Oid Oid = 700
+const Float8Oid Oid = 701
+const VarcharOid Oid = 1043
+const BpcharOid Oid = 1042
+const NameOid Oid = 19
+const DateOid Oid = 1082
+const TimeOid Oid = 1083
+const TimestampOid Oid = 1114
+const TimestamptzOid Oid = 1184
+const IntervalOid Oid = 1186
+const NumericOid Oid = 1700
+const UuidOid Oid = 2950
+
+// Datum is a compact tagged SQL value. Numeric and temporal values retain their canonical text.
+type Datum value struct {
+	oid u32
+	null bool
+	i i64
+	f f64
+	b bool
+	s str
+	bytes []u8
+}
+
+// Null returns an SQL NULL datum.
+fn Null() Datum {
+	return Datum{oid: 0, null: true, i: 0, f: 0.0, b: false, s: "", bytes: []u8{}}
+}
+
+// IsNull reports whether d is SQL NULL.
+fn IsNull(d Datum) bool { return d.null }
+
+fn FromI64(oid Oid, v i64) Datum {
+	return Datum{oid: oid, null: false, i: v, f: 0.0, b: false, s: "", bytes: []u8{}}
+}
+
+fn FromF64(oid Oid, v f64) Datum {
+	return Datum{oid: oid, null: false, i: 0, f: v, b: false, s: "", bytes: []u8{}}
+}
+
+fn FromBool(v bool) Datum {
+	return Datum{oid: BoolOid, null: false, i: 0, f: 0.0, b: v, s: "", bytes: []u8{}}
+}
+
+fn FromStr(oid Oid, v str) Datum {
+	return Datum{oid: oid, null: false, i: 0, f: 0.0, b: false, s: v, bytes: []u8{}}
+}
+
+fn FromBytes(oid Oid, v []u8) Datum {
+	return Datum{oid: oid, null: false, i: 0, f: 0.0, b: false, s: "", bytes: v}
+}
+
+fn (d Datum) Oid() Oid { return d.oid }
+
+fn (d Datum) Text() str {
+	if d.null { return "" }
+	match d.oid {
+		BoolOid => {
+			if d.b { return "true" }
+			return "false"
+		}
+		Int2Oid, Int4Oid, Int8Oid, OidOid => { return mint.Itoa(d.i) }
+		Float4Oid, Float8Oid => { return mint.FormatFloat(d.f, 'g', -1) }
+		ByteaOid => { return "\\x" + hex(d.bytes) }
+		_ => { return d.s }
+	}
+}
+
+fn Parse(oid Oid, text str) !Datum {
+	match oid {
+		BoolOid => {
+			if text == "t" || text == "true" || text == "TRUE" || text == "yes" || text == "on" || text == "1" { return FromBool(true) }
+			if text == "f" || text == "false" || text == "FALSE" || text == "no" || text == "off" || text == "0" { return FromBool(false) }
+			fail "invalid input syntax for type boolean: {text}"
+		}
+		Int2Oid, Int4Oid, Int8Oid, OidOid => {
+			let n = try mint.ParseInt(text, 10)
+			if oid == Int2Oid && (n < -32768 || n > 32767) { fail "smallint out of range" }
+			if oid == Int4Oid && (n < -2147483648 || n > 2147483647) { fail "integer out of range" }
+			if oid == OidOid && n < 0 { fail "value out of range for type oid" }
+			return FromI64(oid, n)
+		}
+		Float4Oid => {
+			let f = try mint.ParseFloat(text)
+			return FromF64(oid, f64(f32(f)))
+		}
+		Float8Oid => {
+			let f = try mint.ParseFloat(text)
+			return FromF64(oid, f)
+		}
+		TextOid, VarcharOid, BpcharOid, NameOid, NumericOid, DateOid, TimeOid, TimestampOid, TimestamptzOid, IntervalOid, UuidOid => {
+			if oid == UuidOid && !valid_uuid(text) { fail "invalid input syntax for type uuid: {text}" }
+			if oid == NumericOid && !valid_numeric(text) { fail "invalid input syntax for type numeric: {text}" }
+			return FromStr(oid, text)
+		}
+		ByteaOid => {
+			let b = try parse_bytea(text)
+			return FromBytes(oid, b)
+		}
+		_ => { fail "unsupported input type OID {oid}" }
+	}
+}
+
+fn valid_numeric(s str) bool {
+	if len(s) == 0 { return false }
+	mut i = 0
+	if s[0] == '-' || s[0] == '+' { i += 1 }
+	mut digits = 0
+	mut dot = false
+	for i < len(s) {
+		let c = s[i]
+		if c >= '0' && c <= '9' { digits += 1 } else if c == '.' && !dot { dot = true } else if (c == 'e' || c == 'E') && digits > 0 {
+			let e = s[i+1:]
+			if len(e) == 0 { return false }
+			let n = mint.Atoi(e) catch _ { return false }
+			_ = n
+			return true
+		} else { return false }
+		i += 1
+	}
+	return digits > 0
+}
+
+fn valid_uuid(s str) bool {
+	if len(s) != 36 { return false }
+	for i, c in s {
+		if i == 8 || i == 13 || i == 18 || i == 23 { if c != '-' { return false } } else if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) { return false }
+	}
+	return true
+}
+
+fn Compare(a Datum, b Datum) i64 {
+	if a.null {
+		if b.null { return 0 }
+		return 1
+	}
+	if b.null { return -1 }
+	if a.oid != b.oid {
+		if a.oid < b.oid { return -1 }
+		return 1
+	}
+	match a.oid {
+		BoolOid => {
+			if a.b == b.b { return 0 }
+			if !a.b { return -1 }
+			return 1
+		}
+		Int2Oid, Int4Oid, Int8Oid, OidOid => {
+			if a.i < b.i { return -1 }
+			if a.i > b.i { return 1 }
+			return 0
+		}
+		Float4Oid, Float8Oid => {
+			if a.f < b.f { return -1 }
+			if a.f > b.f { return 1 }
+			return 0
+		}
+		ByteaOid => { return compare_bytes(a.bytes, b.bytes) }
+		_ => {
+			if a.s < b.s { return -1 }
+			if a.s > b.s { return 1 }
+			return 0
+		}
+	}
+}
+
+fn CanCast(from Oid, to Oid, implicit bool) bool {
+	if from == to { return true }
+	if to == TextOid || to == VarcharOid || to == BpcharOid { return true }
+	if from == Int2Oid && (to == Int4Oid || to == Int8Oid || to == Float4Oid || to == Float8Oid || to == NumericOid) { return true }
+	if from == Int4Oid && (to == Int8Oid || to == Float4Oid || to == Float8Oid || to == NumericOid) { return true }
+	if from == Int8Oid && (to == Float8Oid || to == NumericOid) { return true }
+	if from == Float4Oid && to == Float8Oid { return true }
+	if !implicit && (to == BoolOid || to == Int2Oid || to == Int4Oid || to == Int8Oid || to == Float4Oid || to == Float8Oid || to == NumericOid || to == UuidOid || to == DateOid || to == TimestampOid || to == TimestamptzOid || from == TextOid) { return true }
+	return false
+}
+
+fn Cast(d Datum, to Oid) !Datum {
+	if d.null { return Null() }
+	if d.oid == to { return d }
+	if !CanCast(d.oid, to, false) { fail "cannot cast type {d.oid} to {to}" }
+	if to == TextOid || to == VarcharOid || to == BpcharOid { return FromStr(to, d.Text()) }
+	return try Parse(to, d.Text())
+}
+
+fn ParseBytea(s str) !Datum {
+	let b = try parse_bytea(s)
+	return FromBytes(ByteaOid, b)
+}
+
+fn parse_bytea(s str) ![]u8 {
+	if len(s) >= 2 && s[:2] == "\\x" {
+		if (len(s)-2)%2 != 0 { fail "invalid input syntax for type bytea" }
+		mut out = []u8{}
+		mut i = 2
+		for i < len(s) {
+			let h = hexval(s[i])
+			let l = hexval(s[i+1])
+			if h < 0 || l < 0 { fail "invalid input syntax for type bytea" }
+			out = append(out, u8(h*16+l))
+			i += 2
+		}
+		return out
+	}
+	fail "unsupported bytea escape format"
+}
+
+fn hex(b []u8) str {
+	let digits = "0123456789abcdef"
+	mut out = []u8{}
+	for c in b { out = append(out, digits[c >> 4], digits[c & 15]) }
+	return str(out)
+}
+
+fn hexval(c u8) i64 {
+	if c >= '0' && c <= '9' { return i64(c-'0') }
+	if c >= 'a' && c <= 'f' { return i64(c-'a')+10 }
+	if c >= 'A' && c <= 'F' { return i64(c-'A')+10 }
+	return -1
+}
+
+fn compare_bytes(a []u8, b []u8) i64 {
+	let n = min(len(a), len(b))
+	for i in 0..n {
+		if a[i] < b[i] { return -1 }
+		if a[i] > b[i] { return 1 }
+	}
+	if len(a) < len(b) { return -1 }
+	if len(a) > len(b) { return 1 }
+	return 0
+}
+
+// EncodeBinary appends PostgreSQL's network binary representation for supported scalar types.
+fn EncodeBinary(d Datum, out mut []u8) {
+	if d.null { return }
+	match d.oid {
+		BoolOid => { if d.b { out = append(out, 1) } else { out = append(out, 0) } }
+		Int2Oid => { put_u16(mut out, u16(d.i)) }
+		Int4Oid => { put_u32(mut out, u32(d.i)) }
+		Int8Oid, OidOid => { put_u64(mut out, u64(d.i)) }
+		Float4Oid => { put_u32(mut out, gauge.F32bits(f32(d.f))) }
+		Float8Oid => { put_u64(mut out, gauge.F64bits(d.f)) }
+		ByteaOid => { out = append(out, d.bytes...) }
+		TextOid, VarcharOid, BpcharOid, NameOid => { out = append(out, d.s...) }
+		_ => { }
+	}
+}
+
+// DecodeBinary reads PostgreSQL's network binary representation for supported scalar types.
+fn DecodeBinary(oid Oid, b []u8) !Datum {
+	match oid {
+		BoolOid => {
+			if len(b) != 1 || b[0] > 1 { fail "invalid binary representation for boolean" }
+			return FromBool(b[0] == 1)
+		}
+		Int2Oid => {
+			if len(b) != 2 { fail "invalid binary representation for smallint" }
+			return FromI64(oid, i64(i16(read_u16(b, 0))))
+		}
+		Int4Oid => {
+			if len(b) != 4 { fail "invalid binary representation for integer" }
+			return FromI64(oid, i64(i32(read_u32(b, 0))))
+		}
+		Int8Oid, OidOid => {
+			if len(b) != 8 { fail "invalid binary representation for bigint" }
+			return FromI64(oid, i64(read_u64(b, 0)))
+		}
+		Float4Oid => {
+			if len(b) != 4 { fail "invalid binary representation for real" }
+			return FromF64(oid, f64(gauge.F32frombits(read_u32(b, 0))))
+		}
+		Float8Oid => {
+			if len(b) != 8 { fail "invalid binary representation for double precision" }
+			return FromF64(oid, gauge.F64frombits(read_u64(b, 0)))
+		}
+		ByteaOid => { return FromBytes(oid, b) }
+		TextOid, VarcharOid, BpcharOid, NameOid => { return FromStr(oid, str(b)) }
+		_ => { fail "binary receive is not implemented for type OID {oid}" }
+	}
+}
+
+fn put_u16(out mut []u8, v u16) { out = append(out, u8(v >> 8), u8(v)) }
+fn put_u32(out mut []u8, v u32) { out = append(out, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)) }
+fn put_u64(out mut []u8, v u64) {
+	out = append(out, u8(v >> 56), u8(v >> 48), u8(v >> 40), u8(v >> 32), u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
+}
+fn read_u16(b []u8, at i64) u16 { return u16(b[at]) << 8 | u16(b[at+1]) }
+fn read_u32(b []u8, at i64) u32 { return u32(b[at]) << 24 | u32(b[at+1]) << 16 | u32(b[at+2]) << 8 | u32(b[at+3]) }
+fn read_u64(b []u8, at i64) u64 { return u64(read_u32(b, at)) << 32 | u64(read_u32(b, at+4)) }
+
+type Row = []Datum
+
+// EncodeRow appends a stable tuple payload: u16 column count, null bitmap, then u32-length values.
+fn EncodeRow(types []Oid, r Row, out mut []u8) {
+	put_u16(mut out, u16(len(types)))
+	let bitmapAt = len(out)
+	let bitmapLen = (len(types)+7)/8
+	for i in 0..bitmapLen {
+		_ = i
+		out = append(out, 0)
+	}
+	for i, oid in types {
+		let d = r[i]
+		if d.null {
+			out[bitmapAt+i/8] |= u8(1 << (i%8))
+			continue
+		}
+		let value = row_value(oid, d)
+		put_u32(mut out, u32(len(value)))
+		out = append(out, value...)
+	}
+}
+
+// DecodeRow reads the tuple payload produced by EncodeRow.
+fn DecodeRow(types []Oid, b []u8) !Row {
+	if len(b) < 2 { fail "invalid row payload" }
+	let n = i64(read_u16(b, 0))
+	if n != len(types) { fail "row column count mismatch" }
+	let bitmapLen = (n+7)/8
+	if len(b) < 2+bitmapLen { fail "truncated row payload" }
+	mut at = 2+bitmapLen
+	mut row = []Datum{}
+	for i, oid in types {
+		if (b[2+i/8] & u8(1 << (i%8))) != 0 {
+			row = append(row, Null())
+			continue
+		}
+		if at+4 > len(b) { fail "truncated row value length" }
+		let size = i64(read_u32(b, at))
+		at += 4
+		if size < 0 || at+size > len(b) { fail "truncated row value" }
+		let d = try row_parse(oid, b[at:at+size])
+		row = append(row, d)
+		at += size
+	}
+	if at != len(b) { fail "trailing bytes in row payload" }
+	return row
+}
+
+fn row_value(oid Oid, d Datum) []u8 {
+	mut b = []u8{}
+	if oid == d.oid { EncodeBinary(d, mut b) } else { EncodeBinary(try_cast_for_row(d, oid), mut b) }
+	return b
+}
+
+fn try_cast_for_row(d Datum, oid Oid) Datum { return Cast(d, oid) catch _ { return d } }
+fn row_parse(oid Oid, b []u8) !Datum {
+	return try DecodeBinary(oid, b)
+}
+
+// IndexKey emits a memcmp-ordered key for primitive values.
+fn IndexKey(d Datum) []u8 {
+	mut out = []u8{}
+	if d.null { return []u8{0xff} }
+	out = append(out, 0)
+	match d.oid {
+		BoolOid => { if d.b { out = append(out, 1) } else { out = append(out, 0) } }
+		Int2Oid => {
+			let v = u16(d.i) ^ 0x8000
+			put_u16(mut out, v)
+		}
+		Int4Oid => {
+			let v = u32(d.i) ^ 0x80000000
+			put_u32(mut out, v)
+		}
+		Int8Oid, OidOid => {
+			let v = u64(d.i) ^ 0x8000000000000000
+			put_u64(mut out, v)
+		}
+		Float4Oid => {
+			let v = gauge.F32bits(f32(d.f))
+			if (v & 0x80000000) != 0 { put_u32(mut out, ~v) } else { put_u32(mut out, v ^ 0x80000000) }
+		}
+		Float8Oid => {
+			let v = gauge.F64bits(d.f)
+			if (v & 0x8000000000000000) != 0 { put_u64(mut out, ~v) } else { put_u64(mut out, v ^ 0x8000000000000000) }
+		}
+		ByteaOid => { out = append(out, d.bytes...) }
+		_ => { out = append(out, d.s...) }
+	}
+	return out
+}
