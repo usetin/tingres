@@ -1,0 +1,56 @@
+package types
+
+import "crucible"
+
+// BenchmarkInt4Add measures the resolved int4 addition fast path (no slice).
+fn BenchmarkInt4Add(b mut crucible.B) {
+	if let f = LookupOperator("+", Int4Oid, Int4Oid) {
+		mut sink = i64(0)
+		for i in 0..b.N {
+			let value = f.Int4Binary(i32(i), 7) catch _ { continue }
+			sink +%= i64(value)
+		}
+		if sink < 0 { b.Name = "impossible" }
+	}
+}
+
+// BenchmarkTextCompare measures the resolved text comparison fast path.
+fn BenchmarkTextCompare(b mut crucible.B) {
+	if let f = LookupOperator("<", TextOid, TextOid) {
+		let left = "abcdefghijklmnopqrstuvwxyz"
+		let right = "abcdefghijklmnopqrstuvwxyzz"
+		mut hits = i64(0)
+		for i in 0..b.N {
+			let less = f.TextCompare(left, right) catch _ { continue }
+			if less { hits += 1 }
+			_ = i
+		}
+		if hits < 0 { b.Name = "impossible" }
+	}
+}
+
+// BenchmarkLikeMatch measures the precompiled LIKE matcher on its contains path.
+fn BenchmarkLikeMatch(b mut crucible.B) {
+	let matcher = CompileLike("%needle%", "\\", false, false) catch _ { return }
+	let text = "a haystack with a needle inside it"
+	mut hits = i64(0)
+	for i in 0..b.N {
+		if matcher.Matches(text) { hits += 1 }
+	}
+	if hits < 0 { b.Name = "impossible" }
+}
+
+// BenchmarkSumStep measures the unboxed int8 sum transition step.
+fn BenchmarkSumStep(b mut crucible.B) {
+	if let agg = LookupAgg("sum", []Oid{Int4Oid}) {
+		mut state = agg.Init()
+		mut value = FromI64(Int4Oid, 0)
+		mut row = []Datum{value}
+		for i in 0..b.N {
+			value.i = i%1000
+			row[0] = value
+			state = agg.Step(state, row) catch _ { continue }
+		}
+		if state.I < 0 { b.Name = "impossible" }
+	}
+}

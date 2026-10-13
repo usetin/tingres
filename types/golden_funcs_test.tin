@@ -18,9 +18,14 @@ fn TestPostgreSqlFunctionGoldens(t mut crucible.T) {
 		t.Error("could not load string PostgreSQL goldens: {err}")
 		return
 	}
+	let extras = quarry.ReadFile("types/testdata/golden_funcs_extras.txt") catch err {
+		t.Error("could not load extra PostgreSQL goldens: {err}")
+		return
+	}
 	let scalarCount = testGoldenFile(mut t, "scalar", scalar)
 	let stringCount = testGoldenFile(mut t, "string", strings)
-	t.True("golden corpus has at least 500 expressions", scalarCount+stringCount >= 500)
+	let extraCount = testGoldenFile(mut t, "extras", extras)
+	t.True("golden corpus has at least 500 expressions", scalarCount+stringCount+extraCount >= 500)
 }
 
 fn testGoldenFile(t mut crucible.T, group str, contents str) i64 {
