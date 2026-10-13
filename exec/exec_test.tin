@@ -1,0 +1,36 @@
+package exec
+
+import "crucible"
+
+fn TestThreeValuedLogic(t mut crucible.T) {
+	let andCode = []Instruction{Instruction{Op: Op.PushConst, Value: Value.Null}, Instruction{Op: Op.PushConst, Value: Value.Bool(false)}, Instruction{Op: Op.And, Value: Value.Null}}
+	let andValue = Eval(andCode, []Value{}) catch _ { Value.Null }
+	t.True("NULL AND false is false", andValue == Value.Bool(false))
+	let orCode = []Instruction{Instruction{Op: Op.PushConst, Value: Value.Null}, Instruction{Op: Op.PushConst, Value: Value.Bool(true)}, Instruction{Op: Op.Or, Value: Value.Null}}
+	let orValue = Eval(orCode, []Value{}) catch _ { Value.Null }
+	t.True("NULL OR true is true", orValue == Value.Bool(true))
+	let nullCode = []Instruction{Instruction{Op: Op.PushConst, Value: Value.Null}, Instruction{Op: Op.Not, Value: Value.Null}}
+	let nullValue = Eval(nullCode, []Value{}) catch _ { Value.Bool(false) }
+	t.True("NOT NULL remains NULL", isNull(nullValue))
+}
+
+fn TestPullOperators(t mut crucible.T) {
+	let data = ValuesCursor{Rows: []Row{[]Value{Value.Int(1)}, []Value{Value.Int(2)}, []Value{Value.Int(3)}}}
+	let filter = FilterCursor{Input: data, Test: []Instruction{Instruction{Op: Op.LoadColumn, Column: 0, Value: Value.Null}, Instruction{Op: Op.PushConst, Value: Value.Int(3)}, Instruction{Op: Op.Less, Value: Value.Null}}}
+	let project = ProjectCursor{Input: filter, Exprs: [][]Instruction{[]Instruction{Instruction{Op: Op.LoadColumn, Column: 0, Value: Value.Null}, Instruction{Op: Op.PushConst, Value: Value.Int(10)}, Instruction{Op: Op.Add, Value: Value.Null}}}}
+	mut lim = LimitCursor{Input: project, Left: 1}
+	let (first, hasFirst, firstErr) = lim.Next()
+	t.NoFault("first pull", firstErr)
+	t.True("projected row exists", hasFirst)
+	t.True("projected value", first[0] == Value.Int(11))
+	let (_, hasSecond, secondErr) = lim.Next()
+	t.NoFault("second pull", secondErr)
+	t.True("limit stops", !hasSecond)
+}
+
+fn TestExpressionErrors(t mut crucible.T) {
+	let (_, bad) = Eval([]Instruction{Instruction{Op: Op.LoadColumn, Column: 4, Value: Value.Null}}, []Value{Value.Int(1)})
+	t.HasFault("column out of range", bad)
+	let (_, wrong) = Eval([]Instruction{Instruction{Op: Op.PushConst, Value: Value.Text("a")}, Instruction{Op: Op.PushConst, Value: Value.Int(1)}, Instruction{Op: Op.Add, Value: Value.Null}}, []Value{})
+	t.HasFault("unsupported addition", wrong)
+}
