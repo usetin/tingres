@@ -1,0 +1,23 @@
+package tests
+
+import "crucible"
+import "../proto"
+
+fn TestPublicStartupContract(t mut crucible.T) {
+	let body = []u8("user\x00ada\x00database\x00shop\x00application_name\x00probe\x00\x00")
+	let startup = proto.ParseStartup(196608, body) catch err {
+		t.Error("startup decode: {err}")
+		return
+	}
+	crucible.Equal(mut t, "startup user", startup.User, "ada")
+	crucible.Equal(mut t, "startup database", startup.Database, "shop")
+	crucible.Equal(mut t, "unknown option retained", startup.Parameters["application_name"], "probe")
+}
+
+fn TestFrameContract(t mut crucible.T) {
+	let frame = proto.EncodeFrame('Q', []u8("select 1\x00"))
+	crucible.Equal(mut t, "Query frame type", frame[0], u8('Q'))
+	crucible.Equal(mut t, "Query frame byte length", i64(frame[1])<<24 | i64(frame[2])<<16 | i64(frame[3])<<8 | i64(frame[4]), len(frame)-1)
+	let startup = proto.EncodeFrame(0, []u8{0, 3, 0, 0})
+	crucible.Equal(mut t, "startup frame has no type byte", len(startup), 8)
+}

@@ -1,0 +1,9 @@
+package server
+
+import "crucible"
+
+fn TestM1QueryBoundary(t mut crucible.T) {
+	t.True("SELECT 1 is supported", supported_query(" SELECT 1; "))
+	t.True("SELECT 1 AS answer is supported", supported_query("select 1 as answer"))
+	t.True("other SQL stays unsupported", !supported_query("select 2"))
+}
