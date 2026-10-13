@@ -1,0 +1,170 @@
+package types
+
+import "crucible"
+
+// TestAggregateLookupResultTypes pins PostgreSQL's aggregate result types.
+fn TestAggregateLookupResultTypes(t mut crucible.T) {
+	aggRet(mut t, "count", []Oid{}, Int8Oid)
+	aggRet(mut t, "count", []Oid{Int4Oid}, Int8Oid)
+	aggRet(mut t, "sum", []Oid{Int2Oid}, Int8Oid)
+	aggRet(mut t, "sum", []Oid{Int4Oid}, Int8Oid)
+	aggRet(mut t, "sum", []Oid{Int8Oid}, NumericOid)
+	aggRet(mut t, "sum", []Oid{Float4Oid}, Float4Oid)
+	aggRet(mut t, "sum", []Oid{Float8Oid}, Float8Oid)
+	aggRet(mut t, "sum", []Oid{NumericOid}, NumericOid)
+	aggRet(mut t, "avg", []Oid{Int2Oid}, NumericOid)
+	aggRet(mut t, "avg", []Oid{Int8Oid}, NumericOid)
+	aggRet(mut t, "avg", []Oid{NumericOid}, NumericOid)
+	aggRet(mut t, "avg", []Oid{Float4Oid}, Float8Oid)
+	aggRet(mut t, "avg", []Oid{Float8Oid}, Float8Oid)
+	aggRet(mut t, "min", []Oid{DateOid}, DateOid)
+	aggRet(mut t, "max", []Oid{NumericOid}, NumericOid)
+	aggRet(mut t, "array_agg", []Oid{Int2Oid}, Oid(1005))
+	aggRet(mut t, "array_agg", []Oid{Int4Oid}, Oid(1007))
+	aggRet(mut t, "array_agg", []Oid{TextOid}, Oid(1009))
+	aggRet(mut t, "string_agg", []Oid{TextOid, TextOid}, TextOid)
+	aggRet(mut t, "bool_and", []Oid{BoolOid}, BoolOid)
+	aggRet(mut t, "bit_and", []Oid{Int4Oid}, Int4Oid)
+	t.True("array_agg of an unordered type is not defined", LookupAgg("array_agg", []Oid{Oid(0)}) != nil)
+}
+
+fn aggRet(t mut crucible.T, name str, args []Oid, want Oid) {
+	if let agg = LookupAgg(name, args) {
+		if agg.Ret != want { t.Error("{name} returns {agg.Ret}, want {want}") }
+	} else {
+		t.Error("aggregate {name} is missing")
+	}
+}
+
+// TestAggregateDifferential pins PostgreSQL 17's aggregate results, including
+// empty input and NULL handling.
+fn TestAggregateDifferential(t mut crucible.T) {
+	aggCheck(mut t, "count", []Oid{Int4Oid}, []Datum{FromI64(Int4Oid, 1), Null(), FromI64(Int4Oid, 3)}, "2")
+	aggCheck(mut t, "sum", []Oid{Int2Oid}, []Datum{FromI64(Int2Oid, 1), FromI64(Int2Oid, 2)}, "3")
+	aggCheck(mut t, "sum", []Oid{Int4Oid}, []Datum{FromI64(Int4Oid, 1), Null(), FromI64(Int4Oid, 2)}, "3")
+	aggCheck(mut t, "sum", []Oid{Int8Oid}, []Datum{FromI64(Int8Oid, 1), FromI64(Int8Oid, 2)}, "3")
+	aggCheck(mut t, "sum", []Oid{Float8Oid}, []Datum{FromF64(Float8Oid, 1.5), FromF64(Float8Oid, 2.5)}, "4")
+	aggCheck(mut t, "sum", []Oid{NumericOid}, []Datum{num("1.5"), num("2.5")}, "4.0")
+	aggCheck(mut t, "sum", []Oid{Int4Oid}, []Datum{Null()}, "NULL")
+	aggCheck(mut t, "avg", []Oid{Int4Oid}, []Datum{FromI64(Int4Oid, 1), FromI64(Int4Oid, 2)}, "1.5000000000000000")
+	aggCheck(mut t, "avg", []Oid{Int4Oid}, []Datum{FromI64(Int4Oid, 1), FromI64(Int4Oid, 2), FromI64(Int4Oid, 2)}, "1.6666666666666667")
+	aggCheck(mut t, "avg", []Oid{NumericOid}, []Datum{num("1.5"), num("2.5")}, "2.0000000000000000")
+	aggCheck(mut t, "avg", []Oid{Float8Oid}, []Datum{FromF64(Float8Oid, 1.0), FromF64(Float8Oid, 2.0)}, "1.5")
+	aggCheck(mut t, "avg", []Oid{Int4Oid}, []Datum{Null()}, "NULL")
+	aggCheck(mut t, "min", []Oid{Int4Oid}, []Datum{FromI64(Int4Oid, 3), FromI64(Int4Oid, 1), FromI64(Int4Oid, 2)}, "1")
+	aggCheck(mut t, "max", []Oid{NumericOid}, []Datum{num("1.5"), num("2.5")}, "2.5")
+	aggCheck(mut t, "max", []Oid{DateOid}, []Datum{date("2024-01-02"), Null(), date("2023-05-05")}, "2024-01-02")
+	aggCheck(mut t, "min", []Oid{DateOid}, []Datum{date("2024-01-02"), Null(), date("2023-05-05")}, "2023-05-05")
+	aggCheckRows(mut t, "string_agg", []Oid{TextOid, TextOid}, [][]Datum{{txt("a"), txt(",")}, {txt("b"), txt(",")}, {Null(), txt(",")}}, "a,b")
+	aggCheckRows(mut t, "string_agg", []Oid{TextOid, TextOid}, [][]Datum{{Null(), txt(",")}}, "NULL")
+	aggCheck(mut t, "bool_and", []Oid{BoolOid}, []Datum{FromBool(true), Null(), FromBool(false)}, "false")
+	aggCheck(mut t, "bool_or", []Oid{BoolOid}, []Datum{FromBool(true), Null(), FromBool(false)}, "true")
+	aggCheck(mut t, "every", []Oid{BoolOid}, []Datum{FromBool(true), FromBool(true)}, "true")
+	aggCheck(mut t, "bool_and", []Oid{BoolOid}, []Datum{Null()}, "NULL")
+	aggCheck(mut t, "bit_and", []Oid{Int4Oid}, []Datum{FromI64(Int4Oid, 5), FromI64(Int4Oid, 3)}, "1")
+	aggCheck(mut t, "bit_or", []Oid{Int4Oid}, []Datum{FromI64(Int4Oid, 5), FromI64(Int4Oid, 3)}, "7")
+	aggCheck(mut t, "bit_xor", []Oid{Int4Oid}, []Datum{FromI64(Int4Oid, 5), FromI64(Int4Oid, 3), FromI64(Int4Oid, 1)}, "7")
+	aggCheck(mut t, "array_agg", []Oid{Int4Oid}, []Datum{FromI64(Int4Oid, 1), FromI64(Int4Oid, 2), Null()}, `{1,2,NULL}`)
+	aggCheck(mut t, "array_agg", []Oid{TextOid}, []Datum{txt("a"), txt("b c"), txt("d,e"), Null()}, `{a,"b c","d,e",NULL}`)
+	aggCheck(mut t, "array_agg", []Oid{Int4Oid}, []Datum{}, "NULL")
+	aggCheck(mut t, "min", []Oid{Int4Oid}, []Datum{}, "NULL")
+	aggCheck(mut t, "string_agg", []Oid{TextOid, TextOid}, []Datum{}, "NULL")
+}
+
+// TestAggregateCombine checks the combine transition used for parallel groups.
+fn TestAggregateCombine(t mut crucible.T) {
+	if let agg = LookupAgg("sum", []Oid{Int4Oid}) {
+		mut left = agg.Init()
+		left = agg.Step(left, []Datum{FromI64(Int4Oid, 1)}) catch _ { return }
+		mut right = agg.Init()
+		right = agg.Step(right, []Datum{FromI64(Int4Oid, 2)}) catch _ { return }
+		let combined = agg.Combine(left, right) catch _ { return }
+		let result = agg.Final(combined) catch _ { return }
+		crucible.Equal(mut t, "combined int sum", result.Text(), "3")
+	} else {
+		t.Error("sum is missing")
+	}
+	if let agg = LookupAgg("array_agg", []Oid{Int4Oid}) {
+		mut left = agg.Init()
+		left = agg.Step(left, []Datum{FromI64(Int4Oid, 1)}) catch _ { return }
+		mut right = agg.Init()
+		right = agg.Step(right, []Datum{FromI64(Int4Oid, 2)}) catch _ { return }
+		let combined = agg.Combine(left, right) catch _ { return }
+		let result = agg.Final(combined) catch _ { return }
+		crucible.Equal(mut t, "combined array_agg", result.Text(), `{1,2}`)
+	} else {
+		t.Error("array_agg is missing")
+	}
+}
+
+// TestAggregateCountStar checks count(*) counts rows without a value.
+fn TestAggregateCountStar(t mut crucible.T) {
+	if let agg = LookupAgg("count", []Oid{}) {
+		mut state = agg.Init()
+		for i in 0..3 {
+			_ = i
+			state = agg.Step(state, []Datum{}) catch _ { return }
+		}
+		let result = agg.Final(state) catch _ { return }
+		crucible.Equal(mut t, "count(*)", result.Text(), "3")
+	}
+	if let agg = LookupAgg("count", []Oid{}) {
+		let result = agg.Final(agg.Init()) catch _ { return }
+		crucible.Equal(mut t, "count(*) of no rows", result.Text(), "0")
+	}
+}
+
+fn aggCheck(t mut crucible.T, name str, args []Oid, values []Datum, want str) {
+	let got = aggEval(name, args, values) catch err {
+		let text = "ERROR: " + ErrorMessage(err)
+		if text != want { t.Error("{name}: got {text}, want {want}") }
+		return
+	}
+	if got != want { t.Error("{name}: got {got}, want {want}") }
+}
+
+fn aggEval(name str, args []Oid, values []Datum) !str {
+	if let agg = LookupAgg(name, args) {
+		mut state = agg.Init()
+		for value in values { state = try agg.Step(state, []Datum{value}) }
+		let result = try agg.Final(state)
+		if IsNull(result) { return "NULL" }
+		return result.Text()
+	}
+	fail "aggregate {name} is not defined"
+}
+
+fn num(text str) Datum {
+	let value = ParseNumeric(text) catch _ { return Null() }
+	return value
+}
+
+fn date(text str) Datum {
+	let value = Parse(DateOid, text) catch _ { return Null() }
+	return value
+}
+
+fn txt(value str) Datum { return FromStr(TextOid, value) }
+
+fn aggCheckRows(t mut crucible.T, name str, args []Oid, rows [][]Datum, want str) {
+	if let agg = LookupAgg(name, args) {
+		mut state = agg.Init()
+		for row in rows { state = agg.Step(state, row) catch err {
+			t.Error("{name}: step failed: {err}")
+			return
+			} }
+		let result = agg.Final(state) catch err {
+			t.Error("{name}: final failed: {err}")
+			return
+		}
+		let got = aggResultText(result)
+		if got != want { t.Error("{name}: got {got}, want {want}") }
+	} else {
+		t.Error("aggregate {name} is missing")
+	}
+}
+
+fn aggResultText(result Datum) str {
+	if IsNull(result) { return "NULL" }
+	return result.Text()
+}
