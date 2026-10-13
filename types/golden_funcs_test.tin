@@ -201,7 +201,7 @@ fn (parser mut GoldenParser) readNumber() !Datum {
 		} else { break }
 	}
 	let text = parser.Source[start:parser.Pos]
-	if decimal { return try Parse(Float8Oid, text) }
+	if decimal { return try Parse(NumericOid, text) }
 	let value = try Parse(Int8Oid, text)
 	if value.i <= 2147483647 { return FromI64(Int4Oid, value.i) }
 	return value
@@ -218,8 +218,8 @@ fn (parser mut GoldenParser) readIdentifier() str {
 }
 
 fn (parser mut GoldenParser) binaryOperator() (str, i64, i64) {
-	for op in []str{"OR", "AND", "<<", ">>", "<=", ">=", "<>", "=", "<", ">", "||", "+", "-", "*", "/", "%", "&", "|", "#"} {
-		if op[0] >= 'A' && op[0] <= 'Z' {
+	for op in []str{"NOT SIMILAR TO", "SIMILAR TO", "NOT LIKE", "NOT ILIKE", "LIKE", "ILIKE", "OR", "AND", "IS DISTINCT FROM", "!~~*", "!~~", "!~*", "!~", "~~*", "~~", "~*", "~", "<<", ">>", "<=", ">=", "<>", "=", "<", ">", "||", "+", "-", "*", "/", "%", "^", "&", "|", "#"} {
+		if isGoldenWord(op[0]) {
 			if parser.starts(op) && (parser.Pos+len(op) == len(parser.Source) || !isGoldenWord(parser.Source[parser.Pos+len(op)])) { return op, goldenPrecedence(op), len(op) }
 		} else if parser.starts(op) { return op, goldenPrecedence(op), len(op) }
 	}
@@ -230,6 +230,7 @@ fn goldenPrecedence(op str) i64 {
 	if op == "OR" { return 1 }
 	if op == "AND" { return 2 }
 	if op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" { return 3 }
+	if op == "LIKE" || op == "ILIKE" || op == "NOT LIKE" || op == "NOT ILIKE" || op == "SIMILAR TO" || op == "NOT SIMILAR TO" || op == "~" || op == "~*" || op == "!~" || op == "!~*" || op == "~~" || op == "~~*" || op == "!~~" || op == "!~~*" || op == "IS DISTINCT FROM" { return 3 }
 	if op == "+" || op == "-" || op == "||" { return 4 }
 	if op == "<<" || op == ">>" { return 4 }
 	return 5
@@ -277,14 +278,22 @@ fn goldenCast(value Datum, typeName str) !Datum {
 		"smallint", "int2" => Int2Oid
 		"integer", "int", "int4" => Int4Oid
 		"bigint", "int8" => Int8Oid
+		"oid" => OidOid
 		"real", "float4" => Float4Oid
 		"double", "float8" => Float8Oid
 		"text" => TextOid
 		"varchar" => VarcharOid
 		"bpchar", "char" => BpcharOid
+		"name" => NameOid
 		"bytea" => ByteaOid
 		"uuid" => UuidOid
 		"numeric" => NumericOid
+		"date" => DateOid
+		"time" => TimeOid
+		"timetz" => TimetzOid
+		"timestamp" => TimestampOid
+		"timestamptz" => TimestamptzOid
+		"interval" => IntervalOid
 		_ => Oid(0)
 	}
 	if target == 0 { fail "unsupported test cast target {typeName}" }
