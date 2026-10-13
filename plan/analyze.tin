@@ -528,10 +528,18 @@ fn analyzeSelectCore(c catalog.Catalog, tx txn.Txn, parentScopes []Scope, ctes [
 	mut orderKeys = []AnalyzedSortKey{}
 	for sb in sel.OrderBy {
 		let sortExpr = try analyzeExpr(c, tx, allScopes, ctes, targetFlags, groupByExprs, mut stats, mut params, sb.Value, 0)
+		let desc = sb.Direction == "desc" || sb.Direction == "DESC"
+		// Default null placement: NULLS LAST for ASC, NULLS FIRST for DESC.
+		mut nullsFirst = desc
+		if sb.Nulls == "first" || sb.Nulls == "FIRST" {
+			nullsFirst = true
+		} else if sb.Nulls == "last" || sb.Nulls == "LAST" {
+			nullsFirst = false
+		}
 		orderKeys = append(orderKeys, AnalyzedSortKey{
 			Expr: sortExpr,
-			Descending: sb.Direction == "DESC",
-			NullsFirst: sb.Nulls == "FIRST",
+			Descending: desc,
+			NullsFirst: nullsFirst,
 		})
 	}
 

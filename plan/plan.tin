@@ -451,7 +451,12 @@ fn sortKeyExplain(keys []SortKey, cols []ExplainCol, qualify bool) str {
 		if i > 0 { out += ", " }
 		out += exprText(k.Expr, cols, qualify)
 		if k.Descending { out += " DESC" }
-		if k.NullsFirst { out += " NULLS FIRST" }
+		// Print null placement only when it differs from the direction default.
+		if k.NullsFirst && !k.Descending {
+			out += " NULLS FIRST"
+		} else if !k.NullsFirst && k.Descending {
+			out += " NULLS LAST"
+		}
 	}
 	return out
 }

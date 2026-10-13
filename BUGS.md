@@ -1,3 +1,7 @@
+# tingres bugs in other packages
+
+- `parse`: the lexer's `Token.Pos` is not a character offset. `parse/lexer.tin` initialises `charPos = 1` and then adds only `countCharacters(sql, previousByte, BytePos)` (the whitespace gap) per token, never the token length, so `Pos` is a token-gap ordinal (for `SELECT foo FROM users` the `foo` token reports `Pos == 2`). `plan/` therefore cannot produce PostgreSQL-compatible error positions (`PgError.Position`) and emits analyzer errors with position 0. Fix: `charPos = 1 + countCharacters(sql, 0, tokens[i].BytePos)`.
+
 # Tin compiler bugs
 
 - `tests/compiler_bugs/forward_map_struct_key.tin`: Tin segfaults when a struct declares a map whose struct key and struct value types are declared later in the package. The transaction manager avoids the compiler bug by declaring `LockMode`, `LockKey` and `LockHolder` before `Manager`.
