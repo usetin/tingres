@@ -81,6 +81,17 @@ fn costHashJoin(left Cost, right Cost, outRows f64, width i64) Cost {
 	}
 }
 
+fn costMergeJoin(left Cost, right Cost, outRows f64, width i64) Cost {
+	let startup = left.Startup + right.Startup
+	let total = left.Total + right.Total + (left.Rows + right.Rows) * CpuOperatorCost + outRows * CpuTupleCost
+	return Cost{
+		Startup: startup,
+		Total: total,
+		Rows: outRows,
+		Width: width,
+	}
+}
+
 fn costNestLoop(outer Cost, inner Cost, outRows f64, width i64) Cost {
 	let total = outer.Total + outer.Rows * inner.Total
 	return Cost{
@@ -445,6 +456,22 @@ fn PlanQuery(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
 	}
 }
 
+// scanHintsFor derives the ordering a base scan should try to supply: the
+// ORDER BY keys, or the GROUP BY keys when the query aggregates and has no
+// explicit order.
+fn scanHintsFor(query AnalyzedQuery) ScanHints {
+	mut keys = []SortKey{}
+	for k in query.OrderBy {
+		keys = append(keys, SortKey{Expr: foldExpr(k.Expr), Descending: k.Descending, NullsFirst: k.NullsFirst})
+	}
+	if len(keys) == 0 && (query.HasAggs || len(query.GroupBy) > 0) {
+		for g in query.GroupBy {
+			keys = append(keys, SortKey{Expr: foldExpr(g), Descending: false, NullsFirst: false})
+		}
+	}
+	return ScanHints{OrderKeys: keys}
+}
+
 fn planSelect(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
 	mut foldedWhere ?Expr = nil
 	if let w = query.Where {
@@ -469,7 +496,7 @@ fn planSelect(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
 			Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 8},
 		})
 	} else if len(query.From) == 1 {
-		planNode = try planFromItem(c, tx, mut query.From[0], allQuals)
+		planNode = try planFromItem(c, tx, mut query.From[0], allQuals, scanHintsFor(query))
 	} else {
 		// Multi-table FROM (comma joins)
 		planNode = try planFromJoinList(c, tx, mut query.From, allQuals)
@@ -599,14 +626,18 @@ break } }
 				NullsFirst: k.NullsFirst,
 			})
 		}
-		let sCost = costSort(distinctPlan.Cost(), distinctPlan.Cost().Rows, distinctPlan.Cost().Width)
-		sortedPlan = Plan.Sort(SortNode{
-			Input: distinctPlan,
-			Keys: sortKeys,
-			Limit: topN,
-			Cols: outCols,
-			Cost: sCost,
-		})
+		if planProvidesOrder(distinctPlan, sortKeys) {
+			sortedPlan = distinctPlan
+		} else {
+			let sCost = costSort(distinctPlan.Cost(), distinctPlan.Cost().Rows, distinctPlan.Cost().Width)
+			sortedPlan = Plan.Sort(SortNode{
+				Input: distinctPlan,
+				Keys: sortKeys,
+				Limit: topN,
+				Cols: outCols,
+				Cost: sCost,
+			})
+		}
 	}
 
 	// 7. LIMIT / OFFSET
@@ -681,6 +712,7 @@ fn sameSimpleExpr(a Expr, b Expr) bool {
 // planProvidesOrder reports whether a plan's output is already sorted on the
 // requested keys (a prefix match of an existing Sort node's keys).
 fn planProvidesOrder(p Plan, wanted []SortKey) bool {
+	if len(wanted) == 0 { return true }
 	match p {
 		Sort(n) => {
 			if len(n.Keys) < len(wanted) { return false }
@@ -690,8 +722,41 @@ fn planProvidesOrder(p Plan, wanted []SortKey) bool {
 			}
 			return true
 		}
+		IndexScan(n) => { return indexProvidesOrder(n.Index, n.Table, wanted, n.Direction) }
+		IndexOnlyScan(n) => { return indexProvidesOrder(n.Index, n.Table, wanted, n.Direction) }
+		Project(n) => { return planProvidesOrder(n.Input, wanted) }
+		Filter(n) => { return planProvidesOrder(n.Input, wanted) }
 		_ => { return false }
 	}
+}
+
+// indexProvidesOrder reports whether a directional index scan yields the wanted order.
+fn indexProvidesOrder(idx catalog.Index, tbl catalog.Table, wanted []SortKey, direction ScanDirection) bool {
+	let idxCols = inferIndexColumns(idx, tbl)
+	if len(idxCols) < len(wanted) { return false }
+	for i, w in wanted {
+		let (attno, ok) = tableColAttno(tbl, idxCols[i])
+		if !ok { return false }
+		mut isCol = false
+		mut keyAttno = i16(0)
+		match w.Expr {
+			ColRef(c) => {
+				isCol = true
+				keyAttno = c.AttNo
+			}
+			_ => {}
+		}
+		if !isCol || keyAttno != attno { return false }
+		if w.Descending && direction != ScanDirection.Backward { return false }
+		if !w.Descending && direction != ScanDirection.Forward { return false }
+	}
+	return true
+}
+
+// ScanHints carries ordering requests from planSelect down to a base scan so an
+// index can supply the order and avoid a Sort.
+type ScanHints value struct {
+	OrderKeys []SortKey
 }
 
 // isIdentityProjection reports whether exprs is exactly the input columns in order.
@@ -916,6 +981,32 @@ fn planJoinPair(left Plan, leftRanges []i64, right Plan, rightRanges []i64, qual
 	let width = left.Cost().Width + right.Cost().Width
 	let cols = concatColDesc(left.Cols(), right.Cols())
 	if hasEqui {
+		// Merge join when both inputs already arrive ordered on the join keys
+		// (for example two ordered index scans) and it is cheaper than hashing.
+		mut lKeys = []SortKey{}
+		for e in leftKeys {
+			lKeys = append(lKeys, SortKey{Expr: e, Descending: false, NullsFirst: false})
+		}
+		mut rKeys = []SortKey{}
+		for e in rightKeys {
+			rKeys = append(rKeys, SortKey{Expr: e, Descending: false, NullsFirst: false})
+		}
+		if jt == JoinType.Inner && planProvidesOrder(left, lKeys) && planProvidesOrder(right, rKeys) {
+			let mergeCost = costMergeJoin(left.Cost(), right.Cost(), outRows, width)
+			let hashCost = costHashJoin(left.Cost(), right.Cost(), outRows, width)
+			if mergeCost.Total < hashCost.Total {
+				return Plan.MergeJoin(MergeJoinNode{
+					Left: left,
+					Right: right,
+					JoinType: jt,
+					LeftKeys: leftKeys,
+					RightKeys: rightKeys,
+					Quals: rest,
+					Cols: cols,
+					Cost: mergeCost,
+				})
+			}
+		}
 		let cost = costHashJoin(left.Cost(), right.Cost(), outRows, width)
 		return Plan.HashJoin(HashJoinNode{
 			Left: left,
@@ -939,10 +1030,10 @@ fn planJoinPair(left Plan, leftRanges []i64, right Plan, rightRanges []i64, qual
 	})
 }
 
-fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals []Expr) !Plan {
+fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals []Expr, hints ScanHints) !Plan {
 	match item {
 		Table(tbl) => {
-			return try planTableScan(c, tx, tbl, allQuals)
+			return try planTableScan(c, tx, tbl, allQuals, hints)
 		}
 		Subquery(sub) => {
 			mut subQuery = sub.Query
@@ -972,9 +1063,9 @@ fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals
 		}
 		Join(j) => {
 			mut leftItem = j.Left
-			let leftPlan = try planFromItem(c, tx, mut leftItem, allQuals)
+			let leftPlan = try planFromItem(c, tx, mut leftItem, allQuals, ScanHints{OrderKeys: []SortKey{}})
 			mut rightItem = j.Right
-			let rightPlan = try planFromItem(c, tx, mut rightItem, allQuals)
+			let rightPlan = try planFromItem(c, tx, mut rightItem, allQuals, ScanHints{OrderKeys: []SortKey{}})
 			let leftRanges = fromItemRanges(j.Left)
 			let rightRanges = fromItemRanges(j.Right)
 			mut joinQuals = []Expr{}
@@ -1001,7 +1092,7 @@ fn planFromJoinList(c catalog.Catalog, tx txn.Txn, items mut []FromClauseItem, a
 	mut plans = []Plan{}
 	mut ranges = [][]i64{}
 	for item in items {
-		let p = try planFromItem(c, tx, mut item, allQuals)
+		let p = try planFromItem(c, tx, mut item, allQuals, ScanHints{OrderKeys: []SortKey{}})
 		plans = append(plans, p)
 		ranges = append(ranges, fromItemRanges(item))
 	}
@@ -1193,7 +1284,7 @@ fn estimateIndexRows(baseRows f64, bounds []IndexBound, unique bool) f64 {
 	return rows
 }
 
-fn planTableScan(c catalog.Catalog, tx txn.Txn, tbl FromTable, allQuals []Expr) !Plan {
+fn planTableScan(c catalog.Catalog, tx txn.Txn, tbl FromTable, allQuals []Expr, hints ScanHints) !Plan {
 	mut tableQuals = []Expr{}
 	for q in allQuals {
 		if isSingleTableQual(q, tbl.RangeIndex) {
@@ -1233,6 +1324,32 @@ fn planTableScan(c catalog.Catalog, tx txn.Txn, tbl FromTable, allQuals []Expr) 
 			}
 			if idxCost.Total < seqCost.Total {
 				return plan
+			}
+		}
+
+		// Order-satisfying index: a scan following an index's key order can
+		// supply the requested ORDER BY / GROUP BY order and avoid a Sort.
+		if len(hints.OrderKeys) > 0 {
+			for idx in t.Indexes {
+				let idxCols = inferIndexColumns(idx, t)
+				if len(idxCols) == 0 { continue }
+				mut dir = ScanDirection.Forward
+				if hints.OrderKeys[0].Descending { dir = ScanDirection.Backward }
+				if indexProvidesOrder(idx, t, hints.OrderKeys, dir) {
+					let (oq, ob, orr) = matchIndexQuals(idxCols, t, tableQuals)
+					let rows = estimateIndexRows(baseRows, ob, idx.Unique)
+					let oCost = costIndexScan(rows, width, i64(len(oq)), idx.Unique)
+					return Plan.IndexScan(IndexScanNode{
+						Table: t,
+						Index: idx,
+						Bounds: ob,
+						Quals: oq,
+						Direction: dir,
+						Filter: combineConjunction(orr),
+						Cols: tbl.Cols,
+						Cost: oCost,
+					})
+				}
 			}
 		}
 
@@ -1313,7 +1430,7 @@ fn planUpdate(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
 	}
 	let allQuals = splitConjunction(foldedWhere)
 	mut item = query.From[0]
-	let scan = try planFromItem(c, tx, mut item, allQuals)
+	let scan = try planFromItem(c, tx, mut item, allQuals, ScanHints{OrderKeys: []SortKey{}})
 
 	// The update source emits one full table row per matched row: SET expressions
 	// replace their columns, all other columns pass through.
@@ -1359,7 +1476,7 @@ fn planDelete(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
 	}
 	let allQuals = splitConjunction(foldedWhere)
 	mut item = query.From[0]
-	let scan = try planFromItem(c, tx, mut item, allQuals)
+	let scan = try planFromItem(c, tx, mut item, allQuals, ScanHints{OrderKeys: []SortKey{}})
 
 	return Plan.ModifyTable(ModifyTableNode{
 		Kind: ModifyKind.Delete,

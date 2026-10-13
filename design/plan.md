@@ -45,4 +45,29 @@ All physical plan nodes provide:
 
 ## 3. Preparation & Execution Protocol
 
-`Prepare(c catalog.Catalog, t txn.Txn, s parse.Stmt, paramTypes []Oid) !Prepared` validates catalog entities, resolves types, generates the physical plan, and stamps the prepared plan with `CatalogVersion`. Cached statements call `Prepared.Valid(c)` to verify freshness before reuse.
+`Prepare(c catalog.Catalog, t txn.Txn, s parse.Stmt, paramTypes []Oid) !Prepared` validates catalog entities, resolves types, generates the physical plan, and stamps the prepared plan with `CatalogVersion`. Cached statements call `Prepared.Valid(c)` to verify freshness before reuse. `NormalizeStatement(sql)` builds the cache key (literals replaced by `?`, `$n` parameters and quoted identifiers preserved, comments and extra whitespace removed).
+
+## 4. Optimizer
+
+`PlanQuery` runs after `AnalyzeStatement`:
+
+- **Constant folding** (`foldExpr`) evaluates constant sub-expressions through the resolved `types.Func`.
+- **Predicate pushdown**: top-level WHERE conjuncts are split (`splitConjunction`) and each single-relation qual is pushed into its scan as a filter; an index prefix of equality/range quals becomes an `Index Cond`.
+- **Index selection**: `catalog.Index` carries no key list, so key columns are decoded from the index name (`<table>_<col>...[_pkey|_key|_idx]`). A unique index whose whole key is matched by equality always yields an `Index Scan` (primary-key point-lookup fast path); non-unique indexes are chosen only when cheaper than a sequential scan. A B-tree whose leading columns match the ORDER BY / GROUP BY keys is used as an ordered scan to avoid a Sort.
+- **Join ordering**: comma-separated FROM items are ordered greedily (cheapest relation first, then the cheapest join), and each WHERE qual is pushed into the join that first makes it evaluable. An equality connecting the two sides makes a `Hash Join` (keys split out), otherwise a `Nested Loop`.
+- **Aggregation**: streaming `GroupAgg` when the input already arrives ordered on the GROUP BY keys, otherwise `HashAgg`. ORDER BY bounded by a constant LIMIT sets `SortNode.Limit` for a top-N heap.
+
+The cost model uses PostgreSQL's constants (`seq_page_cost=1`, `random_page_cost=4`, `cpu_tuple_cost=0.01`, `cpu_index_tuple_cost=0.005`, `cpu_operator_cost=0.0025`) and PostgreSQL's default operator selectivities. The catalog exposes no `reltuples`/`relpages`/column statistics, so row counts default to 100 and widths to 8 bytes per column.
+
+## 5. EXPLAIN
+
+`Explain(p, analyze)` renders PostgreSQL-style text: a node line with `(cost=.. rows=.. width=..)`, then indented `Filter:`, `Index Cond:`, `Hash Cond:`, `Merge Cond:`, `Join Filter:`, `Sort Key:` and `Group Key:` lines, using an expression renderer that qualifies columns by relation when the plan has more than one relation. `ExplainJson(p)` emits `FORMAT JSON` with node type, costs, rows, width, details and children. `ExplainAnalyze(p, stats)` annotates a plan with `NodeStat` measurements (`ActualRows`, `Loops`, `ActualTimeMs`) supplied by exec, addressed by root path.
+
+## 6. Known gaps
+
+- IN/EXISTS decorrelation to semi/anti joins, view expansion and column pruning are not implemented; subqueries are planned as `SubLink`/scalar subplans.
+- Index-only scan selection (the node and EXPLAIN exist) and Merge Join selection are not implemented; merge joins are still executed as hash joins by exec.
+- `UPDATE`/`DELETE` with `FROM`/`USING` are not supported.
+- `catalog.Index` has no key list and the catalog has no statistics, so index selection and row estimates use the name convention and defaults above.
+- Analyzer errors carry SQLSTATE and message but `Position == 0`: `parse`'s `Token.Pos` is not a character offset (see `BUGS.md`).
+- An `IndexScan`/`IndexOnlyScan` plan is not yet executable by `exec` (`BuildCursor` has no case for it and returns an empty cursor), so an end-to-end PK point lookup returns no rows until the exec agent implements that node against this contract.
