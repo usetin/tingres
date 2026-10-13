@@ -1,0 +1,78 @@
+package types
+
+import "mint"
+import "say"
+import "twine"
+import "fault"
+
+// PgError is the protocol-facing PostgreSQL error payload.
+type PgError struct {
+	Severity str
+	Code str
+	Message str
+	Detail str
+	Hint str
+	Position i32
+}
+
+// NewError creates an ERROR with the supplied SQLSTATE and message.
+fn NewError(code str, message str) PgError {
+	return PgError{Severity: "ERROR", Code: code, Message: message, Detail: "", Hint: "", Position: 0}
+}
+
+// NewPgError creates an ERROR with all fields used by PostgreSQL ErrorResponse.
+fn NewPgError(code str, message str, detail str, hint str, position i32) PgError {
+	return PgError{Severity: "ERROR", Code: code, Message: message, Detail: detail, Hint: hint, Position: position}
+}
+
+// PgFault creates a Tin fault whose payload can be recovered with ErrorFromFault.
+fn PgFault(code str, message str) ! {
+	fail ErrorFault(NewError(code, message))
+}
+
+// ErrorFault encodes a PostgreSQL error into a fault for a ! result.
+fn ErrorFault(e PgError) ! {
+	let payload = "@PGERR1@" + pg_field(e.Code) + pg_field(e.Severity) + pg_field(e.Message) + pg_field(e.Detail) + pg_field(e.Hint) + pg_field(mint.Itoa(i64(e.Position)))
+	fail say.Fault("{payload}")
+}
+
+// ErrorFromFault extracts a PostgreSQL payload from a package fault.
+fn ErrorFromFault(err fault) PgError {
+	let raw = fault.Message(err)
+	if !twine.HasPrefix(raw, "@PGERR1@") { return PgError{Severity: "ERROR", Code: "XX000", Message: raw, Detail: "", Hint: "", Position: 0} }
+	let body = raw[8:]
+	let (code, at1, ok1) = read_pg_field(body, 0)
+	let (severity, at2, ok2) = read_pg_field(body, at1)
+	let (message, at3, ok3) = read_pg_field(body, at2)
+	let (detail, at4, ok4) = read_pg_field(body, at3)
+	let (hint, at5, ok5) = read_pg_field(body, at4)
+	let (posText, at6, ok6) = read_pg_field(body, at5)
+	if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 || at6 != len(body) {
+		return PgError{Severity: "ERROR", Code: "XX000", Message: raw, Detail: "", Hint: "", Position: 0}
+	}
+	let position = mint.Atoi(posText) catch _ { 0 }
+	return PgError{Severity: severity, Code: code, Message: message, Detail: detail, Hint: hint, Position: i32(position)}
+}
+
+// ErrorCode returns the SQLSTATE carried by err, or XX000 for an unstructured fault.
+fn ErrorCode(err fault) str { return ErrorFromFault(err).Code }
+
+// ErrorMessage returns the PostgreSQL message carried by err.
+fn ErrorMessage(err fault) str { return ErrorFromFault(err).Message }
+
+fn pg_field(s str) str { return mint.Itoa(len(s)) + ":" + s }
+
+fn read_pg_field(s str, at i64) (str, i64, bool) {
+	if at < 0 || at >= len(s) { return "", at, false }
+	mut colon = -1
+	for i in at..len(s) {
+		if s[i] == ':' {
+			colon = i
+			break
+		}
+	}
+	if colon < at { return "", at, false }
+	let size = mint.Atoi(s[at:colon]) catch _ { return "", at, false }
+	if size < 0 || colon+1+size > len(s) { return "", at, false }
+	return s[colon+1:colon+1+size], colon+1+size, true
+}

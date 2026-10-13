@@ -1,0 +1,17 @@
+package types
+
+import "crucible"
+
+fn TestPgErrorFaultRoundTrip(t mut crucible.T) {
+	let source = NewPgError("22P02", "invalid input syntax for type integer: \"abc\"", "detail\x1fline", "hint", 7)
+	let err = ErrorFault(source)
+	let got = ErrorFromFault(err)
+	crucible.Equal(mut t, "sqlstate", got.Code, source.Code)
+	crucible.Equal(mut t, "severity", got.Severity, source.Severity)
+	crucible.Equal(mut t, "message", got.Message, source.Message)
+	crucible.Equal(mut t, "detail", got.Detail, source.Detail)
+	crucible.Equal(mut t, "hint", got.Hint, source.Hint)
+	crucible.Equal(mut t, "position", got.Position, source.Position)
+	crucible.Equal(mut t, "code helper", ErrorCode(err), "22P02")
+	crucible.Equal(mut t, "message helper", ErrorMessage(err), source.Message)
+}
