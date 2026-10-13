@@ -9,13 +9,19 @@ import "../parse"
 type Oid = u32
 
 // ColDesc describes one output column of a plan or result set.
-// Matches RowDescription fields required by the PostgreSQL wire protocol.
+// The first five fields match the RowDescription fields required by the
+// PostgreSQL wire protocol; RangeIndex and SourceName are plan-only EXPLAIN
+// metadata (the range-table index and relation alias that produced the column).
+// They are additive: exec constructs ColDesc without them and gets the zero
+// values.
 type ColDesc struct {
 	Name str
 	Oid u32
 	Typmod i32
 	TableOid u32
 	Attno i16
+	RangeIndex i64
+	SourceName str
 }
 
 // Cost stores startup and total cost, estimated rows, and estimated average tuple width.

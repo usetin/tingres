@@ -225,8 +225,11 @@ fn TestPlannerPhysicalPlans(t mut crucible.T) {
 				}
 			}
 		}
+		HashJoin(hj) => {
+			crucible.Equal(mut t, "hash join has 1 left key", len(hj.LeftKeys), 1)
+		}
 		_ => {
-			t.Error("expected Project over HashJoin")
+			t.Error("expected HashJoin for equijoin")
 		}
 	}
 
