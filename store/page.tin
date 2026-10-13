@@ -1,8 +1,21 @@
 package store
 
+type RelId = u32
+type PageNo = u32
+
+
 const PageSize = 8192
 const pageHeaderSize = 32
 const linePointerSize = 8
+
+const PageAllVisible u16 = 0x0001
+const PageIsLeaf u16 = 0x0002
+const PageIsRoot u16 = 0x0004
+
+const PageTypeHeap u16 = 1
+const PageTypeBtreeLeaf u16 = 2
+const PageTypeBtreeInternal u16 = 3
+const PageTypeBtreeMeta u16 = 4
 
 // Page is an 8 KiB slotted page. The checksum field is zero while hashing.
 type Page struct {
@@ -13,9 +26,13 @@ type Page struct {
 type PageHeader struct {
 	Lsn u64
 	Checksum u32
+	Flags u16
+	PageType u16
 	Lower u16
 	Upper u16
 	Slots u16
+	PrevBlock PageNo
+	NextBlock PageNo
 }
 
 // NewPage returns an empty page with valid free-space boundaries.
@@ -30,6 +47,7 @@ fn (p mut Page) Reset() {
 	for i in 0..len(p.Data) {
 		p.Data[i] = 0
 	}
+	writeU16(mut p.Data, 14, PageTypeHeap)
 	writeU16(mut p.Data, 16, u16(pageHeaderSize))
 	writeU16(mut p.Data, 18, u16(PageSize))
 	p.Seal()
@@ -37,7 +55,17 @@ fn (p mut Page) Reset() {
 
 // Header decodes the common page header.
 fn (p Page) Header() PageHeader {
-	return PageHeader{Lsn: readU64(p.Data, 0), Checksum: readU32(p.Data, 8), Lower: readU16(p.Data, 16), Upper: readU16(p.Data, 18), Slots: readU16(p.Data, 20)}
+	return PageHeader{
+		Lsn: readU64(p.Data, 0),
+		Checksum: readU32(p.Data, 8),
+		Flags: readU16(p.Data, 12),
+		PageType: readU16(p.Data, 14),
+		Lower: readU16(p.Data, 16),
+		Upper: readU16(p.Data, 18),
+		Slots: readU16(p.Data, 20),
+		PrevBlock: PageNo(readU32(p.Data, 24)),
+		NextBlock: PageNo(readU32(p.Data, 28)),
+	}
 }
 
 // FreeSpace is the number of bytes available to another line pointer and item.
@@ -49,6 +77,67 @@ fn (p Page) FreeSpace() i64 {
 // SetLsn updates the page LSN and checksum.
 fn (p mut Page) SetLsn(lsn u64) {
 	writeU64(mut p.Data, 0, lsn)
+	p.Seal()
+}
+
+// Flags returns the header flag bits.
+fn (p Page) Flags() u16 {
+	return readU16(p.Data, 12)
+}
+
+// SetFlags replaces the header flag bits.
+fn (p mut Page) SetFlags(flags u16) {
+	writeU16(mut p.Data, 12, flags)
+	p.Seal()
+}
+
+// AllVisible reports whether all tuples on this page are visible to every transaction.
+fn (p Page) AllVisible() bool {
+	return (readU16(p.Data, 12) & PageAllVisible) != 0
+}
+
+// SetAllVisible sets or clears the page-level all-visible bit.
+fn (p mut Page) SetAllVisible(v bool) {
+	mut flags = readU16(p.Data, 12)
+	if v {
+		flags |= PageAllVisible
+	} else {
+		flags &= ~PageAllVisible
+	}
+	writeU16(mut p.Data, 12, flags)
+	p.Seal()
+}
+
+// PageType returns the page type identifier.
+fn (p Page) PageType() u16 {
+	return readU16(p.Data, 14)
+}
+
+// SetPageType sets the page type identifier.
+fn (p mut Page) SetPageType(pt u16) {
+	writeU16(mut p.Data, 14, pt)
+	p.Seal()
+}
+
+// PrevBlock returns the previous sibling block number.
+fn (p Page) PrevBlock() PageNo {
+	return PageNo(readU32(p.Data, 24))
+}
+
+// SetPrevBlock updates the previous sibling block number.
+fn (p mut Page) SetPrevBlock(b PageNo) {
+	writeU32(mut p.Data, 24, u32(b))
+	p.Seal()
+}
+
+// NextBlock returns the next sibling block number.
+fn (p Page) NextBlock() PageNo {
+	return PageNo(readU32(p.Data, 28))
+}
+
+// SetNextBlock updates the next sibling block number.
+fn (p mut Page) SetNextBlock(b PageNo) {
+	writeU32(mut p.Data, 28, u32(b))
 	p.Seal()
 }
 
@@ -93,6 +182,42 @@ fn (p mut Page) Insert(value []u8) !u16 {
 	writeU16(mut p.Data, 20, slot+1)
 	p.Seal()
 	return slot + 1
+}
+
+// InsertAt inserts an item at the specified 1-based slot, shifting subsequent slots right.
+fn (p mut Page) InsertAt(targetSlot u16, value []u8) !u16 {
+	if len(p.Data) != PageSize || len(value) == 0 {
+		fail "store: invalid page or empty item"
+	}
+	let h = p.Header()
+	if targetSlot == 0 || targetSlot > h.Slots + 1 {
+		fail "store: invalid slot index"
+	}
+	let need = len(value) + linePointerSize
+	if i64(h.Upper) - i64(h.Lower) < need {
+		fail "store: page full"
+	}
+	let off = i64(h.Upper) - len(value)
+	copy(p.Data[off:off+len(value)], value)
+	if targetSlot <= h.Slots {
+		for s in (i64(targetSlot)..i64(h.Slots)+1).step(1) {
+			let fromSlot = i64(h.Slots) + i64(targetSlot) - s
+			let srcLp = pageHeaderSize + (fromSlot-1)*linePointerSize
+			let dstLp = pageHeaderSize + fromSlot*linePointerSize
+			for b in 0..linePointerSize {
+				p.Data[dstLp+b] = p.Data[srcLp+b]
+			}
+		}
+	}
+	let lp = pageHeaderSize + i64(targetSlot-1)*linePointerSize
+	writeU16(mut p.Data, lp, u16(off))
+	writeU16(mut p.Data, lp+2, u16(len(value)))
+	writeU32(mut p.Data, lp+4, 1)
+	writeU16(mut p.Data, 16, u16(i64(h.Lower)+linePointerSize))
+	writeU16(mut p.Data, 18, u16(off))
+	writeU16(mut p.Data, 20, h.Slots+1)
+	p.Seal()
+	return targetSlot
 }
 
 // ReserveSlot reserves line-pointer space and returns a slot for a tuple whose bytes are not yet
@@ -183,6 +308,10 @@ fn (p Page) Item(slot u16) ![]u8 {
 		fail "store: invalid tuple id"
 	}
 	let lp = pageHeaderSize + i64(slot-1)*linePointerSize
+	let status = readU32(p.Data, lp+4)
+	if status != 1 {
+		fail "store: deleted or uninitialized line pointer"
+	}
 	let off = i64(readU16(p.Data, lp))
 	let n = i64(readU16(p.Data, lp+2))
 	if n == 0 || off < pageHeaderSize || off+n > PageSize {
@@ -191,6 +320,82 @@ fn (p Page) Item(slot u16) ![]u8 {
 	let out = make([]u8, n)
 	copy(out, p.Data[off:off+n])
 	return out
+}
+
+// ItemView returns a slice directly into the page data for read-only access while latched.
+fn (p Page) ItemView(slot u16) ![]u8 {
+	let h = p.Header()
+	if slot == 0 || slot > h.Slots {
+		fail "store: invalid tuple id"
+	}
+	let lp = pageHeaderSize + i64(slot-1)*linePointerSize
+	let status = readU32(p.Data, lp+4)
+	if status != 1 {
+		fail "store: deleted or uninitialized line pointer"
+	}
+	let off = i64(readU16(p.Data, lp))
+	let n = i64(readU16(p.Data, lp+2))
+	if n == 0 || off < pageHeaderSize || off+n > PageSize {
+		fail "store: deleted or corrupt line pointer"
+	}
+	return p.Data[off:off+n]
+}
+
+// DeleteItem marks a line pointer unused and defragments the page.
+fn (p mut Page) DeleteItem(slot u16) ! {
+	let h = p.Header()
+	if slot == 0 || slot > h.Slots {
+		fail "store: invalid tuple id"
+	}
+	let lp = pageHeaderSize + i64(slot-1)*linePointerSize
+	writeU16(mut p.Data, lp, 0)
+	writeU16(mut p.Data, lp+2, 0)
+	writeU32(mut p.Data, lp+4, 0)
+	p.Compact()
+}
+
+// Compact defragments page storage by copying all live items towards the end of the page.
+fn (p mut Page) Compact() {
+	let h = p.Header()
+	if h.Slots == 0 {
+		writeU16(mut p.Data, 18, u16(PageSize))
+		p.Seal()
+		return
+	}
+	mut temp = make([]u8, PageSize)
+	copy(temp, p.Data)
+	mut newUpper = i64(PageSize)
+	for slot in 1..i64(h.Slots)+1 {
+		let lp = pageHeaderSize + (slot-1)*linePointerSize
+		let status = readU32(temp, lp+4)
+		let itemLen = i64(readU16(temp, lp+2))
+		let oldOff = i64(readU16(temp, lp))
+		if status == 1 && itemLen > 0 && oldOff >= pageHeaderSize && oldOff+itemLen <= PageSize {
+			newUpper -= itemLen
+			copy(p.Data[newUpper:newUpper+itemLen], temp[oldOff:oldOff+itemLen])
+			writeU16(mut p.Data, lp, u16(newUpper))
+		} else if status != 2 {
+			writeU16(mut p.Data, lp, 0)
+			writeU16(mut p.Data, lp+2, 0)
+			writeU32(mut p.Data, lp+4, 0)
+		}
+	}
+	writeU16(mut p.Data, 18, u16(newUpper))
+	p.Seal()
+}
+
+// PruneSlots marks each listed slot dead and compacts the page.
+fn (p mut Page) PruneSlots(deadSlots []u16) {
+	let h = p.Header()
+	for _, slot in deadSlots {
+		if slot >= 1 && slot <= h.Slots {
+			let lp = pageHeaderSize + i64(slot-1)*linePointerSize
+			writeU16(mut p.Data, lp, 0)
+			writeU16(mut p.Data, lp+2, 0)
+			writeU32(mut p.Data, lp+4, 0)
+		}
+	}
+	p.Compact()
 }
 
 fn writeU16(b mut []u8, off i64, v u16) {
