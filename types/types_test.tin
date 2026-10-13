@@ -1,0 +1,66 @@
+package types
+
+import "crucible"
+
+fn TestScalarInputOutput(t mut crucible.T) {
+	let i = Parse(Int4Oid, "-214") catch err {
+		t.Error("int input failed: {err}")
+		return
+	}
+	crucible.Equal(mut t, "int output", i.Text(), "-214")
+	let b = Parse(BoolOid, "t") catch err {
+		t.Error("bool input failed: {err}")
+		return
+	}
+	crucible.Equal(mut t, "bool output", b.Text(), "true")
+	let f = Parse(Float8Oid, "1.25") catch err {
+		t.Error("float input failed: {err}")
+		return
+	}
+	crucible.Equal(mut t, "float output", f.Text(), "1.25")
+	let n = Parse(NumericOid, "12345678901234567890.00100") catch err {
+		t.Error("numeric input failed: {err}")
+		return
+	}
+	crucible.Equal(mut t, "numeric preserves scale", n.Text(), "12345678901234567890.00100")
+}
+
+fn TestOrderingAndNull(t mut crucible.T) {
+	t.True("integer order", Compare(FromI64(Int4Oid, 2), FromI64(Int4Oid, 8)) < 0)
+	t.True("null sorts last", Compare(FromI64(Int4Oid, 8), Null()) < 0)
+	crucible.Equal(mut t, "null equals null", Compare(Null(), Null()), i64(0))
+}
+
+fn TestUuidAndBytea(t mut crucible.T) {
+	let u = Parse(UuidOid, "a0b1c2d3-e4f5-4678-9abc-def012345678") catch err {
+		t.Error("uuid input failed: {err}")
+		return
+	}
+	crucible.Equal(mut t, "uuid output", u.Text(), "a0b1c2d3-e4f5-4678-9abc-def012345678")
+	let b = Parse(ByteaOid, "\\x00ff41") catch err {
+		t.Error("bytea input failed: {err}")
+		return
+	}
+	crucible.Equal(mut t, "bytea output", b.Text(), "\\x00ff41")
+}
+
+fn TestBinaryAndRows(t mut crucible.T) {
+	mut raw = []u8{}
+	EncodeBinary(FromI64(Int4Oid, -7), mut raw)
+	let decoded = DecodeBinary(Int4Oid, raw) catch err {
+		t.Error("binary decode failed: {err}")
+		return
+	}
+	crucible.Equal(mut t, "binary integer", decoded.Text(), "-7")
+	let oids = []Oid{Int4Oid, TextOid, BoolOid}
+	let source = []Datum{FromI64(Int4Oid, 42), FromStr(TextOid, "hello"), Null()}
+	mut encoded = []u8{}
+	EncodeRow(oids, source, mut encoded)
+	let result = DecodeRow(oids, encoded) catch err {
+		t.Error("row decode failed: {err}")
+		return
+	}
+	crucible.Equal(mut t, "row int", result[0].Text(), "42")
+	crucible.Equal(mut t, "row text", result[1].Text(), "hello")
+	t.True("row null", IsNull(result[2]))
+}
