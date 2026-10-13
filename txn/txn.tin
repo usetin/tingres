@@ -208,10 +208,13 @@ fn (m mut Manager) Begin(iso Isolation) !Txn {
 fn (t Txn) Xid() u32 {
 	return t.xid
 }
-
-// CommandID returns the active command counter.
 fn (t Txn) CommandID() u32 {
 	return t.cid
+}
+
+// NextXid returns the next transaction id the manager will allocate.
+fn (m Manager) NextXid() u32 {
+	return m.nextXid
 }
 
 // CommandCounterIncrement advances the current transaction's command id.
@@ -431,6 +434,25 @@ fn cloneBytes(src []u8) []u8 {
 // Visible applies PostgreSQL MVCC visibility to a store tuple header.
 fn (m Manager) Visible(snap Snapshot, h store.TupleHeader) bool {
 	let (visible, _) = m.visibleHeader(snap, h, snap.Cid)
+	return visible
+}
+
+// HeapTupleVisible applies MVCC visibility to a tuple with its own TID, using the
+// recorded delete command id so a transaction still sees its own delete.
+fn (m Manager) HeapTupleVisible(snap Snapshot, rel store.RelId, h store.TupleHeader, tid store.Tid) bool {
+	return m.TupleHeaderVisible(snap, rel, h.Xmin(), h.Xmax(), h.Cid(), h.Infomask(), tid)
+}
+
+// TupleHeaderVisible is HeapTupleVisible over plain header fields, so a caller that
+// decodes rows itself needs no store.TupleHeader value.
+fn (m Manager) TupleHeaderVisible(snap Snapshot, rel store.RelId, xmin u32, xmax u32, cid u32, infomask u16, tid store.Tid) bool {
+	mut cmax = snap.Cid
+	if xmax == snap.Xid {
+		let key = tupleLockKey(rel, tid)
+		let (deleteCommand, ok) = m.deleteCommands[key]
+		if ok && deleteCommand.xid == snap.Xid { cmax = deleteCommand.cid }
+	}
+	let (visible, _) = m.visibleHeaderFields(snap, xmin, xmax, cid, infomask, cmax)
 	return visible
 }
 
