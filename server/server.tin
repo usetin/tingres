@@ -1,129 +1,673 @@
-// Package server connects PostgreSQL protocol sessions to the query executor.
+// Package server owns the listener, the per-connection tasks and the session loop that
+// binds a proto connection to a query session through exec.Sink.
+//
+// Concurrency: connections are tasks on one lane; every socket wait lets the lane serve
+// the other sessions, so a slow client cannot block the accept loop or another session.
+// Linux SO_REUSEPORT listeners (one per core) are not reachable from Tin yet: wire.Listen
+// exposes no reuse-port option, so this is the single-listener form; see BUGS.md.
 package server
 
+import "../exec"
+import "../proto"
+import "../types"
 import "atomic"
 import "lane"
+import "fault"
+import "quarry"
 import "say"
+import "tide"
 import "twine"
 import "wire"
-import "../proto"
 
-const startupTimeout = 10s
-const idleTimeout = 60s
 const defaultMaxConnections = 100
+const defaultShutdownGrace = 5s
+const copyFlushBytes = 64 * 1024
 
 shared let activeConnections = atomic.NewInt(0)
+shared let stopping = atomic.NewBool(false)
 
-// Serve accepts connections and schedules each session as an independent task.
-// wire.Listen exposes one shared listener on all platforms; Linux SO_REUSEPORT
-// needs a wire API that is not available in this Tin checkout.
-fn Serve(addr str, cfg proto.Config) ! {
-	let listener = try wire.Listen(addr)
-	mut keepAlive = lane.New[bool](1)
-	scope sessions {
-		sessions.spawn(fn() ! {
-			for {
-				let accepted = listener.Accept() catch _ { continue }
-				if !reserve_connection(connection_limit(cfg)) {
-					proto.RejectStartup(accepted, "53300", "sorry, too many clients already") catch _ {
-					}
-					mut rejected = accepted
-					rejected.Close()
-					continue
-				}
-				let client = accepted
-				sessions.spawn(fn() ! {
-					mut acceptedClient = client
-					serve_accepted(mut acceptedClient, cfg) catch err {
-						say.Line("tingres connection closed: {err}")
-					}
-				})
-			}
-		})
-		for { let _ = keepAlive.Recv() catch _ { false } }
+// Config is the server's configuration, after flags and files are read.
+type Config struct {
+	Data str
+	Listen str
+	Role str
+	Database str
+	HbaPath str
+	Auth str
+	Password str
+	MaxConnections i64
+	StartupTimeout i64
+	IdleTimeout i64
+	LogMinDurationMs i64
+	ShutdownFile str
+	ReloadFile str
+	PidFile str
+	TlsCertFile str
+	TlsKeyFile str
+	TlsCert str
+	TlsKey str
+	ServerVersion str
+	Engine str
+	Fake bool
+	Hba []proto.HbaLine
+}
+
+// ConnSlot is the shared state of one accepted connection: a CancelRequest on another
+// connection finds the target session through it.
+type ConnSlot struct {
+	Pid u32
+	SecretKey u32
+	Ready atomic.Bool
+	Done atomic.Bool
+	Terminate atomic.Bool
+	Conn ?proto.Conn
+	Session Session
+}
+
+fn new_slot(pid u32) ConnSlot {
+	return ConnSlot{
+		Pid: pid,
+		SecretKey: 0,
+		Ready: atomic.NewBool(false),
+		Done: atomic.NewBool(false),
+		Terminate: atomic.NewBool(false),
+		Conn: nil,
+		Session: FakeSessionOf(NewFakeSession("", "", pid)),
 	}
 }
 
-fn connection_limit(cfg proto.Config) i64 {
-	if cfg.MaxConnections <= 0 {
-		return defaultMaxConnections
-	}
-	return cfg.MaxConnections
+// RequestShutdown asks a running server to stop accepting and terminate its sessions.
+fn RequestShutdown() { stopping.Store(true) }
+
+// ClearShutdown resets the shutdown flag.
+fn ClearShutdown() { stopping.Store(false) }
+
+// ActiveConnections is the number of connections currently reserved.
+fn ActiveConnections() i64 { return activeConnections.Load() }
+
+// Limit clamps a configured connection limit to the server default.
+fn Limit(configured i64) i64 {
+	if configured <= 0 { return defaultMaxConnections }
+	return configured
+}
+
+// Serve listens on addr and serves until shutdown.
+fn Serve(addr str, cfg Config, engine Engine) ! {
+	let listener = try wire.Listen(addr)
+	say.Line("tingres: listening on {addr} (max_connections={Limit(cfg.MaxConnections)}, engine={engine_name(cfg)})")
+	try serve_listener(listener, cfg, engine)
+	mut closed = listener
+	closed.Close()
+}
+
+// Listen serves until shutdown on an already-open listener (tests bind port 0).
+fn Listen(listener wire.Listener, cfg Config, engine Engine) ! {
+	try serve_listener(listener, cfg, engine)
+}
+
+// engine_name names the engine used for logging.
+fn engine_name(cfg Config) str {
+	if cfg.Fake { return "conformance" }
+	return "real"
 }
 
 fn reserve_connection(maxAllowed i64) bool {
 	let current = activeConnections.Add(1)
-	if current <= maxAllowed {
-		return true
-	}
+	if current <= maxAllowed { return true }
 	activeConnections.Add(-1)
 	return false
 }
 
-fn serve_accepted(sock mut wire.Conn, cfg proto.Config) ! {
-	defer activeConnections.Add(-1)
-	try run_client(mut sock, cfg)
+// proto_config builds the per-connection protocol configuration.
+fn proto_config(cfg Config, pid u32, peer str) proto.Config {
+	return proto.Config{
+		User: cfg.Role,
+		Database: cfg.Database,
+		Auth: cfg.Auth,
+		Password: cfg.Password,
+		MaxConnections: cfg.MaxConnections,
+		Hba: cfg.Hba,
+		TlsCert: cfg.TlsCert,
+		TlsKey: cfg.TlsKey,
+		PeerAddress: peer,
+		ServerVersion: cfg.ServerVersion,
+		Pid: pid,
+	}
 }
 
-fn run_client(client mut wire.Conn, cfg proto.Config) ! {
-	client.SetTimeout(startupTimeout)
-	let conn = proto.Accept(client, cfg) catch err {
+// peer_address is the client address pg_hba matching uses; wire exposes no RemoteAddr yet
+// (see BUGS.md), so it is the listener's own host, which is the loopback address in tests
+// and development.
+fn peer_address(cfg Config) str {
+	let colon = twine.LastIndex(cfg.Listen, ":")
+	if colon <= 0 { return "127.0.0.1" }
+	let host = cfg.Listen[:colon]
+	if host == "" || host == "0.0.0.0" || host == "*" { return "0.0.0.0" }
+	if host == "::" || host == "[::]" { return "::1" }
+	return host
+}
+
+fn serve_listener(listener wire.Listener, cfg Config, engine Engine) ! {
+	mut registry = make(map[u32]ConnSlot)
+	mut nextPid = u32(20000)
+	mut active = cfg
+	ClearShutdown()
+	mut keepAlive = lane.New[bool](1)
+	let eng = engine
+	scope sessions {
+		sessions.spawn(fn() ! {
+			for {
+				if stopping.Load() || shutdown_requested(active) {
+					mut closingEng = eng
+					begin_shutdown(mut registry, mut closingEng, active)
+					keepAlive.Send(true) catch _ {}
+					return
+				}
+				if reload_requested(active) {
+					active = reload_hba(mut active)
+				}
+				mut accepted = listener.Accept() catch _ {
+					if stopping.Load() {
+						mut closingEng = eng
+						begin_shutdown(mut registry, mut closingEng, active)
+					}
+					keepAlive.Send(true) catch _ {}
+					return
+				}
+				prune_registry(mut registry)
+				if !reserve_connection(Limit(active.MaxConnections)) {
+					proto.RejectStartup(mut accepted, "53300", "sorry, too many clients already") catch _ {
+					}
+					accepted.Close()
+					continue
+				}
+				let pid = nextPid
+				nextPid += 1
+				let slot = new_slot(pid)
+				registry[pid] = slot
+				let clientArg = accepted
+				let peer = peer_address(active)
+				let cfgCopy = active
+				sessions.spawn(fn() ! {
+					mut clientLocal = clientArg
+					mut slotLocal = slot
+					client_loop(mut clientLocal, cfgCopy, eng, mut slotLocal, registry, peer, pid) catch err {
+						if !proto.IsProtocolError(err) {
+							say.Line("tingres: connection {pid} ended: {fault.Message(err)}")
+						}
+					}
+				})
+			}
+		})
+		for {
+			let _ = keepAlive.Recv() catch _ { false }
+			break
+		}
+	}
+}
+
+fn client_loop(client mut wire.Conn, cfg Config, engine Engine, slot mut ConnSlot, registry map[u32]ConnSlot, peer str, pid u32) ! {
+
+	defer activeConnections.Add(-1)
+	defer slot.Done.Store(true)
+	client.SetTimeout(cfg.StartupTimeout)
+	mut accepted = proto.Accept(mut client, proto_config(cfg, pid, peer)) catch err {
 		client.Close()
 		fail err
 	}
-	mut c = conn
-	c.SetTimeout(idleTimeout)
-	serve_connection(mut c, false) catch err {
-		c.Close()
-		fail err
-	}
-	c.Close()
-}
-
-// ServeOne accepts and answers one client connection, for conformance tests and probes.
-fn ServeOne(listener wire.Listener, cfg proto.Config) ! {
-	mut sock = try listener.Accept()
-	if !reserve_connection(connection_limit(cfg)) {
-		proto.RejectStartup(sock, "53300", "sorry, too many clients already") catch _ {
+	match accepted {
+		Canceled(target, key) => {
+			handle_cancel(registry, target, key)
+			client.Close()
+			return
 		}
-		mut rejected = sock
-		rejected.Close()
-		return
+		Ready(conn) => {
+			mut c = conn
+			let startup = c.Startup()
+			let user = startup.User
+			mut database = startup.Database
+			if database == "" { database = user }
+			let session = new_session(engine, cfg.Fake, user, database, pid)
+			mut current = session
+			slot.Conn = c
+			slot.Session = current
+			slot.SecretKey = c.SecretKey()
+			slot.Ready.Store(true)
+			c.SetTimeout(cfg.IdleTimeout)
+			send_parameters(mut c, current) catch _ {
+			}
+			try serve_messages(mut c, mut current, cfg, slot)
+			c.Close()
+		}
 	}
-	try serve_accepted(mut sock, cfg)
 }
 
-fn serve_connection(c mut proto.Conn, oneShot bool) ! {
+// new_session creates the execution session for a connection.
+fn new_session(engine Engine, fake bool, user str, db str, pid u32) Session {
+	if fake { return FakeSessionOf(NewFakeSession(user, db, pid)) }
+	return RealSession(engine.NewSession(user, db))
+}
+
+// send_parameters reports every ParameterStatus PostgreSQL reports at startup.
+fn send_parameters(c mut proto.Conn, session Session) ! {
+	for entry in session.Parameters() {
+		try c.SendParameter(entry.Name, entry.Value)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// message loop
+
+fn serve_messages(c mut proto.Conn, session mut Session, cfg Config, slot ConnSlot) ! {
+	mut sink = NewSessionSink(c)
+	mut skipUntilSync = false
 	for {
-		let message = try c.Next()
-		match message {
-			proto.Message.Query(sql) => {
-				let query = twine.ToLower(twine.TrimSpace(twine.Trim(sql, " \t\r\n;")))
-				if query == "" {
-					try c.SendEmptyQueryResponse()
-				} else if query == "select 1" || query == "select 1 as answer" {
-					mut colName = "?column?"
-					if query == "select 1 as answer" { colName = "answer" }
-					try c.SendRowDescription([]proto.Column{proto.Column{Name: colName, TypeOid: 23, TypeSize: 4, TypeMod: -1}})
-					try c.SendDataRow([]proto.Cell{proto.Cell{Value: "1"}})
-					try c.SendCommandComplete("SELECT 1")
-				} else {
-					try c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "0A000", Message: "feature not supported by the M1 executor"})
+		if slot.Terminate.Load() {
+			c.SendError(proto.ErrorFields{Severity: "FATAL", Code: "57P01", Message: "terminating connection due to administrator command"}) catch _ {
+			}
+			c.Abort()
+			return
+		}
+		let message = c.Next() catch err {
+			if proto.IsProtocolError(err) {
+				c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "08P01", Message: fault.Message(err)}) catch _ {
 				}
-				try c.SendReadyForQuery('I')
-				if oneShot {
+			}
+			c.Abort()
+			return
+		}
+		if skipUntilSync {
+			match message {
+				Sync => {
+					skipUntilSync = false
+					session.Sync(mut sink) catch _ {
+					}
+					c.SendReadyForQuery(session.StatusChar()) catch _ {
+					}
+				}
+				Terminate => {
+					c.Abort()
 					return
 				}
+				_ => {}
 			}
-			proto.Message.Terminate => { return }
-			proto.Message.Flush => {
+			continue
+		}
+		match message {
+			Query(sql) => {
+				try run_simple(mut c, mut session, mut sink, cfg, sql)
 			}
-			_ => {
-				try c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "0A000", Message: "frontend message is not supported by the M1 executor"})
-				try c.SendReadyForQuery('I')
+			Parse(name, sql, oids) => {
+				let failed = session.Parse(name, sql, oids)
+				if failed != nil {
+					send_error(mut c, failed)
+					skipUntilSync = true
+				} else {
+					c.SendParseComplete() catch _ {
+					}
+				}
+			}
+			Bind(portal, statement, paramFormats, params, resultFormats) => {
+				let failed = session.BindBytes(portal, statement, mut paramFormats, mut params, mut resultFormats)
+				if failed != nil {
+					send_error(mut c, failed)
+					skipUntilSync = true
+				} else {
+					c.SendBindComplete() catch _ {
+					}
+				}
+			}
+			Describe(kind, name) => {
+				let described = describe_or_skip(mut c, session, kind, name)
+				if !described.Ok {
+					skipUntilSync = true
+					continue
+				}
+				if kind == 'S' {
+					c.SendParameterDescription(described.Desc.ParamOids) catch _ {
+					}
+				}
+				if len(described.Desc.Cols) == 0 {
+					c.SendNoData() catch _ {
+					}
+				} else {
+					c.SendRowDescription(columns_of(described.Desc.Cols, []i16{})) catch _ {
+					}
+				}
+			}
+			Execute(portal, maxRows) => {
+				sink.SawTag = false
+				let started = tide.Now()
+				let failed = session.Execute(portal, maxRows, mut sink)
+				logStatement("execute " + portal, tide.Since(started), cfg.LogMinDurationMs)
+				if sink.Failed {
+					c.Abort()
+					return
+				}
+				if sink.InCopyIn {
+					let copied = finish_copy_in(mut c, mut sink)
+					if !copied.Ok {
+						c.SendError(proto.ErrorFields{Severity: "ERROR", Code: copied.Code, Message: copied.Message}) catch _ {
+						}
+					}
+					send_pending_tag(mut c, mut sink) catch _ {
+					}
+					continue
+				}
+				if failed != nil {
+					send_error(mut c, failed)
+					skipUntilSync = true
+					continue
+				}
+				if !sink.SawTag { c.SendPortalSuspended() catch _ {
+					} }
+			}
+			Close(kind, name) => {
+				let failed = session.Close(kind, name)
+				if failed != nil {
+					send_error(mut c, failed)
+					skipUntilSync = true
+				} else {
+					c.SendCloseComplete() catch _ {
+					}
+				}
+			}
+			Sync => {
+				session.Sync(mut sink) catch _ {
+				}
+				c.SendReadyForQuery(session.StatusChar()) catch _ {
+				}
+			}
+			Flush => {
+				c.Flush() catch _ {
+				}
+			}
+			Terminate => {
+				c.Abort()
+				return
+			}
+			CopyData(_) => {
+				protocol_violation(mut c, "unexpected CopyData message")
+				return
+			}
+			CopyDone => {
+				protocol_violation(mut c, "unexpected CopyDone message")
+				return
+			}
+			CopyFail(_) => {
+				protocol_violation(mut c, "unexpected CopyFail message")
+				return
+			}
+			Password(_) => {
+				protocol_violation(mut c, "unexpected PasswordMessage")
+				return
+			}
+			Unknown(kind) => {
+				protocol_violation(mut c, "invalid frontend message type {kind}")
+				return
 			}
 		}
 	}
+}
+
+// protocol_violation answers 08P01 and closes, as PostgreSQL does.
+fn protocol_violation(c mut proto.Conn, message str) {
+	c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "08P01", Message: message}) catch _ {
+	}
+	c.Abort()
+}
+
+// run_simple executes a simple-query string, COPY included.
+fn run_simple(c mut proto.Conn, session mut Session, sink mut SessionSink, cfg Config, sql str) ! {
+	if is_empty_query(sql) {
+		c.SendEmptyQueryResponse() catch _ {
+		}
+		c.SendReadyForQuery(session.StatusChar()) catch _ {
+		}
+		return
+	}
+	let started = tide.Now()
+	let failed = session.Simple(sql, mut sink)
+	logStatement(sql, tide.Since(started), cfg.LogMinDurationMs)
+	if sink.Failed {
+		c.Abort()
+		return
+	}
+	if sink.InCopyIn {
+		let copied = finish_copy_in(mut c, mut sink)
+		if !copied.Ok {
+			c.SendError(proto.ErrorFields{Severity: "ERROR", Code: copied.Code, Message: copied.Message}) catch _ {
+			}
+		}
+		send_pending_tag(mut c, mut sink) catch _ {
+		}
+		c.SendReadyForQuery(session.StatusChar()) catch _ {
+		}
+		return
+	}
+	if failed != nil {
+		send_error(mut c, failed)
+	}
+	c.SendReadyForQuery(session.StatusChar()) catch _ {
+	}
+}
+
+// DescribeResult reports a Describe outcome: the description or the error to send.
+type DescribeResult struct {
+	Ok bool
+	Desc exec.Description
+	Code str
+	Message str
+}
+
+// describe_or_skip describes a statement or portal, reporting the error itself.
+fn describe_or_skip(c mut proto.Conn, session Session, kind u8, name str) DescribeResult {
+	mut failedToDescribe = false
+	mut payload = types.NewError("XX000", "")
+	let described = session.Describe(kind, name) catch err {
+		failedToDescribe = true
+		payload = types.ErrorFromFault(err)
+		exec.Description{Cols: []exec.ColDesc{}, ParamOids: []u32{}}
+	}
+	if failedToDescribe {
+		c.SendError(error_fields(payload)) catch _ {
+		}
+		return DescribeResult{Ok: false, Desc: described, Code: payload.Code, Message: payload.Message}
+	}
+	return DescribeResult{Ok: true, Desc: described, Code: "", Message: ""}
+}
+
+// send_error writes a fault as a PostgreSQL ErrorResponse.
+fn send_error(c mut proto.Conn, err fault) {
+	let payload = types.ErrorFromFault(err)
+	c.SendError(error_fields(payload)) catch _ {
+	}
+}
+
+// send_pending_tag sends the CommandComplete a COPY FROM STDIN deferred while the client's
+// copy data was read.
+fn send_pending_tag(c mut proto.Conn, sink mut SessionSink) ! {
+	if sink.PendingTag != "" {
+		try c.SendCommandComplete(sink.PendingTag)
+		sink.PendingTag = ""
+	}
+	sink.InCopyIn = false
+	sink.InCopyOut = false
+	sink.SawTag = false
+}
+
+// error_fields converts a PostgreSQL error payload for the wire.
+fn error_fields(p types.PgError) proto.ErrorFields {
+	return proto.ErrorFields{Severity: p.Severity, Code: p.Code, Message: p.Message, Detail: p.Detail, Hint: p.Hint, Position: p.Position}
+}
+
+// columns_of builds RowDescription descriptors from executor column descriptions.
+fn columns_of(cols []exec.ColDesc, formats []i16) []proto.Column {
+	mut out = make([]proto.Column, 0, len(cols))
+	for i, c in cols {
+		mut format = i16(0)
+		if i < len(formats) { format = formats[i] }
+		out = append(out, proto.Column{Name: c.Name, TableOid: c.TableOid, Attribute: c.Attno, TypeOid: c.Oid, TypeSize: type_size(c.Oid), TypeMod: c.Typmod, Format: format})
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// COPY
+
+// CopyResult reports how a COPY FROM STDIN exchange ended.
+type CopyResult struct {
+	Ok bool
+	Code str
+	Message str
+}
+
+// finish_copy_in reads the client's CopyData stream until CopyDone, or reports the
+// CopyFail message, and counts the bytes and rows for the log.
+fn finish_copy_in(c mut proto.Conn, sink mut SessionSink) CopyResult {
+	mut bytes = i64(0)
+	mut rows = i64(0)
+	for {
+		let message = c.Next() catch err {
+			return CopyResult{Ok: false, Code: "08006", Message: fault.Message(err)}
+		}
+		match message {
+			CopyData(data) => {
+				bytes += i64(len(data))
+				for i in 0..len(data) { if data[i] == '\n' { rows += 1 } }
+			}
+			CopyDone => {
+				sink.CopyRows += rows
+				say.Line("LOG: COPY IN: {rows} rows, {bytes} bytes received (storage path pending in exec)")
+				return CopyResult{Ok: true, Code: "", Message: ""}
+			}
+			CopyFail(message) => {
+				return CopyResult{Ok: false, Code: "57014", Message: "COPY from stdin failed: " + message}
+			}
+			Terminate => {
+				return CopyResult{Ok: false, Code: "57014", Message: "COPY from stdin failed: client terminated"}
+			}
+			_ => {
+				return CopyResult{Ok: false, Code: "08P01", Message: "unexpected message during COPY FROM STDIN"}
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// shutdown, reload, cancel, registry
+
+fn shutdown_requested(cfg Config) bool {
+	if cfg.ShutdownFile == "" { return false }
+	return quarry.Exists(cfg.ShutdownFile)
+}
+
+fn reload_requested(cfg Config) bool {
+	if cfg.ReloadFile == "" { return false }
+	return quarry.Exists(cfg.ReloadFile)
+}
+
+// reload_hba re-reads pg_hba.conf, as SIGHUP does in PostgreSQL. Until Tin can deliver a
+// signal, the server watches --reload-file instead (see BUGS.md).
+fn reload_hba(cfg mut Config) Config {
+	mut next = cfg
+	quarry.Remove(cfg.ReloadFile) catch _ {
+	}
+	let text = quarry.ReadFile(cfg.HbaPath) catch _ {
+		return next
+	}
+	next.Hba = proto.ParseHba(text)
+	say.Line("tingres: reloaded {cfg.HbaPath} ({len(next.Hba)} rules)")
+	return next
+}
+
+// begin_shutdown is PostgreSQL's fast shutdown: stop accepting, terminate sessions with
+// 57P01, checkpoint, and return so the process exits 0.
+fn begin_shutdown(registry mut map[u32]ConnSlot, engine mut Engine, cfg Config) {
+	say.Line("tingres: shutting down ({activeConnections.Load()} connections)")
+	stopping.Store(true)
+	for _, slot in registry {
+		slot.Terminate.Store(true)
+	}
+	let deadline = tide.Now() + defaultShutdownGrace
+	for tide.Now() < deadline {
+		if pending_connections(registry) == 0 { break }
+		tide.Sleep(20ms)
+	}
+	for _, slot in registry {
+		if slot.Ready.Load() && !slot.Done.Load() {
+			if let conn = slot.Conn {
+				mut closing = conn
+				closing.Abort()
+			}
+		}
+	}
+	engine.Close() catch err {
+		say.Line("tingres: checkpoint on shutdown failed: {fault.Message(err)}")
+	}
+}
+
+// pending_connections counts sessions that have not finished.
+fn pending_connections(registry map[u32]ConnSlot) i64 {
+	mut n = i64(0)
+	for _, slot in registry {
+		if slot.Ready.Load() && !slot.Done.Load() { n += 1 }
+	}
+	return n
+}
+
+fn prune_registry(registry mut map[u32]ConnSlot) {
+	mut finished = []u32{}
+	for pid, slot in registry {
+		if slot.Done.Load() { finished = append(finished, pid) }
+	}
+	for pid in finished { delete(registry, pid) }
+}
+
+// handle_cancel answers a CancelRequest: when the pid and secret match a live session,
+// that session is flagged for cancellation, which the executor turns into 57014.
+fn handle_cancel(registry map[u32]ConnSlot, pid u32, key u32) {
+	let (slot, ok) = registry[pid]
+	if !ok { return }
+	if !slot.Ready.Load() { return }
+	if slot.SecretKey != key { return }
+	slot.Session.Cancel()
+	say.Line("LOG: cancel request for backend {pid}")
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+
+// ReadHba parses a pg_hba.conf file; a missing file is no rules.
+fn ReadHba(path str) []proto.HbaLine {
+	let text = quarry.ReadFile(path) catch _ {
+		return []proto.HbaLine{}
+	}
+	return proto.ParseHba(text)
+}
+
+// WritePidFile writes postmaster.pid, PostgreSQL's lock file, and returns the path.
+fn WritePidFile(dataDir str, listen str) !str {
+	let path = dataDir + "/postmaster.pid"
+	try quarry.WriteFile(path, "{quarry.Pid()}\n{dataDir}\n{listen}\n{tide.Now()}\n")
+	return path
+}
+
+// RemovePidFile removes the lock file at shutdown.
+fn RemovePidFile(path str) {
+	if path == "" { return }
+	quarry.Remove(path) catch _ {
+	}
+}
+
+// is_empty_query reports whether a simple query holds no statement at all.
+fn is_empty_query(sql str) bool {
+	for i in 0..len(sql) {
+		let c = sql[i]
+		if c == ';' || c == ' ' || c == '\t' || c == '\n' || c == '\r' { continue }
+		return false
+	}
+	return true
 }
 
 fn supported_query(sql str) bool {

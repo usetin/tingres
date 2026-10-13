@@ -54,3 +54,24 @@ fn TestBufferedRowEncoders(t mut crucible.T) {
 	t.True("RowDescription column name", out[7] == 'x' && out[8] == 0)
 	crucible.Equal(mut t, "RowDescription type oid", be(out, 15, 4), 23)
 }
+
+fn TestMd5Hex(t mut crucible.T) {
+	crucible.Equal(mut t, "md5 empty", Md5Hex([]u8("")), "d41d8cd98f00b204e9800998ecf8427e")
+	crucible.Equal(mut t, "md5 hello", Md5Hex([]u8("hello")), "5d41402abc4b2a76b9719d911017c592")
+}
+
+fn TestHbaParsing(t mut crucible.T) {
+	let sample = "# A comment line\nhost all all 127.0.0.1/32 trust\nhostssl db1 user1 0.0.0.0/0 md5\nlocal all all peer\n"
+	let lines = ParseHba(sample)
+	crucible.Equal(mut t, "hba line count", len(lines), 3)
+	let m1 = MatchHba(lines, "postgres", "postgres", "127.0.0.1", false)
+	t.True("matched 127.0.0.1 rule", m1 != nil)
+	if let rule = m1 {
+		crucible.Equal(mut t, "m1 method", rule.Method, "trust")
+	}
+	let m2 = MatchHba(lines, "db1", "user1", "10.0.0.1", true)
+	t.True("matched hostssl rule", m2 != nil)
+	if let rule = m2 {
+		crucible.Equal(mut t, "m2 method", rule.Method, "md5")
+	}
+}

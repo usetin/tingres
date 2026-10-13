@@ -1,0 +1,753 @@
+// FakeSession is the built-in conformance executor: the small, honest subset of SQL the
+// server can answer while exec.Session is still a skeleton (it parses and plans, but does
+// not run DML or scans end to end). It exists so the protocol layer, the drivers, the
+// cancel/timeout paths and the differential harness can be tested for real; every
+// statement it cannot answer is a clean 0A000, never a wrong answer.
+package server
+
+import "../exec"
+import "../types"
+import "atomic"
+import "mint"
+import "tide"
+import "twine"
+
+// FakeItem is one analyzed select-list item.
+type FakeItem struct {
+	Name str
+	Oid u32
+	Kind str
+	Value str
+}
+
+// FakeStmt is one prepared statement of the conformance engine.
+type FakeStmt struct {
+	Sql str
+	ParamOids []u32
+	Items []FakeItem
+	IsQuery bool
+	Tag str
+	Params i64
+}
+
+// FakeValue is one bound parameter or result cell.
+type FakeValue struct {
+	Null bool
+	Text str
+}
+
+// FakePortal is one bound portal with its materialized rows and cursor.
+type FakePortal struct {
+	Stmt FakeStmt
+	Params []FakeValue
+	Formats []i16
+	Rows [][]FakeValue
+	At i64
+	Ran bool
+}
+
+// FakeSession is the conformance session.
+type FakeSession struct {
+	User str
+	Database str
+	Pid u32
+	state u8
+	canceled atomic.Bool
+	gucs map[str]str
+	report map[str]bool
+	stmts map[str]FakeStmt
+	portals map[str]FakePortal
+}
+
+// NewFakeSession creates a conformance session with PostgreSQL's default GUCs.
+fn NewFakeSession(user str, db str, pid u32) FakeSession {
+	return FakeSession{
+		User: user,
+		Database: db,
+		Pid: pid,
+		state: 'I',
+		canceled: atomic.NewBool(false),
+		gucs: fake_default_gucs(user),
+		report: fake_report_set(),
+		stmts: make(map[str]FakeStmt),
+		portals: make(map[str]FakePortal),
+	}
+}
+
+// fake_report_set lists the GUCs PostgreSQL sends as ParameterStatus.
+fn fake_report_set() map[str]bool {
+	return map[str]bool{"server_version": true, "server_encoding": true, "client_encoding": true, "application_name": true, "datestyle": true, "timezone": true, "integer_datetimes": true, "standard_conforming_strings": true, "intervalstyle": true, "is_superuser": true, "session_authorization": true, "scram_iterations": true, "in_hot_standby": true, "default_transaction_read_only": true, "default_transaction_deferrable": true}
+}
+
+// fake_default_gucs is the GUC table of the conformance engine.
+fn fake_default_gucs(user str) map[str]str {
+	return map[str]str{"server_version": "17.3", "server_version_num": "170003", "server_encoding": "UTF8", "client_encoding": "UTF8", "datestyle": "ISO, MDY", "timezone": "UTC", "integer_datetimes": "on", "standard_conforming_strings": "on", "intervalstyle": "postgres", "is_superuser": "on", "session_authorization": user, "scram_iterations": "4096", "in_hot_standby": "off", "default_transaction_read_only": "off", "default_transaction_deferrable": "off", "search_path": "\"$user\", public", "application_name": "", "transaction_isolation": "read committed", "default_transaction_isolation": "read committed", "statement_timeout": "0", "lock_timeout": "0", "extra_float_digits": "1", "work_mem": "4MB", "client_min_messages": "notice", "backslash_quote": "safe_encoding", "bytea_output": "hex", "escape_string_warning": "on", "array_nulls": "on", "lc_collate": "C", "lc_ctype": "C", "default_tablespace": "", "temp_tablespaces": "", "row_security": "on", "check_function_bodies": "on", "xmloption": "content", "commit_delay": "0", "commit_siblings": "5", "ssl": "off", "max_identifier_length": "63", "max_index_keys": "32", "block_size": "8192", "segment_size": "131072", "wal_block_size": "8192", "wal_segment_size": "16777216", "jit": "off", "allow_system_table_mods": "off", "autovacuum": "on", "idle_in_transaction_session_timeout": "0", "idle_session_timeout": "0", "default_transaction_read_only_num": "0"}
+}
+
+// Cancel flags the session. Safe from the accept task.
+fn (s FakeSession) Cancel() { s.canceled.Store(true) }
+
+// ResetCancel clears the cancel flag.
+fn (s FakeSession) ResetCancel() { s.canceled.Store(false) }
+
+// IsCanceled reports whether Cancel was requested.
+fn (s FakeSession) IsCanceled() bool { return s.canceled.Load() }
+
+// StatusChar is the ReadyForQuery transaction status.
+fn (s FakeSession) StatusChar() u8 {
+	if s.state == 'T' || s.state == 'E' { return s.state }
+	return 'I'
+}
+
+// ParameterStatusList lists the reported GUCs in the order PostgreSQL reports them.
+fn (s FakeSession) ParameterStatusList() []exec.GucStatus {
+	mut list = []exec.GucStatus{}
+	for name in fake_report_order() {
+		let (value, ok) = s.gucs[name]
+		mut text = ""
+		if ok { text = value }
+		list = append(list, exec.GucStatus{Name: name, Value: text})
+	}
+	return list
+}
+
+// fake_report_order is PostgreSQL's ParameterStatus order at startup.
+fn fake_report_order() []str {
+	return []str{"server_version", "server_encoding", "client_encoding", "application_name", "datestyle", "intervalstyle", "timezone", "integer_datetimes", "standard_conforming_strings", "scram_iterations", "in_hot_standby", "is_superuser", "session_authorization", "default_transaction_read_only", "default_transaction_deferrable"}
+}
+
+// GetGuc reads one GUC value.
+fn (s FakeSession) GetGuc(name str) ?str {
+	let (value, ok) = s.gucs[twine.ToLower(name)]
+	if !ok { return nil }
+	return value
+}
+
+// Simple runs every statement of a simple-query string.
+fn (s mut FakeSession) Simple(sql str, out mut dyn exec.Sink) ! {
+	if s.canceled.Load() {
+		try fake_error("57014", "canceling statement due to user request")
+	}
+	for raw in fake_split(sql) {
+		let stmt = twine.TrimSpace(raw)
+		if stmt == "" { continue }
+		if s.state == 'E' {
+			let kind = fake_keyword(stmt)
+			if kind != "commit" && kind != "end" && kind != "rollback" && kind != "abort" {
+				try fake_error("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+			}
+		}
+		s.run_one(stmt, mut out) catch err {
+			if s.state == 'T' { s.state = 'E' }
+			fail err
+		}
+	}
+}
+
+// run_one executes one statement, reporting its result.
+fn (s mut FakeSession) run_one(sql str, out mut dyn exec.Sink) ! {
+	let kind = fake_keyword(sql)
+	if kind == "begin" || kind == "start" {
+		if s.state == 'T' { out.Notice(exec.Notice{Message: "there is already a transaction in progress", Code: "25001"}) }
+		s.state = 'T'
+		out.CommandComplete("BEGIN")
+		return
+	}
+	if kind == "commit" || kind == "end" {
+		if s.state == 'I' { out.Notice(exec.Notice{Message: "there is no transaction in progress", Code: "25P01"}) }
+		s.state = 'I'
+		out.CommandComplete("COMMIT")
+		return
+	}
+	if kind == "rollback" || kind == "abort" {
+		if s.state == 'I' { out.Notice(exec.Notice{Message: "there is no transaction in progress", Code: "25P01"}) }
+		s.state = 'I'
+		out.CommandComplete("ROLLBACK")
+		return
+	}
+	if kind == "select" {
+		let stmt = try s.analyze(sql)
+		if !stmt.IsQuery { try fake_error("0A000", "feature not supported: " + stmt.Tag) }
+		out.RowDescription(stmt.cols(), []i16{})
+		out.DataRow(s.values(stmt.Items))
+		out.CommandComplete("SELECT 1")
+		return
+	}
+	if kind == "show" {
+		let name = twine.ToLower(twine.TrimSpace(sql[4:]))
+		if let v = s.GetGuc(name) {
+			out.RowDescription([]exec.ColDesc{exec.ColDesc{Name: name, Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 0}}, []i16{})
+			out.DataRow([]types.Datum{types.FromStr(types.TextOid, v)})
+			out.CommandComplete("SHOW")
+			return
+		}
+		try fake_error("42704", "unrecognized configuration parameter \"" + name + "\"")
+		return
+	}
+	if kind == "set" {
+		let (ok, tag) = try s.run_set(sql)
+		if ok {
+			out.CommandComplete(tag)
+			return
+		}
+	}
+	if kind == "reset" {
+		try s.run_reset(sql)
+		out.CommandComplete("RESET")
+		return
+	}
+	if kind == "discard" {
+		out.CommandComplete("DISCARD ALL")
+		return
+	}
+	if kind == "table" {
+		try fake_error("0A000", "feature not supported by the tingres conformance engine: TABLE")
+	}
+	if kind == "values" {
+		try fake_error("0A000", "feature not supported by the tingres conformance engine: VALUES")
+	}
+	try fake_error("0A000", "feature not supported by the tingres conformance engine: " + fake_first_word(sql))
+}
+
+// run_set applies `set [session|local] name =|to value`; the tag is SET or SET SESSION/LOCAL.
+fn (s mut FakeSession) run_set(sql str) !(bool, str) {
+	mut rest = twine.TrimSpace(sql[3:])
+	mut tag = "SET"
+	if twine.HasPrefix(twine.ToLower(rest), "session ") {
+		rest = twine.TrimSpace(rest[8:])
+		tag = "SET"
+	}
+	if twine.HasPrefix(twine.ToLower(rest), "local ") {
+		rest = twine.TrimSpace(rest[6:])
+		tag = "SET"
+	}
+	mut name = ""
+	mut value = ""
+	let eq = twine.Index(rest, "=")
+	if eq >= 0 {
+		name = twine.TrimSpace(rest[:eq])
+		value = twine.TrimSpace(rest[eq+1:])
+	} else {
+		let at = twine.Index(twine.ToLower(rest), " to ")
+		if at < 0 { try fake_error("42601", "syntax error at or near \"" + sql + "\"") }
+		name = twine.TrimSpace(rest[:at])
+		value = twine.TrimSpace(rest[at+4:])
+	}
+	let key = twine.ToLower(name)
+	if s.GetGuc(key) == nil { try fake_error("42704", "unrecognized configuration parameter \"" + key + "\"") }
+	let (_, exists) = s.gucs[key]
+	if !exists { return false, tag }
+	s.gucs[key] = fake_unquote(value)
+	return true, tag
+}
+
+// run_reset resets one GUC or all of them.
+fn (s mut FakeSession) run_reset(sql str) ! {
+	let name = twine.ToLower(twine.TrimSpace(sql[5:]))
+	if name == "all" {
+		s.gucs = fake_default_gucs(s.User)
+		return
+	}
+	if s.GetGuc(name) == nil { try fake_error("42704", "unrecognized configuration parameter \"" + name + "\"") }
+	let defaults = fake_default_gucs(s.User)
+	let (value, ok) = defaults[name]
+	if ok { s.gucs[name] = value }
+}
+
+fn fake_first_word(sql str) str {
+	mut at = i64(0)
+	for at < len(sql) {
+		let c = sql[at]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' { break }
+		at += 1
+	}
+	return sql[:at]
+}
+
+// fake_keyword returns the lower-case first word of a statement.
+fn fake_keyword(sql str) str {
+	return twine.ToLower(fake_first_word(twine.TrimSpace(sql)))
+}
+
+// fake_error raises a PostgreSQL error through the shared fault encoding.
+fn fake_error(code str, message str) ! {
+	try types.ErrorFault(types.NewPgError(code, message, "", "", 0))
+}
+
+// fake_split splits a simple-query string on top-level semicolons.
+fn fake_split(sql str) []str {
+	mut out = []str{}
+	mut start = i64(0)
+	mut i = i64(0)
+	mut inQuote = false
+	for i < len(sql) {
+		let c = sql[i]
+		if c == '\'' {
+			if inQuote && i+1 < len(sql) && sql[i+1] == '\'' {
+				i += 2
+				continue
+			}
+			inQuote = !inQuote
+			i += 1
+			continue
+		}
+		if c == ';' && !inQuote {
+			out = append(out, sql[start:i])
+			start = i+1
+		}
+		i += 1
+	}
+	if start < len(sql) { out = append(out, sql[start:]) }
+	return out
+}
+
+// fake_unquote returns the value of a quoted or bare literal.
+fn fake_unquote(value str) str {
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		let body = value[1:len(value)-1]
+		mut out = []u8{}
+		mut i = i64(0)
+		for i < len(body) {
+			if body[i] == '\'' && i+1 < len(body) && body[i+1] == '\'' {
+				out = append(out, '\'')
+				i += 2
+				continue
+			}
+			out = append(out, body[i])
+			i += 1
+		}
+		return str(out)
+	}
+	return value
+}
+
+// analyze turns a `select` statement into its items and column metadata.
+fn (s FakeSession) analyze(sql str) !FakeStmt {
+	mut rest = twine.TrimSpace(sql[6:])
+	if twine.HasPrefix(twine.ToLower(rest), "distinct ") { rest = twine.TrimSpace(rest[9:]) }
+	if fake_find_keyword(rest, "from") >= 0 { return FakeStmt{IsQuery: false, Tag: "SELECT ... FROM (query planning is not implemented)"} }
+	if fake_find_keyword(rest, "where") >= 0 { return FakeStmt{IsQuery: false, Tag: "SELECT ... WHERE (query planning is not implemented)"} }
+	mut items = []FakeItem{}
+	mut params = i64(0)
+	for piece in fake_split_top(rest, ',') {
+		let item = try s.analyze_item(piece)
+		if item.Kind == "param" {
+			let (indexText, _, _) = fake_cut3(item.Value, "|")
+			let index = mint.Atoi(indexText) catch _ { 0 }
+			if index > params { params = index }
+		}
+		items = append(items, item)
+	}
+	if len(items) == 0 { try fake_error("42601", "syntax error: SELECT list is empty") }
+	return FakeStmt{Sql: sql, Items: items, IsQuery: true, Params: params}
+}
+
+// cols builds the RowDescription descriptors of a statement.
+fn (stmt FakeStmt) cols() []exec.ColDesc {
+	mut cols = []exec.ColDesc{}
+	for item in stmt.Items {
+		cols = append(cols, exec.ColDesc{Name: item.Name, Oid: item.Oid, Typmod: -1, TableOid: 0, Attno: 0})
+	}
+	return cols
+}
+
+// analyze_item analyzes one select-list item: an alias, then a small expression grammar.
+fn (s FakeSession) analyze_item(piece str) !FakeItem {
+	mut text = twine.TrimSpace(piece)
+	mut alias = ""
+	let asAt = fake_find_keyword(text, "as")
+	if asAt > 0 {
+		alias = twine.TrimSpace(text[asAt+2:])
+		text = twine.TrimSpace(text[:asAt])
+	}
+	let lower = twine.ToLower(text)
+	if lower == "null" { return FakeItem{Name: fake_or(alias, "?column?"), Oid: types.TextOid, Kind: "null", Value: ""} }
+	if lower == "true" || lower == "false" { return FakeItem{Name: fake_or(alias, "bool"), Oid: types.BoolOid, Kind: "bool", Value: lower} }
+	if fake_is_int(text) {
+		let v = mint.Atoi(text) catch _ { 0 }
+		return FakeItem{Name: fake_or(alias, "?column?"), Oid: types.Int4Oid, Kind: "int", Value: mint.Itoa(v)}
+	}
+	if fake_is_float(text) {
+		return FakeItem{Name: fake_or(alias, "?column?"), Oid: types.Float8Oid, Kind: "float", Value: text}
+	}
+	if len(text) >= 2 && text[0] == '\'' && text[len(text)-1] == '\'' {
+		return FakeItem{Name: fake_or(alias, "?column?"), Oid: types.TextOid, Kind: "text", Value: fake_unquote(text)}
+	}
+	let castAt = twine.Index(text, "::")
+	if castAt >= 0 {
+		let inner = twine.TrimSpace(text[:castAt])
+		let typeName = twine.ToLower(twine.TrimSpace(text[castAt+2:]))
+		if len(inner) > 0 && inner[0] == '$' {
+			let index = mint.Atoi(inner[1:]) catch _ { 0 }
+			return FakeItem{Name: fake_or(alias, typeName), Oid: fake_type_oid(typeName), Kind: "param", Value: "{index}|{typeName}"}
+		}
+		let value = try fake_cast_value(fake_unquote(inner), typeName)
+		return FakeItem{Name: fake_or(alias, typeName), Oid: fake_type_oid(typeName), Kind: "text", Value: value}
+	}
+	if len(text) > 0 && text[0] == '$' {
+		let index = mint.Atoi(text[1:]) catch _ { 0 }
+		return FakeItem{Name: fake_or(alias, "?column?"), Oid: types.TextOid, Kind: "param", Value: "{index}|text"}
+	}
+	if len(text) > 1 && text[0] == '(' && text[len(text)-1] == ')' {
+		return try s.analyze_item(text[1:len(text)-1])
+	}
+	if lower == "current_user" || lower == "session_user" || lower == "user" {
+		return FakeItem{Name: fake_or(alias, lower), Oid: types.NameOid, Kind: "user", Value: ""}
+	}
+	let open = twine.Index(text, "(")
+	if open > 0 && text[len(text)-1] == ')' {
+		let fname = twine.ToLower(twine.TrimSpace(text[:open]))
+		let inner = twine.TrimSpace(text[open+1:len(text)-1])
+		return try s.analyze_call(fname, inner, alias)
+	}
+	try fake_error("0A000", "feature not supported by the tingres conformance engine: " + text)
+	return FakeItem{}
+}
+
+// analyze_call analyzes the small set of supported scalar functions.
+fn (s FakeSession) analyze_call(fname str, inner str, alias str) !FakeItem {
+	if fname == "version" { return FakeItem{Name: fake_or(alias, "version"), Oid: types.TextOid, Kind: "text", Value: "PostgreSQL 17.3 (tingres 0.1) on tin, compiled by tin, 64-bit"} }
+	if fname == "current_database" { return FakeItem{Name: fake_or(alias, "current_database"), Oid: types.NameOid, Kind: "database", Value: ""} }
+	if fname == "current_schema" { return FakeItem{Name: fake_or(alias, "current_schema"), Oid: types.NameOid, Kind: "text", Value: "public"} }
+	if fname == "current_setting" {
+		let name = twine.ToLower(fake_unquote(inner))
+		mut text = ""
+		let found = s.GetGuc(name)
+		if let v = found { text = v }
+		if found == nil { try fake_error("42704", "unrecognized configuration parameter \"" + name + "\"") }
+		return FakeItem{Name: fake_or(alias, "current_setting"), Oid: types.TextOid, Kind: "text", Value: text}
+	}
+	if fname == "pg_backend_pid" { return FakeItem{Name: fake_or(alias, "pg_backend_pid"), Oid: types.Int4Oid, Kind: "pid", Value: ""} }
+	if fname == "pg_is_in_recovery" { return FakeItem{Name: fake_or(alias, "pg_is_in_recovery"), Oid: types.BoolOid, Kind: "bool", Value: "false"} }
+	if fname == "pg_sleep" { return FakeItem{Name: fake_or(alias, "pg_sleep"), Oid: 2278, Kind: "sleep", Value: inner} }
+	try fake_error("0A000", "feature not supported by the tingres conformance engine: " + fname + "()")
+	return FakeItem{}
+}
+
+// values evaluates the select items against the session state.
+fn (s FakeSession) values(items []FakeItem) []types.Datum {
+	mut row = []types.Datum{}
+	for item in items {
+		row = append(row, s.value_of(item))
+	}
+	return row
+}
+
+fn (s FakeSession) value_of(item FakeItem) types.Datum {
+	if item.Kind == "null" { return types.Null() }
+	if item.Kind == "int" {
+		let v = mint.Atoi(item.Value) catch _ { 0 }
+		if item.Oid == types.Int8Oid { return types.FromI64(types.Int8Oid, v) }
+		return types.FromI64(types.Int4Oid, v)
+	}
+	if item.Kind == "float" {
+		let v = mint.ParseFloat(item.Value) catch _ { 0.0 }
+		return types.FromF64(types.Float8Oid, v)
+	}
+	if item.Kind == "bool" { return types.FromBool(item.Value == "true") }
+	if item.Kind == "user" { return types.FromStr(types.NameOid, s.User) }
+	if item.Kind == "database" { return types.FromStr(types.NameOid, s.Database) }
+	if item.Kind == "pid" { return types.FromI64(types.Int4Oid, i64(s.Pid)) }
+	if item.Kind == "sleep" {
+		fake_sleep(item.Value)
+		return types.FromStr(types.TextOid, "")
+	}
+	return types.FromStr(types.TextOid, item.Value)
+}
+
+// fake_sleep waits for the seconds in a pg_sleep argument, letting other tasks run.
+fn fake_sleep(argument str) {
+	if argument == "" { return }
+	let seconds = mint.ParseFloat(argument) catch _ { 0.0 }
+	if seconds > 0.0 { tide.Sleep(i64(seconds * 1000000000.0)) }
+}
+
+// fake_or picks the alias or a default column name.
+fn fake_or(alias str, fallback str) str {
+	if alias != "" { return alias }
+	return fallback
+}
+
+// fake_type_oid maps the type names the conformance engine accepts after a cast.
+fn fake_type_oid(name str) u32 {
+	if name == "int" || name == "int4" || name == "integer" { return types.Int4Oid }
+	if name == "int2" || name == "smallint" { return types.Int2Oid }
+	if name == "int8" || name == "bigint" { return types.Int8Oid }
+	if name == "varchar" || name == "character varying" { return types.VarcharOid }
+	if name == "bool" || name == "boolean" { return types.BoolOid }
+	if name == "float8" || name == "double precision" { return types.Float8Oid }
+	if name == "float4" || name == "real" { return types.Float4Oid }
+	if name == "oid" { return types.OidOid }
+	if name == "bytea" { return types.ByteaOid }
+	if name == "date" { return types.DateOid }
+	if name == "timestamp" { return types.TimestampOid }
+	if name == "timestamptz" { return types.TimestamptzOid }
+	if name == "interval" { return types.IntervalOid }
+	if name == "numeric" || name == "decimal" { return types.NumericOid }
+	if name == "uuid" { return types.UuidOid }
+	if name == "name" { return types.NameOid }
+	return types.TextOid
+}
+
+// fake_cast_value checks a literal against its cast type.
+fn fake_cast_value(inner str, typeName str) !str {
+	let oid = fake_type_oid(typeName)
+	let parsed = types.Parse(oid, inner) catch _ {
+		fail "22P02: invalid input syntax for type " + typeName + ": \"" + inner + "\""
+	}
+	return parsed.Text()
+}
+
+// fake_is_int reports whether text is an optional-sign decimal integer.
+fn fake_is_int(text str) bool {
+	if text == "" { return false }
+	mut i = i64(0)
+	if text[0] == '-' || text[0] == '+' { i = 1 }
+	if i >= len(text) { return false }
+	for i < len(text) {
+		if text[i] < '0' || text[i] > '9' { return false }
+		i += 1
+	}
+	return true
+}
+
+// fake_is_float reports whether text is a plain decimal fraction.
+fn fake_is_float(text str) bool {
+	if text == "" { return false }
+	mut dots = 0
+	mut i = i64(0)
+	if text[0] == '-' || text[0] == '+' { i = 1 }
+	for i < len(text) {
+		let c = text[i]
+		if c == '.' {
+			dots += 1
+			i += 1
+			continue
+		}
+		if c < '0' || c > '9' { return false }
+		i += 1
+	}
+	return dots == 1
+}
+
+// fake_find_keyword finds a whole-word keyword, ignoring case.
+fn fake_find_keyword(text str, word str) i64 {
+	let lower = twine.ToLower(text)
+	mut from = i64(0)
+	for from <= len(lower) - len(word) {
+		let at = twine.Index(lower[from:], word)
+		if at < 0 { return -1 }
+		let index = from + at
+		let beforeOk = index == 0 || !fake_word_char(lower[index-1])
+		let after = index + len(word)
+		let afterOk = after >= len(lower) || !fake_word_char(lower[after])
+		if beforeOk && afterOk { return index }
+		from = index + 1
+	}
+	return -1
+}
+
+fn fake_word_char(c u8) bool {
+	if c >= 'a' && c <= 'z' { return true }
+	if c >= 'A' && c <= 'Z' { return true }
+	if c >= '0' && c <= '9' { return true }
+	return c == '_'
+}
+
+// fake_split_top splits on a separator outside quotes and parentheses.
+fn fake_split_top(text str, sep u8) []str {
+	mut out = []str{}
+	mut start = i64(0)
+	mut depth = i64(0)
+	mut inQuote = false
+	mut i = i64(0)
+	for i < len(text) {
+		let c = text[i]
+		if c == '\'' {
+			if inQuote && i+1 < len(text) && text[i+1] == '\'' {
+				i += 2
+				continue
+			}
+			inQuote = !inQuote
+			i += 1
+			continue
+		}
+		if !inQuote {
+			if c == '(' { depth += 1 }
+			if c == ')' { depth -= 1 }
+			if c == sep && depth == 0 {
+				out = append(out, text[start:i])
+				start = i+1
+			}
+		}
+		i += 1
+	}
+	out = append(out, text[start:])
+	return out
+}
+
+// Parse prepares a conformance statement.
+fn (s mut FakeSession) Parse(name str, sql str, paramOids []u32) ! {
+	let trimmed = twine.TrimSpace(sql)
+	mut stmt = FakeStmt{Sql: trimmed, ParamOids: paramOids, Items: []FakeItem{}, IsQuery: false, Tag: "", Params: 0}
+	if trimmed != "" && fake_keyword(trimmed) == "select" {
+		let analyzed = try s.analyze(trimmed)
+		stmt.Items = analyzed.Items
+		stmt.IsQuery = analyzed.IsQuery
+		stmt.Tag = analyzed.Tag
+		stmt.Params = analyzed.Params
+		if stmt.Params < i64(len(paramOids)) { stmt.Params = i64(len(paramOids)) }
+	}
+	s.stmts[name] = stmt
+}
+
+// BindBytes decodes the client's parameter bytes into text values.
+fn (s mut FakeSession) BindBytes(portalName str, prepName str, paramFormats mut []i16, paramValues mut [][]u8, resultFormats mut []i16) ! {
+	let (stmt, ok) = s.stmts[prepName]
+	if !ok {
+		try fake_error("26000", "prepared statement \"" + prepName + "\" does not exist")
+		return
+	}
+	mut values = []FakeValue{}
+	for i, raw in paramValues {
+		if len(raw) == 0 {
+			values = append(values, FakeValue{Null: true, Text: ""})
+			continue
+		}
+		mut binary = false
+		if len(paramFormats) == 1 { binary = paramFormats[0] == 1 }
+		if i < len(paramFormats) && paramFormats[i] == 1 { binary = true }
+		if binary {
+			mut oid = types.TextOid
+			if i < len(stmt.ParamOids) && stmt.ParamOids[i] != 0 { oid = stmt.ParamOids[i] }
+			let d = types.DecodeBinary(oid, raw) catch err { fail err }
+			values = append(values, FakeValue{Null: types.IsNull(d), Text: d.Text()})
+		} else {
+			values = append(values, FakeValue{Null: false, Text: str(raw)})
+		}
+	}
+	s.portals[portalName] = FakePortal{Stmt: stmt, Params: values, Formats: resultFormats, Rows: [][]FakeValue{}, At: 0, Ran: false}
+}
+
+// Execute runs a portal, honouring maxRows with PortalSuspended.
+fn (s mut FakeSession) Execute(portalName str, maxRows i64, out mut dyn exec.Sink) ! {
+	let (portal, ok) = s.portals[portalName]
+	if !ok {
+		try fake_error("34000", "portal \"" + portalName + "\" does not exist")
+		return
+	}
+	mut p = portal
+	if !p.Stmt.IsQuery {
+		if !p.Ran {
+			p.Ran = true
+			s.portals[portalName] = p
+			try s.run_one(p.Stmt.Sql, mut out)
+		}
+		return
+	}
+	if !p.Ran {
+		p.Ran = true
+		p.Rows = [][]FakeValue{s.materialize(p.Stmt, p.Params)}
+	}
+	out.RowDescription(p.Stmt.cols(), p.Formats)
+	mut emitted = i64(0)
+	for p.At < len(p.Rows) {
+		if maxRows > 0 && emitted >= maxRows { break }
+		out.DataRow(s.row_datum(p.Rows[p.At]))
+		p.At += 1
+		emitted += 1
+	}
+	s.portals[portalName] = p
+	if p.At < len(p.Rows) { return }
+	out.CommandComplete("SELECT {emitted}")
+}
+
+// materialize evaluates one query row with its bound parameters.
+fn (s FakeSession) materialize(stmt FakeStmt, params []FakeValue) []FakeValue {
+	mut row = []FakeValue{}
+	for item in stmt.Items {
+		if item.Kind == "param" {
+			let (indexText, _, _) = fake_cut3(item.Value, "|")
+			let index = mint.Atoi(indexText) catch _ { 0 }
+			if index >= 1 && index <= len(params) {
+				row = append(row, params[index-1])
+			} else {
+				row = append(row, FakeValue{Null: true, Text: ""})
+			}
+			continue
+		}
+		if item.Kind == "sleep" {
+			fake_sleep(item.Value)
+			row = append(row, FakeValue{Null: false, Text: ""})
+			continue
+		}
+		row = append(row, FakeValue{Null: false, Text: s.text_of(item)})
+	}
+	return row
+}
+
+// text_of renders one evaluated item as its text form.
+fn (s FakeSession) text_of(item FakeItem) str {
+	if item.Kind == "user" { return s.User }
+	if item.Kind == "database" { return s.Database }
+	if item.Kind == "pid" { return mint.Itoa(i64(s.Pid)) }
+	return item.Value
+}
+
+// row_datum converts a materialized row into executor datums.
+fn (s FakeSession) row_datum(row []FakeValue) []types.Datum {
+	mut out = []types.Datum{}
+	for value in row {
+		if value.Null {
+			out = append(out, types.Null())
+			continue
+		}
+		out = append(out, types.FromStr(types.TextOid, value.Text))
+	}
+	return out
+}
+
+// fake_cut3 splits text once on sep, returning the three pieces.
+fn fake_cut3(text str, sep str) (str, str, bool) {
+	let at = twine.Index(text, sep)
+	if at < 0 { return text, "", false }
+	return text[:at], text[at+len(sep):], true
+}
+
+// Describe describes a conformance statement or portal.
+fn (s FakeSession) Describe(kind u8, name str) !exec.Description {
+	if kind == 'S' {
+		let (stmt, ok) = s.stmts[name]
+		if !ok {
+			try fake_error("26000", "prepared statement \"" + name + "\" does not exist")
+			return exec.Description{Cols: []exec.ColDesc{}, ParamOids: []u32{}}
+		}
+		if !stmt.IsQuery {
+			return exec.Description{Cols: []exec.ColDesc{}, ParamOids: stmt.ParamOids}
+		}
+		return exec.Description{Cols: stmt.cols(), ParamOids: stmt.ParamOids}
+	}
+	let (portal, ok) = s.portals[name]
+	if !ok {
+		try fake_error("34000", "portal \"" + name + "\" does not exist")
+		return exec.Description{Cols: []exec.ColDesc{}, ParamOids: []u32{}}
+	}
+	if !portal.Stmt.IsQuery {
+		return exec.Description{Cols: []exec.ColDesc{}, ParamOids: []u32{}}
+	}
+	return exec.Description{Cols: portal.Stmt.cols(), ParamOids: []u32{}}
+}
+
+// Close drops a statement or portal.
+fn (s mut FakeSession) Close(kind u8, name str) ! {
+	if kind == 'S' {
+		delete(s.stmts, name)
+		return
+	}
+	delete(s.portals, name)
+}
+
+// Sync ends an extended-query cycle: an aborted extended cycle returns to idle.
+fn (s mut FakeSession) Sync(out mut dyn exec.Sink) ! {
+	if s.state == 'E' { s.state = 'I' }
+}

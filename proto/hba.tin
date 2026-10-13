@@ -1,0 +1,114 @@
+package proto
+
+import "twine"
+
+// HbaLine is one effective pg_hba.conf rule: a connection type, a database list, a user
+// list, a client address and the authentication method the first matching rule selects.
+type HbaLine struct {
+	Type str
+	Database str
+	User str
+	Address str
+	Method str
+}
+
+// ParseHba parses a pg_hba.conf: one rule per line, `local db user method` or
+// `host[ssl|nossl] db user address method`, `#` starts a comment, rule options after the
+// method are ignored (tingres implements no cert map or clientcert policies yet).
+fn ParseHba(text str) []HbaLine {
+	mut lines = []HbaLine{}
+	for raw in twine.Split(text, "\n") {
+		let line = twine.TrimSpace(twine.Trim(raw, "\r"))
+		if line == "" || line[0] == '#' { continue }
+		let fields = twine.Fields(line)
+		if len(fields) < 4 { continue }
+		let kind = twine.ToLower(fields[0])
+		if kind == "local" {
+			lines = append(lines, HbaLine{Type: "local", Database: fields[1], User: fields[2], Address: "", Method: twine.ToLower(fields[3])})
+			continue
+		}
+		if kind == "host" || kind == "hostssl" || kind == "hostnossl" {
+			if len(fields) < 5 { continue }
+			lines = append(lines, HbaLine{Type: kind, Database: fields[1], User: fields[2], Address: fields[3], Method: twine.ToLower(fields[4])})
+		}
+	}
+	return lines
+}
+
+// MatchHba returns the first rule that matches a TCP connection, or nil when no rule does.
+// A connection with no matching rule is rejected, exactly as PostgreSQL rejects it.
+fn MatchHba(lines []HbaLine, database str, user str, address str, tls bool) ?HbaLine {
+	for line in lines {
+		if line.Type == "local" { continue }
+		if line.Type == "hostssl" && !tls { continue }
+		if line.Type == "hostnossl" && tls { continue }
+		if !hba_names_match(line.Database, database) { continue }
+		if !hba_names_match(line.User, user) { continue }
+		if !hba_address_match(line.Address, address) { continue }
+		return line
+	}
+	return nil
+}
+
+// hba_names_match implements the database and user patterns tingres supports: all, one
+// name, or a comma-separated list of names.
+fn hba_names_match(pattern str, name str) bool {
+	if pattern == "" || pattern == "all" { return true }
+	if pattern == name { return true }
+	for part in twine.Split(pattern, ",") {
+		if twine.TrimSpace(part) == name { return true }
+	}
+	return false
+}
+
+// hba_address_match compares the rule's address to the peer's dotted-quad address.
+fn hba_address_match(pattern str, address str) bool {
+	if pattern == "all" || pattern == "samehost" || pattern == "" { return true }
+	if pattern == address { return true }
+	let slash = twine.Index(pattern, "/")
+	if slash < 0 { return false }
+	let network = ipv4_parse(pattern[:slash])
+	let peer = ipv4_parse(address)
+	if network == nil || peer == nil { return false }
+	let bits = parse_ipv4_bits(pattern[slash+1:]) catch _ { return false }
+	if bits < 0 || bits > 32 { return false }
+	if bits == 0 { return true }
+	let mask = u32(0xffffffff) << (32 - bits)
+	return (network & mask) == (peer & mask)
+}
+
+// ipv4_parse parses dotted-quad IPv4 text into a big-endian 32-bit value.
+fn ipv4_parse(text str) ?u32 {
+	mut value = u32(0)
+	mut parts = 0
+	mut current = i64(0)
+	mut digits = 0
+	for i in 0..len(text) {
+		let c = text[i]
+		if c == '.' {
+			if digits == 0 || current > 255 { return nil }
+			value = (value << 8) | u32(current)
+			parts += 1
+			current = 0
+			digits = 0
+			continue
+		}
+		if c < '0' || c > '9' { return nil }
+		current = current*10 + i64(c - '0')
+		if current > 255 { return nil }
+		digits += 1
+	}
+	if digits == 0 || current > 255 || parts != 3 { return nil }
+	return (value << 8) | u32(current)
+}
+
+fn parse_ipv4_bits(text str) !i64 {
+	mut value = i64(0)
+	if text == "" { fail "proto: empty prefix length" }
+	for i in 0..len(text) {
+		let c = text[i]
+		if c < '0' || c > '9' { fail "proto: invalid prefix length" }
+		value = value*10 + i64(c - '0')
+	}
+	return value
+}

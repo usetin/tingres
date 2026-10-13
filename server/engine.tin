@@ -1,0 +1,50 @@
+// Engine opens and owns the durable server state (store, transaction manager and
+// catalog) and hands out one execution session per connection. Tin structs are
+// references, so the Manager and Catalog copied into a session are the same objects the
+// engine holds: xids, locks and catalog versions are shared, and no state is per-session
+// that must be.
+package server
+
+import "../catalog"
+import "../exec"
+import "../store"
+import "../txn"
+
+// Engine is the process-wide storage and transaction state.
+type Engine struct {
+	DataDir str
+	Store store.Store
+	Manager txn.Manager
+	Catalog catalog.Catalog
+}
+
+// OpenEngine opens (or initializes) the data directory and its catalog.
+fn OpenEngine(dataDir str, opts store.Options) !Engine {
+	mut s = try store.Open(dataDir, opts)
+	let m = try txn.NewManager(mut s)
+	let c = try catalog.Open(mut s, m)
+	return Engine{DataDir: dataDir, Store: s, Manager: m, Catalog: c}
+}
+
+// NewSession creates an execution session for a connection against the real engine.
+fn (e Engine) NewSession(user str, db str) exec.Session {
+	return exec.NewSession(e.Catalog, e.Manager, user, db)
+}
+
+// Close checkpoints and closes the store.
+fn (e mut Engine) Close() ! {
+	try e.Store.Close()
+}
+
+// ProbeRealEngine reports whether exec.Session.Simple runs a trivial query end to end,
+// which decides what `--engine auto` selects. It is a read-only probe on a scratch
+// session; a server that answers SELECT 1 with anything but a SELECT 1 tag (exec is still
+// a skeleton) must not be picked.
+fn ProbeRealEngine(e mut Engine) bool {
+	mut s = e.NewSession("postgres", "postgres")
+	mut sink = exec.NewRecordSink()
+	let ran = s.Simple("SELECT 1", mut sink)
+	if ran != nil { return false }
+	if len(sink.Tags) != 1 { return false }
+	return sink.Tags[0] == "SELECT 1"
+}
