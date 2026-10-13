@@ -7,28 +7,132 @@ import "twine"
 const TextArrayOid Oid = 1009
 
 fn registerRegexFuncs(funcs mut []Func) {
-	for _, name in []str{"regexp_match", "regexp_matches", "regexp_split_to_array"} {
+	for _, name in []str{"regexp_match", "regexp_matches"} {
 		registerFunc(mut funcs, function2(name, []Oid{TextOid, TextOid}, TextArrayOid, true, false, fn(text Datum, pattern Datum) !Datum {
-			return try regexArrayUnsupported(name, text, pattern, Null())
+			return try regexMatchArray(name, text.Text(), pattern.Text(), "")
 		}))
 		registerFunc(mut funcs, function3(name, []Oid{TextOid, TextOid, TextOid}, TextArrayOid, true, false, fn(text Datum, pattern Datum, flags Datum) !Datum {
-			return try regexArrayUnsupported(name, text, pattern, flags)
+			return try regexMatchArray(name, text.Text(), pattern.Text(), flags.Text())
 		}))
 	}
+	registerFunc(mut funcs, function2("regexp_split_to_array", []Oid{TextOid, TextOid}, TextArrayOid, true, false, fn(text Datum, pattern Datum) !Datum {
+		return try regexSplitToArray(text.Text(), pattern.Text(), "")
+	}))
+	registerFunc(mut funcs, function3("regexp_split_to_array", []Oid{TextOid, TextOid, TextOid}, TextArrayOid, true, false, fn(text Datum, pattern Datum, flags Datum) !Datum {
+		return try regexSplitToArray(text.Text(), pattern.Text(), flags.Text())
+	}))
+	registerFunc(mut funcs, function2("regexp_like", []Oid{TextOid, TextOid}, BoolOid, true, false, fn(text Datum, pattern Datum) !Datum {
+		return try regexLike(text.Text(), pattern.Text(), "")
+	}))
+	registerFunc(mut funcs, function3("regexp_like", []Oid{TextOid, TextOid, TextOid}, BoolOid, true, false, fn(text Datum, pattern Datum, flags Datum) !Datum {
+		return try regexLike(text.Text(), pattern.Text(), flags.Text())
+	}))
 	registerFunc(mut funcs, function3("regexp_replace", []Oid{TextOid, TextOid, TextOid}, TextOid, true, false, fn(text Datum, pattern Datum, replacement Datum) !Datum {
 		return try regexReplace(text.Text(), pattern.Text(), replacement.Text(), "")
 	}))
 	registerFunc(mut funcs, function("regexp_replace", []Oid{TextOid, TextOid, TextOid, TextOid}, TextOid, true, false, fn(args []Datum) !Datum {
 		return try regexReplace(args[0].Text(), args[1].Text(), args[2].Text(), args[3].Text())
 	}))
+	registerFunc(mut funcs, function2("substring", []Oid{TextOid, TextOid}, TextOid, true, false, fn(text Datum, pattern Datum) !Datum {
+		return try regexSubstring(text.Text(), pattern.Text(), "")
+	}))
 }
 
-fn regexArrayUnsupported(name str, text Datum, pattern Datum, flags Datum) !Datum {
-	_ = text
-	_ = pattern
-	_ = flags
-	try pgRaise("0A000", "{name} array results are not supported")
-	return Null()
+// regexMatchArray implements regexp_match and (scalarised) regexp_matches: the
+// capture groups of the first match, or the whole match when there is no group.
+fn regexMatchArray(name str, text str, pattern str, flags str) !Datum {
+	let global = allowsGlobalFlags(name)
+	if name == "regexp_match" && containsGlobalFlag(flags) { try regexpMatchGlobalFault() }
+	let parsed = try parseRegexFlags(flags, global)
+	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	let offsets = re.SubmatchIndex(text)
+	if len(offsets) == 0 || offsets[0] < 0 { return Null() }
+	if re.NumSubexp() == 0 {
+		return FromStr(TextArrayOid, arrayText([]?str{text[offsets[0]:offsets[1]]}))
+	}
+	mut elements = make([]?str, 0, re.NumSubexp())
+	for i in 1..len(offsets)/2 {
+		let start = offsets[i*2]
+		let end = offsets[i*2+1]
+		if start < 0 || end < 0 {
+			elements = append(elements, nil)
+		} else {
+			elements = append(elements, text[start:end])
+		}
+	}
+	return FromStr(TextArrayOid, arrayText(elements))
+}
+
+fn regexSplitToArray(text str, pattern str, flags str) !Datum {
+	let parsed = try parseRegexFlags(flags, false)
+	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	let pieces = re.Split(text, -1)
+	mut elements = make([]?str, 0, len(pieces))
+	for piece in pieces { elements = append(elements, piece) }
+	return FromStr(TextArrayOid, arrayText(elements))
+}
+
+fn regexLike(text str, pattern str, flags str) !Datum {
+	let parsed = try parseRegexFlags(flags, false)
+	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	return FromBool(re.Match(text))
+}
+
+// regexSubstring is the SQL substring(text from pattern) form: the first capture
+// group, or the whole match when the pattern has no group.
+fn regexSubstring(text str, pattern str, flags str) !Datum {
+	let parsed = try parseRegexFlags(flags, false)
+	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	let offsets = re.SubmatchIndex(text)
+	if len(offsets) == 0 || offsets[0] < 0 { return Null() }
+	if re.NumSubexp() == 0 { return FromStr(TextOid, text[offsets[0]:offsets[1]]) }
+	if offsets[2] < 0 { return Null() }
+	return FromStr(TextOid, text[offsets[2]:offsets[3]])
+}
+
+fn allowsGlobalFlags(name str) bool { return name == "regexp_matches" }
+
+fn containsGlobalFlag(flags str) bool {
+	for _, flag in flags { if flag == 'g' { return true } }
+	return false
+}
+
+fn regexpMatchGlobalFault() ! {
+	fail ErrorFault(NewPgError("22023", "regexp_match() does not support the \"global\" option", "", "Use the regexp_matches function instead.", 0))
+}
+
+// arrayText renders a PostgreSQL text array literal, quoting as array_out does.
+fn arrayText(elements []?str) str {
+	mut out = "{{"
+	for i, element in elements {
+		if i > 0 { out += "," }
+		if element == nil {
+			out += "NULL"
+		} else {
+			out += arrayElementText(element)
+		}
+	}
+	return out+"}}"
+}
+
+fn arrayElementText(value str) str {
+	if value != "NULL" && !arrayNeedsQuotes(value) { return value }
+	mut out = "\""
+	for i, c in value {
+		_ = i
+		if c == '"' || c == '\\' { out += "\\" }
+		out += str(c)
+	}
+	return out+"\""
+}
+
+fn arrayNeedsQuotes(value str) bool {
+	if len(value) == 0 { return true }
+	for i, c in value {
+		_ = i
+		if c == '{' || c == '}' || c == ',' || c == '"' || c == '\\' || c <= ' ' { return true }
+	}
+	return false
 }
 
 fn regexOperator(name str, text str, pattern str) !Datum {
