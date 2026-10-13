@@ -1,45 +1,159 @@
 package types
 
+import "twine"
+
 // registerOperators installs comparison, boolean, arithmetic and bit operators.
 fn registerOperators(funcs mut []Func) {
 	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid} {
 		for _, op in []str{"=", "<>", "<", "<=", ">", ">="} {
-			registerFunc(mut funcs, function(op, []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try comparisonFunc(op, args) }))
+			registerFunc(mut funcs, comparisonOperator(op, oid))
 		}
 	}
 	for _, op in []str{"+", "-", "*", "/", "%", "^"} {
 		for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
 			if op == "^" && isInteger(oid) { continue }
-			registerFunc(mut funcs, function(op, []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc(op, args) }))
+			registerFunc(mut funcs, arithmeticOperator(op, oid))
 		}
 	}
 	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid} {
 		for _, op in []str{"&", "|", "#", "<<", ">>"} {
-			registerFunc(mut funcs, function(op, []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try arithmeticFunc(op, args) }))
+			registerFunc(mut funcs, arithmeticOperator(op, oid))
 		}
 	}
 	for _, oid in []Oid{Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid} {
-		registerFunc(mut funcs, function("+", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try callUnary("+", args[0]) }))
-		registerFunc(mut funcs, function("-", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try callUnary("-", args[0]) }))
+		registerFunc(mut funcs, function1("+", []Oid{oid}, oid, true, false, fn(a Datum) !Datum { return try callUnary("+", a) }))
+		registerFunc(mut funcs, function1("-", []Oid{oid}, oid, true, false, fn(a Datum) !Datum { return try callUnary("-", a) }))
 	}
-	registerFunc(mut funcs, function("NOT", []Oid{BoolOid}, BoolOid, true, false, fn(args []Datum) !Datum { return try booleanFunc("NOT", args) }))
-	registerFunc(mut funcs, function("AND", []Oid{BoolOid, BoolOid}, BoolOid, false, false, fn(args []Datum) !Datum { return try booleanFunc("AND", args) }))
-	registerFunc(mut funcs, function("OR", []Oid{BoolOid, BoolOid}, BoolOid, false, false, fn(args []Datum) !Datum { return try booleanFunc("OR", args) }))
-	for _, oid in []Oid{BoolOid} {
-		for _, op in []str{"IS TRUE", "IS FALSE", "IS UNKNOWN", "IS NOT TRUE", "IS NOT FALSE", "IS NOT UNKNOWN"} {
-			registerFunc(mut funcs, function(op, []Oid{oid}, BoolOid, false, false, fn(args []Datum) !Datum { return try callIs(op, args[0]) }))
-		}
+	registerFunc(mut funcs, function1("NOT", []Oid{BoolOid}, BoolOid, true, false, fn(a Datum) !Datum { return try booleanNot(a) }))
+	registerFunc(mut funcs, function2("AND", []Oid{BoolOid, BoolOid}, BoolOid, false, false, fn(a Datum, b Datum) !Datum { return try booleanValues("AND", a, b) }))
+	registerFunc(mut funcs, function2("OR", []Oid{BoolOid, BoolOid}, BoolOid, false, false, fn(a Datum, b Datum) !Datum { return try booleanValues("OR", a, b) }))
+	for _, op in []str{"IS TRUE", "IS FALSE", "IS UNKNOWN", "IS NOT TRUE", "IS NOT FALSE", "IS NOT UNKNOWN"} {
+		registerFunc(mut funcs, function1(op, []Oid{BoolOid}, BoolOid, false, false, fn(a Datum) !Datum { return try callIs(op, a) }))
 	}
 	for _, oid in []Oid{BoolOid, Int2Oid, Int4Oid, Int8Oid, Float4Oid, Float8Oid, TextOid, VarcharOid, BpcharOid, NameOid, ByteaOid, UuidOid} {
-		registerFunc(mut funcs, function("IS DISTINCT FROM", []Oid{oid, oid}, BoolOid, false, false, fn(args []Datum) !Datum { return try callDistinct("IS DISTINCT FROM", args[0], args[1]) }))
-		registerFunc(mut funcs, function("IS NOT DISTINCT FROM", []Oid{oid, oid}, BoolOid, false, false, fn(args []Datum) !Datum { return try callDistinct("IS NOT DISTINCT FROM", args[0], args[1]) }))
+		registerFunc(mut funcs, function2("IS DISTINCT FROM", []Oid{oid, oid}, BoolOid, false, false, fn(a Datum, b Datum) !Datum { return try callDistinct("IS DISTINCT FROM", a, b) }))
+		registerFunc(mut funcs, function2("IS NOT DISTINCT FROM", []Oid{oid, oid}, BoolOid, false, false, fn(a Datum, b Datum) !Datum { return try callDistinct("IS NOT DISTINCT FROM", a, b) }))
 	}
+}
+
+fn comparisonOperator(op str, oid Oid) Func {
+	mut f = function2(op, []Oid{oid, oid}, BoolOid, true, false, fn(a Datum, b Datum) !Datum {
+		return FromBool(compareOp(op, compareValues(a, b)))
+	})
+	if oid == Int4Oid {
+		f.Int4Compare = fn(a i32, b i32) !bool { return compareOp(op, compareI64(i64(a), i64(b))) }
+	} else if oid == Int8Oid {
+		f.Int8Compare = fn(a i64, b i64) !bool { return compareOp(op, compareI64(a, b)) }
+	} else if oid == Float8Oid {
+		f.Float8Compare = fn(a f64, b f64) !bool { return compareOp(op, compareFloat(a, b)) }
+	} else if oid == TextOid {
+		f.TextCompare = fn(a str, b str) !bool { return compareOp(op, compareText(a, b)) }
+	}
+	return f
+}
+
+fn arithmeticOperator(op str, oid Oid) Func {
+	mut f = function2(op, []Oid{oid, oid}, oid, true, false, fn(a Datum, b Datum) !Datum { return try arithmeticValues(op, a, b) })
+	if oid == Int4Oid {
+		f.Int4Binary = fn(a i32, b i32) !i32 {
+			let value = try checkedIntegerValue(op, i64(a), i64(b), oid)
+			return i32(value)
+		}
+	} else if oid == Int8Oid {
+		f.Int8Binary = fn(a i64, b i64) !i64 { return try checkedIntegerValue(op, a, b, oid) }
+	} else if oid == Float8Oid {
+		f.Float8Binary = fn(a f64, b f64) !f64 { return try arithmeticFloat(op, a, b) }
+	}
+	return f
+}
+
+fn compareOp(op str, c i64) bool {
+	return match op {
+		"=" => c == 0
+		"<>" => c != 0
+		"<" => c < 0
+		"<=" => c <= 0
+		">" => c > 0
+		">=" => c >= 0
+		_ => false
+	}
+}
+
+fn compareValues(a Datum, b Datum) i64 {
+	if IsNull(a) || IsNull(b) { return Compare(a, b) }
+	let oid = a.Oid()
+	if oid == Int4Oid || oid == Int8Oid || oid == Int2Oid { return compareI64(a.i, b.i) }
+	if oid == Float4Oid || oid == Float8Oid { return compareFloat(a.f, b.f) }
+	if isStringType(oid) {
+		mut left = a.Text()
+		mut right = b.Text()
+		if oid == BpcharOid {
+			left = twine.TrimRight(left, " ")
+			right = twine.TrimRight(right, " ")
+		}
+		return compareText(left, right)
+	}
+	if oid == UuidOid { return compareText(twine.ToLower(a.Text()), twine.ToLower(b.Text())) }
+	return Compare(a, b)
+}
+
+fn compareI64(a i64, b i64) i64 {
+	if a < b { return -1 }
+	if a > b { return 1 }
+	return 0
+}
+
+fn compareFloat(a f64, b f64) i64 {
+	let aNan = a != a
+	let bNan = b != b
+	if aNan {
+		if bNan { return 0 }
+		return 1
+	}
+	if bNan { return -1 }
+	if a < b { return -1 }
+	if a > b { return 1 }
+	return 0
+}
+
+fn compareText(a str, b str) i64 {
+	if a < b { return -1 }
+	if a > b { return 1 }
+	return 0
+}
+
+fn comparisonFunc(op str, args []Datum) !Datum {
+	return FromBool(compareOp(op, compareValues(args[0], args[1])))
 }
 
 fn callUnary(op str, arg Datum) !Datum {
 	if op == "+" { return arg }
-	if isInteger(arg.Oid()) { return try numericFromInt(arg.Oid(), 0-arg.i) }
+	if isInteger(arg.Oid()) {
+		if arg.i == minInt(arg.Oid()) { try pgRaise("22003", integerRangeMessage(arg.Oid())) }
+		return FromI64(arg.Oid(), 0-arg.i)
+	}
 	return numericFromFloat(arg.Oid(), -arg.f)
+}
+
+fn booleanNot(a Datum) !Datum {
+	if IsNull(a) { return Null() }
+	return FromBool(!a.b)
+}
+
+fn booleanValues(op str, a Datum, b Datum) !Datum {
+	if op == "AND" {
+		if !IsNull(a) && !a.b || !IsNull(b) && !b.b { return FromBool(false) }
+		if IsNull(a) || IsNull(b) { return Null() }
+		return FromBool(true)
+	}
+	if !IsNull(a) && a.b || !IsNull(b) && b.b { return FromBool(true) }
+	if IsNull(a) || IsNull(b) { return Null() }
+	return FromBool(false)
+}
+
+fn booleanFunc(op str, args []Datum) !Datum {
+	if op == "NOT" { return try booleanNot(args[0]) }
+	return try booleanValues(op, args[0], args[1])
 }
 
 fn callIs(op str, arg Datum) !Datum {
@@ -60,7 +174,7 @@ fn callIs(op str, arg Datum) !Datum {
 
 fn callDistinct(name str, a Datum, b Datum) !Datum {
 	mut different = false
-	if IsNull(a) { different = !IsNull(b) } else if IsNull(b) { different = true } else { different = Compare(a, b) != 0 }
+	if IsNull(a) { different = !IsNull(b) } else if IsNull(b) { different = true } else { different = compareValues(a, b) != 0 }
 	if name == "IS DISTINCT FROM" { return FromBool(different) }
 	return FromBool(!different)
 }
