@@ -1,0 +1,166 @@
+package plan
+
+// Kind identifies a physical operator.
+type Kind enum {
+	SeqScan
+	IndexScan
+	Filter
+	Project
+	NestLoop
+	HashJoin
+	MergeJoin
+	Sort
+	HashAgg
+	GroupAgg
+	Limit
+	Unique
+	SetOp
+	Values
+	CTE
+	ModifyTable
+}
+
+// Node is one immutable operator description in a physical plan.
+type Node struct {
+	Kind       Kind
+	Name       str
+	Detail     str
+	Children   []Node
+	Rows       f64
+	Startup    f64
+	Total      f64
+	HasEstimate bool
+}
+
+// Plan is a physical operator tree.
+type Plan struct {
+	Root Node
+}
+
+// Estimate fills missing row and cost estimates recursively using conservative defaults.
+fn Estimate(node Node) Node {
+	mut childRows = 0.0
+	mut childCost = 0.0
+	for child in node.Children {
+		let estimated = Estimate(child)
+		childRows += estimated.Rows
+		childCost += estimated.Total
+	}
+	if node.HasEstimate {
+		return node
+	}
+	mut rows = 1000.0
+	mut work = 1000.0
+	match node.Kind {
+		SeqScan => {
+			rows = 1000.0
+			work = rows
+		}
+		IndexScan => {
+			rows = 100.0
+			work = 3.0 + rows * 0.1
+		}
+		Filter => {
+			rows = childRows * 0.3333333333333333
+			work = childRows * 0.01
+		}
+		Project => {
+			rows = childRows
+			work = rows * 0.005
+		}
+		NestLoop => {
+			rows = childRows * 0.1
+			work = childRows * 10.0
+		}
+		HashJoin => {
+			rows = childRows * 0.1
+			work = childRows * 1.5
+		}
+		MergeJoin => {
+			rows = childRows * 0.1
+			work = childRows * 1.2
+		}
+		Sort => {
+			rows = childRows
+			work = childRows * 10.0
+		}
+		HashAgg, GroupAgg => {
+			rows = childRows * 0.1
+			work = childRows * 1.5
+		}
+		Limit => {
+			rows = min(100.0, childRows)
+			work = 0.1
+		}
+		Unique => {
+			rows = childRows * 0.5
+			work = childRows * 0.1
+		}
+		SetOp => {
+			rows = childRows * 0.5
+			work = childRows
+		}
+		Values => {
+			rows = 1.0
+			work = 0.01
+		}
+		CTE => {
+			rows = childRows
+			work = childRows
+		}
+		ModifyTable => {
+			rows = childRows
+			work = childRows
+		}
+	}
+	return Node{Kind: node.Kind, Name: node.Name, Detail: node.Detail, Children: node.Children, Rows: rows, Startup: childCost, Total: childCost + work, HasEstimate: true}
+}
+
+// Explain returns a PostgreSQL-style text rendering of a plan.
+fn Explain(p Plan, analyze bool) []str {
+	mut lines = []str{}
+	let root = Estimate(p.Root)
+	_ = analyze
+	writeExplain(root, 0, analyze, mut lines)
+	return lines
+}
+
+fn writeExplain(node Node, depth i64, analyze bool, lines mut []str) {
+	mut prefix = ""
+	for i in 0..depth {
+		prefix += "  "
+		_ = i
+	}
+	let title = nodeTitle(node)
+	mut detail = ""
+	if node.Detail != "" {
+		detail = " " + node.Detail
+	}
+	let estimateNode = Estimate(node)
+	let estimate = " (cost={estimateNode.Startup:.2}..{estimateNode.Total:.2} rows={i64(estimateNode.Rows)} width=0)"
+	lines = append(lines, prefix + title + detail + estimate)
+	for child in node.Children {
+		writeExplain(child, depth + 1, analyze, mut lines)
+	}
+}
+
+fn nodeTitle(node Node) str {
+	match node.Kind {
+		SeqScan => { return "Seq Scan on " + node.Name }
+		IndexScan => { return "Index Scan using " + node.Name }
+		Filter => { return "Filter" }
+		Project => { return "Result" }
+		NestLoop => { return "Nested Loop" }
+		HashJoin => { return "Hash Join" }
+		MergeJoin => { return "Merge Join" }
+		Sort => { return "Sort" }
+		HashAgg => { return "HashAggregate" }
+		GroupAgg => { return "GroupAggregate" }
+		Limit => { return "Limit" }
+		Unique => { return "Unique" }
+		SetOp => { return "SetOp" }
+		Values => { return "Values Scan" }
+		CTE => { return "CTE Scan on " + node.Name }
+		ModifyTable => { return "ModifyTable" }
+	}
+}

@@ -37,19 +37,6 @@ type Datum value struct {
 	bytes []u8
 }
 
-// PgError is the PostgreSQL error payload shared by callers.
-type PgError struct {
-	Code str
-	Message str
-	Detail str
-	Hint str
-	Position i32
-}
-
-fn NewError(code str, message str) PgError {
-	return PgError{Code: code, Message: message, Detail: "", Hint: "", Position: 0}
-}
-
 // Null returns an SQL NULL datum.
 fn Null() Datum {
 	return Datum{oid: 0, null: true, i: 0, f: 0.0, b: false, s: "", bytes: []u8{}}
