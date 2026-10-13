@@ -61,6 +61,14 @@ type TupleCheckCode enum {
 	BeingModified
 }
 
+// TupleHeader is the subset of a heap header required for visibility.
+type TupleHeader struct {
+	Xmin u32
+	Xmax u32
+	Cid u32
+	Infomask u16
+}
+
 type TupleCheck struct {
 	Code TupleCheckCode
 	By u32
@@ -426,6 +434,17 @@ fn (m Manager) Visible(snap Snapshot, h store.TupleHeader) bool {
 	return visible
 }
 
+// VisibleHeader applies MVCC visibility to a decoded value header.
+fn (m Manager) VisibleHeader(snap Snapshot, h TupleHeader) bool {
+	let (visible, _) = m.visibleHeaderFields(snap, h.Xmin, h.Xmax, h.Cid, h.Infomask, snap.Cid)
+	return visible
+}
+
+// HeapTupleSatisfiesMVCC is the PostgreSQL name for the visibility rule.
+fn (m Manager) HeapTupleSatisfiesMVCC(snap Snapshot, h store.TupleHeader) bool {
+	return m.Visible(snap, h)
+}
+
 // VisibleTuple applies MVCC visibility and persists final xmin/xmax hint bits.
 fn (m mut Manager) VisibleTuple(snap Snapshot, rel store.RelId, tuple store.HeapTuple) bool {
 	let pageKey = TuplePageKey{rel: u32(rel), page: u32(tuple.Tid.Page())}
@@ -474,13 +493,12 @@ fn (m mut Manager) InvalidatePageVisibility(rel store.RelId, page u32) {
 	delete(m.allVisiblePages, TuplePageKey{rel: u32(rel), page: page})
 }
 
-fn (m Manager) visibleHeader(snap Snapshot, h store.TupleHeader, cmax u32) (bool, u16) {
+fn (m Manager) visibleHeaderFields(snap Snapshot, xmin u32, xmax u32, cid u32, infomask u16, cmax u32) (bool, u16) {
 	mut hints = u16(0)
-	let xmin = h.Xmin()
-	let xminBits = h.Infomask() & infXminFrozen
+	let xminBits = infomask & infXminFrozen
 	if xmin == 0 || xminBits == infXminInvalid { return false, hints }
 	if xmin == snap.Xid {
-		if h.Cid() >= snap.Cid { return false, hints }
+		if cid >= snap.Cid { return false, hints }
 	} else {
 		mut committed = xminBits == infXminFrozen || xminBits&infXminCommitted != 0
 		if !committed {
@@ -495,11 +513,9 @@ fn (m Manager) visibleHeader(snap Snapshot, h store.TupleHeader, cmax u32) (bool
 			}
 			if !committed { return false, hints }
 		}
-		// A committed xmin below the snapshot horizon cannot be in xip or beyond xmax.
 		if xmin >= snap.Xmin && (xidIn(xmin, snap.Xip) || xmin >= snap.Xmax) { return false, hints }
 	}
-	let xmax = h.Xmax()
-	let xmaxBits = h.Infomask()
+	let xmaxBits = infomask
 	if xmax == 0 || xmaxBits&infXmaxInvalid != 0 || xmaxBits&infXmaxLockOnly != 0 { return true, hints }
 	if xmax == snap.Xid {
 		return cmax >= snap.Cid, hints
@@ -517,6 +533,10 @@ fn (m Manager) visibleHeader(snap Snapshot, h store.TupleHeader, cmax u32) (bool
 	}
 	if xmaxState == XidState.Aborted { hints |= infXmaxInvalid }
 	return true, hints
+}
+
+fn (m Manager) visibleHeader(snap Snapshot, h store.TupleHeader, cmax u32) (bool, u16) {
+	return m.visibleHeaderFields(snap, h.Xmin(), h.Xmax(), h.Cid(), h.Infomask(), cmax)
 }
 
 // HeapTupleSatisfiesDirty reports whether a write must wait before it can inspect this tuple.
