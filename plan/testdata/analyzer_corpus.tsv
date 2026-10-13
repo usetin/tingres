@@ -1,0 +1,325 @@
+valid	SELECT 1		
+valid	SELECT 1 + 2 * 3		
+valid	SELECT true		
+valid	SELECT false		
+valid	SELECT 'hello'		
+valid	SELECT 1, 2		
+valid	SELECT 2, 4		
+valid	SELECT 3, 6		
+valid	SELECT 4, 8		
+valid	SELECT 5, 10		
+valid	SELECT 6, 12		
+valid	SELECT 7, 14		
+valid	SELECT 8, 16		
+valid	SELECT 9, 18		
+valid	SELECT 10, 20		
+valid	SELECT 11, 22		
+valid	SELECT 12, 24		
+valid	SELECT 13, 26		
+valid	SELECT 14, 28		
+valid	SELECT 15, 30		
+valid	SELECT 16, 32		
+valid	SELECT 17, 34		
+valid	SELECT 18, 36		
+valid	SELECT 19, 38		
+valid	SELECT 20, 40		
+valid	SELECT id, name FROM users WHERE id = 1		
+valid	SELECT * FROM users WHERE age > 16		
+valid	SELECT id, name FROM users WHERE id = 2		
+valid	SELECT * FROM users WHERE age > 17		
+valid	SELECT id, name FROM users WHERE id = 3		
+valid	SELECT * FROM users WHERE age > 18		
+valid	SELECT id, name FROM users WHERE id = 4		
+valid	SELECT * FROM users WHERE age > 19		
+valid	SELECT id, name FROM users WHERE id = 5		
+valid	SELECT * FROM users WHERE age > 20		
+valid	SELECT id, name FROM users WHERE id = 6		
+valid	SELECT * FROM users WHERE age > 21		
+valid	SELECT id, name FROM users WHERE id = 7		
+valid	SELECT * FROM users WHERE age > 22		
+valid	SELECT id, name FROM users WHERE id = 8		
+valid	SELECT * FROM users WHERE age > 23		
+valid	SELECT id, name FROM users WHERE id = 9		
+valid	SELECT * FROM users WHERE age > 24		
+valid	SELECT id, name FROM users WHERE id = 10		
+valid	SELECT * FROM users WHERE age > 25		
+valid	SELECT id, name FROM users WHERE id = 11		
+valid	SELECT * FROM users WHERE age > 26		
+valid	SELECT id, name FROM users WHERE id = 12		
+valid	SELECT * FROM users WHERE age > 27		
+valid	SELECT id, name FROM users WHERE id = 13		
+valid	SELECT * FROM users WHERE age > 28		
+valid	SELECT id, name FROM users WHERE id = 14		
+valid	SELECT * FROM users WHERE age > 29		
+valid	SELECT id, name FROM users WHERE id = 15		
+valid	SELECT * FROM users WHERE age > 30		
+valid	SELECT id, name FROM users WHERE id = 16		
+valid	SELECT * FROM users WHERE age > 31		
+valid	SELECT id, name FROM users WHERE id = 17		
+valid	SELECT * FROM users WHERE age > 32		
+valid	SELECT id, name FROM users WHERE id = 18		
+valid	SELECT * FROM users WHERE age > 33		
+valid	SELECT id, name FROM users WHERE id = 19		
+valid	SELECT * FROM users WHERE age > 34		
+valid	SELECT id, name FROM users WHERE id = 20		
+valid	SELECT * FROM users WHERE age > 35		
+valid	SELECT id, name FROM users WHERE id = 21		
+valid	SELECT * FROM users WHERE age > 36		
+valid	SELECT id, name FROM users WHERE id = 22		
+valid	SELECT * FROM users WHERE age > 37		
+valid	SELECT id, name FROM users WHERE id = 23		
+valid	SELECT * FROM users WHERE age > 38		
+valid	SELECT id, name FROM users WHERE id = 24		
+valid	SELECT * FROM users WHERE age > 39		
+valid	SELECT id, name FROM users WHERE id = 25		
+valid	SELECT * FROM users WHERE age > 40		
+valid	SELECT name FROM users WHERE name = 'Alice'		
+valid	SELECT name FROM users WHERE name <> 'Bob'		
+valid	SELECT * FROM users WHERE age >= 20 AND age <= 50		
+valid	SELECT * FROM users WHERE age < 20 OR age > 60		
+valid	SELECT * FROM users WHERE NOT age = 30		
+valid	SELECT * FROM users WHERE name IS NULL		
+valid	SELECT * FROM users WHERE name IS NOT NULL		
+valid	SELECT * FROM users WHERE name LIKE 'A%'		
+valid	SELECT * FROM users WHERE name ILIKE 'a%'		
+valid	SELECT * FROM users WHERE age = 21 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 22 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 23 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 24 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 25 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 26 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 27 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 28 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 29 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 30 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 31 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 32 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 33 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 34 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 35 AND name IS NOT NULL		
+valid	SELECT * FROM users WHERE age = 36 AND name IS NOT NULL		
+valid	SELECT * FROM users JOIN orders ON users.id = orders.user_id		
+valid	SELECT * FROM users u JOIN orders o ON u.id = o.user_id		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id		
+valid	SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id		
+valid	SELECT * FROM users RIGHT JOIN orders ON users.id = orders.user_id		
+valid	SELECT * FROM users CROSS JOIN products		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 19		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 21		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 22		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 23		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 24		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 25		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 26		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 27		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 28		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 29		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 30		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 31		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 32		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 33		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 34		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 35		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 36		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 37		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 38		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 39		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 40		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 41		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 42		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 43		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 44		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 45		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 46		
+valid	SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 47		
+valid	SELECT count(*) FROM users		
+valid	SELECT count(id) FROM users		
+valid	SELECT sum(age) FROM users		
+valid	SELECT avg(age) FROM users		
+valid	SELECT min(age) FROM users		
+valid	SELECT max(age) FROM users		
+valid	SELECT age, count(*) FROM users GROUP BY age		
+valid	SELECT age, min(id), max(id) FROM users GROUP BY age		
+valid	SELECT user_id, sum(amount) FROM orders GROUP BY user_id		
+valid	SELECT age, count(*) FROM users GROUP BY age HAVING count(*) > 1		
+valid	SELECT age, count(*) FROM users WHERE age > 16 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 17 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 18 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 19 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 20 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 21 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 22 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 23 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 24 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 25 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 26 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 27 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 28 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 29 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 30 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 31 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 32 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 33 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 34 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 35 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 36 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 37 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 38 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 39 GROUP BY age		
+valid	SELECT age, count(*) FROM users WHERE age > 40 GROUP BY age		
+valid	SELECT * FROM users ORDER BY age		
+valid	SELECT * FROM users ORDER BY age DESC		
+valid	SELECT * FROM users ORDER BY name ASC, age DESC		
+valid	SELECT * FROM users LIMIT 10		
+valid	SELECT * FROM users OFFSET 5		
+valid	SELECT * FROM users LIMIT 10 OFFSET 5		
+valid	SELECT * FROM users ORDER BY age LIMIT 5		
+valid	SELECT * FROM users ORDER BY age DESC LIMIT 3		
+valid	SELECT * FROM users ORDER BY id LIMIT 1		
+valid	SELECT * FROM users ORDER BY id LIMIT 2		
+valid	SELECT * FROM users ORDER BY id LIMIT 3		
+valid	SELECT * FROM users ORDER BY id LIMIT 4		
+valid	SELECT * FROM users ORDER BY id LIMIT 5		
+valid	SELECT * FROM users ORDER BY id LIMIT 6		
+valid	SELECT * FROM users ORDER BY id LIMIT 7		
+valid	SELECT * FROM users ORDER BY id LIMIT 8		
+valid	SELECT * FROM users ORDER BY id LIMIT 9		
+valid	SELECT * FROM users ORDER BY id LIMIT 10		
+valid	SELECT * FROM users ORDER BY id LIMIT 11		
+valid	SELECT * FROM users ORDER BY id LIMIT 12		
+valid	SELECT * FROM users ORDER BY id LIMIT 13		
+valid	SELECT * FROM users ORDER BY id LIMIT 14		
+valid	SELECT * FROM users ORDER BY id LIMIT 15		
+valid	SELECT * FROM users ORDER BY id LIMIT 16		
+valid	SELECT * FROM users ORDER BY id LIMIT 17		
+valid	INSERT INTO users (id, name, age) VALUES (101, 'user_1', 21)		
+valid	INSERT INTO users (id, name, age) VALUES (102, 'user_2', 22)		
+valid	INSERT INTO users (id, name, age) VALUES (103, 'user_3', 23)		
+valid	INSERT INTO users (id, name, age) VALUES (104, 'user_4', 24)		
+valid	INSERT INTO users (id, name, age) VALUES (105, 'user_5', 25)		
+valid	INSERT INTO users (id, name, age) VALUES (106, 'user_6', 26)		
+valid	INSERT INTO users (id, name, age) VALUES (107, 'user_7', 27)		
+valid	INSERT INTO users (id, name, age) VALUES (108, 'user_8', 28)		
+valid	INSERT INTO users (id, name, age) VALUES (109, 'user_9', 29)		
+valid	INSERT INTO users (id, name, age) VALUES (110, 'user_10', 30)		
+valid	UPDATE users SET age = 31 WHERE id = 1		
+valid	UPDATE users SET age = 32 WHERE id = 2		
+valid	UPDATE users SET age = 33 WHERE id = 3		
+valid	UPDATE users SET age = 34 WHERE id = 4		
+valid	UPDATE users SET age = 35 WHERE id = 5		
+valid	DELETE FROM users WHERE id = 1		
+valid	DELETE FROM users WHERE id = 2		
+valid	DELETE FROM users WHERE id = 3		
+valid	DELETE FROM users WHERE id = 4		
+valid	DELETE FROM users WHERE id = 5		
+invalid	SELECT * FROM ghost_table_1	42P01	does not exist
+invalid	SELECT * FROM ghost_table_2	42P01	does not exist
+invalid	SELECT * FROM ghost_table_3	42P01	does not exist
+invalid	SELECT * FROM ghost_table_4	42P01	does not exist
+invalid	SELECT * FROM ghost_table_5	42P01	does not exist
+invalid	SELECT * FROM ghost_table_6	42P01	does not exist
+invalid	SELECT * FROM ghost_table_7	42P01	does not exist
+invalid	SELECT * FROM ghost_table_8	42P01	does not exist
+invalid	SELECT * FROM ghost_table_9	42P01	does not exist
+invalid	SELECT * FROM ghost_table_10	42P01	does not exist
+invalid	SELECT * FROM ghost_table_11	42P01	does not exist
+invalid	SELECT * FROM ghost_table_12	42P01	does not exist
+invalid	SELECT * FROM ghost_table_13	42P01	does not exist
+invalid	SELECT * FROM ghost_table_14	42P01	does not exist
+invalid	SELECT * FROM ghost_table_15	42P01	does not exist
+invalid	SELECT * FROM ghost_table_16	42P01	does not exist
+invalid	SELECT * FROM ghost_table_17	42P01	does not exist
+invalid	SELECT * FROM ghost_table_18	42P01	does not exist
+invalid	SELECT * FROM ghost_table_19	42P01	does not exist
+invalid	SELECT * FROM ghost_table_20	42P01	does not exist
+invalid	SELECT ghost_col_1 FROM users	42703	does not exist
+invalid	SELECT ghost_col_2 FROM users	42703	does not exist
+invalid	SELECT ghost_col_3 FROM users	42703	does not exist
+invalid	SELECT ghost_col_4 FROM users	42703	does not exist
+invalid	SELECT ghost_col_5 FROM users	42703	does not exist
+invalid	SELECT ghost_col_6 FROM users	42703	does not exist
+invalid	SELECT ghost_col_7 FROM users	42703	does not exist
+invalid	SELECT ghost_col_8 FROM users	42703	does not exist
+invalid	SELECT ghost_col_9 FROM users	42703	does not exist
+invalid	SELECT ghost_col_10 FROM users	42703	does not exist
+invalid	SELECT ghost_col_11 FROM users	42703	does not exist
+invalid	SELECT ghost_col_12 FROM users	42703	does not exist
+invalid	SELECT ghost_col_13 FROM users	42703	does not exist
+invalid	SELECT ghost_col_14 FROM users	42703	does not exist
+invalid	SELECT ghost_col_15 FROM users	42703	does not exist
+invalid	SELECT ghost_col_16 FROM users	42703	does not exist
+invalid	SELECT ghost_col_17 FROM users	42703	does not exist
+invalid	SELECT ghost_col_18 FROM users	42703	does not exist
+invalid	SELECT ghost_col_19 FROM users	42703	does not exist
+invalid	SELECT ghost_col_20 FROM users	42703	does not exist
+invalid	SELECT * FROM users WHERE ghost_pred_1 = 1	42703	does not exist
+invalid	SELECT * FROM users WHERE ghost_pred_2 = 1	42703	does not exist
+invalid	SELECT * FROM users WHERE ghost_pred_3 = 1	42703	does not exist
+invalid	SELECT * FROM users WHERE ghost_pred_4 = 1	42703	does not exist
+invalid	SELECT * FROM users WHERE ghost_pred_5 = 1	42703	does not exist
+invalid	INSERT INTO users (id, id) VALUES (1, 1)	42701	specified more than once
+invalid	INSERT INTO users (id, id) VALUES (2, 2)	42701	specified more than once
+invalid	INSERT INTO users (id, id) VALUES (3, 3)	42701	specified more than once
+invalid	INSERT INTO users (id, id) VALUES (4, 4)	42701	specified more than once
+invalid	INSERT INTO users (id, id) VALUES (5, 5)	42701	specified more than once
+invalid	INSERT INTO users (id, id) VALUES (6, 6)	42701	specified more than once
+invalid	INSERT INTO users (id, id) VALUES (7, 7)	42701	specified more than once
+invalid	INSERT INTO users (id, id) VALUES (8, 8)	42701	specified more than once
+invalid	INSERT INTO users (id, id) VALUES (9, 9)	42701	specified more than once
+invalid	INSERT INTO users (id, id) VALUES (10, 10)	42701	specified more than once
+invalid	SELECT name, count(*) FROM users WHERE age > 1	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 2	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 3	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 4	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 5	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 6	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 7	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 8	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 9	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 10	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 11	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 12	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 13	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 14	42803	must appear in the GROUP BY clause
+invalid	SELECT name, count(*) FROM users WHERE age > 15	42803	must appear in the GROUP BY clause
+invalid	INSERT INTO users (id, age) VALUES (1, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (2, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (3, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (4, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (5, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (6, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (7, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (8, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (9, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (10, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (11, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (12, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (13, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (14, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, age) VALUES (15, true)	42804	is of type integer but expression is of type boolean
+invalid	INSERT INTO users (id, name) VALUES (1)	42601	has more target columns than expressions
+invalid	INSERT INTO users (id, name) VALUES (2)	42601	has more target columns than expressions
+invalid	INSERT INTO users (id, name) VALUES (3)	42601	has more target columns than expressions
+invalid	INSERT INTO users (id, name) VALUES (4)	42601	has more target columns than expressions
+invalid	INSERT INTO users (id, name) VALUES (5)	42601	has more target columns than expressions
+invalid	INSERT INTO users (id, name) VALUES (6)	42601	has more target columns than expressions
+invalid	INSERT INTO users (id, name) VALUES (7)	42601	has more target columns than expressions
+invalid	INSERT INTO users (id) VALUES (1, 'extra')	42601	has more expressions than target columns
+invalid	INSERT INTO users (id) VALUES (2, 'extra')	42601	has more expressions than target columns
+invalid	INSERT INTO users (id) VALUES (3, 'extra')	42601	has more expressions than target columns
+invalid	INSERT INTO users (id) VALUES (4, 'extra')	42601	has more expressions than target columns
+invalid	INSERT INTO users (id) VALUES (5, 'extra')	42601	has more expressions than target columns
+invalid	INSERT INTO users (id) VALUES (6, 'extra')	42601	has more expressions than target columns
+invalid	INSERT INTO users (id) VALUES (7, 'extra')	42601	has more expressions than target columns
+invalid	INSERT INTO users (id) VALUES (8, 'extra')	42601	has more expressions than target columns
+invalid	INSERT INTO users (name) VALUES ('x1') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint
+invalid	INSERT INTO users (name) VALUES ('x2') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint
+invalid	INSERT INTO users (name) VALUES ('x3') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint
+invalid	INSERT INTO users (name) VALUES ('x4') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint
+invalid	INSERT INTO users (name) VALUES ('x5') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint
+invalid	INSERT INTO users (name) VALUES ('x6') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint
+invalid	INSERT INTO users (name) VALUES ('x7') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint
+invalid	INSERT INTO users (name) VALUES ('x8') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint
+invalid	INSERT INTO users (name) VALUES ('x9') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint
+invalid	INSERT INTO users (name) VALUES ('x10') ON CONFLICT (name) DO NOTHING	42P10	no unique or exclusion constraint

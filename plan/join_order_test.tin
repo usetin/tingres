@@ -1,0 +1,83 @@
+package plan
+
+import "../types"
+import "../catalog"
+import "../txn"
+import "../store"
+import "../parse"
+import "crucible"
+import "quarry"
+
+fn TestRandomizedJoinOrderEquivalence(t mut crucible.T) {
+	let envOpt = setupCorpusEnv(mut t, "join_order")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	// 6 syntactic permutations of a 3-table equijoin
+	let permQueries = []str{
+		"SELECT u.id, o.id, p.id FROM (users u JOIN orders o ON u.id = o.user_id) JOIN products p ON o.id = p.id",
+		"SELECT u.id, o.id, p.id FROM users u JOIN (orders o JOIN products p ON o.id = p.id) ON u.id = o.user_id",
+		"SELECT u.id, o.id, p.id FROM (orders o JOIN products p ON o.id = p.id) JOIN users u ON u.id = o.user_id",
+		"SELECT u.id, o.id, p.id FROM orders o JOIN (users u JOIN products p ON o.id = p.id) ON u.id = o.user_id",
+		"SELECT u.id, o.id, p.id FROM (products p JOIN orders o ON p.id = o.id) JOIN users u ON u.id = o.user_id",
+		"SELECT u.id, o.id, p.id FROM products p JOIN (users u JOIN orders o ON u.id = o.user_id) ON p.id = o.id",
+	}
+
+	mut firstRows = 0.0
+	mut firstColCount = 0
+
+	for i, q in permQueries {
+		let stmt = parseSql(q) catch err {
+			t.Error("parse perm {i}: " + types.ErrorMessage(err))
+			continue
+		}
+		let prep = Prepare(env.Cat, env.Txn, stmt, []u32{}) catch err {
+			t.Error("prepare perm {i}: " + types.ErrorMessage(err))
+			continue
+		}
+
+		let cost = prep.Plan.Cost()
+		t.True("plan cost is finite and positive", cost.Total > 0.0 && cost.Startup >= 0.0)
+		t.True("plan rows positive", cost.Rows > 0.0)
+
+		if i == 0 {
+			firstRows = cost.Rows
+			firstColCount = len(prep.ResultCols)
+		} else {
+			crucible.Equal(mut t, "col count matches across perm {i}", len(prep.ResultCols), firstColCount)
+			crucible.Equal(mut t, "estimated rows match for perm {i}", i64(cost.Rows), i64(firstRows))
+		}
+	}
+
+	// Permutations with pushed-down filters on one relation
+	let filterPerms = []str{
+		"SELECT u.name, o.amount FROM (users u JOIN orders o ON u.id = o.user_id) WHERE u.age > 25",
+		"SELECT u.name, o.amount FROM (orders o JOIN users u ON u.id = o.user_id) WHERE u.age > 25",
+		"SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id AND u.age > 25",
+		"SELECT u.name, o.amount FROM orders o JOIN users u ON u.id = o.user_id AND u.age > 25",
+	}
+
+	mut baseFilteredCost = 0.0
+	for i, q in filterPerms {
+		let stmt = parseSql(q) catch err {
+			t.Error("parse filter perm {i}: " + types.ErrorMessage(err))
+			continue
+		}
+		let prep = Prepare(env.Cat, env.Txn, stmt, []u32{}) catch err {
+			t.Error("prepare filter perm {i}: " + types.ErrorMessage(err))
+			continue
+		}
+
+		let cost = prep.Plan.Cost()
+		if i == 0 {
+			baseFilteredCost = cost.Total
+		} else {
+			let diff = cost.Total - baseFilteredCost
+			mut absDiff = diff
+			if diff < 0.0 { absDiff = -diff }
+			t.True("join order cost equivalence within tolerance for perm {i}", absDiff < 10.0)
+		}
+	}
+
+	cleanupTestEnv(env)
+}

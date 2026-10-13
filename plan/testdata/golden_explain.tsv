@@ -1,0 +1,100 @@
+SELECT * FROM users	Seq Scan	Seq Scan on users
+SELECT id, name FROM users	Seq Scan	Seq Scan on users
+SELECT * FROM orders	Seq Scan	Seq Scan on orders
+SELECT * FROM products	Seq Scan	Seq Scan on products
+SELECT * FROM users WHERE age > 21	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE age < 30	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE age >= 25	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE age <= 40	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE age = 30	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE age <> 30	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE name = 'Alice'	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE age > 20 AND age < 50	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE age < 20 OR age > 30	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE NOT age = 30	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE name IS NULL	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE name IS NOT NULL	Seq Scan	Seq Scan on users
+SELECT * FROM orders WHERE amount > 50.0	Seq Scan	Seq Scan on orders
+SELECT * FROM orders WHERE amount < 200.0	Seq Scan	Seq Scan on orders
+SELECT * FROM products WHERE price > 20.0	Seq Scan	Seq Scan on products
+SELECT * FROM products WHERE price <= 500.0	Seq Scan	Seq Scan on products
+SELECT * FROM users WHERE id = 1	Seq Scan	Seq Scan on users
+SELECT * FROM users WHERE id = 2	Seq Scan	Seq Scan on users
+SELECT name FROM users WHERE id = 1	Seq Scan	Seq Scan on users
+SELECT age FROM users WHERE id = 2	Seq Scan	Seq Scan on users
+SELECT * FROM orders WHERE id = 101	Seq Scan	Seq Scan on orders
+SELECT * FROM orders WHERE id = 102	Seq Scan	Seq Scan on orders
+SELECT * FROM products WHERE id = 201	Seq Scan	Seq Scan on products
+SELECT * FROM products WHERE id = 202	Seq Scan	Seq Scan on products
+SELECT id FROM users WHERE id = 3	Seq Scan	Seq Scan on users
+SELECT title, price FROM products WHERE id = 201	Seq Scan	Seq Scan on products
+SELECT * FROM users JOIN orders ON users.id = orders.user_id	Hash Join	Hash Join
+SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id	Hash Join	Hash Join
+SELECT * FROM users u JOIN orders o ON u.id = o.user_id	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age > 20	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 50.0	Nested Loop	Nested Loop
+SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id	Hash Right Join	Hash Right Join
+SELECT * FROM orders RIGHT JOIN users ON users.id = orders.user_id	Hash Right Join	Hash Right Join
+SELECT * FROM users CROSS JOIN products	Nested Loop	Nested Loop
+SELECT * FROM users u, orders o WHERE u.id = o.user_id	Hash Join	Hash Join
+SELECT u.name, p.title FROM users u CROSS JOIN products p WHERE u.id = 1	Nested Loop	Nested Loop
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 19	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 20	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 21	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 22	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 23	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 24	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 25	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 26	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 27	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 28	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 29	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 30	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 31	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 32	Hash Join	Hash Join
+SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.age >= 33	Hash Join	Hash Join
+SELECT count(*) FROM users	Aggregate	Aggregate
+SELECT count(id) FROM users	Aggregate	Aggregate
+SELECT sum(age) FROM users	Aggregate	Aggregate
+SELECT avg(age) FROM users	Aggregate	Aggregate
+SELECT min(age) FROM users	Aggregate	Aggregate
+SELECT max(age) FROM users	Aggregate	Aggregate
+SELECT age, count(*) FROM users GROUP BY age	HashAggregate	HashAggregate
+SELECT age, count(id) FROM users GROUP BY age	HashAggregate	HashAggregate
+SELECT age, sum(id) FROM users GROUP BY age	HashAggregate	HashAggregate
+SELECT user_id, count(*), sum(amount) FROM orders GROUP BY user_id	HashAggregate	HashAggregate
+SELECT age, count(*) FROM users GROUP BY age HAVING count(*) > 0	HashAggregate	HashAggregate
+SELECT user_id, sum(amount) FROM orders GROUP BY user_id HAVING sum(amount) > 100.0	HashAggregate	HashAggregate
+SELECT age, max(id) FROM users WHERE age > 16 GROUP BY age	HashAggregate	HashAggregate
+SELECT age, max(id) FROM users WHERE age > 17 GROUP BY age	HashAggregate	HashAggregate
+SELECT age, max(id) FROM users WHERE age > 18 GROUP BY age	HashAggregate	HashAggregate
+SELECT age, max(id) FROM users WHERE age > 19 GROUP BY age	HashAggregate	HashAggregate
+SELECT age, max(id) FROM users WHERE age > 20 GROUP BY age	HashAggregate	HashAggregate
+SELECT age, max(id) FROM users WHERE age > 21 GROUP BY age	HashAggregate	HashAggregate
+SELECT age, max(id) FROM users WHERE age > 22 GROUP BY age	HashAggregate	HashAggregate
+SELECT age, max(id) FROM users WHERE age > 23 GROUP BY age	HashAggregate	HashAggregate
+SELECT * FROM users ORDER BY age	Sort	Sort
+SELECT * FROM users ORDER BY age DESC	Sort	Sort
+SELECT * FROM users ORDER BY name ASC	Sort	Sort
+SELECT * FROM users ORDER BY age, name	Sort	Sort
+SELECT * FROM users ORDER BY age LIMIT 1	Limit	Limit
+SELECT * FROM users ORDER BY age LIMIT 5	Limit	Limit
+SELECT * FROM users ORDER BY age DESC LIMIT 2	Limit	Limit
+SELECT * FROM orders ORDER BY amount DESC LIMIT 3	Limit	Limit
+SELECT * FROM products ORDER BY price LIMIT 2	Limit	Limit
+SELECT id, name FROM users ORDER BY name LIMIT 10	Limit	Limit
+SELECT * FROM users LIMIT 5	Limit	Limit
+SELECT * FROM users LIMIT 10 OFFSET 5	Limit	Limit
+SELECT * FROM orders LIMIT 2 OFFSET 1	Limit	Limit
+SELECT name FROM users ORDER BY id LIMIT 3	Limit	Limit
+SELECT * FROM users ORDER BY id DESC LIMIT 5	Limit	Limit
+INSERT INTO users VALUES (10, 'Dave', 28)	Insert	Insert on users
+INSERT INTO users (id, name) VALUES (11, 'Eve')	Insert	Insert on users
+INSERT INTO orders VALUES (104, 1, 75.0)	Insert	Insert on orders
+INSERT INTO products VALUES (203, 'Watch', 120.0)	Insert	Insert on products
+UPDATE users SET age = 35 WHERE id = 1	Update	Update on users
+UPDATE users SET name = 'Bobby' WHERE id = 2	Update	Update on users
+UPDATE orders SET amount = 120.0 WHERE id = 101	Update	Update on orders
+DELETE FROM users WHERE id = 3	Delete	Delete on users
+DELETE FROM orders WHERE id = 103	Delete	Delete on orders
+DELETE FROM products WHERE id = 202	Delete	Delete on products

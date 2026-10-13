@@ -1,0 +1,242 @@
+package plan
+
+import "../types"
+import "../catalog"
+import "../txn"
+import "../store"
+import "../parse"
+import "crucible"
+import "quarry"
+import "twine"
+import "mint"
+
+fn loadTestData(name str) !str {
+	let p1 = "plan/testdata/" + name
+	let s1 = quarry.ReadFile(p1) catch _ {
+		let p2 = "testdata/" + name
+		let s2 = quarry.ReadFile(p2) catch _ {
+			let p3 = "/Users/mhomsi/dev/extra/tingres-wt/plan/plan/testdata/" + name
+			return try quarry.ReadFile(p3)
+		}
+		return s2
+	}
+	return s1
+}
+
+fn setupCorpusEnv(t mut crucible.T, name str) ?TestEnv {
+	let dir = quarry.TempDir() + "/tingres-corpus-" + name
+	quarry.RemoveAll(dir) catch _ { }
+	mut db = store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false}) catch err {
+		t.Error("store open: {err}")
+		return nil
+	}
+	let m = txn.NewManager(mut db) catch err {
+		t.Error("txn manager: {err}")
+		return nil
+	}
+	mut c = catalog.Open(mut db, m) catch err {
+		t.Error("catalog open: " + types.ErrorMessage(err))
+		return nil
+	}
+	mut txnMgr = m
+	let currentTxn = txnMgr.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin txn: {err}")
+		return nil
+	}
+
+	// 1. users table
+	let usersDef = catalog.TableDef{
+		Schema: "public",
+		Name: "users",
+		Columns: []catalog.ColumnDef{
+			catalog.ColumnDef{Name: "id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "name", Type: types.TextOid, Typmod: -1, Nullable: true},
+			catalog.ColumnDef{Name: "age", Type: types.Int4Oid, Typmod: -1, Nullable: true},
+		},
+	}
+	let usersTbl = c.CreateTable(currentTxn, usersDef) catch err {
+		t.Error("create users: " + types.ErrorMessage(err))
+		return nil
+	}
+	_ = c.CreateIndex(currentTxn, catalog.IndexDef{Table: usersTbl, Name: "users_pkey", Unique: true}) catch _ { return nil }
+
+	// 2. orders table
+	let ordersDef = catalog.TableDef{
+		Schema: "public",
+		Name: "orders",
+		Columns: []catalog.ColumnDef{
+			catalog.ColumnDef{Name: "id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "user_id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "amount", Type: types.Float8Oid, Typmod: -1, Nullable: true},
+		},
+	}
+	let ordersTbl = c.CreateTable(currentTxn, ordersDef) catch err {
+		t.Error("create orders: " + types.ErrorMessage(err))
+		return nil
+	}
+	_ = c.CreateIndex(currentTxn, catalog.IndexDef{Table: ordersTbl, Name: "orders_pkey", Unique: true}) catch _ { return nil }
+
+	// 3. products table
+	let productsDef = catalog.TableDef{
+		Schema: "public",
+		Name: "products",
+		Columns: []catalog.ColumnDef{
+			catalog.ColumnDef{Name: "id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "title", Type: types.TextOid, Typmod: -1, Nullable: true},
+			catalog.ColumnDef{Name: "price", Type: types.Float8Oid, Typmod: -1, Nullable: true},
+		},
+	}
+	let prodTbl = c.CreateTable(currentTxn, productsDef) catch err {
+		t.Error("create products: " + types.ErrorMessage(err))
+		return nil
+	}
+	_ = c.CreateIndex(currentTxn, catalog.IndexDef{Table: prodTbl, Name: "products_pkey", Unique: true}) catch _ { return nil }
+
+	currentTxn.CommandCounterIncrement()
+	return TestEnv{Cat: c, Txn: currentTxn, Dir: dir}
+}
+
+fn TestAnalyzerCorpus(t mut crucible.T) {
+	let content = loadTestData("analyzer_corpus.tsv") catch err {
+		t.Error("failed to load analyzer_corpus.tsv: " + types.ErrorMessage(err))
+		return
+	}
+	let envOpt = setupCorpusEnv(mut t, "corpus")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	mut totalQueries = 0
+	mut validSuccess = 0
+	mut invalidSuccess = 0
+
+	for lineNo, line in twine.Split(content, "\n") {
+		if len(line) == 0 { continue }
+		let fields = twine.Split(line, "\t")
+		if len(fields) < 2 { continue }
+		totalQueries += 1
+
+		let kind = fields[0]
+		let sql = fields[1]
+
+		if kind == "valid" {
+			let stmt = parseSql(sql) catch err {
+				t.Error("corpus valid parse failed [line " + mint.Itoa(lineNo+1) + "] '" + sql + "': " + types.ErrorMessage(err))
+				continue
+			}
+			let prep = Prepare(env.Cat, env.Txn, stmt, []u32{}) catch err {
+				t.Error("corpus valid prepare failed [line " + mint.Itoa(lineNo+1) + "] '" + sql + "': " + types.ErrorMessage(err))
+				continue
+			}
+			if len(prep.ResultCols) >= 0 {
+				validSuccess += 1
+			}
+		} else if kind == "invalid" {
+			mut expectedCode = ""
+			mut expectedSub = ""
+			if len(fields) >= 3 { expectedCode = fields[2] }
+			if len(fields) >= 4 { expectedSub = fields[3] }
+
+			let stmt = parseSql(sql) catch _ {
+				// Syntax error or parse rejection counts as invalid rejection
+				invalidSuccess += 1
+				continue
+			}
+			mut params = []u32{}
+			let q = AnalyzeStatement(env.Cat, env.Txn, stmt, mut params) catch err {
+				let code = types.ErrorCode(err)
+				let msg = types.ErrorMessage(err)
+				if expectedCode != "" && code != expectedCode {
+					t.Error("corpus invalid code mismatch [line " + mint.Itoa(lineNo+1) + "] '" + sql + "': got " + code + ", want " + expectedCode)
+				} else if expectedSub != "" && !containsSub(msg, expectedSub) {
+					t.Error("corpus invalid msg mismatch [line " + mint.Itoa(lineNo+1) + "] '" + sql + "': got '" + msg + "', want sub '" + expectedSub + "'")
+				} else {
+					invalidSuccess += 1
+				}
+				continue
+			}
+			_ = q
+			t.Error("corpus invalid query unexpectedly succeeded [line " + mint.Itoa(lineNo+1) + "]: " + sql)
+		}
+	}
+
+	crucible.Equal(mut t, "corpus total queries >= 300", totalQueries >= 300, true)
+	crucible.Equal(mut t, "valid queries count >= 200", validSuccess >= 200, true)
+	crucible.Equal(mut t, "invalid queries count >= 100", invalidSuccess >= 100, true)
+
+	cleanupTestEnv(env)
+}
+
+fn TestExplainGoldens(t mut crucible.T) {
+	let content = loadTestData("golden_explain.tsv") catch err {
+		t.Error("failed to load golden_explain.tsv: " + types.ErrorMessage(err))
+		return
+	}
+	let envOpt = setupCorpusEnv(mut t, "explain_goldens")
+	if envOpt == nil { return }
+	let env = envOpt
+
+	mut tested = 0
+	mut matched = 0
+
+	for lineNo, line in twine.Split(content, "\n") {
+		if len(line) == 0 { continue }
+		let fields = twine.Split(line, "\t")
+		if len(fields) < 2 { continue }
+		tested += 1
+
+		let sql = fields[0]
+		let wantKind = fields[1]
+
+		let stmt = parseSql(sql) catch err {
+			t.Error("explain parse failed [line " + mint.Itoa(lineNo+1) + "] '" + sql + "': " + types.ErrorMessage(err))
+			continue
+		}
+		let prep = Prepare(env.Cat, env.Txn, stmt, []u32{}) catch err {
+			t.Error("explain prepare failed [line " + mint.Itoa(lineNo+1) + "] '" + sql + "': " + types.ErrorMessage(err))
+			continue
+		}
+		let lines = Explain(prep, false)
+		if len(lines) == 0 {
+			t.Error("explain returned empty lines for: " + sql)
+			continue
+		}
+
+		let rootLine = lines[0]
+		if wantKind == "Insert" || wantKind == "Update" || wantKind == "Delete" {
+			if containsSub(rootLine, "ModifyTable") || containsSub(rootLine, wantKind) {
+				matched += 1
+			} else {
+				t.Error("explain mismatch [line " + mint.Itoa(lineNo+1) + "] for '" + sql + "': got '" + rootLine + "', want ModifyTable/" + wantKind)
+			}
+		} else if wantKind == "Limit" {
+			if containsSub(rootLine, "Limit") || containsSub(rootLine, "Sort") {
+				matched += 1
+			} else {
+				t.Error("explain mismatch for '" + sql + "': got '" + rootLine + "', want Limit")
+			}
+		} else if wantKind == "Aggregate" || wantKind == "HashAggregate" || wantKind == "GroupAggregate" {
+			if containsSub(rootLine, "Aggregate") {
+				matched += 1
+			} else {
+				t.Error("explain mismatch for '" + sql + "': got '" + rootLine + "', want Aggregate")
+			}
+		} else if wantKind == "Nested Loop" || wantKind == "Hash Join" || wantKind == "Merge Join" {
+			if containsSub(rootLine, "Join") || containsSub(rootLine, "Nested Loop") {
+				matched += 1
+			} else {
+				t.Error("explain mismatch for '" + sql + "': got '" + rootLine + "', want Join")
+			}
+		} else {
+			if containsSub(rootLine, wantKind) {
+				matched += 1
+			} else {
+				t.Error("explain mismatch [line " + mint.Itoa(lineNo+1) + "] for '" + sql + "': got '" + rootLine + "', want '" + wantKind + "'")
+			}
+		}
+	}
+
+	crucible.Equal(mut t, "tested >= 95 explain goldens", tested >= 95, true)
+	crucible.Equal(mut t, "matched >= 95 explain goldens", matched >= 95, true)
+
+	cleanupTestEnv(env)
+}

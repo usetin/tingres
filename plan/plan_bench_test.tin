@@ -44,6 +44,43 @@ fn BenchmarkPlanJoin(b mut crucible.B) {
 	cleanupTestEnv(env)
 }
 
+fn BenchmarkAnalyzeOnly(b mut crucible.B) {
+	let envOpt = setupBenchEnv("bench_analyze")
+	if envOpt == nil { return }
+	let env = envOpt
+	let stmt = parseSql("SELECT id, name FROM users WHERE age > 21") catch _ {
+		cleanupTestEnv(env)
+		return
+	}
+
+	for i in 0..b.N {
+		mut params = []u32{}
+		let q = AnalyzeStatement(env.Cat, env.Txn, stmt, mut params) catch _ {
+			continue
+		}
+		if len(q.Targets) == 0 || i < 0 { continue }
+	}
+	cleanupTestEnv(env)
+}
+
+fn BenchmarkPlanDml(b mut crucible.B) {
+	let envOpt = setupBenchEnv("bench_dml")
+	if envOpt == nil { return }
+	let env = envOpt
+	let stmt = parseSql("INSERT INTO users (id, name, age) VALUES (10, 'benchmark', 30)") catch _ {
+		cleanupTestEnv(env)
+		return
+	}
+
+	for i in 0..b.N {
+		let prep = Prepare(env.Cat, env.Txn, stmt, []u32{}) catch _ {
+			continue
+		}
+		if len(prep.ResultCols) < 0 || i < 0 { continue }
+	}
+	cleanupTestEnv(env)
+}
+
 fn setupBenchEnv(testName str) ?TestEnv {
 	let dir = quarry.TempDir() + "/tingres-bench-" + testName
 	quarry.RemoveAll(dir) catch _ { }
