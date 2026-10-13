@@ -1,0 +1,185 @@
+package main
+
+import "say"
+import "quarry"
+import "../../parse"
+
+// parsecheck FILE.sql...: how much of PostgreSQL's own regression SQL tingres's parser accepts.
+// Each file is split into statements (psql meta-commands and COPY data blocks removed) and every
+// statement goes through parse.Parse. Prints one line per file and a TOTAL line:
+//   FILE <name> <statements> <parsed>
+//   TOTAL <files> <filesFullyParsed> <statements> <parsed>
+
+fn main() {
+	let args = quarry.Args()
+	mut files i64 = 0
+	mut full i64 = 0
+	mut total i64 = 0
+	mut ok i64 = 0
+	for a in args[1:] {
+		let text = quarry.ReadFile(a) catch _ { "" }
+		let stmts = splitStatements(stripMeta(text))
+		mut good i64 = 0
+		for s in stmts {
+			let r = parse.Parse(s) catch _ { []parse.Stmt{} }
+			if len(r) > 0 { good += 1 }
+		}
+		say.Line("FILE {baseName(a)} {len(stmts)} {good}")
+		files += 1
+		if good == len(stmts) { full += 1 }
+		total += len(stmts)
+		ok += good
+	}
+	say.Line("TOTAL {files} {full} {total} {ok}")
+}
+
+fn baseName(p str) str {
+	mut cut = 0
+	for i in 0..len(p) {
+		if p[i] == '/' { cut = i + 1 }
+	}
+	return p[cut:]
+}
+
+// stripMeta drops psql meta-command lines and the data block after COPY ... FROM stdin.
+fn stripMeta(text str) str {
+	mut out = []u8{}
+	mut inCopy = false
+	mut start = 0
+	for i in 0..len(text) + 1 {
+		if i == len(text) || text[i] == '\n' {
+			let line = text[start:i]
+			start = i + 1
+			if inCopy {
+				if line == "\\." { inCopy = false }
+				continue
+			}
+			if len(line) > 0 && line[0] == '\\' { continue }
+			for j in 0..len(line) { out = append(out, line[j]) }
+			out = append(out, '\n')
+			if hasCopyStdin(line) { inCopy = true }
+		}
+	}
+	return str(out)
+}
+
+fn hasCopyStdin(line str) bool {
+	let l = lower(line)
+	return contains(l, "copy ") && contains(l, "from stdin")
+}
+
+fn lower(s str) str {
+	mut b = []u8{}
+	for i in 0..len(s) {
+		mut c = s[i]
+		if c >= 'A' && c <= 'Z' { c = c + 32 }
+		b = append(b, c)
+	}
+	return str(b)
+}
+
+fn contains(s str, sub str) bool {
+	if len(sub) > len(s) { return false }
+	for i in 0..len(s) - len(sub) + 1 {
+		if s[i:i + len(sub)] == sub { return true }
+	}
+	return false
+}
+
+// splitStatements splits at top-level semicolons, honouring '..', E'..', "..", $tag$..$tag$,
+// -- comments and nested /* */ comments. Chunks that are only whitespace/comments are dropped.
+fn splitStatements(sql str) []str {
+	mut out = []str{}
+	mut start = 0
+	mut i = 0
+	mut meaningful = false
+	let n = len(sql)
+	for i < n {
+		let c = sql[i]
+		if c == '-' && i + 1 < n && sql[i + 1] == '-' {
+			for i < n && sql[i] != '\n' { i += 1 }
+			continue
+		}
+		if c == '/' && i + 1 < n && sql[i + 1] == '*' {
+			mut depth = 1
+			i += 2
+			for i < n && depth > 0 {
+				if sql[i] == '/' && i + 1 < n && sql[i + 1] == '*' {
+					depth += 1
+					i += 2
+					continue
+				}
+				if sql[i] == '*' && i + 1 < n && sql[i + 1] == '/' {
+					depth -= 1
+					i += 2
+					continue
+				}
+				i += 1
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			meaningful = true
+			let q = c
+			i += 1
+			for i < n {
+				if sql[i] == '\\' && q == '\'' && isEscapeStart(sql, start, i) {
+					i += 2
+					continue
+				}
+				if sql[i] == q {
+					if i + 1 < n && sql[i + 1] == q {
+						i += 2
+						continue
+					}
+					break
+				}
+				i += 1
+			}
+			i += 1
+			continue
+		}
+		if c == '$' {
+			mut j = i + 1
+			for j < n && (isIdent(sql[j])) { j += 1 }
+			if j < n && sql[j] == '$' {
+				let tag = sql[i:j + 1]
+				meaningful = true
+				mut k = j + 1
+				mut found = false
+				for k + len(tag) <= n {
+					if sql[k:k + len(tag)] == tag {
+						found = true
+						break
+					}
+					k += 1
+				}
+				if found { i = k + len(tag) } else { i = n }
+				continue
+			}
+		}
+		if c == ';' {
+			if meaningful { out = append(out, sql[start:i + 1]) }
+			start = i + 1
+			meaningful = false
+			i += 1
+			continue
+		}
+		if c != ' ' && c != '\n' && c != '\t' && c != '\r' { meaningful = true }
+		i += 1
+	}
+	if meaningful { out = append(out, sql[start:n]) }
+	return out
+}
+
+fn isIdent(c u8) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// isEscapeStart reports whether the string whose backslash is at i was opened as E'...'.
+fn isEscapeStart(sql str, start i64, i i64) bool {
+	mut j = i - 1
+	for j > start && sql[j] != '\'' { j -= 1 }
+	if j > start && (sql[j - 1] == 'E' || sql[j - 1] == 'e') { return true }
+	return false
+}
