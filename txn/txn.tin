@@ -428,16 +428,21 @@ fn cloneBytes(src []u8) []u8 {
 	return dst
 }
 
-// Visible applies MVCC visibility to a TupleHeader.
-fn (m Manager) Visible(snap Snapshot, h TupleHeader) bool {
+// Visible applies PostgreSQL MVCC visibility to a store tuple header.
+fn (m Manager) Visible(snap Snapshot, h store.TupleHeader) bool {
+	let (visible, _) = m.visibleHeader(snap, h, snap.Cid)
+	return visible
+}
+
+// VisibleHeader applies MVCC visibility to a decoded value header.
+fn (m Manager) VisibleHeader(snap Snapshot, h TupleHeader) bool {
 	let (visible, _) = m.visibleHeaderFields(snap, h.Xmin, h.Xmax, h.Cid, h.Infomask, snap.Cid)
 	return visible
 }
 
-// HeapTupleSatisfiesMVCC applies PostgreSQL MVCC visibility to a store tuple header.
+// HeapTupleSatisfiesMVCC is the PostgreSQL name for the visibility rule.
 fn (m Manager) HeapTupleSatisfiesMVCC(snap Snapshot, h store.TupleHeader) bool {
-	let (visible, _) = m.visibleHeader(snap, h, snap.Cid)
-	return visible
+	return m.Visible(snap, h)
 }
 
 // VisibleTuple applies MVCC visibility and persists final xmin/xmax hint bits.
