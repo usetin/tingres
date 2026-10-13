@@ -39,34 +39,30 @@ fn testTypeGoldenFile(t mut crucible.T, group str, contents str) i64 {
 			continue
 		}
 		count += 1
-		let expression = fields[0]
-		let expected = fields[1]
-		let got = evalTypeGoldenExpression(expression) catch err {
-			let actualError = "ERROR: " + ErrorMessage(err)
-			if actualError != expected && failures < 40 {
-				t.Error("{group} {expression}: got {actualError}, want {expected}")
-				failures += 1
-			}
-			continue
-		}
-		if expected == "NULL" {
-			if !IsNull(got) && failures < 40 {
-				t.Error("{group} {expression}: got {got.Text()}, want SQL NULL")
-				failures += 1
-			}
-		} else if twine.HasPrefix(expected, "ERROR: ") {
-			if failures < 40 {
-				t.Error("{group} {expression}: got {got.Text()}, want {expected}")
-				failures += 1
-			}
-		} else if got.Text() != expected {
-			if failures < 40 {
-				t.Error("{group} {expression}: got {got.Text()}, want {expected}")
-				failures += 1
-			}
+		let (status, message) = arena { typeGoldenOutcome(fields[0], fields[1]) }
+		if status != 0 && failures < 40 {
+			t.Error("{group} {message}")
+			failures += 1
 		}
 	}
 	return count
+}
+
+// typeGoldenOutcome evaluates one corpus line and returns 0 with no message on
+// a match, or 1 with a description on a mismatch.
+fn typeGoldenOutcome(expression str, expected str) (i64, str) {
+	let got = evalTypeGoldenExpression(expression) catch err {
+		let actualError = "ERROR: " + ErrorMessage(err)
+		if actualError == expected { return 0, "" }
+		return 1, "{expression}: got {actualError}, want {expected}"
+	}
+	if expected == "NULL" {
+		if IsNull(got) { return 0, "" }
+		return 1, "{expression}: got {got.Text()}, want SQL NULL"
+	}
+	if twine.HasPrefix(expected, "ERROR: ") { return 1, "{expression}: got {got.Text()}, want {expected}" }
+	if got.Text() != expected { return 1, "{expression}: got {got.Text()}, want {expected}" }
+	return 0, ""
 }
 
 // TypeGoldenParser evaluates a restricted PostgreSQL expression subset using

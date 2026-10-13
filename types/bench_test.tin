@@ -1,0 +1,117 @@
+package types
+
+import "crucible"
+
+// Benchmarks for the scalar hot paths. Run with `tin test -bench types`.
+
+fn BenchmarkInt4TextIn(b mut crucible.B) {
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let d = Parse(Int4Oid, "123456") catch _ { continue }
+		acc += d.i
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkInt4TextOut(b mut crucible.B) {
+	mut acc = i64(0)
+	let d = FromI64(Int4Oid, 123456)
+	for i in 0..b.N {
+		acc += len(d.Text())
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkFloat8TextOut(b mut crucible.B) {
+	mut acc = i64(0)
+	let d = FromF64(Float8Oid, 3.141592653589793)
+	for i in 0..b.N {
+		acc += len(d.Text())
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkFloat8TextIn(b mut crucible.B) {
+	mut acc = f64(0)
+	for i in 0..b.N {
+		let d = Parse(Float8Oid, "3.141592653589793") catch _ { continue }
+		acc += d.f
+		_ = i
+	}
+	if acc == 0.0 { }
+}
+
+fn BenchmarkNumericAdd(b mut crucible.B) {
+	let x = FromStr(NumericOid, "12345678901234567890.12345")
+	let y = FromStr(NumericOid, "-987654321.54321")
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let d = NumericAdd(x, y) catch _ { continue }
+		acc += len(d.s)
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkNumericMul(b mut crucible.B) {
+	let x = FromStr(NumericOid, "12345678901234567890.12345")
+	let y = FromStr(NumericOid, "987654321.54321")
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let d = NumericMul(x, y) catch _ { continue }
+		acc += len(d.s)
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkTimestampParse(b mut crucible.B) {
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let d = Parse(TimestampOid, "2024-01-31 12:34:56.789") catch _ { continue }
+		if d.i != 0 { acc += 1 }
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkTimestampText(b mut crucible.B) {
+	let d = FromI64(TimestampOid, 1000000*microsPerDay+microsPerHour*12)
+	mut acc = i64(0)
+	for i in 0..b.N {
+		acc += len(d.Text())
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkIndexKey(b mut crucible.B) {
+	let values = []Datum{
+		FromI64(Int4Oid, 123456),
+		FromF64(Float8Oid, 3.14159),
+		FromStr(NumericOid, "12345678901234567890.12345"),
+		FromI64(TimestampOid, 1000000*microsPerDay),
+		FromStr(TextOid, "the quick brown fox"),
+		FromBytes(ByteaOid, []u8{1, 2, 3, 4, 5, 6, 7, 8}),
+	}
+	mut acc = i64(0)
+	for i in 0..b.N {
+		for v in values { acc += len(IndexKey(v)) }
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkTimestampExtract(b mut crucible.B) {
+	let d = FromI64(TimestampOid, 1000000*microsPerDay+microsPerHour*12+microsPerMinute*34)
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let v = DatePart("year", d) catch _ { continue }
+		acc += i64(v.f)
+		_ = i
+	}
+	if acc == 0 { }
+}

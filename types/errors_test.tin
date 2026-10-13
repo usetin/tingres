@@ -1,6 +1,9 @@
 package types
 
 import "crucible"
+import "fault"
+
+let plainFailure = fault("plain failure")
 
 fn TestPgErrorFaultRoundTrip(t mut crucible.T) {
 	let source = NewPgError("22P02", "invalid input syntax for type integer: \"abc\"", "detail\x1fline", "hint", 7)
@@ -14,4 +17,15 @@ fn TestPgErrorFaultRoundTrip(t mut crucible.T) {
 	crucible.Equal(mut t, "position", got.Position, source.Position)
 	crucible.Equal(mut t, "code helper", ErrorCode(err), "22P02")
 	crucible.Equal(mut t, "message helper", ErrorMessage(err), source.Message)
+}
+
+fn TestPgErrorSurvivesWrapping(t mut crucible.T) {
+	let err = ErrorFault(NewPgError("22012", "division by zero", "d", "h", 3))
+	let wrapped = fault.Wrap(err, "evaluating x/y")
+	let got = ErrorFromFault(wrapped)
+	crucible.Equal(mut t, "wrapped sqlstate", got.Code, "22012")
+	crucible.Equal(mut t, "wrapped message", got.Message, "division by zero")
+	crucible.Equal(mut t, "wrapped hint", got.Hint, "h")
+	let plain = ErrorFromFault(plainFailure)
+	crucible.Equal(mut t, "plain fault code", plain.Code, "XX000")
 }
