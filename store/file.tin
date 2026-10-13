@@ -12,16 +12,48 @@ type RelationFiles struct {
 	sizes map[u32]i64
 }
 
-// NewRelationFiles opens the relation directory and starts an empty size cache.
+// NewRelationFiles opens the relation directory, cleans stale temporary files, and preloads the size cache.
 fn NewRelationFiles(dir str) !RelationFiles {
 	let base = dir + "/base"
 	try quarry.MkdirAll(base)
-	return RelationFiles{base: base, sizes: map[u32]i64{}}
+	mut sizes = map[u32]i64{}
+	let entries = quarry.ReadDir(base) catch _ { []str{} }
+	for _, name in entries {
+		let path = base + "/" + name
+		if len(name) > 4 && name[len(name)-4:] == ".tmp" {
+			quarry.Remove(path) catch _ { }
+			continue
+		}
+		let (rel, ok) = parseRelId(name)
+		if ok {
+			let sz = quarry.Size(path) catch _ { 0 }
+			sizes[rel] = sz
+		}
+	}
+	return RelationFiles{base: base, sizes: sizes}
 }
 
 // Path is the on-disk path for rel.
 fn (f RelationFiles) Path(rel RelId) str {
 	return f.base + "/" + say.Fmt("%d", u64(rel))
+}
+
+// Exists reports whether the relation file exists.
+fn (f RelationFiles) Exists(rel RelId) bool {
+	let (_, ok) = f.sizes[u32(rel)]
+	if ok {
+		return true
+	}
+	return quarry.Exists(f.Path(rel))
+}
+
+// List returns all relation IDs found in the file store.
+fn (f RelationFiles) List() []RelId {
+	mut rels = []RelId{}
+	for rel, _ in f.sizes {
+		rels = append(rels, RelId(rel))
+	}
+	return rels
 }
 
 // Size is the cached byte length of a relation file.
@@ -250,6 +282,24 @@ fn (f RelationFiles) PageCount(rel RelId) !u32 {
 		fail "store: relation file has a partial block"
 	}
 	return u32(size/PageSize)
+}
+
+fn parseRelId(s str) (u32, bool) {
+	if len(s) == 0 {
+		return 0, false
+	}
+	mut val = u64(0)
+	for i in 0..len(s) {
+		let c = s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		val = val*10 + u64(c-'0')
+		if val > 0xffffffff {
+			return 0, false
+		}
+	}
+	return u32(val), true
 }
 
 // skipFileBytes consumes exactly n bytes from r.
