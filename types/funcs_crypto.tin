@@ -69,7 +69,14 @@ fn reverseText(s str) str {
 fn md5Text(s str) str {
 	mut data = make([]u8, 0, len(s)+72)
 	for i in 0..len(s) { data = append(data, s[i]) }
-	let bitLength = u64(len(s))*8
+	return md5Digest(data)
+}
+
+// md5Digest returns the MD5 digest of raw bytes as lower-case hex.
+fn md5Digest(bytes []u8) str {
+	mut data = make([]u8, 0, len(bytes)+72)
+	data = append(data, bytes...)
+	let bitLength = u64(len(bytes))*8
 	data = append(data, 0x80)
 	for len(data)%64 != 56 { data = append(data, 0) }
 	for i in 0..8 { data = append(data, u8(bitLength >> u64(i*8))) }

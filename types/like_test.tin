@@ -1,0 +1,58 @@
+package types
+
+import "crucible"
+
+// TestRegexAndLikeDifferential pins PostgreSQL 17's regex and LIKE results,
+// including text[] output formatting and NULL capture groups.
+fn TestRegexAndLikeDifferential(t mut crucible.T) {
+	goldenCheck(mut t, "regexp_match('foobar', 'o')", `{o}`)
+	goldenCheck(mut t, "regexp_match('foobar', '(o)(o)')", `{o,o}`)
+	goldenCheck(mut t, "regexp_match('foobar', '(o)(x)?')", `{o,NULL}`)
+	goldenCheck(mut t, "regexp_match('foobar', '(o)?x')", "NULL")
+	goldenCheck(mut t, "regexp_match('foobar', 'O', 'i')", `{o}`)
+	goldenCheck(mut t, "regexp_match('foobar', 'O', 'c')", "NULL")
+	goldenCheck(mut t, "regexp_match('foobar', 'o', 'g')", "ERROR: regexp_match() does not support the \"global\" option")
+	goldenCheck(mut t, "regexp_matches('foobarbequebaz', '(b.)(.*)', 'g')", `{ba,rbequebaz}`)
+	goldenCheck(mut t, "regexp_split_to_array('the quick brown', '\\s+')", `{the,quick,brown}`)
+	goldenCheck(mut t, "regexp_split_to_array('a,b,,c', ',')", `{a,b,"",c}`)
+	goldenCheck(mut t, "regexp_split_to_array('abc', '')", `{a,b,c}`)
+	goldenCheck(mut t, "regexp_split_to_array('', 'x')", `{""}`)
+	goldenCheck(mut t, "regexp_like('abc', 'b')", "true")
+	goldenCheck(mut t, "regexp_like('abc', 'B', 'i')", "true")
+	goldenCheck(mut t, "regexp_replace('foobarbaz', 'b', 'X', 'g')", "fooXarXaz")
+	goldenCheck(mut t, "regexp_replace('foobar', '(o+)', '<\\1>')", "f<oo>bar")
+	goldenCheck(mut t, "regexp_replace('a1 b2', '[0-9]', 'X')", "aX b2")
+	goldenCheck(mut t, "'abc' LIKE 'a%'", "true")
+	goldenCheck(mut t, "'abc' ILIKE 'A%'", "true")
+	goldenCheck(mut t, "'abc' NOT LIKE 'x%'", "true")
+	goldenCheck(mut t, "'abc123' SIMILAR TO 'abc%'", "true")
+	goldenCheck(mut t, "'abc' ~ '^a'", "true")
+	goldenCheck(mut t, "'abc' ~* '^A'", "true")
+	goldenCheck(mut t, "'abc' !~ '^b'", "true")
+	goldenCheck(mut t, "substring('foobar', 'o(b)')", "b")
+}
+
+// TestLikeEscape pins the LIKE ESCAPE matcher and its fast paths.
+fn TestLikeEscape(t mut crucible.T) {
+	likeTrue(mut t, "a_b", "a\\_b", "\\")
+	likeFalse(mut t, "axb", "a\\_b", "\\")
+	likeTrue(mut t, "a%b", "a\\%b", "\\")
+	likeFalse(mut t, "aXb", "a\\%b", "\\")
+	likeTrue(mut t, "a\\b", "a\\\\b", "\\")
+}
+
+fn likeTrue(t mut crucible.T, text str, pattern str, escape str) {
+	let matcher = CompileLike(pattern, escape, false, false) catch err {
+		t.Error("LIKE compile {pattern}: {err}")
+		return
+	}
+	t.True("{text} LIKE {pattern}", matcher.Matches(text))
+}
+
+fn likeFalse(t mut crucible.T, text str, pattern str, escape str) {
+	let matcher = CompileLike(pattern, escape, false, false) catch err {
+		t.Error("LIKE compile {pattern}: {err}")
+		return
+	}
+	t.False("{text} LIKE {pattern}", matcher.Matches(text))
+}
