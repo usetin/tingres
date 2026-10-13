@@ -1,0 +1,32 @@
+package types
+
+import "crucible"
+
+// TestByteaFunctionsDifferential pins PostgreSQL 17's bytea function results,
+// including index range errors and the bit numbering (bit 0 is the low bit).
+// bytea literals use the hex form because types.tin's text input function does
+// not yet accept the escape format (see the KNOWN gaps in the package report).
+fn TestByteaFunctionsDifferential(t mut crucible.T) {
+	goldenCheck(mut t, "get_byte('\\x0102'::bytea, 0)", "1")
+	goldenCheck(mut t, "get_byte('\\x0102'::bytea, 5)", "ERROR: index 5 out of valid range, 0..1")
+	goldenCheck(mut t, "get_byte('\\x'::bytea, 0)", "ERROR: index 0 out of valid range, 0..-1")
+	goldenCheck(mut t, "set_byte('\\x0102'::bytea, 1, 255)", "\\x01ff")
+	goldenCheck(mut t, "set_byte('\\x01'::bytea, 0, 256)", "\\x00")
+	goldenCheck(mut t, "set_byte('\\x01'::bytea, 0, -1)", "\\xff")
+	goldenCheck(mut t, "get_bit('\\x01'::bytea, 0)", "1")
+	goldenCheck(mut t, "get_bit('\\x80'::bytea, 0)", "0")
+	goldenCheck(mut t, "get_bit('\\x0102'::bytea, 16)", "ERROR: index 16 out of valid range, 0..15")
+	goldenCheck(mut t, "set_bit('\\x00'::bytea, 3, 1)", "\\x08")
+	goldenCheck(mut t, "set_bit('\\xff'::bytea, 0, 0)", "\\xfe")
+	goldenCheck(mut t, "position('\\x02'::bytea, '\\x010203'::bytea)", "2")
+	goldenCheck(mut t, "position('\\x09'::bytea, '\\x0102'::bytea)", "0")
+	goldenCheck(mut t, "md5('\\x00ff'::bytea)", "d07d34efac6328007ad67c7e0a985e00")
+	goldenCheck(mut t, "md5('abc')", "900150983cd24fb0d6963f7d28e17f72")
+	goldenCheck(mut t, "md5('\\x'::bytea)", "d41d8cd98f00b204e9800998ecf8427e")
+	goldenCheck(mut t, "sha256('\\x'::bytea)", "\\xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	goldenCheck(mut t, "sha384('\\x'::bytea)", "\\x38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b")
+	goldenCheck(mut t, "length('\\x0102'::bytea)", "2")
+	goldenCheck(mut t, "octet_length('\\x0102'::bytea)", "2")
+	goldenCheck(mut t, "substring('\\x01020304'::bytea, 2, 2)", "\\x0203")
+	goldenCheck(mut t, "('\\x0102'::bytea || '\\x03'::bytea)", "\\x010203")
+}

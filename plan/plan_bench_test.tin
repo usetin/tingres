@@ -1,0 +1,101 @@
+package plan
+
+import "crucible"
+import "quarry"
+import "../catalog"
+import "../txn"
+import "../types"
+import "../parse"
+import "../store"
+
+fn BenchmarkPlanPointLookup(b mut crucible.B) {
+	let envOpt = setupBenchEnv("bench_point")
+	if envOpt == nil { return }
+	let env = envOpt
+	let stmt = parseSql("SELECT id, name FROM users WHERE id = 1") catch _ {
+		cleanupTestEnv(env)
+		return
+	}
+
+	for i in 0..b.N {
+		let prep = Prepare(env.Cat, env.Txn, stmt, []u32{}) catch _ {
+			continue
+		}
+		if len(prep.ResultCols) == 0 || i < 0 { continue }
+	}
+	cleanupTestEnv(env)
+}
+
+fn BenchmarkPlanJoin(b mut crucible.B) {
+	let envOpt = setupBenchEnv("bench_join")
+	if envOpt == nil { return }
+	let env = envOpt
+	let stmt = parseSql("SELECT users.name, orders.id FROM users JOIN orders ON users.id = orders.user_id") catch _ {
+		cleanupTestEnv(env)
+		return
+	}
+
+	for i in 0..b.N {
+		let prep = Prepare(env.Cat, env.Txn, stmt, []u32{}) catch _ {
+			continue
+		}
+		if len(prep.ResultCols) == 0 || i < 0 { continue }
+	}
+	cleanupTestEnv(env)
+}
+
+fn setupBenchEnv(testName str) ?TestEnv {
+	let dir = quarry.TempDir() + "/tingres-bench-" + testName
+	quarry.RemoveAll(dir) catch _ { }
+	mut db = store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false}) catch _ {
+		return nil
+	}
+	let m = txn.NewManager(mut db) catch _ {
+		return nil
+	}
+	mut c = catalog.Open(mut db, m) catch _ {
+		return nil
+	}
+	mut txnMgr = m
+	let currentTxn = txnMgr.Begin(txn.Isolation.ReadCommitted) catch _ {
+		return nil
+	}
+
+	let usersDef = catalog.TableDef{
+		Schema: "public",
+		Name: "users",
+		Columns: []catalog.ColumnDef{
+			catalog.ColumnDef{Name: "id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "name", Type: types.TextOid, Typmod: -1, Nullable: true},
+			catalog.ColumnDef{Name: "age", Type: types.Int4Oid, Typmod: -1, Nullable: true},
+		},
+	}
+	let usersTable = c.CreateTable(currentTxn, usersDef) catch _ {
+		return nil
+	}
+
+	let idxDef = catalog.IndexDef{
+		Table: usersTable,
+		Name: "users_pkey",
+		Unique: true,
+	}
+	_ = c.CreateIndex(currentTxn, idxDef) catch _ {
+		return nil
+	}
+
+	let ordersDef = catalog.TableDef{
+		Schema: "public",
+		Name: "orders",
+		Columns: []catalog.ColumnDef{
+			catalog.ColumnDef{Name: "id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "user_id", Type: types.Int4Oid, Typmod: -1, Nullable: false},
+			catalog.ColumnDef{Name: "amount", Type: types.Float8Oid, Typmod: -1, Nullable: true},
+		},
+	}
+	_ = c.CreateTable(currentTxn, ordersDef) catch _ {
+		return nil
+	}
+
+	currentTxn.CommandCounterIncrement()
+	return TestEnv{Cat: c, Txn: currentTxn, Dir: dir}
+}
