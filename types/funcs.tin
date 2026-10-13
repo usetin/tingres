@@ -82,18 +82,18 @@ fn bindFunc(f Func) Func {
 	return Func{
 		Name: f.Name, Args: f.Args, Ret: f.Ret, Strict: f.Strict, Volatile: f.Volatile,
 		Call: fn(args []Datum) !Datum {
-		if f.Strict {
-			for _, arg in args {
-				if IsNull(arg) { return Null() }
+			if f.Strict {
+				for _, arg in args {
+					if IsNull(arg) { return Null() }
+				}
 			}
-		}
 			if len(args) != len(f.Args) { fail "wrong number of arguments to {f.Name}" }
 			mut converted = make([]Datum, 0, len(args))
 			for i, arg in args {
 				let value = try bindArgument(arg, Oid(f.Args[i]))
 				converted = append(converted, value)
-		}
-		return try f.Call(converted)
+			}
+			return try f.Call(converted)
 		},
 		Call1: fn(a Datum) !Datum {
 			if len(f.Args) != 1 { fail "wrong number of arguments to {f.Name}" }
@@ -340,6 +340,7 @@ fn LookupFunc(name str, argOids []Oid) ?Func {
 	mut bestCost = i64(9223372036854775807)
 	mut bestExact = -1
 	mut bestPreferred = -1
+	mut bestFit = -1
 	mut tied = false
 	for candidate in funcs {
 		if candidate.Name != name { continue }
@@ -347,18 +348,34 @@ fn LookupFunc(name str, argOids []Oid) ?Func {
 		if !ok { continue }
 		if !matchesUnknownCategory(candidate, argOids, unknownCategory) { continue }
 		let preferred = unknownPreferredCount(candidate, argOids, unknownCategory)
-		if exact > bestExact || (exact == bestExact && cost < bestCost) || (exact == bestExact && cost == bestCost && preferred > bestPreferred) {
+		let fit = preferredTypeFit(candidate, argOids)
+		let better = exact > bestExact || (exact == bestExact && cost < bestCost) || (exact == bestExact && cost == bestCost && preferred > bestPreferred) || (exact == bestExact && cost == bestCost && preferred == bestPreferred && fit > bestFit)
+		if better {
 			best = candidate
 			bestCost = cost
 			bestExact = exact
 			bestPreferred = preferred
+			bestFit = fit
 			tied = false
-		} else if exact == bestExact && cost == bestCost && preferred == bestPreferred {
+		} else if exact == bestExact && cost == bestCost && preferred == bestPreferred && fit == bestFit {
 			tied = true
 		}
 	}
 	if tied || best == nil { return nil }
 	return bindFunc(best)
+}
+
+// preferredTypeFit counts arguments that PostgreSQL would coerce to the preferred
+// type of their category, which resolves float8/numeric ties (round(5) is float8).
+fn preferredTypeFit(f Func, argOids []Oid) i64 {
+	mut count = i64(0)
+	for i, actual in argOids {
+		if actual == UnknownLiteralOid || i >= len(f.Args) { continue }
+		let formal = Oid(f.Args[i])
+		if formal == actual { continue }
+		if formal == preferredType(typeCategory(actual)) { count += 1 }
+	}
+	return count
 }
 
 fn hasOnlyUnknowns(argOids []Oid) bool {
@@ -457,12 +474,22 @@ fn arithmeticFunc(op str, args []Datum) !Datum {
 
 fn arithmeticValues(op str, left Datum, right Datum) !Datum {
 	let oid = left.Oid()
+	if oid == NumericOid { return try numericArithmetic(op, left, right) }
 	if isInteger(oid) {
 		let value = try checkedIntegerValue(op, left.i, right.i, oid)
 		return FromI64(oid, value)
 	}
 	let value = try arithmeticFloat(op, numericAsFloat(left), numericAsFloat(right))
 	return numericFromFloat(oid, value)
+}
+
+fn numericArithmetic(op str, left Datum, right Datum) !Datum {
+	if op == "+" { return try NumericAdd(left, right) }
+	if op == "-" { return try NumericSub(left, right) }
+	if op == "*" { return try NumericMul(left, right) }
+	if op == "/" { return try NumericDivide(left, right) }
+	if op == "%" { return try NumericModulo(left, right) }
+	fail "numeric operator {op} is not supported"
 }
 
 fn arithmeticFloat(op str, a f64, b f64) !f64 {
@@ -473,7 +500,7 @@ fn arithmeticFloat(op str, a f64, b f64) !f64 {
 		"*" => a*b
 		"/" => a/b
 		"%" => a-b*gauge.Trunc(a/b)
-		"^" => gauge.Pow(a,b)
+		"^" => gauge.Pow(a, b)
 		_ => 0.0
 	}
 	return value

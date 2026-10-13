@@ -177,3 +177,68 @@ fn TestLikeAndRegexFunctions(t mut crucible.T) {
 		if err != nil { crucible.Equal(mut t, "unsupported regex SQLSTATE", ErrorCode(err), "0A000") }
 	}
 }
+
+// TestNumericOperatorsDifferential pins PostgreSQL 17's exact numeric operator
+// results (including the division result scale) and the temporal comparisons.
+fn TestNumericOperatorsDifferential(t mut crucible.T) {
+	goldenCheck(mut t, "1.5::numeric + 2", "3.5")
+	goldenCheck(mut t, "1.5::numeric * 2", "3.0")
+	goldenCheck(mut t, "1.50::numeric + 2.5", "4.00")
+	goldenCheck(mut t, "7.5::numeric / 2", "3.7500000000000000")
+	goldenCheck(mut t, "5.5::numeric % 2", "1.5")
+	goldenCheck(mut t, "1.0::numeric / 3", "0.33333333333333333333")
+	goldenCheck(mut t, "2.50::numeric % 0.7", "0.40")
+	goldenCheck(mut t, "-7.5::numeric / 2", "-3.7500000000000000")
+	goldenCheck(mut t, "7.5::numeric % -2", "1.5")
+	goldenCheck(mut t, "0.001::numeric / 3", "0.00033333333333333333")
+	goldenCheck(mut t, "0.0::numeric / 0.5", "0.0000000000000000")
+	goldenCheck(mut t, "1.5::numeric % 0.4", "0.3")
+	goldenCheck(mut t, "0.00000001::numeric / 3", "0.0000000033333333333333333333")
+	goldenCheck(mut t, "mod(5.5::numeric, 2::numeric)", "1.5")
+	goldenCheck(mut t, "div(5.5::numeric, 2::numeric)", "2")
+	goldenCheck(mut t, "-5.5::numeric % 2", "-1.5")
+	goldenCheck(mut t, "round(1.5::numeric)", "2")
+	goldenCheck(mut t, "round(-1.5::numeric)", "-2")
+	goldenCheck(mut t, "round(1.55::numeric, 1)", "1.6")
+	goldenCheck(mut t, "trunc(1.99::numeric)", "1")
+	goldenCheck(mut t, "trunc(2.55::numeric, 1)", "2.5")
+	goldenCheck(mut t, "ceil(1.2::numeric)", "2")
+	goldenCheck(mut t, "floor(-1.2::numeric)", "-2")
+	goldenCheck(mut t, "sign(-3.5::numeric)", "-1")
+	goldenCheck(mut t, "abs(-1.5::numeric)", "1.5")
+	goldenCheck(mut t, "1.5::numeric = 1.50", "true")
+	goldenCheck(mut t, "1.5::numeric < 2::numeric", "true")
+	goldenCheck(mut t, "'2024-01-02'::date < '2024-01-03'::date", "true")
+	goldenCheck(mut t, "'2024-01-02 10:00'::timestamp <= '2024-01-03'::timestamp", "true")
+	goldenCheck(mut t, "'10:00'::time < '12:00'::time", "true")
+	goldenCheck(mut t, "'1 day'::interval < '2 days'::interval", "true")
+	goldenCheck(mut t, "1.5::numeric / 0", "ERROR: division by zero")
+	goldenCheck(mut t, "1::int2 + 32767::int2", "ERROR: smallint out of range")
+}
+
+// TestFloatRoundingIsRint pins PostgreSQL's round(double precision) ties-to-even.
+fn TestFloatRoundingIsRint(t mut crucible.T) {
+	goldenCheck(mut t, "round(0.5::float8)", "0")
+	goldenCheck(mut t, "round(1.5::float8)", "2")
+	goldenCheck(mut t, "round(2.5::float8)", "2")
+	goldenCheck(mut t, "round(3.5::float8)", "4")
+	goldenCheck(mut t, "round(-1.5::float8)", "-2")
+	goldenCheck(mut t, "round(-2.5::float8)", "-2")
+	goldenCheck(mut t, "trunc(1.99::float8)", "1")
+	goldenCheck(mut t, "trunc(-1.99::float8)", "-1")
+	goldenCheck(mut t, "ceil(1.2::float8)", "2")
+	goldenCheck(mut t, "floor(-1.2::float8)", "-2")
+	goldenCheck(mut t, "to_hex(255)", "ff")
+	goldenCheck(mut t, "to_hex(-1::int4)", "ffffffff")
+	goldenCheck(mut t, "to_hex(-1::int8)", "ffffffffffffffff")
+}
+
+fn goldenCheck(t mut crucible.T, expression str, want str) {
+	let got = evalGoldenExpression(expression) catch err {
+		let text = "ERROR: " + ErrorMessage(err)
+		if text != want { t.Error("{expression}: got {text}, want {want}") }
+		return
+	}
+	let text = got.Text()
+	if text != want { t.Error("{expression}: got {text}, want {want}") }
+}
