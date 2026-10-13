@@ -41,6 +41,16 @@ modes and four tuple lock modes with the conflict matrices. `Commit`/`Abort` rel
 held locks. (Blocking waits, FIFO queues, deadlock detection and lock_timeout are not
 implemented yet.)
 
+## Savepoints and subtransactions
+
+`Savepoint` allocates a subtransaction xid; writes inside it are stamped with that xid
+(`Txn.WriteXid`), and `Snapshot.Xids` makes the transaction's own xids visible under the
+cmin/cmax rule. `RollbackTo` aborts the subtransaction and restarts the savepoint with a
+fresh subxid, so its tuples become invisible and locks/snapshots it took are released;
+`Release` marks the subtransaction `SubCommitted`, which the parent's `Commit` promotes to
+`Committed` (and `Abort` to `Aborted`). Recovery aborts every `SubCommitted` xid, since its
+parent had not committed at the crash.
+
 ## Public API
 
 ```tin
@@ -56,6 +66,11 @@ fn (m mut Manager) ReleaseSnapshot(h SnapshotHandle)
 fn (m Manager) GlobalXmin() u32
 fn (m mut Manager) Commit(t mut Txn) !
 fn (m mut Manager) Abort(t mut Txn) !
+fn (m mut Manager) Savepoint(t mut Txn, name str) !
+fn (m mut Manager) RollbackTo(t mut Txn, name str) !
+fn (m mut Manager) Release(t mut Txn, name str) !
+fn (t Txn) WriteXid() u32
+fn (t Txn) Subxids() []u32
 fn (m Manager) State(xid u32) XidState
 
 fn (m Manager) Visible(snap Snapshot, h store.TupleHeader) bool
@@ -87,8 +102,9 @@ and global xmin, durable commit/abort and xid reservation, two-bit clog (12 test
 - Relation/tuple locks do not wait: a conflict fails immediately with `55P03`. Wait
   queues, upgrade rules, `deadlock_timeout` detection (`40P01`), `lock_timeout`, cancel
   wakeups and transaction-id locks are still to do.
-- Savepoints/subtransactions (subxid allocation, subcommit in the clog, lock retention)
-  are not implemented; `SubCommitted` exists in the clog only.
+- Savepoints/subtransactions are implemented for visibility, locks and recovery, but the
+  store stamps the subxid as xmin (PostgreSQL instead keeps the parent xid and a combo
+  cmin); observable rollback/commit behaviour matches.
 - `Vacuum(rel, opts)` and clog truncation are not implemented (the store has no prune
   hook yet).
 - Serializable behaves as repeatable read (no SSI).
