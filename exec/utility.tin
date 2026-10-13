@@ -133,13 +133,14 @@ fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
 		Execute(ex) => {
 			let prepOpt = session.GetPreparedStatement(ex.Name.Name)
 			if let prep = prepOpt {
-				let ctx = ExprContext{
+				mut ctx = ExprContext{
 					Row: []types.Datum{},
 					Params: []types.Datum{},
 					Txn: tx,
 					Catalog: session.Catalog,
 				}
-				mut cur = try BuildCursor(prep.Plan, ctx)
+				mut prepPlan = prep.Plan
+				mut cur = try BuildCursor(mut prepPlan, mut ctx)
 				if len(prep.Cols) > 0 {
 					mut sinkCols = []ColDesc{}
 					mut formats = []i16{}

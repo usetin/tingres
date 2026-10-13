@@ -619,16 +619,17 @@ fn (s mut Session) Parse(name str, sql str, paramOids []u32) ! {
 }
 
 // Bind binds parameters to a prepared portal skeleton.
-fn (s mut Session) Bind(portalName str, prepName str, params []types.Datum, resultFormats []i16) ! {
+fn (s mut Session) Bind(portalName str, prepName str, params mut []types.Datum, resultFormats []i16) ! {
 	let prepOpt = s.GetPreparedStatement(prepName)
 	if let prep = prepOpt {
-		let ctx = ExprContext{
+		mut ctx = ExprContext{
 			Row: []types.Datum{},
 			Params: params,
 			Txn: s.currentTxn,
 			Catalog: s.Catalog,
 		}
-		mut cur = try BuildCursor(prep.Plan, ctx)
+		mut prepPlan = prep.Plan
+		mut cur = try BuildCursor(mut prepPlan, mut ctx)
 		s.portals[portalName] = Portal{
 			Name: portalName,
 			Cursor: cur,
@@ -668,7 +669,7 @@ fn (s mut Session) BindBytes(portalName str, prepName str, paramFormats []i16, p
 				}
 			}
 		}
-		try s.Bind(portalName, prepName, decodedParams, resultFormats)
+		try s.Bind(portalName, prepName, mut decodedParams, resultFormats)
 		return
 	}
 	try types.ErrorFault(types.NewPgError("26000", "prepared statement \"" + prepName + "\" does not exist", "", "", 0))
@@ -687,13 +688,14 @@ fn (s mut Session) Execute(portalName str, maxRows i64, out mut dyn Sink) ! {
 	}
 	match portal.Plan {
 		ModifyTable(mt) => {
-			let ctx = ExprContext{
+			mut ctx = ExprContext{
 				Row: []types.Datum{},
 				Params: []types.Datum{},
 				Txn: s.currentTxn,
 				Catalog: s.Catalog,
 			}
-			try ExecuteModifyTable(mt, ctx, mut out)
+			mut mtMut = mt
+			try ExecuteModifyTable(mut mtMut, mut ctx, mut out)
 			mut updated = portal
 			updated.Completed = true
 			s.portals[portalName] = updated

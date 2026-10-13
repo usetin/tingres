@@ -31,21 +31,21 @@ fn TestOperatorsFilterProjectLimitUnique(t mut crucible.T) {
 		})
 	}
 	let colDesc = plan.ColDesc{Name: "c1", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: 1}
-	let vPlan = plan.Plan.Values(plan.ValuesNode{
+	mut vPlan = plan.Plan.Values(plan.ValuesNode{
 		Rows: vRows,
 		Cols: []plan.ColDesc{colDesc},
 		Cost: plan.Cost{},
 	})
 
-	let ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
 
 	// 1. Unique: (1), (2), (3), (4)
-	let uPlan = plan.Plan.Unique(plan.UniqueNode{
+	mut uPlan = plan.Plan.Unique(plan.UniqueNode{
 		Input: vPlan,
 		Cols: []plan.ColDesc{colDesc},
 		Cost: plan.Cost{},
 	})
-	mut uCur = BuildCursor(uPlan, ctx) catch err {
+	mut uCur = BuildCursor(mut uPlan, mut ctx) catch err {
 		t.Error("BuildCursor Unique failed: {err}")
 		return
 	}
@@ -64,13 +64,13 @@ fn TestOperatorsFilterProjectLimitUnique(t mut crucible.T) {
 	let gtOp = types.LookupOperator(">", types.Int4Oid, types.Int4Oid)
 	if let op = gtOp {
 		let pred = plan.Expr.OpCall(plan.OpCallExpr{Op: ">", Func: op, Args: []plan.Expr{c1Ref, const2}, Type: types.BoolOid})
-		let fPlan = plan.Plan.Filter(plan.FilterNode{
+		mut fPlan = plan.Plan.Filter(plan.FilterNode{
 			Input: uPlan,
 			Predicate: pred,
 			Cols: []plan.ColDesc{colDesc},
 			Cost: plan.Cost{},
 		})
-		mut fCur = BuildCursor(fPlan, ctx) catch err {
+		mut fCur = BuildCursor(mut fPlan, mut ctx) catch err {
 			t.Error("BuildCursor Filter failed: {err}")
 			return
 		}
@@ -84,14 +84,14 @@ fn TestOperatorsFilterProjectLimitUnique(t mut crucible.T) {
 
 	// 3. Limit / Offset: offset 1, count 2 over Values -> (2), (2)
 	let const1 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: types.Int4Oid})
-	let limPlan = plan.Plan.Limit(plan.LimitNode{
+	mut limPlan = plan.Plan.Limit(plan.LimitNode{
 		Input: vPlan,
 		Count: const2,
 		Offset: const1,
 		Cols: []plan.ColDesc{colDesc},
 		Cost: plan.Cost{},
 	})
-	mut lCur = BuildCursor(limPlan, ctx) catch err {
+	mut lCur = BuildCursor(mut limPlan, mut ctx) catch err {
 		t.Error("BuildCursor Limit failed: {err}")
 		return
 	}
@@ -111,24 +111,24 @@ fn TestOperatorsSort(t mut crucible.T) {
 		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 20), Type: types.Int4Oid})},
 	}
 	let colDesc = plan.ColDesc{Name: "v", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: 1}
-	let vPlan = plan.Plan.Values(plan.ValuesNode{
+	mut vPlan = plan.Plan.Values(plan.ValuesNode{
 		Rows: vRows,
 		Cols: []plan.ColDesc{colDesc},
 		Cost: plan.Cost{},
 	})
 
-	let ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
 	let col0 = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.Int4Oid})
 
 	// Ascending Sort -> 10, 20, 30
-	let sortAscPlan = plan.Plan.Sort(plan.SortNode{
+	mut sortAscPlan = plan.Plan.Sort(plan.SortNode{
 		Input: vPlan,
 		Keys: []plan.SortKey{plan.SortKey{Expr: col0, Descending: false, NullsFirst: false}},
 		Limit: -1,
 		Cols: []plan.ColDesc{colDesc},
 		Cost: plan.Cost{},
 	})
-	mut sCur = BuildCursor(sortAscPlan, ctx) catch err {
+	mut sCur = BuildCursor(mut sortAscPlan, mut ctx) catch err {
 		t.Error("BuildCursor Sort failed: {err}")
 		return
 	}
@@ -141,14 +141,14 @@ fn TestOperatorsSort(t mut crucible.T) {
 	}
 
 	// Descending Sort with Top-1 -> 30
-	let sortDescPlan = plan.Plan.Sort(plan.SortNode{
+	mut sortDescPlan = plan.Plan.Sort(plan.SortNode{
 		Input: vPlan,
 		Keys: []plan.SortKey{plan.SortKey{Expr: col0, Descending: true, NullsFirst: false}},
 		Limit: 1,
 		Cols: []plan.ColDesc{colDesc},
 		Cost: plan.Cost{},
 	})
-	mut topCur = BuildCursor(sortDescPlan, ctx) catch err {
+	mut topCur = BuildCursor(mut sortDescPlan, mut ctx) catch err {
 		t.Error("BuildCursor TopSort failed: {err}")
 		return
 	}
@@ -170,7 +170,7 @@ fn TestOperatorsNestLoopAndHashJoin(t mut crucible.T) {
 		plan.ColDesc{Name: "id", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: 1},
 		plan.ColDesc{Name: "val", Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 2},
 	}
-	let leftPlan = plan.Plan.Values(plan.ValuesNode{Rows: leftRows, Cols: leftCols, Cost: plan.Cost{}})
+	mut leftPlan = plan.Plan.Values(plan.ValuesNode{Rows: leftRows, Cols: leftCols, Cost: plan.Cost{}})
 
 	// Right: (2, 'two'), (3, 'three'), (4, 'four')
 	let rightRows = [][]plan.Expr{
@@ -182,9 +182,9 @@ fn TestOperatorsNestLoopAndHashJoin(t mut crucible.T) {
 		plan.ColDesc{Name: "rid", Oid: types.Int4Oid, Typmod: -1, TableOid: 0, Attno: 1},
 		plan.ColDesc{Name: "rval", Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 2},
 	}
-	let rightPlan = plan.Plan.Values(plan.ValuesNode{Rows: rightRows, Cols: rightCols, Cost: plan.Cost{}})
+	mut rightPlan = plan.Plan.Values(plan.ValuesNode{Rows: rightRows, Cols: rightCols, Cost: plan.Cost{}})
 
-	let ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
 
 	// Equal qual: slot 0 (Left id) = slot 2 (Right rid)
 	let leftKey = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.Int4Oid})
@@ -195,7 +195,7 @@ fn TestOperatorsNestLoopAndHashJoin(t mut crucible.T) {
 		let qual = plan.Expr.OpCall(plan.OpCallExpr{Op: "=", Func: op, Args: []plan.Expr{leftKey, rightKeyInJoined}, Type: types.BoolOid})
 
 		// 1. NestLoop Inner Join: matches id 2 and 3 -> 2 rows
-		let nlPlan = plan.Plan.NestLoop(plan.NestLoopNode{
+		mut nlPlan = plan.Plan.NestLoop(plan.NestLoopNode{
 			Left: leftPlan,
 			Right: rightPlan,
 			JoinType: plan.JoinType.Inner,
@@ -203,7 +203,7 @@ fn TestOperatorsNestLoopAndHashJoin(t mut crucible.T) {
 			Cols: []plan.ColDesc{},
 			Cost: plan.Cost{},
 		})
-		mut nlCur = BuildCursor(nlPlan, ctx) catch err {
+		mut nlCur = BuildCursor(mut nlPlan, mut ctx) catch err {
 			t.Error("BuildCursor NestLoop failed: {err}")
 			return
 		}
@@ -211,7 +211,7 @@ fn TestOperatorsNestLoopAndHashJoin(t mut crucible.T) {
 		t.True("nest loop inner count is 2", len(nlRows) == 2)
 
 		// 2. NestLoop Left Join: id 1 (unmatched), id 2, id 3 -> 3 rows
-		let nlLeftPlan = plan.Plan.NestLoop(plan.NestLoopNode{
+		mut nlLeftPlan = plan.Plan.NestLoop(plan.NestLoopNode{
 			Left: leftPlan,
 			Right: rightPlan,
 			JoinType: plan.JoinType.Left,
@@ -219,7 +219,7 @@ fn TestOperatorsNestLoopAndHashJoin(t mut crucible.T) {
 			Cols: []plan.ColDesc{},
 			Cost: plan.Cost{},
 		})
-		mut nlLeftCur = BuildCursor(nlLeftPlan, ctx) catch err {
+		mut nlLeftCur = BuildCursor(mut nlLeftPlan, mut ctx) catch err {
 			t.Error("BuildCursor NestLoop Left failed: {err}")
 			return
 		}
@@ -230,7 +230,7 @@ fn TestOperatorsNestLoopAndHashJoin(t mut crucible.T) {
 		}
 
 		// 3. HashJoin Inner: id 2 and 3 -> 2 rows
-		let hjPlan = plan.Plan.HashJoin(plan.HashJoinNode{
+		mut hjPlan = plan.Plan.HashJoin(plan.HashJoinNode{
 			Left: leftPlan,
 			Right: rightPlan,
 			JoinType: plan.JoinType.Inner,
@@ -240,7 +240,7 @@ fn TestOperatorsNestLoopAndHashJoin(t mut crucible.T) {
 			Cols: []plan.ColDesc{},
 			Cost: plan.Cost{},
 		})
-		mut hjCur = BuildCursor(hjPlan, ctx) catch err {
+		mut hjCur = BuildCursor(mut hjPlan, mut ctx) catch err {
 			t.Error("BuildCursor HashJoin failed: {err}")
 			return
 		}
@@ -256,13 +256,13 @@ fn TestOperatorsHashAggAndWindow(t mut crucible.T) {
 		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "cat"), Type: types.TextOid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 20), Type: types.Int4Oid})},
 		[]plan.Expr{plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "dog"), Type: types.TextOid}), plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 5), Type: types.Int4Oid})},
 	}
-	let vPlan = plan.Plan.Values(plan.ValuesNode{
+	mut vPlan = plan.Plan.Values(plan.ValuesNode{
 		Rows: rows,
 		Cols: []plan.ColDesc{},
 		Cost: plan.Cost{},
 	})
 
-	let ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
 
 	let groupCol = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.TextOid})
 	let valCol = plan.Expr.ColRef(plan.ColRefExpr{Slot: 1, RangeIndex: 1, AttNo: 2, Type: types.Int4Oid})
@@ -277,14 +277,14 @@ fn TestOperatorsHashAggAndWindow(t mut crucible.T) {
 			Distinct: false,
 			Type: types.Int8Oid,
 		}
-		let aggPlan = plan.Plan.HashAgg(plan.HashAggNode{
+		mut aggPlan = plan.Plan.HashAgg(plan.HashAggNode{
 			Input: vPlan,
 			GroupKeys: []plan.Expr{groupCol},
 			Aggs: []plan.AggRefExpr{aggRef},
 			Cols: []plan.ColDesc{},
 			Cost: plan.Cost{},
 		})
-		mut aCur = BuildCursor(aggPlan, ctx) catch err {
+		mut aCur = BuildCursor(mut aggPlan, mut ctx) catch err {
 			t.Error("BuildCursor HashAgg failed: {err}")
 			return
 		}
@@ -308,7 +308,7 @@ fn TestOperatorsHashAggAndWindow(t mut crucible.T) {
 		WindowIndex: 0,
 		Type: types.Int8Oid,
 	}
-	let winPlan = plan.Plan.WindowAgg(plan.WindowAggNode{
+	mut winPlan = plan.Plan.WindowAgg(plan.WindowAggNode{
 		Input: vPlan,
 		Funcs: []plan.WindowFuncRefExpr{winRef},
 		Partitions: []plan.Expr{},
@@ -317,7 +317,7 @@ fn TestOperatorsHashAggAndWindow(t mut crucible.T) {
 		Cols: []plan.ColDesc{},
 		Cost: plan.Cost{},
 	})
-	mut wCur = BuildCursor(winPlan, ctx) catch err {
+	mut wCur = BuildCursor(mut winPlan, mut ctx) catch err {
 		t.Error("BuildCursor WindowAgg failed: {err}")
 		return
 	}
@@ -331,15 +331,15 @@ fn TestOperatorsHashAggAndWindow(t mut crucible.T) {
 }
 
 fn TestOperatorsFunctionScan(t mut crucible.T) {
-	let ctx = NewExprContext([]types.Datum{}, []types.Datum{})
+	mut ctx = NewExprContext([]types.Datum{}, []types.Datum{})
 
 	let genFn = types.LookupFunc("generate_series", []u32{types.Int4Oid, types.Int4Oid})
 	if let f = genFn {
 		let c1 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: types.Int4Oid})
 		let c3 = plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 3), Type: types.Int4Oid})
 		let fnCall = plan.Expr.FuncCall(plan.FuncCallExpr{Func: f, Args: []plan.Expr{c1, c3}, Type: types.Int4Oid})
-		let fnPlan = plan.Plan.FunctionScan(plan.FunctionScanNode{Expr: fnCall, Cols: []plan.ColDesc{}, Cost: plan.Cost{}})
-		mut fnCur = BuildCursor(fnPlan, ctx) catch err {
+		mut fnPlan = plan.Plan.FunctionScan(plan.FunctionScanNode{Expr: fnCall, Cols: []plan.ColDesc{}, Cost: plan.Cost{}})
+		mut fnCur = BuildCursor(mut fnPlan, mut ctx) catch err {
 			t.Error("BuildCursor FunctionScan failed: {err}")
 			return
 		}

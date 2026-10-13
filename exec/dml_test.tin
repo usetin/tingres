@@ -42,7 +42,7 @@ fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
 		System: false,
 	}
 
-	let ctx = ExprContext{
+	mut ctx = ExprContext{
 		Row: []types.Datum{},
 		Params: []types.Datum{},
 		Txn: txnVal,
@@ -56,7 +56,7 @@ fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
 		plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: types.Int4Oid}),
 		plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "alice"), Type: types.TextOid}),
 	}
-	let insertNode1 = plan.ModifyTableNode{
+	mut insertNode1 = plan.ModifyTableNode{
 		Kind: plan.ModifyKind.Insert,
 		Table: tbl,
 		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{row1}, Cols: []plan.ColDesc{}, Cost: plan.Cost{}}),
@@ -66,7 +66,7 @@ fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
 		Cols: []plan.ColDesc{},
 		Cost: plan.Cost{},
 	}
-	let tag1 = ExecuteModifyTable(insertNode1, ctx, mut sink) catch err {
+	let tag1 = ExecuteModifyTable(mut insertNode1, mut ctx, mut sink) catch err {
 		t.Error("insert valid row failed: {err}")
 		return
 	}
@@ -78,7 +78,7 @@ fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
 		plan.Expr.Const(plan.ConstExpr{Value: types.Null(), Type: types.Int4Oid}),
 		plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "bob"), Type: types.TextOid}),
 	}
-	let insertNull = plan.ModifyTableNode{
+	mut insertNull = plan.ModifyTableNode{
 		Kind: plan.ModifyKind.Insert,
 		Table: tbl,
 		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{nullRow}, Cols: []plan.ColDesc{}, Cost: plan.Cost{}}),
@@ -88,7 +88,7 @@ fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
 		Cols: []plan.ColDesc{},
 		Cost: plan.Cost{},
 	}
-	ExecuteModifyTable(insertNull, ctx, mut sink) catch err {
+	ExecuteModifyTable(mut insertNull, mut ctx, mut sink) catch err {
 		nullFail = true
 		let pgErr = types.ErrorFromFault(err)
 		t.True("error code 23502", pgErr.Code == "23502")
@@ -101,7 +101,7 @@ fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
 		plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), Type: types.Int4Oid}),
 		plan.Expr.Const(plan.ConstExpr{Value: types.FromStr(types.TextOid, "alice2"), Type: types.TextOid}),
 	}
-	let insertDup = plan.ModifyTableNode{
+	mut insertDup = plan.ModifyTableNode{
 		Kind: plan.ModifyKind.Insert,
 		Table: tbl,
 		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{dupRow}, Cols: []plan.ColDesc{}, Cost: plan.Cost{}}),
@@ -111,7 +111,7 @@ fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
 		Cols: []plan.ColDesc{},
 		Cost: plan.Cost{},
 	}
-	ExecuteModifyTable(insertDup, ctx, mut sink) catch err {
+	ExecuteModifyTable(mut insertDup, mut ctx, mut sink) catch err {
 		uniqFail = true
 		let pgErr = types.ErrorFromFault(err)
 		t.True("error code 23505", pgErr.Code == "23505")
@@ -119,7 +119,7 @@ fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
 	t.True("unique violation rejected", uniqFail)
 
 	// 4. ON CONFLICT DO NOTHING must succeed and skip the conflicting insert
-	let insertDoNothing = plan.ModifyTableNode{
+	mut insertDoNothing = plan.ModifyTableNode{
 		Kind: plan.ModifyKind.Insert,
 		Table: tbl,
 		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{dupRow}, Cols: []plan.ColDesc{}, Cost: plan.Cost{}}),
@@ -134,7 +134,7 @@ fn TestDmlInsertNotNullAndUnique(t mut crucible.T) {
 		Cols: []plan.ColDesc{},
 		Cost: plan.Cost{},
 	}
-	let tagDoNothing = ExecuteModifyTable(insertDoNothing, ctx, mut sink) catch err {
+	let tagDoNothing = ExecuteModifyTable(mut insertDoNothing, mut ctx, mut sink) catch err {
 		t.Error("on conflict do nothing failed: {err}")
 		return
 	}
@@ -164,7 +164,7 @@ fn TestDmlReturningAndCommandTags(t mut crucible.T) {
 		System: false,
 	}
 
-	let ctx = ExprContext{
+	mut ctx = ExprContext{
 		Row: []types.Datum{},
 		Params: []types.Datum{},
 		Txn: txnVal,
@@ -179,7 +179,7 @@ fn TestDmlReturningAndCommandTags(t mut crucible.T) {
 	let retCol = plan.Expr.ColRef(plan.ColRefExpr{Slot: 0, RangeIndex: 1, AttNo: 1, Type: types.Int4Oid})
 	let retColDesc = plan.ColDesc{Name: "num", Oid: types.Int4Oid, Typmod: -1, TableOid: tbl.Oid, Attno: 1}
 
-	let insertRet = plan.ModifyTableNode{
+	mut insertRet = plan.ModifyTableNode{
 		Kind: plan.ModifyKind.Insert,
 		Table: tbl,
 		Source: plan.Plan.Values(plan.ValuesNode{Rows: [][]plan.Expr{r1, r2}, Cols: []plan.ColDesc{retColDesc}, Cost: plan.Cost{}}),
@@ -190,7 +190,7 @@ fn TestDmlReturningAndCommandTags(t mut crucible.T) {
 		Cost: plan.Cost{},
 	}
 
-	let tag = ExecuteModifyTable(insertRet, ctx, mut sink) catch err {
+	let tag = ExecuteModifyTable(mut insertRet, mut ctx, mut sink) catch err {
 		t.Error("insert returning failed: {err}")
 		return
 	}

@@ -7,10 +7,11 @@ import "../txn"
 import "../store"
 
 // ExecuteModifyTable executes an INSERT, UPDATE, or DELETE plan node against the store.
-fn ExecuteModifyTable(node plan.ModifyTableNode, ctx ExprContext, out mut dyn Sink) !str {
+fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mut dyn Sink) !str {
 	if let cat = ctx.Catalog {
 		if let t = ctx.Txn {
-			mut sourceCur = try BuildCursor(node.Source, ctx)
+			mut sourcePlan = node.Source
+			mut sourceCur = try BuildCursor(mut sourcePlan, mut ctx)
 			let rel = store.RelId(node.Table.Rel)
 			let x = store.NewXidCtx(t.Xid(), t.CommandID())
 
@@ -121,7 +122,7 @@ fn ExecuteModifyTable(node plan.ModifyTableNode, ctx ExprContext, out mut dyn Si
 							retCtx.Row = targetRow
 							mut retRow = []types.Datum{}
 							for expr in node.Returning {
-								let retVal = try EvalExpr(expr, retCtx)
+								let retVal = try EvalExpr(expr, mut retCtx)
 								retRow = append(retRow, retVal)
 							}
 							out.DataRow(retRow)
@@ -166,7 +167,7 @@ fn ExecuteModifyTable(node plan.ModifyTableNode, ctx ExprContext, out mut dyn Si
 								retCtx.Row = sourceRow
 								mut retRow = []types.Datum{}
 								for expr in node.Returning {
-									let retVal = try EvalExpr(expr, retCtx)
+									let retVal = try EvalExpr(expr, mut retCtx)
 									retRow = append(retRow, retVal)
 								}
 								out.DataRow(retRow)
@@ -225,7 +226,7 @@ fn ExecuteModifyTable(node plan.ModifyTableNode, ctx ExprContext, out mut dyn Si
 								retCtx.Row = updatedRow
 								mut retRow = []types.Datum{}
 								for expr in node.Returning {
-									let retVal = try EvalExpr(expr, retCtx)
+									let retVal = try EvalExpr(expr, mut retCtx)
 									retRow = append(retRow, retVal)
 								}
 								out.DataRow(retRow)
