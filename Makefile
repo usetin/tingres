@@ -2,7 +2,7 @@
 TIN ?= $(HOME)/dev/extra/tin/tin
 BIN := bin/server
 
-.PHONY: all build test check fmt clean client diff concurrency
+.PHONY: all build test check fmt clean client diff concurrency bench
 
 all: build
 
@@ -22,6 +22,10 @@ test: build
 client:
 	mkdir -p $(BIN)
 	$(TIN) build tests/client/main.tin -o $(BIN)/client_probe
+
+bench:
+	mkdir -p $(BIN)
+	$(TIN) build bench/main.tin -o $(BIN)/tingres-bench
 
 diff: build client
 	./tests/diff.sh

@@ -1,0 +1,31 @@
+lower('HELLO')	hello
+upper('hello')	HELLO
+initcap('hello world')	Hello World
+length('hello')	5
+char_length('héllo')	5
+octet_length('héllo')	6
+bit_length('abc')	24
+substr('abcdef', 2, 3)	bcd
+substring('abcdef', 4)	def
+left('abcdef', 2)	ab
+right('abcdef', 2)	ef
+replace('banana', 'na', 'X')	baXX
+translate('12345', '135', 'abc')	a2b4c
+repeat('xy', 3)	xyxyxy
+split_part('a,b,c', ',', 2)	b
+lpad('hi', 5, 'xy')	xyxhi
+rpad('hi', 5, 'xy')	hixyx
+reverse('héllo')	olléh
+ascii('A')	65
+chr(65)	A
+md5('abc')	900150983cd24fb0d6963f7d28e17f72
+quote_ident('select')	"select"
+quote_literal('a''b')	'a''b'
+concat('a', NULL::text, 'b')	ab
+concat_ws('-', 'a', NULL::text, 'b')	a-b
+format('%s:%I:%L', 'v', 'user', 'x')	v:"user":'x'
+strpos('abc', 'bc')	2
+starts_with('abcdef', 'abc')	true
+'a' || 'b'	ab
+'2'::int4 + 3	5
+1 + '2'	3

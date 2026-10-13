@@ -1,0 +1,820 @@
+package types
+
+import "gauge"
+import "mint"
+import "twine"
+
+const NumericBase i64 = 10000
+
+// Numeric stores PostgreSQL base-10000 digits and the display scale.
+type Numeric value struct {
+	sign i64
+	weight i64
+	dscale i64
+	digits []i64
+	special i64
+}
+
+fn float_text(d Datum) str {
+	if d.f != d.f { return "NaN" }
+	if d.f == 0.0 && gauge.Signbit(d.f) { return "-0" }
+	let raw = mint.FormatFloat(d.f, 'g', -1)
+	if raw == "+Inf" || raw == "Inf" { return "Infinity" }
+	if raw == "-Inf" { return "-Infinity" }
+	if d.oid != Float4Oid { return raw }
+	for precision in 1..10 {
+		let candidate = mint.FormatFloat(d.f, 'g', precision)
+		let parsed = mint.ParseFloat(candidate) catch _ { continue }
+		if f64(f32(parsed)) == d.f { return candidate }
+	}
+	return raw
+}
+
+fn compare_float(a f64, b f64) i64 {
+	let aNan = a != a
+	let bNan = b != b
+	if aNan {
+		if bNan { return 0 }
+		return 1
+	}
+	if bNan { return -1 }
+	if a < b { return -1 }
+	if a > b { return 1 }
+	return 0
+}
+
+// ParseNumeric parses PostgreSQL decimal syntax into a numeric Datum.
+fn ParseNumeric(text str) !Datum {
+	let n = try parse_numeric_value(text)
+	return FromStr(NumericOid, format_numeric(n))
+}
+
+// ParseNumericTypmod parses and applies PostgreSQL numeric precision and scale.
+fn ParseNumericTypmod(text str, precision i64, scale i64) !Datum {
+	if precision < 1 || precision > 1000 || scale < -1000 || scale > 1000 {
+		fail ErrorFault(NewError("22023", "numeric field overflow"))
+	}
+	let n = try parse_numeric_value(text)
+	if n.special != 0 { return FromStr(NumericOid, format_numeric(n)) }
+	let rounded = numeric_round_value(n, scale)
+	let rendered = format_numeric(rounded)
+	let dot = find_dot(rendered)
+	mut integerText = rendered
+	if dot >= 0 { integerText = rendered[:dot] }
+	if len(integerText) > 0 && integerText[0] == '-' { integerText = integerText[1:] }
+	let integerDigits = len(strip_leading_zeroes(integerText))
+	if rounded.sign != 0 && integerDigits > precision-scale {
+		fail ErrorFault(NewError("22003", "numeric field overflow"))
+	}
+	return FromStr(NumericOid, format_numeric(rounded))
+}
+
+// NumericText returns the exact PostgreSQL text representation of a numeric Datum.
+fn NumericText(d Datum) str {
+	let n = parse_numeric_value(d.s) catch _ { return d.s }
+	return format_numeric(n)
+}
+
+// EncodeNumericBinary appends PostgreSQL's base-10000 numeric wire representation.
+fn EncodeNumericBinary(d Datum, out mut []u8) {
+	let n = parse_numeric_value(NumericText(d)) catch _ { return }
+	let wireDigits = canonical_wire_digits(n)
+	put_u16(mut out, u16(len(wireDigits)))
+	put_u16(mut out, u16(i16(n.weight)))
+	mut sign = u16(0)
+	if n.special == 2 { sign = 0xC000 } else if n.special == 1 { sign = 0xD000 } else if n.special == -1 { sign = 0xF000 } else if n.sign < 0 { sign = 0x4000 }
+	put_u16(mut out, sign)
+	put_u16(mut out, u16(n.dscale))
+	for digit in wireDigits { put_u16(mut out, u16(digit)) }
+}
+
+// DecodeNumericBinary reads PostgreSQL's base-10000 numeric wire representation.
+fn DecodeNumericBinary(b []u8) !Datum {
+	if len(b) < 8 { fail PgFault("22P03", "invalid binary representation for type numeric") }
+	let count = i64(i16(read_u16(b, 0)))
+	let weight = i64(i16(read_u16(b, 2)))
+	let sign = read_u16(b, 4)
+	let scale = i64(read_u16(b, 6))
+	if count < 0 || len(b) != 8+count*2 { fail PgFault("22P03", "invalid binary representation for type numeric") }
+	mut special = i64(0)
+	mut numericSign = i64(1)
+	if sign == 0xC000 { special = 2 } else if sign == 0xD000 { special = 1 } else if sign == 0xF000 { special = -1 } else if sign == 0x4000 { numericSign = -1 } else if sign != 0 { fail PgFault("22P03", "invalid binary representation for type numeric") }
+	mut digits = []i64{}
+	for i in 0..count {
+		let digit = i64(read_u16(b, 8+i*2))
+		if digit >= NumericBase { fail PgFault("22P03", "invalid binary representation for type numeric") }
+		digits = append(digits, digit)
+	}
+	if special != 0 { return FromStr(NumericOid, format_numeric(Numeric{sign: numericSign, weight: 0, dscale: scale, digits: []i64{}, special: special})) }
+	if count == 0 { numericSign = 0 }
+	return FromStr(NumericOid, format_numeric(Numeric{sign: numericSign, weight: weight, dscale: scale, digits: digits, special: 0}))
+}
+
+fn canonical_wire_digits(n Numeric) []i64 {
+	if n.special != 0 || n.sign == 0 { return []i64{} }
+	return n.digits
+}
+
+fn parse_numeric_value(raw str) !Numeric {
+	let s = twine.TrimSpace(raw)
+	if s == "NaN" || s == "nan" || s == "NAN" {
+		return Numeric{sign: 1, weight: 0, dscale: 0, digits: []i64{}, special: 2}
+	}
+	if s == "Infinity" || s == "+Infinity" || s == "infinity" || s == "+infinity" {
+		return Numeric{sign: 1, weight: 0, dscale: 0, digits: []i64{}, special: 1}
+	}
+	if s == "-Infinity" || s == "-infinity" {
+		return Numeric{sign: -1, weight: 0, dscale: 0, digits: []i64{}, special: -1}
+	}
+	if len(s) == 0 { fail ErrorFault(NewError("22P02", "invalid input syntax for type numeric: \"{raw}\"")) }
+	mut sign = i64(1)
+	mut at = i64(0)
+	if s[0] == '-' {
+		sign = -1
+		at = 1
+	} else if s[0] == '+' {
+		at = 1
+	}
+	let exponentAt = find_exp(s, at)
+	mut exp = i64(0)
+	mut mantissaEnd = len(s)
+	if exponentAt >= 0 {
+		mantissaEnd = exponentAt
+		let expText = s[exponentAt+1:]
+		if len(expText) == 0 { fail ErrorFault(NewError("22P02", "invalid input syntax for type numeric: \"{raw}\"")) }
+		exp = mint.Atoi(expText) catch _ { fail ErrorFault(NewError("22P02", "invalid input syntax for type numeric: \"{raw}\"")) }
+		if exp < -10000 || exp > 10000 { fail ErrorFault(NewError("22003", "value overflows numeric format")) }
+	}
+	mut dotAt = -1
+	mut digitCount = i64(0)
+	for i in at..mantissaEnd {
+		let c = s[i]
+		if c >= '0' && c <= '9' { digitCount += 1 } else if c == '.' && dotAt < 0 { dotAt = i } else { fail ErrorFault(NewError("22P02", "invalid input syntax for type numeric: \"{raw}\"")) }
+	}
+	if digitCount == 0 { fail ErrorFault(NewError("22P02", "invalid input syntax for type numeric: \"{raw}\"")) }
+	mut intEnd = dotAt
+	mut fracStart = dotAt+1
+	if dotAt < 0 {
+		intEnd = mantissaEnd
+		fracStart = mantissaEnd
+	}
+	let intRaw = s[at:intEnd]
+	let fracRaw = s[fracStart:mantissaEnd]
+	mut all = ""
+	for i in at..mantissaEnd { if s[i] != '.' { all += str(s[i]) } }
+	let decimalAt = len(intRaw)+exp
+	mut whole = ""
+	mut fraction = ""
+	if decimalAt <= 0 {
+		whole = "0"
+		fraction = zeroes(-decimalAt)+all
+	} else if decimalAt >= len(all) {
+		whole = all+zeroes(decimalAt-len(all))
+	} else {
+		whole = all[:decimalAt]
+		fraction = all[decimalAt:]
+	}
+	_ = fracRaw
+	whole = strip_leading_zeroes(whole)
+	if whole == "" { whole = "0" }
+	let scale = len(fraction)
+	let intPad = (4-len(whole)%4)%4
+	let paddedWhole = zeroes(intPad)+whole
+	let paddedFraction = fraction+zeroes((4-len(fraction)%4)%4)
+	mut groups = []i64{}
+	for i in 0..len(paddedWhole)/4 {
+		let group = mint.Atoi(paddedWhole[i*4:i*4+4]) catch _ { 0 }
+		groups = append(groups, group)
+	}
+	for i in 0..len(paddedFraction)/4 {
+		let group = mint.Atoi(paddedFraction[i*4:i*4+4]) catch _ { 0 }
+		groups = append(groups, group)
+	}
+	mut weight = len(paddedWhole)/4-1
+	for len(groups) > 0 && groups[0] == 0 {
+		groups = groups[1:]
+		weight -= 1
+	}
+	for len(groups) > 0 && groups[len(groups)-1] == 0 { groups = groups[:len(groups)-1] }
+	mut nonzero = false
+	for g in groups { if g != 0 { nonzero = true } }
+	if !nonzero {
+		sign = 0
+		weight = 0
+		groups = []i64{}
+	}
+	return Numeric{sign: sign, weight: weight, dscale: scale, digits: groups, special: 0}
+}
+
+fn find_exp(s str, from i64) i64 {
+	for i in from..len(s) {
+		if s[i] == 'e' || s[i] == 'E' { return i }
+	}
+	return -1
+}
+
+fn strip_leading_zeroes(s str) str {
+	mut i = i64(0)
+	for i < len(s) && s[i] == '0' { i += 1 }
+	return s[i:]
+}
+
+fn zeroes(n i64) str {
+	mut out = ""
+	for i in 0..n {
+		out += "0"
+		_ = i
+	}
+	return out
+}
+
+fn format_numeric(n Numeric) str {
+	if n.special == 2 { return "NaN" }
+	if n.special == 1 { return "Infinity" }
+	if n.special == -1 { return "-Infinity" }
+	let negative = n.sign < 0
+	mut whole = "0"
+	if n.sign != 0 && n.weight >= 0 {
+		whole = mint.Itoa(n.digits[0])
+		for idx in 1..n.weight+1 {
+			if idx < len(n.digits) { whole += numeric_group_text(n.digits[idx]) } else { whole += "0000" }
+		}
+	}
+	mut out = whole
+	if negative { out = "-"+whole }
+	if n.dscale > 0 {
+		mut frac = ""
+		let fracGroups = (n.dscale+3)/4
+		for j in 0..fracGroups {
+			let idx = n.weight+1+j
+			if n.sign != 0 && idx >= 0 && idx < len(n.digits) { frac += numeric_group_text(n.digits[idx]) } else { frac += "0000" }
+		}
+		out += "."+frac[:n.dscale]
+	}
+	return out
+}
+
+fn numeric_group_text(v i64) str {
+	let s = mint.Itoa(v)
+	return zeroes(4-len(s))+s
+}
+
+// NumericAdd adds two numeric Datums without converting through floating point.
+fn NumericAdd(a Datum, b Datum) !Datum { return try numeric_binary(a, b, 0) }
+
+// NumericSub subtracts b from a without converting through floating point.
+fn NumericSub(a Datum, b Datum) !Datum { return try numeric_binary(a, b, 1) }
+
+fn numeric_binary(a Datum, b Datum, op i64) !Datum {
+	let x = try parse_numeric_value(NumericText(a))
+	let y0 = try parse_numeric_value(NumericText(b))
+	if x.special != 0 || y0.special != 0 { return try numeric_special_binary(x, y0, op) }
+	mut y = y0
+	if op == 1 { y = numeric_neg_value(y0) }
+	if x.sign == 0 { return FromStr(NumericOid, format_numeric(y)) }
+	if y.sign == 0 { return FromStr(NumericOid, format_numeric(x)) }
+	let high = max(x.weight, y.weight)
+	let low = min(numeric_low_exp(x), numeric_low_exp(y))
+	let n = high-low+1
+	mut xs = []i64{}
+	mut ys = []i64{}
+	for i in 0..n {
+		let exp = high-i
+		xs = append(xs, numeric_digit_at(x, exp))
+		ys = append(ys, numeric_digit_at(y, exp))
+	}
+	mut sign = x.sign
+	mut digits = []i64{}
+	for i in 0..n {
+		digits = append(digits, 0)
+		_ = i
+	}
+	if x.sign == y.sign {
+		mut carry = i64(0)
+		for k in 0..n {
+			let i = n-1-k
+			let v = xs[i]+ys[i]+carry
+			digits[i] = v%NumericBase
+			carry = v/NumericBase
+		}
+		if carry > 0 {
+			mut shifted = []i64{carry}
+			shifted = append(shifted, digits...)
+			digits = shifted
+		}
+	} else {
+		let cmp = numeric_abs_compare(x, y)
+		if cmp == 0 { return FromStr(NumericOid, zero_with_scale(max(x.dscale, y.dscale))) }
+		mut larger = xs
+		mut smaller = ys
+		if cmp < 0 {
+			larger = ys
+			smaller = xs
+		}
+		if cmp < 0 { sign = y.sign }
+		mut borrow = i64(0)
+		for k in 0..n {
+			let i = n-1-k
+			mut v = larger[i]-smaller[i]-borrow
+			borrow = 0
+			if v < 0 {
+				v += NumericBase
+				borrow = 1
+			}
+			digits[i] = v
+		}
+	}
+	let mutN = numeric_from_dense(sign, high, max(x.dscale, y.dscale), digits)
+	return FromStr(NumericOid, format_numeric(mutN))
+}
+
+// NumericMul multiplies two numeric Datums with base-10000 arithmetic.
+fn NumericMul(a Datum, b Datum) !Datum {
+	let x = try parse_numeric_value(NumericText(a))
+	let y = try parse_numeric_value(NumericText(b))
+	if x.special != 0 || y.special != 0 { return FromStr(NumericOid, numeric_special_mul(x, y)) }
+	if x.sign == 0 || y.sign == 0 { return FromStr(NumericOid, zero_with_scale(x.dscale+y.dscale)) }
+	let xa = reverse_i64(x.digits)
+	let ya = reverse_i64(y.digits)
+	mut out = []i64{}
+	for i in 0..len(xa)+len(ya)+1 {
+		out = append(out, 0)
+		_ = i
+	}
+	for i in 0..len(xa) {
+		mut carry = i64(0)
+		for j in 0..len(ya) {
+			let k = i+j
+			let v = out[k]+xa[i]*ya[j]+carry
+			out[k] = v%NumericBase
+			carry = v/NumericBase
+		}
+		mut k = i+len(ya)
+		for carry > 0 {
+			let v = out[k]+carry
+			out[k] = v%NumericBase
+			carry = v/NumericBase
+			k += 1
+		}
+	}
+	for len(out) > 0 && out[len(out)-1] == 0 { out = out[:len(out)-1] }
+	let digits = reverse_i64(out)
+	let productWeight = numeric_low_exp(x)+numeric_low_exp(y)+len(digits)-1
+	let n = numeric_from_dense(x.sign*y.sign, productWeight, x.dscale+y.dscale, digits)
+	return FromStr(NumericOid, format_numeric(n))
+}
+
+// NumericDiv divides a numeric Datum to PostgreSQL's default 20 fractional digits.
+fn NumericDiv(a Datum, b Datum) !Datum {
+	let x = try parse_numeric_value(NumericText(a))
+	let y = try parse_numeric_value(NumericText(b))
+	if y.sign == 0 && y.special == 0 { fail ErrorFault(NewError("22012", "division by zero")) }
+	if x.special != 0 || y.special != 0 { return FromStr(NumericOid, numeric_special_div(x, y)) }
+	if x.sign == 0 { return FromStr(NumericOid, "0.00000000000000000000") }
+	let numerator = reverse_i64(x.digits)
+	let denominator = reverse_i64(y.digits)
+	let xlow = numeric_low_exp(x)
+	let ylow = numeric_low_exp(y)
+	let commonLow = min(xlow, ylow)
+	let n = big_append_zero_groups(numerator, xlow-commonLow)
+	let d = big_append_zero_groups(denominator, ylow-commonLow)
+	let (wholeQ, rem) = big_divmod(n, d)
+	mut q = reverse_i64(wholeQ)
+	mut remainder = rem
+	mut fracGroups = []i64{}
+	for i in 0..5 {
+		remainder = big_mul_base_add(remainder, 0)
+		let (digit, rest) = big_div_digit(remainder, d)
+		fracGroups = append(fracGroups, digit)
+		remainder = rest
+		_ = i
+	}
+	if len(q) == 0 { q = []i64{0} }
+	mut digits = []i64{}
+	digits = append(digits, q...)
+	digits = append(digits, fracGroups...)
+	mut weight = len(q)-1
+	let mutN = numeric_from_dense(x.sign*y.sign, weight, 20, digits)
+	return FromStr(NumericOid, format_numeric(mutN))
+}
+
+// NumericMod returns the PostgreSQL numeric remainder of a and b.
+fn NumericMod(a Datum, b Datum) !Datum {
+	let quotient = try NumericDiv(a, b)
+	let whole = NumericTrunc(quotient, 0)
+	let product = try NumericMul(whole, b)
+	return try NumericSub(a, product)
+}
+
+// NumericNeg returns the additive inverse of a numeric Datum.
+fn NumericNeg(a Datum) !Datum {
+	let n = try parse_numeric_value(NumericText(a))
+	return FromStr(NumericOid, format_numeric(numeric_neg_value(n)))
+}
+
+// NumericAbs returns the absolute value of a numeric Datum.
+fn NumericAbs(a Datum) !Datum {
+	let n = try parse_numeric_value(NumericText(a))
+	mut copy = n
+	if copy.sign < 0 { copy.sign = 1 }
+	if copy.special < 0 { copy.special = 1 }
+	return FromStr(NumericOid, format_numeric(copy))
+}
+
+// NumericRound rounds at scale decimal places, ties away from zero.
+fn NumericRound(a Datum, scale i64) !Datum {
+	let n = try parse_numeric_value(NumericText(a))
+	return FromStr(NumericOid, format_numeric(numeric_round_value(n, scale)))
+}
+
+// NumericTrunc truncates at scale decimal places toward zero.
+fn NumericTrunc(a Datum, scale i64) Datum {
+	let n = parse_numeric_value(NumericText(a)) catch _ { return a }
+	return FromStr(NumericOid, format_numeric(numeric_trunc_value(n, scale)))
+}
+
+// NumericFloor returns the greatest integer not greater than a.
+fn NumericFloor(a Datum) Datum { return NumericRoundDirected(a, 0, -1) }
+
+// NumericCeil returns the least integer not less than a.
+fn NumericCeil(a Datum) Datum { return NumericRoundDirected(a, 0, 1) }
+
+// NumericSign returns -1, 0 or 1 as a numeric Datum.
+fn NumericSign(a Datum) Datum {
+	let n = parse_numeric_value(NumericText(a)) catch _ { return FromStr(NumericOid, "0") }
+	if n.special == 2 { return FromStr(NumericOid, "NaN") }
+	if n.special != 0 {
+		if n.special < 0 { return FromStr(NumericOid, "-1") }
+		return FromStr(NumericOid, "1")
+	}
+	if n.sign < 0 { return FromStr(NumericOid, "-1") }
+	if n.sign > 0 { return FromStr(NumericOid, "1") }
+	return FromStr(NumericOid, "0")
+}
+
+// NumericPow raises a numeric value to a numeric exponent.
+fn NumericPow(a Datum, b Datum) !Datum {
+	let x = try mint.ParseFloat(NumericText(a))
+	let y = try mint.ParseFloat(NumericText(b))
+	return try ParseNumeric(mint.FormatFloat(gauge.Pow(x, y), 'f', 20))
+}
+
+// NumericSqrt returns the square root of a numeric value.
+fn NumericSqrt(a Datum) !Datum {
+	let x = try mint.ParseFloat(NumericText(a))
+	if x < 0.0 { fail ErrorFault(NewError("2201F", "cannot take square root of a negative number")) }
+	return try ParseNumeric(mint.FormatFloat(gauge.Sqrt(x), 'f', 20))
+}
+
+// NumericExp returns e raised to a numeric value.
+fn NumericExp(a Datum) !Datum {
+	let x = try mint.ParseFloat(NumericText(a))
+	return try ParseNumeric(mint.FormatFloat(gauge.Exp(x), 'f', 20))
+}
+
+// NumericLn returns the natural logarithm of a numeric value.
+fn NumericLn(a Datum) !Datum {
+	let x = try mint.ParseFloat(NumericText(a))
+	if x <= 0.0 { fail ErrorFault(NewError("2201E", "cannot take logarithm of zero")) }
+	return try ParseNumeric(mint.FormatFloat(gauge.Log(x), 'f', 20))
+}
+
+// CompareNumeric compares numeric values exactly, including PostgreSQL NaN ordering.
+fn CompareNumeric(a Datum, b Datum) i64 {
+	let x = parse_numeric_value(NumericText(a)) catch _ { return 0 }
+	let y = parse_numeric_value(NumericText(b)) catch _ { return 0 }
+	if x.special == 2 {
+		if y.special == 2 { return 0 }
+		return 1
+	}
+	if y.special == 2 { return -1 }
+	if x.special != 0 || y.special != 0 {
+		if x.special < y.special { return -1 }
+		if x.special > y.special { return 1 }
+		return 0
+	}
+	if x.sign < y.sign { return -1 }
+	if x.sign > y.sign { return 1 }
+	if x.sign == 0 { return 0 }
+	return numeric_abs_compare(x, y)*x.sign
+}
+
+fn NumericIndexKey(d Datum) []u8 {
+	let n = parse_numeric_value(NumericText(d)) catch _ { return []u8{} }
+	mut out = []u8{}
+	if n.special == 2 { return []u8{0x81} }
+	if n.special == 1 { return []u8{0x80} }
+	if n.special == -1 { return []u8{0x00} }
+	if n.sign == 0 { return []u8{0x40} }
+	if n.sign > 0 { out = append(out, 0x60) } else { out = append(out, 0x20) }
+	let biased = u32(n.weight+2147483648)
+	mut mag = []u8{}
+	put_u32(mut mag, biased)
+	let valueDigits = canonical_numeric_digits(n)
+	for i in 0..len(valueDigits) {
+		let d0 = valueDigits[i]
+		mag = append(mag, u8(d0 >> 8), u8(d0))
+	}
+	mag = append(mag, 0, 0)
+	if n.sign < 0 { for i in 0..len(mag) { out = append(out, ~mag[i]) } } else { out = append(out, mag...) }
+	return out
+}
+
+fn canonical_numeric_digits(n Numeric) []i64 {
+	mut digits = n.digits
+	for len(digits) > 0 && digits[len(digits)-1] == 0 { digits = digits[:len(digits)-1] }
+	return digits
+}
+
+fn numeric_neg_value(n Numeric) Numeric {
+	mut out = n
+	if out.special == 1 {
+		out.special = -1
+		return out
+	}
+	if out.special == -1 {
+		out.special = 1
+		return out
+	}
+	out.sign = 0-out.sign
+	return out
+}
+
+fn numeric_low_exp(n Numeric) i64 { return n.weight-len(n.digits)+1 }
+
+fn numeric_digit_at(n Numeric, exp i64) i64 {
+	let idx = n.weight-exp
+	if idx < 0 || idx >= len(n.digits) { return 0 }
+	return n.digits[idx]
+}
+
+fn numeric_abs_compare(a Numeric, b Numeric) i64 {
+	if a.sign == 0 {
+		if b.sign == 0 { return 0 }
+		return -1
+	}
+	if b.sign == 0 { return 1 }
+	if a.weight < b.weight { return -1 }
+	if a.weight > b.weight { return 1 }
+	let low = min(numeric_low_exp(a), numeric_low_exp(b))
+	for i in 0..a.weight-low+1 {
+		let exp = a.weight-i
+		let x = numeric_digit_at(a, exp)
+		let y = numeric_digit_at(b, exp)
+		if x < y { return -1 }
+		if x > y { return 1 }
+	}
+	return 0
+}
+
+fn numeric_from_dense(sign i64, weight i64, scale i64, input []i64) Numeric {
+	mut digits = input
+	mut w = weight
+	for len(digits) > 0 && digits[0] == 0 {
+		digits = digits[1:]
+		w -= 1
+	}
+	for len(digits) > 0 && digits[len(digits)-1] == 0 { digits = digits[:len(digits)-1] }
+	mut s = sign
+	if len(digits) == 0 {
+		s = 0
+		w = 0
+	}
+	return Numeric{sign: s, weight: w, dscale: max(0, scale), digits: digits, special: 0}
+}
+
+fn numeric_round_value(n Numeric, scale i64) Numeric {
+	if n.special != 0 { return n }
+	return numeric_decimal_rescale(n, scale, true)
+}
+
+fn numeric_trunc_value(n Numeric, scale i64) Numeric {
+	if n.special != 0 { return n }
+	return numeric_decimal_rescale(n, scale, false)
+}
+
+fn numeric_decimal_rescale(n Numeric, scale i64, round bool) Numeric {
+	let text = format_numeric(n)
+	mut magnitude = text
+	if n.sign < 0 { magnitude = text[1:] }
+	let dot = find_dot(magnitude)
+	mut integer = magnitude
+	mut fraction = ""
+	if dot >= 0 {
+		integer = magnitude[:dot]
+		fraction = magnitude[dot+1:]
+	}
+	if scale < 0 {
+		let keepCount = max(0, len(integer)+scale)
+		mut first = u8('0')
+		if keepCount < len(integer) { first = integer[keepCount] }
+		mut prefix = integer[:keepCount]
+		if round && first >= u8('5') { prefix = increment_decimal_digits(prefix) }
+		let out = prefix+zeroes(-scale)
+		return parse_numeric_value(signed_numeric_text(n.sign, out, 0)) catch _ { n }
+	}
+	let missing = max(0, scale+1-len(fraction))
+	let padded = fraction+zeroes(missing)
+	let first = padded[scale]
+	let kept = padded[:scale]
+	mut out = integer
+	if scale > 0 { out += "."+kept }
+	if round && first >= u8('5') { out = increment_decimal_point(out) }
+	return parse_numeric_value(signed_numeric_text(n.sign, out, scale)) catch _ { n }
+}
+
+fn find_dot(s str) i64 {
+	for i in 0..len(s) { if s[i] == '.' { return i } }
+	return -1
+}
+
+fn signed_numeric_text(sign i64, magnitude str, scale i64) str {
+	if all_numeric_zero(magnitude) { return zero_with_scale(scale) }
+	if sign < 0 { return "-"+magnitude }
+	return magnitude
+}
+
+fn all_numeric_zero(s str) bool {
+	for c in s { if c >= '1' && c <= '9' { return false } }
+	return true
+}
+
+fn increment_decimal_digits(s str) str {
+	mut digits = []u8{}
+	for i in 0..len(s) { digits = append(digits, s[i]) }
+	if len(digits) == 0 { return "1" }
+	mut at = len(digits)-1
+	for at >= 0 {
+		if digits[at] < u8('9') {
+			digits[at] += 1
+			return str(digits)
+		}
+		digits[at] = u8('0')
+		at -= 1
+	}
+	mut out = []u8{'1'}
+	out = append(out, digits...)
+	return str(out)
+}
+
+fn increment_decimal_point(s str) str {
+	mut digits = []u8{}
+	for i in 0..len(s) { digits = append(digits, s[i]) }
+	mut at = len(digits)-1
+	for at >= 0 {
+		if digits[at] == u8('.') { at -= 1 } else if digits[at] < u8('9') {
+			digits[at] += 1
+			return str(digits)
+		} else {
+			digits[at] = u8('0')
+			at -= 1
+		}
+	}
+	mut out = []u8{'1'}
+	out = append(out, digits...)
+	return str(out)
+}
+
+fn NumericRoundDirected(a Datum, scale i64, direction i64) Datum {
+	let n = parse_numeric_value(NumericText(a)) catch _ { return a }
+	let t = numeric_trunc_value(n, scale)
+	if CompareNumeric(a, FromStr(NumericOid, format_numeric(t))) == 0 { return FromStr(NumericOid, format_numeric(t)) }
+	if direction < 0 && n.sign < 0 { return FromStr(NumericOid, format_numeric(numeric_add_one(t, -1, scale))) }
+	if direction > 0 && n.sign > 0 { return FromStr(NumericOid, format_numeric(numeric_add_one(t, 1, scale))) }
+	return FromStr(NumericOid, format_numeric(t))
+}
+
+fn numeric_add_one(n Numeric, sign i64, scale i64) Numeric {
+	mut unitText = "1"+zeroes(-scale)
+	if scale > 0 { unitText = "0."+zeroes(scale-1)+"1" }
+	let unit = ParseNumeric(unitText) catch _ { return n }
+	mut step = unit
+	if sign < 0 { step = NumericNeg(unit) catch _ { unit } }
+	let current = FromStr(NumericOid, format_numeric(n))
+	let sum = NumericAdd(current, step) catch _ { return n }
+	return parse_numeric_value(sum.s) catch _ { n }
+}
+
+fn zero_with_scale(scale i64) str {
+	if scale <= 0 { return "0" }
+	return "0."+zeroes(scale)
+}
+
+fn reverse_i64(values []i64) []i64 {
+	mut out = []i64{}
+	for i in 0..len(values) { out = append(out, values[len(values)-1-i]) }
+	return out
+}
+
+fn numeric_special_binary(a Numeric, b Numeric, op i64) !Datum {
+	_ = op
+	if a.special == 2 || b.special == 2 { return FromStr(NumericOid, "NaN") }
+	if a.special != 0 {
+		if a.special < 0 { return FromStr(NumericOid, "-Infinity") }
+		return FromStr(NumericOid, "Infinity")
+	}
+	if b.special < 0 { return FromStr(NumericOid, "-Infinity") }
+	return FromStr(NumericOid, "Infinity")
+}
+
+fn numeric_special_mul(a Numeric, b Numeric) str {
+	if a.special == 2 || b.special == 2 { return "NaN" }
+	mut sign = ""
+	if a.sign*b.sign < 0 { sign = "-" }
+	if a.special != 0 || b.special != 0 {
+		if a.sign == 0 || b.sign == 0 { return "NaN" }
+		return sign+"Infinity"
+	}
+	return "0"
+}
+
+fn numeric_special_div(a Numeric, b Numeric) str {
+	if a.special == 2 || b.special == 2 { return "NaN" }
+	if a.special != 0 && b.special != 0 { return "NaN" }
+	if a.special != 0 {
+		if a.special*b.sign < 0 { return "-Infinity" }
+		return "Infinity"
+	}
+	if b.special != 0 { return "0" }
+	return "0"
+}
+
+fn big_append_zero_groups(a []i64, n i64) []i64 {
+	mut out = []i64{}
+	out = append(out, a...)
+	for i in 0..n {
+		out = append(out, 0)
+		_ = i
+	}
+	return out
+}
+
+fn big_trim(a []i64) []i64 {
+	mut out = a
+	for len(out) > 0 && out[len(out)-1] == 0 { out = out[:len(out)-1] }
+	return out
+}
+
+fn big_compare(a []i64, b []i64) i64 {
+	let x = big_trim(a)
+	let y = big_trim(b)
+	if len(x) < len(y) { return -1 }
+	if len(x) > len(y) { return 1 }
+	for k in 0..len(x) {
+		let i = len(x)-1-k
+		if x[i] < y[i] { return -1 }
+		if x[i] > y[i] { return 1 }
+	}
+	return 0
+}
+
+fn big_sub(a []i64, b []i64) []i64 {
+	mut out = []i64{}
+	out = append(out, a...)
+	mut borrow = i64(0)
+	for i in 0..len(out) {
+		mut bv = i64(0)
+		if i < len(b) { bv = b[i] }
+		mut v = out[i]-bv-borrow
+		borrow = 0
+		if v < 0 {
+			v += NumericBase
+			borrow = 1
+		}
+		out[i] = v
+	}
+	return big_trim(out)
+}
+
+fn big_mul_base_add(a []i64, digit i64) []i64 {
+	mut out = []i64{digit}
+	out = append(out, a...)
+	return big_trim(out)
+}
+
+fn big_divmod(a []i64, b []i64) ([]i64, []i64) {
+	mut q = []i64{}
+	mut rem = []i64{}
+	for i in 0..len(a) {
+		q = append(q, 0)
+		_ = i
+	}
+	for k in 0..len(a) {
+		let i = len(a)-1-k
+		rem = big_mul_base_add(rem, a[i])
+		let (digit, next) = big_div_digit(rem, b)
+		q[i] = digit
+		rem = next
+	}
+	return big_trim(q), rem
+}
+
+fn big_div_digit(a []i64, b []i64) (i64, []i64) {
+	mut q = i64(0)
+	mut rem = a
+	for big_compare(rem, b) >= 0 {
+		rem = big_sub(rem, b)
+		q += 1
+	}
+	return q, rem
+}

@@ -21,10 +21,18 @@ type PageHeader struct {
 // NewPage returns an empty page with valid free-space boundaries.
 fn NewPage() Page {
 	mut p = Page{Data: make([]u8, PageSize)}
+	p.Reset()
+	return p
+}
+
+// Reset clears the reusable page bytes and restores an empty slotted-page header.
+fn (p mut Page) Reset() {
+	for i in 0..len(p.Data) {
+		p.Data[i] = 0
+	}
 	writeU16(mut p.Data, 16, u16(pageHeaderSize))
 	writeU16(mut p.Data, 18, u16(PageSize))
 	p.Seal()
-	return p
 }
 
 // Header decodes the common page header.
@@ -85,6 +93,71 @@ fn (p mut Page) Insert(value []u8) !u16 {
 	writeU16(mut p.Data, 20, slot+1)
 	p.Seal()
 	return slot + 1
+}
+
+// ReserveSlot reserves line-pointer space and returns a slot for a tuple whose bytes are not yet
+// installed. A reserved slot is invisible to Item and can be completed after WAL append returns.
+fn (p mut Page) ReserveSlot(itemBytes i64, reservedBytes i64) !u16 {
+	if len(p.Data) != PageSize || itemBytes <= 0 || reservedBytes < 0 {
+		fail "store: invalid tuple reservation"
+	}
+	let h = p.Header()
+	for slot in 1..i64(h.Slots)+1 {
+		let lp = pageHeaderSize + (slot-1)*linePointerSize
+		if readU32(p.Data, lp+4) == 0 && readU16(p.Data, lp+2) == 0 {
+			if p.FreeSpace() < itemBytes+reservedBytes {
+				fail "store: page full"
+			}
+			writeU32(mut p.Data, lp+4, 2)
+			p.Seal()
+			return u16(slot)
+		}
+	}
+	if p.FreeSpace() < itemBytes+reservedBytes+linePointerSize {
+		fail "store: page full"
+	}
+	let slot = h.Slots+1
+	let lp = pageHeaderSize+i64(h.Slots)*linePointerSize
+	writeU16(mut p.Data, lp, 0)
+	writeU16(mut p.Data, lp+2, 0)
+	writeU32(mut p.Data, lp+4, 2)
+	writeU16(mut p.Data, 16, u16(i64(h.Lower)+linePointerSize))
+	writeU16(mut p.Data, 20, slot)
+	p.Seal()
+	return slot
+}
+
+// InsertReserved fills a slot reserved by ReserveSlot; reservedBytes includes this value.
+fn (p mut Page) InsertReserved(slot u16, value []u8, reservedBytes i64) ! {
+	let h = p.Header()
+	if slot == 0 || slot > h.Slots || len(value) == 0 || reservedBytes < len(value) {
+		fail "store: invalid reserved tuple"
+	}
+	let lp = pageHeaderSize+i64(slot-1)*linePointerSize
+	if readU32(p.Data, lp+4) != 2 || readU16(p.Data, lp+2) != 0 || p.FreeSpace() < reservedBytes {
+		fail "store: invalid reserved line pointer"
+	}
+	let off = i64(h.Upper)-len(value)
+	copy(p.Data[off:off+len(value)], value)
+	writeU16(mut p.Data, lp, u16(off))
+	writeU16(mut p.Data, lp+2, u16(len(value)))
+	writeU32(mut p.Data, lp+4, 1)
+	writeU16(mut p.Data, 18, u16(off))
+	p.Seal()
+}
+
+// Unreserve releases a tuple slot when the WAL append itself fails.
+fn (p mut Page) Unreserve(slot u16) ! {
+	let h = p.Header()
+	if slot == 0 || slot > h.Slots {
+		fail "store: invalid tuple reservation"
+	}
+	let lp = pageHeaderSize+i64(slot-1)*linePointerSize
+	if readU32(p.Data, lp+4) != 2 || readU16(p.Data, lp+2) != 0 {
+		fail "store: line pointer is not reserved"
+	}
+	writeU32(mut p.Data, lp+4, 0)
+	p.Seal()
 }
 
 // SetItem replaces a live item's bytes without changing its line pointer.

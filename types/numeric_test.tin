@@ -1,0 +1,117 @@
+package types
+
+import "crucible"
+
+fn TestNumericParseAndText(t mut crucible.T) {
+	let inputs = []str{"1.2300", "1.23e2", "1.23e-2", "-.5", "999999999999999999999999.001", "NaN", "Infinity", "-Infinity"}
+	let wants = []str{"1.2300", "123", "0.0123", "-0.5", "999999999999999999999999.001", "NaN", "Infinity", "-Infinity"}
+	for i, input in inputs {
+		let got = ParseNumeric(input) catch err {
+			t.Error("numeric parse {input} failed: {ErrorMessage(err)}")
+			return
+		}
+		crucible.Equal(mut t, "numeric text {input}", got.Text(), wants[i])
+	}
+	let invalid = ParseNumeric("12x") catch err {
+		crucible.Equal(mut t, "numeric invalid code", ErrorCode(err), "22P02")
+		crucible.Equal(mut t, "numeric invalid message", ErrorMessage(err), "invalid input syntax for type numeric: \"12x\"")
+		return
+	}
+	_ = invalid
+	t.Error("invalid numeric input succeeded")
+}
+
+fn TestNumericArithmetic(t mut crucible.T) {
+	let a = ParseNumeric("12345678901234567890.12") catch _ { return }
+	let b = ParseNumeric("0.88") catch _ { return }
+	let sum = NumericAdd(a, b) catch _ { return }
+	crucible.Equal(mut t, "numeric addition", sum.Text(), "12345678901234567891.00")
+	let product = NumericMul(a, b) catch _ { return }
+	crucible.Equal(mut t, "numeric multiplication", product.Text(), "10864197433086419743.3056")
+	let one = ParseNumeric("1") catch _ { return }
+	let three = ParseNumeric("3") catch _ { return }
+	let third = NumericDiv(one, three) catch _ { return }
+	crucible.Equal(mut t, "numeric division scale", third.Text(), "0.33333333333333333333")
+	let a1 = ParseNumeric("1.00") catch _ { return }
+	let a2 = ParseNumeric("1.000") catch _ { return }
+	let neg = NumericSub(a1, a2) catch _ { return }
+	crucible.Equal(mut t, "numeric subtraction zero scale", neg.Text(), "0.000")
+	let ten = ParseNumeric("10") catch _ { return }
+	let remainder = NumericMod(ten, three) catch _ { return }
+	crucible.Equal(mut t, "numeric modulo", remainder.Text(), "1")
+}
+
+fn TestNumericRoundingAndCompare(t mut crucible.T) {
+	let half = ParseNumeric("1.235") catch _ { return }
+	let rounded = NumericRound(half, 2) catch _ { return }
+	crucible.Equal(mut t, "numeric half away from zero", rounded.Text(), "1.24")
+	let truncInput = ParseNumeric("-1.239") catch _ { return }
+	crucible.Equal(mut t, "numeric trunc", NumericTrunc(truncInput, 2).Text(), "-1.23")
+	let directedInput = ParseNumeric("-1.2") catch _ { return }
+	crucible.Equal(mut t, "numeric floor", NumericFloor(directedInput).Text(), "-2")
+	crucible.Equal(mut t, "numeric ceil", NumericCeil(directedInput).Text(), "-1")
+	let bigA = ParseNumeric("99999999999999999999") catch _ { return }
+	let bigB = ParseNumeric("100000000000000000000") catch _ { return }
+	t.True("numeric order huge", CompareNumeric(bigA, bigB) < 0)
+	let scaled = ParseNumeric("1.00") catch _ { return }
+	let plain = ParseNumeric("1") catch _ { return }
+	t.True("numeric scale compares equal", CompareNumeric(scaled, plain) == 0)
+}
+
+fn TestNumericTypmodAndSpecialFaults(t mut crucible.T) {
+	let rounded = ParseNumericTypmod("123.456", 5, 2) catch _ { return }
+	crucible.Equal(mut t, "numeric typmod round", rounded.Text(), "123.46")
+	let overflow = ParseNumericTypmod("999.99", 4, 2) catch err {
+		crucible.Equal(mut t, "numeric typmod overflow code", ErrorCode(err), "22003")
+		return
+	}
+	_ = overflow
+	t.Error("numeric typmod overflow succeeded")
+	let one = ParseNumeric("1") catch _ { return }
+	let zero = ParseNumeric("0") catch _ { return }
+	let divzero = NumericDiv(one, zero) catch err {
+		crucible.Equal(mut t, "numeric division zero code", ErrorCode(err), "22012")
+		return
+	}
+	_ = divzero
+	t.Error("numeric division by zero succeeded")
+}
+
+fn TestNumericBinaryWire(t mut crucible.T) {
+	let value = Parse(NumericOid, "12.34") catch _ { return }
+	mut encoded = []u8{}
+	EncodeBinary(value, mut encoded)
+	crucible.Equal(mut t, "numeric wire bytes", hex(encoded), "0002000000000002000c0d48")
+	let decoded = DecodeBinary(NumericOid, encoded) catch err {
+		t.Error("numeric binary decode: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "numeric binary text", decoded.Text(), "12.34")
+	let invalid = DecodeBinary(NumericOid, []u8{}) catch err {
+		crucible.Equal(mut t, "numeric malformed binary code", ErrorCode(err), "22P03")
+		return
+	}
+	_ = invalid
+	t.Error("empty numeric binary input succeeded")
+}
+
+fn TestFloatOutputAndOrdering(t mut crucible.T) {
+	let tenth = Parse(Float4Oid, "0.1") catch _ { return }
+	crucible.Equal(mut t, "float4 shortest", tenth.Text(), "0.1")
+	let large = Parse(Float8Oid, "1e20") catch _ { return }
+	crucible.Equal(mut t, "float8 exponent", large.Text(), "1e+20")
+	let nan = Parse(Float8Oid, "NaN") catch _ { return }
+	let inf = Parse(Float8Oid, "Infinity") catch _ { return }
+	crucible.Equal(mut t, "float infinity spelling", inf.Text(), "Infinity")
+	t.True("PostgreSQL NaN ordering", Compare(nan, inf) > 0)
+}
+
+fn TestStructuredScalarParseErrors(t mut crucible.T) {
+	let invalid = Parse(Int4Oid, "abc") catch err {
+		crucible.Equal(mut t, "integer parse SQLSTATE", ErrorCode(err), "22P02")
+		crucible.Equal(mut t, "integer parse message", ErrorMessage(err), "invalid input syntax for type integer: \"abc\"")
+		return
+	}
+	_ = invalid
+	t.Error("invalid integer input succeeded")
+}

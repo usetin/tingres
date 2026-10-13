@@ -1,0 +1,151 @@
+package types
+
+import "glyph"
+import "lasso"
+import "twine"
+
+const TextArrayOid Oid = 1009
+
+fn registerRegexFuncs(funcs mut []Func) {
+	for _, name in []str{"regexp_match", "regexp_matches", "regexp_split_to_array"} {
+		registerFunc(mut funcs, function2(name, []Oid{TextOid, TextOid}, TextArrayOid, true, false, fn(text Datum, pattern Datum) !Datum {
+			return try regexArrayUnsupported(name, text, pattern, Null())
+		}))
+		registerFunc(mut funcs, function3(name, []Oid{TextOid, TextOid, TextOid}, TextArrayOid, true, false, fn(text Datum, pattern Datum, flags Datum) !Datum {
+			return try regexArrayUnsupported(name, text, pattern, flags)
+		}))
+	}
+	registerFunc(mut funcs, function3("regexp_replace", []Oid{TextOid, TextOid, TextOid}, TextOid, true, false, fn(text Datum, pattern Datum, replacement Datum) !Datum {
+		return try regexReplace(text.Text(), pattern.Text(), replacement.Text(), "")
+	}))
+	registerFunc(mut funcs, function("regexp_replace", []Oid{TextOid, TextOid, TextOid, TextOid}, TextOid, true, false, fn(args []Datum) !Datum {
+		return try regexReplace(args[0].Text(), args[1].Text(), args[2].Text(), args[3].Text())
+	}))
+}
+
+fn regexArrayUnsupported(name str, text Datum, pattern Datum, flags Datum) !Datum {
+	_ = text
+	_ = pattern
+	_ = flags
+	try pgRaise("0A000", "{name} array results are not supported")
+	return Null()
+}
+
+fn regexOperator(name str, text str, pattern str) !Datum {
+	let insensitive = name == "~*" || name == "!~*"
+	let re = try compileRegex(pattern, insensitive, false)
+	mut matched = re.Match(text)
+	if name == "!~" || name == "!~*" { matched = !matched }
+	return FromBool(matched)
+}
+
+fn regexReplace(text str, pattern str, replacement str, flags str) !Datum {
+	let parsed = try parseRegexFlags(flags, true)
+	let re = try compileRegex(pattern, parsed.Insensitive, parsed.DotAll)
+	let template = postgresReplacement(replacement)
+	mut out = ""
+	if parsed.Global {
+		out = re.Replace(text, template)
+	} else {
+		let (start, _, found) = re.Find(text)
+		if !found { return FromStr(TextOid, text) }
+		let suffix = text[start:]
+		let anchored = try compileRegex("^(?:" + pattern + ")", parsed.Insensitive, parsed.DotAll)
+		out = text[:start] + anchored.Replace(suffix, template)
+	}
+	return FromStr(TextOid, out)
+}
+
+type RegexFlags value struct {
+	Global bool
+	Insensitive bool
+	DotAll bool
+}
+
+fn parseRegexFlags(flags str, allowGlobal bool) !RegexFlags {
+	mut out = RegexFlags{Global: false, Insensitive: false, DotAll: false}
+	for _, flag in flags {
+		if flag == 'g' && allowGlobal { out.Global = true
+		} else if flag == 'i' { out.Insensitive = true
+		} else if flag == 'c' { out.Insensitive = false
+		} else if flag == 's' { out.DotAll = true
+		} else { try pgRaise("0A000", "regular expression flag is not supported: {str(flag)}") }
+	}
+	return out
+}
+
+fn compileRegex(pattern str, insensitive bool, dotAll bool) !lasso.Regexp {
+	try rejectUnsupportedRegex(pattern)
+	mut source = ""
+	if insensitive { source += "(?i)" }
+	if dotAll { source += "(?s)" }
+	source += pattern
+	let re = lasso.Compile(source) catch _ {
+		try pgRaise("2201B", "invalid regular expression")
+		return try lasso.Compile("")
+	}
+	return re
+}
+
+fn rejectUnsupportedRegex(pattern str) ! {
+	mut i = i64(0)
+	for i < len(pattern) {
+		if pattern[i] == '\\' && i+1 < len(pattern) {
+			let next = pattern[i+1]
+			if next >= '0' && next <= '9' || next == 'm' || next == 'M' || next == 'y' || next == 'Y' || next == 'A' || next == 'Z' {
+				try pgRaise("0A000", "regular expression construct is not supported")
+			}
+			i += 2
+			continue
+		}
+		if pattern[i] == '(' && i+2 < len(pattern) && pattern[i+1] == '?' && (pattern[i+2] == '=' || pattern[i+2] == '!' || pattern[i+2] == '<') {
+			try pgRaise("0A000", "regular expression lookaround is not supported")
+		}
+		i += 1
+	}
+}
+
+fn postgresReplacement(replacement str) str {
+	mut out = ""
+	mut i = i64(0)
+	for i < len(replacement) {
+		let c = replacement[i]
+		if c == '&' {
+			out += "$0"
+		} else if c == '\\' && i+1 < len(replacement) {
+			let next = replacement[i+1]
+			if next >= '0' && next <= '9' { out += "$" + str(next) } else { out += str(next) }
+			i += 1
+		} else if c == '$' { out += "$$"
+		} else { out += str(c) }
+		i += 1
+	}
+	return out
+}
+
+fn similarRegexMatch(text str, pattern str, escape str) !Datum {
+	let transformed = try similarRegexPattern(pattern, escape)
+	let re = try compileRegex("^(" + transformed + ")$", false, false)
+	return FromBool(re.Match(text))
+}
+
+fn similarRegexPattern(pattern str, escape str) !str {
+	let chars = textRunes(pattern)
+	let esc = textRunes(escape)
+	if len(esc) > 1 { try pgRaise("22025", "SIMILAR TO escape must be a single character") }
+	mut out = ""
+	mut i = i64(0)
+	for i < len(chars) {
+		let c = chars[i]
+		if len(esc) == 1 && c == esc[0] {
+			i += 1
+			if i >= len(chars) { try pgRaise("22025", "LIKE pattern must not end with escape character") }
+			out += lasso.QuoteMeta(glyph.RuneStr(chars[i]))
+		} else if c == '%' { out += ".*"
+		} else if c == '_' { out += "."
+		} else if c == '.' || c == '^' || c == '$' { out += "\\" + glyph.RuneStr(c)
+		} else { out += glyph.RuneStr(c) }
+		i += 1
+	}
+	return out
+}
