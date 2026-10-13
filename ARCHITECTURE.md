@@ -188,6 +188,10 @@ type Sink shape {
 	DataRow(r types.Row)
 	CommandComplete(tag str)                       // "SELECT 5", "INSERT 0 1", ...
 	Notice(n Notice)
+	CopyIn(format i8, columnFormats []i16)
+	CopyOut(format i8, columnFormats []i16)
+	CopyData(d []u8)
+	CopyDone()
 }
 ```
 
@@ -221,3 +225,32 @@ type ErrorFields struct { severity str, code str, message str, detail str, hint 
   under `tests/compiler_bugs/NAME.tin`, note it in `BUGS.md`, work around it, and keep going.
 - **Benchmarks** are Linux only (`bench/`), against real PostgreSQL on the same machine, medians with the ratio.
 - **Format** with `tin fmt -w`. Style: match the neighbouring code; comments say why, not what.
+
+## 4. Performance is the product
+
+Tin exists for speed, so tingres must beat PostgreSQL by a wide margin on the same Linux machine, not just match it.
+This is a design constraint on every package, checked by benchmarks, not a slogan.
+
+Where the advantage has to come from (PostgreSQL's known costs, and our answer):
+
+| PostgreSQL cost | tingres design |
+|---|---|
+| process per connection, shared-memory IPC, LWLock/spinlock traffic | one task per connection on a lane (core); shared structures sharded per lane; no latch held across a wait |
+| tuple-at-a-time interpreter, `Datum` boxing and function-call overhead per expression | expressions compiled once per plan to straight-line closures/bytecode over unboxed values; typed fast paths (int4/int8/float8/text) with no NULL checks when a column is NOT NULL; batch (vector of 1k rows) operators for scans, filters, hash joins and aggregates |
+| per-row `palloc`, `MemoryContext` churn | per-statement arenas (`arena { }`), rows are slices into pinned pages until they must be copied; no per-row heap allocation on the scan path |
+| 24-byte tuple header, MVCC visibility check per tuple | hint bits set early; page-level "all visible" bit so scans skip the clog and the snapshot test; compact header |
+| plan and parse on every simple query | parse-tree/plan cache keyed by normalized text and catalog version; extended protocol skips re-planning |
+| WAL: one fsync per commit unless grouped, full-page writes after checkpoint | group commit with an io_uring/fdatasync batch on Linux, a WAL ring in memory, `full_page_writes` only when the page is torn-risky (checksum + double-write alternative evaluated) |
+| B-tree: pointer chasing, per-key `memcmp` through a comparator | memcmp-ordered key bytes (types.IndexKey), prefix compression, SIMD-friendly in-page search, right-sized pages, no comparator indirection |
+| syscalls per IO | batched positional IO, io_uring where available (Linux), readahead for sequential scans |
+
+Rules:
+- Every hot path gets a benchmark in `bench/` from the day it is written (`BenchmarkXxx` or a pgbench-style script), and a
+  regression is a failed check, not a note.
+- Linux numbers only (arm64 and x86-64), tingres vs real PostgreSQL 17 on the same machine in the same run, interleaved,
+  medians with the ratio, machine/CPU/kernel stated. Never quote macOS numbers. Targets to publish once measured:
+  pgbench select-only, tpcb-like, point lookups by PK, scan+aggregate (TPC-H Q1/Q6 shape), bulk insert and COPY, 1..N clients.
+- When a design choice trades speed for compatibility, compatibility of observable behaviour wins and the speed is
+  recovered under the hood (plan cache, fast paths), never by changing results.
+- Durability is not traded away to win a benchmark: `fsync` stays on in every published number; a faster-than-fsync
+  mode (`synchronous_commit=off`) is compared only against PostgreSQL's equivalent setting.

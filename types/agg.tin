@@ -1,0 +1,305 @@
+package types
+
+import "mint"
+
+// AggState is the compact per-group state shared by built-in transitions.
+type AggState value struct {
+	Count i64
+	Value Datum
+	HasValue bool
+	Text str
+	Delimiter str
+	Bool bool
+}
+
+// Agg describes one aggregate transition and finalization pair.
+type Agg value struct {
+	Name str
+	Args []u32
+	Ret u32
+	Init fn() AggState
+	Step fn(AggState, []Datum) !AggState
+	Final fn(AggState) !Datum
+	HasCombine bool
+	Combine fn(AggState, AggState) !AggState
+}
+
+fn registerAgg(aggs mut []Agg, agg Agg) { aggs = append(aggs, agg) }
+
+fn LookupAgg(name str, args []Oid) ?Agg {
+	if name == "array_agg" && len(args) == 1 {
+		return unsupportedArrayAgg(args[0])
+	}
+	if name == "count" && len(args) <= 1 {
+		return makeAgg(name, args, Int8Oid, fn(state AggState, values []Datum) !AggState {
+			mut out = state
+			if len(values) == 0 || !IsNull(values[0]) { out.Count += 1 }
+			return out
+		})
+	}
+	if name == "string_agg" && len(args) == 2 && (args[0] == TextOid || args[0] == VarcharOid || args[0] == BpcharOid) && isStringType(args[1]) {
+		return makeAgg(name, args, TextOid, fn(state AggState, values []Datum) !AggState { return try stringAggStep(state, values) })
+	}
+	if len(args) != 1 { return nil }
+	let arg = args[0]
+	if name == "sum" {
+		if arg == Int2Oid || arg == Int4Oid { return makeAgg(name, args, Int8Oid, fn(state AggState, values []Datum) !AggState { return try sumStep(state, values[0], Int8Oid) }) }
+		if arg == Int8Oid { return makeAgg(name, args, NumericOid, fn(state AggState, values []Datum) !AggState { return try sumStep(state, values[0], NumericOid) }) }
+		if arg == Float4Oid || arg == Float8Oid { return makeAgg(name, args, arg, fn(state AggState, values []Datum) !AggState { return try sumStep(state, values[0], arg) }) }
+	}
+	if name == "avg" {
+		if arg == Int2Oid || arg == Int4Oid || arg == Int8Oid { return makeAgg(name, args, NumericOid, fn(state AggState, values []Datum) !AggState { return try avgStep(state, values[0]) }) }
+		if arg == Float4Oid || arg == Float8Oid { return makeAgg(name, args, Float8Oid, fn(state AggState, values []Datum) !AggState { return try avgStepFloat(state, values[0]) }) }
+	}
+	if name == "min" || name == "max" {
+		if isOrderable(arg) { return makeAgg(name, args, arg, fn(state AggState, values []Datum) !AggState { return try extremumStep(state, values[0], name == "max") }) }
+	}
+	if name == "bool_and" || name == "every" || name == "bool_or" {
+		if arg == BoolOid { return makeAgg(name, args, BoolOid, fn(state AggState, values []Datum) !AggState { return try boolAggStep(state, values[0], name == "bool_or") }) }
+	}
+	if name == "bit_and" || name == "bit_or" {
+		if isInteger(arg) { return makeAgg(name, args, arg, fn(state AggState, values []Datum) !AggState { return try bitAggStep(state, values[0], name == "bit_or") }) }
+	}
+	return nil
+}
+
+fn makeAgg(name str, args []Oid, ret Oid, step fn(AggState, []Datum) !AggState) ?Agg {
+	let agg = Agg{
+		Name: name,
+		Args: args,
+		Ret: ret,
+		Init: fn() AggState { return AggState{Count: 0, Value: Null(), HasValue: false, Text: "", Delimiter: "", Bool: false} },
+		Step: step,
+		Final: fn(state AggState) !Datum { return try aggregateFinal(name, ret, state) },
+		HasCombine: true,
+		Combine: fn(a AggState, b AggState) !AggState { return try combineAgg(name, a, b) },
+	}
+	return agg
+}
+
+fn isOrderable(oid Oid) bool {
+	return isNumericType(oid) || isStringType(oid) || oid == BoolOid || oid == ByteaOid || oid == UuidOid
+}
+
+fn sumStep(state AggState, value Datum, ret Oid) !AggState {
+	if IsNull(value) { return state }
+	mut out = state
+	if ret == NumericOid {
+		let next = mint.Itoa(value.i)
+		if out.HasValue { out.Text = addDecimalIntegers(out.Text, next) } else { out.Text = next }
+		out.Value = FromStr(NumericOid, out.Text)
+	} else if isInteger(value.Oid()) {
+		mut current = i64(0)
+		if out.HasValue { current = out.Value.i }
+		let next = current+value.i
+		out.Value = FromI64(ret, next)
+	} else {
+		mut current = 0.0
+		if out.HasValue { current = out.Value.f }
+		out.Value = FromF64(ret, current+value.f)
+	}
+	out.Count += 1
+	out.HasValue = true
+	return out
+}
+
+fn avgStep(state AggState, value Datum) !AggState {
+	if IsNull(value) { return state }
+	mut out = state
+	let text = mint.Itoa(value.i)
+	if out.HasValue { out.Text = addDecimalIntegers(out.Text, text) } else { out.Text = text }
+	out.Count += 1
+	out.HasValue = true
+	return out
+}
+
+fn avgStepFloat(state AggState, value Datum) !AggState {
+	if IsNull(value) { return state }
+	mut current = 0.0
+	if state.HasValue { current = state.Value.f }
+	mut out = state
+	out.Value = FromF64(Float8Oid, current+numericAsFloat(value))
+	out.Count += 1
+	out.HasValue = true
+	return out
+}
+
+fn extremumStep(state AggState, value Datum, greatest bool) !AggState {
+	if IsNull(value) { return state }
+	mut out = state
+	if !out.HasValue || greatest && Compare(value, out.Value) > 0 || !greatest && Compare(value, out.Value) < 0 {
+		out.Value = value
+		out.HasValue = true
+	}
+	out.Count += 1
+	return out
+}
+
+fn stringAggStep(state AggState, values []Datum) !AggState {
+	if IsNull(values[0]) || IsNull(values[1]) { return state }
+	mut out = state
+	if out.HasValue { out.Text += values[1].Text()+values[0].Text() } else { out.Text = values[0].Text() }
+	out.HasValue = true
+	out.Count += 1
+	return out
+}
+
+fn boolAggStep(state AggState, value Datum, isOr bool) !AggState {
+	if IsNull(value) { return state }
+	mut out = state
+	if !out.HasValue { out.Bool = value.b } else if isOr { out.Bool = out.Bool || value.b } else { out.Bool = out.Bool && value.b }
+	out.HasValue = true
+	out.Count += 1
+	return out
+}
+
+fn bitAggStep(state AggState, value Datum, isOr bool) !AggState {
+	if IsNull(value) { return state }
+	mut out = state
+	if !out.HasValue { out.Value = value } else if isOr { out.Value = FromI64(value.Oid(), out.Value.i | value.i) } else { out.Value = FromI64(value.Oid(), out.Value.i & value.i) }
+	out.HasValue = true
+	out.Count += 1
+	return out
+}
+
+fn aggregateFinal(name str, ret Oid, state AggState) !Datum {
+	if name == "count" { return FromI64(Int8Oid, state.Count) }
+	if name == "avg" {
+		if !state.HasValue { return Null() }
+		if ret == NumericOid { return FromStr(NumericOid, decimalAverage(state.Text, state.Count)) }
+		return FromF64(Float8Oid, state.Value.f/f64(state.Count))
+	}
+	if !state.HasValue { return Null() }
+	if name == "string_agg" { return FromStr(TextOid, state.Text) }
+	if name == "bool_and" || name == "every" || name == "bool_or" { return FromBool(state.Bool) }
+	if ret == NumericOid { return FromStr(NumericOid, state.Text) }
+	return state.Value
+}
+
+fn combineAgg(name str, left AggState, right AggState) !AggState {
+	if name == "count" {
+		mut out = left
+		out.Count += right.Count
+		return out
+	}
+	if !right.HasValue { return left }
+	if !left.HasValue { return right }
+	mut out = left
+	if name == "sum" && left.Value.Oid() == NumericOid {
+		out.Text = addDecimalIntegers(left.Text, right.Text)
+		out.Value = FromStr(NumericOid, out.Text)
+	} else if name == "sum" { out.Value = FromF64(left.Value.Oid(), left.Value.f+right.Value.f)
+	} else if name == "avg" && left.Value.Oid() == Float8Oid {
+		out.Value = FromF64(Float8Oid, left.Value.f+right.Value.f)
+		out.Count += right.Count
+	} else if name == "avg" {
+		out.Text = addDecimalIntegers(left.Text, right.Text)
+		out.Count += right.Count
+	} else if name == "min" || name == "max" {
+		if (name == "max" && Compare(right.Value,left.Value)>0) || (name == "min" && Compare(right.Value,left.Value)<0) { out.Value = right.Value }
+	} else if name == "string_agg" { out.Text += right.Text
+	} else if name == "bool_or" { out.Bool = left.Bool || right.Bool
+	} else if name == "bool_and" || name == "every" { out.Bool = left.Bool && right.Bool
+	} else if name == "bit_or" { out.Value = FromI64(left.Value.Oid(), left.Value.i | right.Value.i)
+	} else if name == "bit_and" { out.Value = FromI64(left.Value.Oid(), left.Value.i & right.Value.i)
+	}
+	out.HasValue = true
+	out.Count += right.Count
+	return out
+}
+
+fn unsupportedArrayAgg(oid Oid) ?Agg {
+	return makeAgg("array_agg", []Oid{oid}, 0, fn(state AggState, values []Datum) !AggState { fail "array_agg transition is not available" })
+}
+
+fn addDecimalIntegers(a str, b str) str {
+	let aneg = len(a) > 0 && a[0] == '-'
+	let bneg = len(b) > 0 && b[0] == '-'
+	mut aa = a
+	mut bb = b
+	if aneg { aa = a[1:] }
+	if bneg { bb = b[1:] }
+	if aneg == bneg {
+		let sum = addPositiveIntegers(aa, bb)
+		if aneg { return "-"+sum }
+		return sum
+	}
+	let cmp = compareDecimalDigits(aa, bb)
+	if cmp == 0 { return "0" }
+	if cmp > 0 {
+		let difference = subtractPositiveIntegers(aa, bb)
+		if aneg { return "-"+difference }
+		return difference
+	}
+	let difference = subtractPositiveIntegers(bb, aa)
+	if bneg { return "-"+difference }
+	return difference
+}
+
+fn compareDecimalDigits(a str, b str) i64 {
+	let aa = trimDecimalZeroes(a)
+	let bb = trimDecimalZeroes(b)
+	if len(aa) < len(bb) { return -1 }
+	if len(aa) > len(bb) { return 1 }
+	if aa < bb { return -1 }
+	if aa > bb { return 1 }
+	return 0
+}
+
+fn trimDecimalZeroes(s str) str {
+	mut i = i64(0)
+	for i+1 < len(s) && s[i] == '0' { i += 1 }
+	return s[i:]
+}
+
+fn addPositiveIntegers(a str, b str) str {
+	mut i = len(a)-1
+	mut j = len(b)-1
+	mut carry = i64(0)
+	mut out = ""
+	for i >= 0 || j >= 0 || carry > 0 {
+		mut n = carry
+		if i >= 0 {
+			n += i64(a[i]-'0')
+			i -= 1
+		}
+		if j >= 0 {
+			n += i64(b[j]-'0')
+			j -= 1
+		}
+		out = str(u8('0'+u8(n%10)))+out
+		carry = n/10
+	}
+	return out
+}
+
+fn subtractPositiveIntegers(a str, b str) str {
+	mut i = len(a)-1
+	mut j = len(b)-1
+	mut borrow = i64(0)
+	mut out = ""
+	for i >= 0 {
+		mut n = i64(a[i]-'0')-borrow
+		if j >= 0 {
+			n -= i64(b[j]-'0')
+			j -= 1
+		}
+		borrow = 0
+		if n < 0 {
+			n += 10
+			borrow = 1
+		}
+		out = str(u8('0'+u8(n)))+out
+		i -= 1
+	}
+	return trimDecimalZeroes(out)
+}
+
+fn decimalAverage(sum str, count i64) str {
+	let value = tryParseFloatDecimal(sum)
+	return mint.FormatFloat(value/f64(count), 'f', 16)
+}
+
+fn tryParseFloatDecimal(s str) f64 {
+	return mint.ParseFloat(s) catch _ { 0.0 }
+}

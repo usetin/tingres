@@ -1,0 +1,286 @@
+package types
+
+import "glyph"
+import "twine"
+import "mint"
+import "seal"
+
+fn registerStringFuncs(funcs mut []Func) {
+	for _, oid in []Oid{TextOid, VarcharOid, BpcharOid, NameOid} {
+		for _, name in []str{"lower", "upper", "initcap", "reverse", "md5", "quote_ident", "quote_literal", "quote_nullable"} {
+			registerFunc(mut funcs, function(name, []Oid{oid}, TextOid, name != "quote_nullable", false, fn(args []Datum) !Datum { return try stringUnary(name, args[0]) }))
+		}
+		for _, name in []str{"length", "char_length", "character_length", "octet_length", "bit_length", "ascii"} {
+			registerFunc(mut funcs, function(name, []Oid{oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try stringLength(name, args[0]) }))
+		}
+		registerFunc(mut funcs, function("||", []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringConcat(args[0], args[1]) }))
+		registerFunc(mut funcs, function("strpos", []Oid{oid, oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try stringPosition(args[0], args[1]) }))
+		registerFunc(mut funcs, function("position", []Oid{oid, oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try stringPosition(args[1], args[0]) }))
+		registerFunc(mut funcs, function("starts_with", []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try stringStartsWith(args[0], args[1]) }))
+		for _, name in []str{"substr", "substring"} {
+			registerFunc(mut funcs, function(name, []Oid{oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringSubstr(args[0], args[1].i, -1) }))
+			registerFunc(mut funcs, function(name, []Oid{oid, Int4Oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringSubstr(args[0], args[1].i, args[2].i) }))
+		}
+		registerFunc(mut funcs, function("left", []Oid{oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringLeftRight(args[0], args[1].i, false) }))
+		registerFunc(mut funcs, function("right", []Oid{oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringLeftRight(args[0], args[1].i, true) }))
+		registerFunc(mut funcs, function("ltrim", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTrim("ltrim", args[0], "") }))
+		registerFunc(mut funcs, function("rtrim", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTrim("rtrim", args[0], "") }))
+		registerFunc(mut funcs, function("btrim", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTrim("btrim", args[0], "") }))
+		for _, name in []str{"ltrim", "rtrim", "btrim", "trim"} {
+			registerFunc(mut funcs, function(name, []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTrim(name, args[0], args[1].Text()) }))
+		}
+		registerFunc(mut funcs, function("replace", []Oid{oid, oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringReplace(args[0], args[1], args[2]) }))
+		registerFunc(mut funcs, function("translate", []Oid{oid, oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTranslate(args[0], args[1], args[2]) }))
+		registerFunc(mut funcs, function("repeat", []Oid{oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringRepeat(args[0], args[1].i) }))
+		registerFunc(mut funcs, function("split_part", []Oid{oid, oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringSplitPart(args[0], args[1], args[2].i) }))
+		registerFunc(mut funcs, function("overlay", []Oid{oid, oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringOverlay(args[0], args[1], args[2].i, -1) }))
+		registerFunc(mut funcs, function("overlay", []Oid{oid, oid, Int4Oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringOverlay(args[0], args[1], args[2].i, args[3].i) }))
+		registerFunc(mut funcs, function("lpad", []Oid{oid, Int4Oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringPad(args[0], args[1].i, args[2], false) }))
+		registerFunc(mut funcs, function("rpad", []Oid{oid, Int4Oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringPad(args[0], args[1].i, args[2], true) }))
+	}
+	registerFunc(mut funcs, function("chr", []Oid{Int4Oid}, TextOid, true, false, fn(args []Datum) !Datum { return try stringChr(args[0].i) }))
+	registerFunc(mut funcs, function("encode", []Oid{ByteaOid, TextOid}, TextOid, true, false, fn(args []Datum) !Datum { return try encodeBytes(args[0], args[1].Text()) }))
+	registerFunc(mut funcs, function("decode", []Oid{TextOid, TextOid}, ByteaOid, true, false, fn(args []Datum) !Datum { return try decodeBytes(args[0].Text(), args[1].Text()) }))
+}
+
+fn stringUnary(name str, arg Datum) !Datum {
+	let s = arg.Text()
+	if name == "lower" { return FromStr(TextOid, twine.ToLower(s)) }
+	if name == "upper" { return FromStr(TextOid, twine.ToUpper(s)) }
+	if name == "initcap" { return FromStr(TextOid, twine.Title(s)) }
+	if name == "reverse" { return FromStr(TextOid, reverseText(s)) }
+	if name == "md5" { return FromStr(TextOid, md5Text(s)) }
+	if name == "quote_ident" { return FromStr(TextOid, quoteIdent(s)) }
+	if name == "quote_literal" || name == "quote_nullable" { return FromStr(TextOid, quoteLiteral(s)) }
+	return FromStr(TextOid, s)
+}
+
+fn stringLength(name str, arg Datum) !Datum {
+	let s = arg.Text()
+	mut n = glyph.RuneCount(s)
+	if name == "octet_length" { n = len(s) } else if name == "bit_length" { n = len(s)*8 } else if name == "ascii" && len(s) > 0 {
+		let (r, _) = glyph.DecodeRune(s, 0)
+		n = i64(r)
+	}
+	return FromI64(Int4Oid, n)
+}
+
+fn stringConcat(a Datum, b Datum) !Datum { return FromStr(a.Oid(), a.Text()+b.Text()) }
+
+fn stringPosition(s Datum, sub Datum) !Datum { return FromI64(Int4Oid, twine.Index(s.Text(), sub.Text())+1) }
+
+fn stringStartsWith(s Datum, prefix Datum) !Datum { return FromBool(twine.HasPrefix(s.Text(), prefix.Text())) }
+
+fn charCount(s str) i64 { return glyph.RuneCount(s) }
+
+fn charOffset(s str, charIndex i64) i64 {
+	if charIndex <= 0 { return 0 }
+	mut offset = i64(0)
+	mut n = i64(0)
+	for offset < len(s) && n < charIndex {
+		let (_, size) = glyph.DecodeRune(s, offset)
+		offset += size
+		n += 1
+	}
+	return offset
+}
+
+fn sliceChars(s str, start i64, count i64) str {
+	let total = charCount(s)
+	mut first = start
+	if first < 1 { first = 1 }
+	if first > total || count == 0 { return "" }
+	let begin = charOffset(s, first-1)
+	mut endChar = total
+	if count >= 0 { endChar = min(total, first+count-1) }
+	return s[begin:charOffset(s, endChar)]
+}
+
+fn stringSubstr(arg Datum, start i64, count i64) !Datum {
+	return FromStr(arg.Oid(), sliceChars(arg.Text(), start, count))
+}
+
+fn stringLeftRight(arg Datum, count i64, right bool) !Datum {
+	let total = charCount(arg.Text())
+	mut n = count
+	if n < 0 { n = total+n }
+	if n < 0 { n = 0 }
+	if n > total { n = total }
+	if right { return FromStr(arg.Oid(), sliceChars(arg.Text(), total-n+1, n)) }
+	return FromStr(arg.Oid(), sliceChars(arg.Text(), 1, n))
+}
+
+fn stringTrim(name str, arg Datum, cutset str) !Datum {
+	let s = arg.Text()
+	mut out = ""
+	if cutset == "" {
+		if name == "ltrim" { out = twine.TrimLeft(s, " \t\n\r\v\f") } else if name == "rtrim" { out = twine.TrimRight(s, " \t\n\r\v\f") } else { out = twine.TrimSpace(s) }
+	} else if name == "ltrim" { out = twine.TrimLeft(s, cutset)
+	} else if name == "rtrim" { out = twine.TrimRight(s, cutset)
+	} else { out = twine.Trim(s, cutset) }
+	return FromStr(arg.Oid(), out)
+}
+
+fn stringReplace(s Datum, old Datum, replacement Datum) !Datum {
+	return FromStr(s.Oid(), twine.ReplaceAll(s.Text(), old.Text(), replacement.Text()))
+}
+
+fn stringTranslate(s Datum, from Datum, to Datum) !Datum {
+	let source = from.Text()
+	let dest = to.Text()
+	mut out = ""
+	for i, _ in s.Text() {
+		let (r, size) = glyph.DecodeRune(s.Text(), i)
+		let c = glyph.RuneStr(r)
+		let j = twine.Index(source, c)
+		if j < 0 { out += c } else if j < charCount(dest) { out += sliceChars(dest, j+1, 1) }
+		_ = size
+	}
+	return FromStr(s.Oid(), out)
+}
+
+fn stringRepeat(arg Datum, count i64) !Datum {
+	if count <= 0 { return FromStr(arg.Oid(), "") }
+	return FromStr(arg.Oid(), twine.Repeat(arg.Text(), count))
+}
+
+fn stringSplitPart(s Datum, delimiter Datum, field i64) !Datum {
+	if field == 0 { fail "field position must not be zero" }
+	let parts = twine.Split(s.Text(), delimiter.Text())
+	mut index = field-1
+	if field < 0 { index = len(parts)+field }
+	if index < 0 || index >= len(parts) { return FromStr(s.Oid(), "") }
+	return FromStr(s.Oid(), parts[index])
+}
+
+fn stringOverlay(s Datum, repl Datum, start i64, count i64) !Datum {
+	let original = s.Text()
+	let replacement = repl.Text()
+	let before = sliceChars(original, 1, start-1)
+	mut removed = count
+	if count < 0 { removed = charCount(replacement) }
+	let after = sliceChars(original, start+removed, -1)
+	return FromStr(s.Oid(), before+replacement+after)
+}
+
+fn stringPad(s Datum, target i64, pad Datum, right bool) !Datum {
+	let source = s.Text()
+	let plen = charCount(source)
+	if target <= 0 { return FromStr(s.Oid(), "") }
+	if target <= plen { return FromStr(s.Oid(), sliceChars(source, 1, target)) }
+	let need = target-plen
+	if charCount(pad.Text()) == 0 { return FromStr(s.Oid(), source) }
+	let copies = need/charCount(pad.Text())+1
+	let fill = sliceChars(twine.Repeat(pad.Text(), copies), 1, need)
+	if right { return FromStr(s.Oid(), source+fill) }
+	return FromStr(s.Oid(), fill+source)
+}
+
+fn stringChr(code i64) !Datum {
+	if code == 0 { fail "null character not permitted" }
+	if code < 0 || code > 0x10ffff { fail "chr() argument out of range" }
+	return FromStr(TextOid, glyph.RuneStr(i32(code)))
+}
+
+fn quoteLiteral(s str) str {
+	mut out = "'"
+	for i, c in s {
+		out += str(c)
+		if c == '\'' { out += "'" }
+		_ = i
+	}
+	return out+"'"
+}
+
+fn quoteIdent(s str) str {
+	mut simple = len(s) > 0
+	for i, c in s {
+		if !(c == '_' || c >= 'a' && c <= 'z' || i > 0 && c >= '0' && c <= '9') { simple = false }
+	}
+	if simple && !isReservedWord(s) { return s }
+	mut out = "\""
+	for _, c in s {
+		out += str(c)
+		if c == '"' { out += "\"" }
+	}
+	return out+"\""
+}
+
+fn isReservedWord(s str) bool {
+	for word in []str{"all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric", "authorization", "between", "bigint", "binary", "bit", "boolean", "both", "case", "cast", "char", "character", "check", "collate", "column", "constraint", "create", "current_date", "current_role", "current_time", "current_timestamp", "current_user", "default", "deferrable", "desc", "distinct", "do", "else", "end", "except", "false", "fetch", "float", "for", "foreign", "from", "grant", "group", "having", "in", "initially", "inner", "intersect", "into", "is", "join", "leading", "left", "like", "limit", "localtime", "localtimestamp", "natural", "not", "null", "numeric", "offset", "on", "only", "or", "order", "outer", "overlaps", "precision", "primary", "real", "references", "returning", "right", "select", "session_user", "setof", "smallint", "some", "symmetric", "table", "then", "to", "trailing", "true", "union", "unique", "user", "using", "values", "varchar", "variadic", "when", "where", "window", "with"} {
+		if s == word { return true }
+	}
+	return false
+}
+
+fn formatString(args []Datum) !str {
+	let format = args[0].Text()
+	mut out = ""
+	mut arg = i64(1)
+	mut i = i64(0)
+	for i < len(format) {
+		if format[i] != '%' {
+			out += str(format[i])
+			i += 1
+			continue
+		}
+		if i+1 < len(format) && format[i+1] == '%' {
+			out += "%"
+			i += 2
+			continue
+		}
+		i += 1
+		if i < len(format) && format[i] >= '0' && format[i] <= '9' {
+			mut p = i64(0)
+			for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+				p = p*10+i64(format[i]-'0')
+				i += 1
+			}
+			if i < len(format) && format[i] == '$' {
+				arg = p
+				i += 1
+			} else { i -= 1 }
+		}
+		if i >= len(format) { fail "unterminated format specifier" }
+		if arg <= 0 || arg >= len(args) { fail "too few arguments for format" }
+		let v = args[arg]
+		if format[i] == 's' { if !IsNull(v) { out += v.Text() } } else if format[i] == 'I' {
+			if IsNull(v) { fail "null values cannot be formatted as an SQL identifier" }
+			out += quoteIdent(v.Text())
+		} else if format[i] == 'L' { if IsNull(v) { out += "NULL" } else { out += quoteLiteral(v.Text()) } } else { fail "unsupported format specifier" }
+		arg += 1
+		i += 1
+	}
+	return out
+}
+
+fn encodeBytes(value Datum, format str) !Datum {
+	if format == "hex" { return FromStr(TextOid, seal.Hex(value.bytes)) }
+	if format == "base64" { return FromStr(TextOid, seal.B64(value.bytes)) }
+	if format == "escape" { return FromStr(TextOid, byteaEscape(value.bytes)) }
+	fail "unrecognized encoding: {format}"
+}
+
+fn decodeBytes(value str, format str) !Datum {
+	if format == "hex" {
+		let decoded = try seal.HexDecode(value)
+		return FromBytes(ByteaOid, decoded)
+	}
+	if format == "base64" {
+		let decoded = try seal.B64Decode(value)
+		return FromBytes(ByteaOid, decoded)
+	}
+	if format == "escape" {
+		let decoded = try parse_bytea(value)
+		return FromBytes(ByteaOid, decoded)
+	}
+	fail "unrecognized encoding: {format}"
+}
+
+fn byteaEscape(bytes []u8) str {
+	mut out = ""
+	for _, b in bytes {
+		if b >= 32 && b < 127 && b != '\\' { out += str(b) } else if b == '\\' { out += "\\\\" } else { out += "\\"+mint.Itoa(i64(b>>6))+mint.Itoa(i64((b>>3)&7))+mint.Itoa(i64(b&7)) }
+	}
+	return out
+}

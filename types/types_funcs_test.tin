@@ -1,0 +1,100 @@
+package types
+
+import "crucible"
+
+fn TestLookupFunctionResolution(t mut crucible.T) {
+	if let f = LookupFunc("abs", []Oid{Int4Oid}) {
+		crucible.Equal(mut t, "exact abs overload", f.Ret, u32(Int4Oid))
+		crucible.Equal(mut t, "abs strict", f.Strict, true)
+		let got = f.Call([]Datum{FromI64(Int4Oid, -19)}) catch err {
+			t.Error("abs call failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "abs value", got.Text(), "19")
+	} else {
+		t.Error("missing int4 abs overload")
+	}
+
+	if let f = LookupFunc("+", []Oid{Int2Oid, Int4Oid}) {
+		crucible.Equal(mut t, "widened integer result", f.Ret, u32(Int4Oid))
+		let got = f.Call([]Datum{FromI64(Int2Oid, 3), FromI64(Int4Oid, 7)}) catch err {
+			t.Error("mixed integer operator failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "mixed integer operator value", got.Text(), "10")
+	} else {
+		t.Error("missing implicit-cast integer operator")
+	}
+	if let f = LookupFunc("+", []Oid{Int4Oid, UnknownLiteralOid}) {
+		crucible.Equal(mut t, "known integer guides unknown literal", f.Ret, u32(Int4Oid))
+	} else {
+		t.Error("typed integer operator rejected an unknown literal")
+	}
+	t.True("two unknown numeric operator inputs stay ambiguous", LookupFunc("+", []Oid{UnknownLiteralOid, UnknownLiteralOid}) == nil)
+
+	if let f = LookupFunc("lower", []Oid{UnknownLiteralOid}) {
+		crucible.Equal(mut t, "unknown literal resolves to text", f.Args[0], u32(TextOid))
+		let got = f.Call([]Datum{FromStr(UnknownLiteralOid, "HELLO")}) catch err {
+			t.Error("unknown string call failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "unknown string value", got.Text(), "hello")
+	} else {
+		t.Error("unknown string did not resolve")
+	}
+
+	if let f = LookupOperator("=", Int4Oid, Int4Oid) {
+		crucible.Equal(mut t, "operator lookup name", f.Name, "=")
+		crucible.Equal(mut t, "operator lookup result", f.Ret, u32(BoolOid))
+	} else {
+		t.Error("operator lookup missed equality")
+	}
+
+	t.True("unknown overload is rejected", LookupFunc("does_not_exist", []Oid{}) == nil)
+}
+
+fn TestStrictNullAndBooleanTruthTables(t mut crucible.T) {
+	if let f = LookupFunc("abs", []Oid{Int4Oid}) {
+		let got = f.Call([]Datum{Null()}) catch err {
+			t.Error("strict null call failed: {err}")
+			return
+		}
+		t.True("strict function propagates NULL", IsNull(got))
+	}
+
+	let andFunc = LookupFunc("AND", []Oid{BoolOid, BoolOid})
+	if let f = andFunc {
+		let got = f.Call([]Datum{Null(), FromBool(false)}) catch err {
+			t.Error("three-valued AND failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "NULL AND FALSE", got.Text(), "false")
+		let unknown = f.Call([]Datum{Null(), FromBool(true)}) catch err {
+			t.Error("three-valued AND failed: {err}")
+			return
+		}
+		t.True("NULL AND TRUE is NULL", IsNull(unknown))
+	} else {
+		t.Error("missing AND")
+	}
+
+	if let f = LookupFunc("IS NOT TRUE", []Oid{BoolOid}) {
+		let got = f.Call([]Datum{Null()}) catch err {
+			t.Error("IS NOT TRUE failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "NULL IS NOT TRUE", got.Text(), "true")
+	} else {
+		t.Error("missing IS NOT TRUE")
+	}
+
+	if let f = LookupFunc("IS DISTINCT FROM", []Oid{Int4Oid, Int4Oid}) {
+		let got = f.Call([]Datum{Null(), FromI64(Int4Oid, 1)}) catch err {
+			t.Error("IS DISTINCT FROM failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "NULL distinct from value", got.Text(), "true")
+	} else {
+		t.Error("missing IS DISTINCT FROM")
+	}
+}

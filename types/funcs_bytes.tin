@@ -1,0 +1,48 @@
+package types
+
+import "dice"
+import "seal"
+
+fn registerByteaUuidFuncs(funcs mut []Func) {
+	for _, name in []str{"length", "octet_length"} {
+		registerFunc(mut funcs, function(name, []Oid{ByteaOid}, Int4Oid, true, false, fn(args []Datum) !Datum { return FromI64(Int4Oid, len(args[0].bytes)) }))
+	}
+	registerFunc(mut funcs, function("||", []Oid{ByteaOid, ByteaOid}, ByteaOid, true, false, fn(args []Datum) !Datum {
+		mut out = make([]u8, 0, len(args[0].bytes)+len(args[1].bytes))
+		out = append(out, args[0].bytes...)
+		out = append(out, args[1].bytes...)
+		return FromBytes(ByteaOid, out)
+	}))
+	registerFunc(mut funcs, function("substring", []Oid{ByteaOid, Int4Oid}, ByteaOid, true, false, fn(args []Datum) !Datum { return try byteaSubstring(args[0], args[1].i, -1) }))
+	registerFunc(mut funcs, function("substring", []Oid{ByteaOid, Int4Oid, Int4Oid}, ByteaOid, true, false, fn(args []Datum) !Datum { return try byteaSubstring(args[0], args[1].i, args[2].i) }))
+	registerFunc(mut funcs, function("get_byte", []Oid{ByteaOid, Int4Oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try byteaGetByte(args[0], args[1].i) }))
+	registerFunc(mut funcs, function("gen_random_uuid", []Oid{}, UuidOid, false, true, fn(args []Datum) !Datum { return try randomUuid() }))
+	for _, name in []str{"regexp_replace", "regexp_match", "regexp_matches", "regexp_split_to_array"} {
+		registerFunc(mut funcs, function(name, []Oid{TextOid, TextOid, TextOid}, TextOid, true, false, fn(args []Datum) !Datum { fail "regular expression functions are not supported" }))
+	}
+}
+
+fn byteaSubstring(value Datum, start i64, count i64) !Datum {
+	let bytes = value.bytes
+	mut first = start
+	if first < 1 { first = 1 }
+	if first > len(bytes) { return FromBytes(ByteaOid, []u8{}) }
+	let begin = first-1
+	mut end = len(bytes)
+	if count >= 0 { end = min(len(bytes), begin+count) }
+	if end < begin { return FromBytes(ByteaOid, []u8{}) }
+	return FromBytes(ByteaOid, bytes[begin:end])
+}
+
+fn byteaGetByte(value Datum, index i64) !Datum {
+	if index < 0 || index >= len(value.bytes) { fail "index {index} out of range" }
+	return FromI64(Int4Oid, i64(value.bytes[index]))
+}
+
+fn randomUuid() !Datum {
+	mut bytes = dice.Bytes(16)
+	bytes[6] = (bytes[6] & 0x0f) | 0x40
+	bytes[8] = (bytes[8] & 0x3f) | 0x80
+	let h = seal.Hex(bytes)
+	return FromStr(UuidOid, h[:8]+"-"+h[8:12]+"-"+h[12:16]+"-"+h[16:20]+"-"+h[20:32])
+}

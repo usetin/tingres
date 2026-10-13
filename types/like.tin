@@ -1,0 +1,120 @@
+package types
+
+import "glyph"
+import "twine"
+
+type LikeToken value struct {
+	Kind u8
+	Rune i32
+}
+
+fn registerLikeFuncs(funcs mut []Func) {
+	for _, oid in []Oid{TextOid, VarcharOid, BpcharOid, NameOid} {
+		for _, name in []str{"LIKE", "ILIKE", "NOT LIKE", "NOT ILIKE", "~~", "~~*", "!~~", "!~~*"} {
+			registerFunc(mut funcs, function(name, []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try likeOperator(name, args[0].Text(), args[1].Text(), "\\") }))
+			registerFunc(mut funcs, function(name, []Oid{oid, oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try likeOperator(name, args[0].Text(), args[1].Text(), args[2].Text()) }))
+		}
+		registerFunc(mut funcs, function("SIMILAR TO", []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try similarTo(args[0].Text(), args[1].Text(), "\\") }))
+		registerFunc(mut funcs, function("SIMILAR TO", []Oid{oid, oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try similarTo(args[0].Text(), args[1].Text(), args[2].Text()) }))
+	}
+	for _, name in []str{"~", "~*", "!~", "!~*"} {
+		for _, oid in []Oid{TextOid, VarcharOid, BpcharOid, NameOid} {
+			registerFunc(mut funcs, function(name, []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { fail "regular expression operators are not supported" }))
+		}
+	}
+}
+
+fn likeOperator(name str, text str, pattern str, escape str) !Datum {
+	let insensitive = name == "ILIKE" || name == "NOT ILIKE" || name == "~~*" || name == "!~~*"
+	let negated = name == "NOT LIKE" || name == "NOT ILIKE" || name == "!~~" || name == "!~~*"
+	mut matches = try likeMatch(text, pattern, escape, insensitive)
+	if negated { matches = !matches }
+	return FromBool(matches)
+}
+
+fn textRunes(s str) []i32 {
+	mut out = make([]i32, 0, glyph.RuneCount(s))
+	mut i = 0
+	for i < len(s) {
+		let (r, size) = glyph.DecodeRune(s, i)
+		out = append(out, r)
+		i += size
+	}
+	return out
+}
+
+fn parseLike(pattern str, escape str) ![]LikeToken {
+	let esc = textRunes(escape)
+	if len(esc) > 1 { fail "LIKE escape must be a single character" }
+	let chars = textRunes(pattern)
+	mut out = make([]LikeToken, 0, len(chars))
+	mut i = i64(0)
+	for i < len(chars) {
+		let c = chars[i]
+		if len(esc) == 1 && c == esc[0] {
+			i += 1
+			if i >= len(chars) { fail "LIKE pattern must not end with escape character" }
+			out = append(out, LikeToken{Kind: 0, Rune: chars[i]})
+		} else if c == '%' {
+			if len(out) == 0 || out[len(out)-1].Kind != 2 { out = append(out, LikeToken{Kind: 2, Rune: 0}) }
+		} else if c == '_' { out = append(out, LikeToken{Kind: 1, Rune: 0}) } else { out = append(out, LikeToken{Kind: 0, Rune: c}) }
+		i += 1
+	}
+	return out
+}
+
+fn likeMatch(text str, pattern str, escape str, insensitive bool) !bool {
+	if insensitive {
+		text = twine.ToLower(text)
+		pattern = twine.ToLower(pattern)
+		escape = twine.ToLower(escape)
+	}
+	let chars = textRunes(text)
+	let tokens = try parseLike(pattern, escape)
+	mut prev = make([]bool, len(chars)+1)
+	prev[0] = true
+	for token in tokens {
+		mut next = make([]bool, len(chars)+1)
+		if token.Kind == 2 {
+			next[0] = prev[0]
+			for j in 1..len(chars)+1 { next[j] = prev[j] || next[j-1] }
+		} else {
+			for j in 1..len(chars)+1 {
+				if token.Kind == 1 || token.Rune == chars[j-1] { next[j] = prev[j-1] }
+			}
+		}
+		prev = next
+	}
+	return prev[len(chars)]
+}
+
+fn similarTo(text str, pattern str, escape str) !Datum {
+	let chars = textRunes(pattern)
+	for c in chars {
+		if c == '|' || c == '(' || c == ')' || c == '[' || c == ']' || c == '*' || c == '+' || c == '?' || c == '{' || c == '}' || c == '^' || c == '$' {
+			fail "SIMILAR TO pattern syntax is not supported"
+		}
+	}
+	let tokens = try similarLikePattern(chars, escape)
+	let matches = try likeMatch(text, tokens, "\\", false)
+	return FromBool(matches)
+}
+
+fn similarLikePattern(chars []i32, escape str) !str {
+	let esc = textRunes(escape)
+	if len(esc) > 1 { fail "SIMILAR TO escape must be a single character" }
+	mut out = ""
+	mut i = i64(0)
+	for i < len(chars) {
+		let c = chars[i]
+		if len(esc) == 1 && c == esc[0] {
+			i += 1
+			if i >= len(chars) { fail "LIKE pattern must not end with escape character" }
+			let escaped = chars[i]
+			if escaped == '%' || escaped == '_' || escaped == '\\' { out += "\\" }
+			out += glyph.RuneStr(escaped)
+		} else if c == '\\' { out += "\\\\" } else { out += glyph.RuneStr(c) }
+		i += 1
+	}
+	return out
+}
