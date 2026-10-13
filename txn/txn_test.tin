@@ -1,0 +1,82 @@
+package txn
+
+import "crucible"
+
+fn TestSnapshotAndVisibility(t mut crucible.T) {
+	mut m = NewManager() catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut first = m.Begin(Isolation.ReadCommitted)
+	let snap = m.Snapshot(first)
+	crucible.Equal(mut t, "own insert before next command is invisible", m.Visible(snap, TupleHeader{Xmin: first.xid, Cid: 0}), false)
+	first.CommandCounterIncrement()
+	let next = m.Snapshot(first)
+	crucible.Equal(mut t, "own insert after command is visible", m.Visible(next, TupleHeader{Xmin: first.xid, Cid: 0}), true)
+	mut second = m.Begin(Isolation.ReadCommitted)
+	crucible.Equal(mut t, "uncommitted foreign insert is invisible", m.Visible(m.Snapshot(second), TupleHeader{Xmin: first.xid}), false)
+	crucible.NoFault("commit first", m.Commit(mut first))
+	crucible.Equal(mut t, "committed insert is visible to a later statement", m.Visible(m.Snapshot(second), TupleHeader{Xmin: first.xid}), true)
+	m.Abort(mut second)
+}
+
+fn TestDeleteVisibility(t mut crucible.T) {
+	mut m = NewManager() catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut deleter = m.Begin(Isolation.ReadCommitted)
+	let before = m.Snapshot(deleter)
+	let row = TupleHeader{Xmin: 2, Xmax: deleter.xid, Cid: 0}
+	crucible.Equal(mut t, "own delete remains visible in its command", m.Visible(before, row), true)
+	deleter.CommandCounterIncrement()
+	crucible.Equal(mut t, "own delete hides row in the next command", m.Visible(m.Snapshot(deleter), row), false)
+	m.Abort(mut deleter)
+	mut other = m.Begin(Isolation.ReadCommitted)
+	crucible.Equal(mut t, "aborted delete leaves row visible", m.Visible(m.Snapshot(other), TupleHeader{Xmin: 2, Xmax: deleter.xid}), true)
+	m.Abort(mut other)
+}
+
+fn TestRelationLocks(t mut crucible.T) {
+	mut m = NewManager() catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	let first = m.Begin(Isolation.ReadCommitted)
+	mut second = m.Begin(Isolation.ReadCommitted)
+	crucible.NoFault("compatible access share locks", m.LockRelation(first, 42, LockMode.AccessShare))
+	crucible.NoFault("row exclusive coexists with access share", m.LockRelation(second, 42, LockMode.RowExclusive))
+	crucible.HasFault("access exclusive conflicts", m.LockRelation(second, 42, LockMode.AccessExclusive))
+	m.Abort(mut second)
+}
+
+fn TestTupleLocks(t mut crucible.T) {
+	mut m = NewManager() catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut first = m.Begin(Isolation.ReadCommitted)
+	mut second = m.Begin(Isolation.ReadCommitted)
+	crucible.NoFault("lock tuple", m.LockTuple(first, 7, 0, 1, TupleLock.ForUpdate))
+	crucible.HasFault("same tuple write lock conflicts", m.LockTuple(second, 7, 0, 1, TupleLock.ForShare))
+	crucible.NoFault("different tuple locks independently", m.LockTuple(second, 7, 0, 2, TupleLock.ForUpdate))
+	m.Abort(mut first)
+	m.Abort(mut second)
+}
+
+fn TestIsolationSnapshots(t mut crucible.T) {
+	mut m = NewManager() catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut repeatable = m.Begin(Isolation.RepeatableRead)
+	let readCommitted = m.Begin(Isolation.ReadCommitted)
+	mut writer = m.Begin(Isolation.ReadCommitted)
+	let inserted = TupleHeader{Xmin: writer.xid, Cid: 0}
+	writer.CommandCounterIncrement()
+	crucible.NoFault("commit writer", m.Commit(mut writer))
+	crucible.Equal(mut t, "repeatable read keeps its original horizon", m.Visible(m.Snapshot(repeatable), inserted), false)
+	crucible.Equal(mut t, "read committed takes a new snapshot", m.Visible(m.Snapshot(readCommitted), inserted), true)
+	m.Abort(mut repeatable)
+	m.Abort(mut readCommitted)
+}
