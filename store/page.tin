@@ -1,0 +1,174 @@
+package store
+
+const PageSize = 8192
+const pageHeaderSize = 32
+const linePointerSize = 8
+
+// Page is an 8 KiB slotted page. The checksum field is zero while hashing.
+type Page struct {
+	Data []u8
+}
+
+// PageHeader is the stable public view of a page header.
+type PageHeader struct {
+	Lsn u64
+	Checksum u32
+	Lower u16
+	Upper u16
+	Slots u16
+}
+
+// NewPage returns an empty page with valid free-space boundaries.
+fn NewPage() Page {
+	mut p = Page{Data: make([]u8, PageSize)}
+	writeU16(mut p.Data, 16, u16(pageHeaderSize))
+	writeU16(mut p.Data, 18, u16(PageSize))
+	p.Seal()
+	return p
+}
+
+// Header decodes the common page header.
+fn (p Page) Header() PageHeader {
+	return PageHeader{Lsn: readU64(p.Data, 0), Checksum: readU32(p.Data, 8), Lower: readU16(p.Data, 16), Upper: readU16(p.Data, 18), Slots: readU16(p.Data, 20)}
+}
+
+// FreeSpace is the number of bytes available to another line pointer and item.
+fn (p Page) FreeSpace() i64 {
+	let h = p.Header()
+	return i64(h.Upper) - i64(h.Lower)
+}
+
+// SetLsn updates the page LSN and checksum.
+fn (p mut Page) SetLsn(lsn u64) {
+	writeU64(mut p.Data, 0, lsn)
+	p.Seal()
+}
+
+// Seal recomputes the page checksum.
+fn (p mut Page) Seal() {
+	writeU32(mut p.Data, 8, 0)
+	let c = crc32(p.Data)
+	writeU32(mut p.Data, 8, c)
+}
+
+// Valid reports whether the page size and checksum are valid.
+fn (p Page) Valid() bool {
+	if len(p.Data) != PageSize {
+		return false
+	}
+	let got = readU32(p.Data, 8)
+	mut dst = make([]u8, len(p.Data))
+	copy(dst, p.Data)
+	writeU32(mut dst, 8, 0)
+	return got == crc32(dst)
+}
+
+// Insert stores bytes in the page and returns a one-based line pointer.
+fn (p mut Page) Insert(value []u8) !u16 {
+	if len(p.Data) != PageSize || len(value) == 0 {
+		fail "store: invalid page or empty item"
+	}
+	let h = p.Header()
+	let need = len(value) + linePointerSize
+	if i64(h.Upper)-i64(h.Lower) < need {
+		fail "store: page full"
+	}
+	let slot = h.Slots
+	let off = i64(h.Upper) - len(value)
+	copy(p.Data[off:off+len(value)], value)
+	let lp = pageHeaderSize + i64(slot)*linePointerSize
+	writeU16(mut p.Data, lp, u16(off))
+	writeU16(mut p.Data, lp+2, u16(len(value)))
+	writeU32(mut p.Data, lp+4, 1)
+	writeU16(mut p.Data, 16, u16(i64(h.Lower)+linePointerSize))
+	writeU16(mut p.Data, 18, u16(off))
+	writeU16(mut p.Data, 20, slot+1)
+	p.Seal()
+	return slot + 1
+}
+
+// SetItem replaces a live item's bytes without changing its line pointer.
+fn (p mut Page) SetItem(slot u16, value []u8) ! {
+	let h = p.Header()
+	if len(p.Data) != PageSize || slot == 0 || slot > h.Slots {
+		fail "store: invalid tuple id"
+	}
+	let lp = pageHeaderSize + i64(slot-1)*linePointerSize
+	let off = i64(readU16(p.Data, lp))
+	let n = i64(readU16(p.Data, lp+2))
+	if n == 0 || off < pageHeaderSize || off+n > PageSize || len(value) != n {
+		fail "store: invalid replacement item"
+	}
+	copy(p.Data[off:off+n], value)
+	p.Seal()
+}
+
+// Item returns a copy of a live line-pointer item.
+fn (p Page) Item(slot u16) ![]u8 {
+	let h = p.Header()
+	if slot == 0 || slot > h.Slots {
+		fail "store: invalid tuple id"
+	}
+	let lp = pageHeaderSize + i64(slot-1)*linePointerSize
+	let off = i64(readU16(p.Data, lp))
+	let n = i64(readU16(p.Data, lp+2))
+	if n == 0 || off < pageHeaderSize || off+n > PageSize {
+		fail "store: deleted or corrupt line pointer"
+	}
+	let out = make([]u8, n)
+	copy(out, p.Data[off:off+n])
+	return out
+}
+
+fn writeU16(b mut []u8, off i64, v u16) {
+	b[off] = u8(v)
+	b[off+1] = u8(v >> 8)
+}
+
+fn readU16(b []u8, off i64) u16 {
+	return u16(b[off]) | (u16(b[off+1]) << 8)
+}
+
+fn writeU32(b mut []u8, off i64, v u32) {
+	for i in 0..4 {
+		b[off+i] = u8(v >> (i*8))
+	}
+}
+
+fn readU32(b []u8, off i64) u32 {
+	mut v = u32(0)
+	for i in 0..4 {
+		v |= u32(b[off+i]) << (i*8)
+	}
+	return v
+}
+
+fn writeU64(b mut []u8, off i64, v u64) {
+	for i in 0..8 {
+		b[off+i] = u8(v >> (i*8))
+	}
+}
+
+fn readU64(b []u8, off i64) u64 {
+	mut v = u64(0)
+	for i in 0..8 {
+		v |= u64(b[off+i]) << (i*8)
+	}
+	return v
+}
+
+fn crc32(b []u8) u32 {
+	mut crc = u32(0xffffffff)
+	for x in b {
+		crc ^= u32(x)
+		for bit in 0..8 {
+			_ = bit
+			if crc&1 != 0 {
+				crc = (crc >> 1) ^ 0xedb88320
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc ^ 0xffffffff
+}
