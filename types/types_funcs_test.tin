@@ -98,3 +98,192 @@ fn TestStrictNullAndBooleanTruthTables(t mut crucible.T) {
 		t.Error("missing IS DISTINCT FROM")
 	}
 }
+
+fn TestPostgreSqlArithmeticErrors(t mut crucible.T) {
+	if let f = LookupOperator("/", Int4Oid, Int4Oid) {
+		let (_, err) = f.Call2(FromI64(Int4Oid, 7), FromI64(Int4Oid, 0))
+		t.HasFault("integer division by zero", err)
+		if err != nil {
+			crucible.Equal(mut t, "division SQLSTATE", ErrorCode(err), "22012")
+			crucible.Equal(mut t, "division message", ErrorMessage(err), "division by zero")
+		}
+	} else {
+		t.Error("missing integer division")
+	}
+	if let f = LookupOperator("+", Int4Oid, Int4Oid) {
+		let (_, err) = f.Call2(FromI64(Int4Oid, 2147483647), FromI64(Int4Oid, 1))
+		t.HasFault("int4 addition overflow", err)
+		if err != nil {
+			crucible.Equal(mut t, "overflow SQLSTATE", ErrorCode(err), "22003")
+			crucible.Equal(mut t, "overflow message", ErrorMessage(err), "integer out of range")
+		}
+	} else {
+		t.Error("missing int4 addition")
+	}
+}
+
+fn TestLikeAndRegexFunctions(t mut crucible.T) {
+	let prefix = CompileLike("abc%", "\\", false, false) catch err {
+		t.Error("LIKE compilation failed: {err}")
+		return
+	}
+	t.True("precompiled LIKE prefix", prefix.Matches("abcdef"))
+	t.False("precompiled LIKE prefix rejects mismatch", prefix.Matches("zabcdef"))
+	let contains = CompileLike("%AbC%", "\\", true, false) catch err {
+		t.Error("ILIKE compilation failed: {err}")
+		return
+	}
+	t.True("precompiled ILIKE contains", contains.Matches("xabcY"))
+
+	if let f = LookupOperator("~", TextOid, TextOid) {
+		let got = f.Call2(FromStr(TextOid, "abbbc"), FromStr(TextOid, "^ab+c$")) catch err {
+			t.Error("regular expression operator failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "POSIX regex operator", got.Text(), "true")
+	} else {
+		t.Error("missing regex operator")
+	}
+	if let f = LookupOperator("SIMILAR TO", TextOid, TextOid) {
+		let got = f.Call2(FromStr(TextOid, "abc123"), FromStr(TextOid, "abc%")) catch err {
+			t.Error("SIMILAR TO failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "SIMILAR TO wildcard", got.Text(), "true")
+	} else {
+		t.Error("missing SIMILAR TO")
+	}
+	if let f = LookupFunc("regexp_replace", []Oid{TextOid, TextOid, TextOid}) {
+		let got = f.Call3(FromStr(TextOid, "a1 b2"), FromStr(TextOid, "[0-9]"), FromStr(TextOid, "X")) catch err {
+			t.Error("regexp_replace failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "regexp_replace defaults to first match", got.Text(), "aX b2")
+	} else {
+		t.Error("missing regexp_replace")
+	}
+	if let f = LookupFunc("regexp_replace", []Oid{TextOid, TextOid, TextOid, TextOid}) {
+		let got = f.Call([]Datum{FromStr(TextOid, "a1 b2"), FromStr(TextOid, "[0-9]"), FromStr(TextOid, "X"), FromStr(TextOid, "g")}) catch err {
+			t.Error("global regexp_replace failed: {err}")
+			return
+		}
+		crucible.Equal(mut t, "regexp_replace global flag", got.Text(), "aX bX")
+	} else {
+		t.Error("missing flagged regexp_replace")
+	}
+	if let f = LookupOperator("~", TextOid, TextOid) {
+		let (_, err) = f.Call2(FromStr(TextOid, "a1"), FromStr(TextOid, "(a)\\1"))
+		t.HasFault("unsupported regex backreference", err)
+		if err != nil { crucible.Equal(mut t, "unsupported regex SQLSTATE", ErrorCode(err), "0A000") }
+	}
+}
+
+// TestNumericOperatorsDifferential pins PostgreSQL 17's exact numeric operator
+// results (including the division result scale) and the temporal comparisons.
+fn TestNumericOperatorsDifferential(t mut crucible.T) {
+	goldenCheck(mut t, "1.5::numeric + 2", "3.5")
+	goldenCheck(mut t, "1.5::numeric * 2", "3.0")
+	goldenCheck(mut t, "1.50::numeric + 2.5", "4.00")
+	goldenCheck(mut t, "7.5::numeric / 2", "3.7500000000000000")
+	goldenCheck(mut t, "5.5::numeric % 2", "1.5")
+	goldenCheck(mut t, "1.0::numeric / 3", "0.33333333333333333333")
+	goldenCheck(mut t, "2.50::numeric % 0.7", "0.40")
+	goldenCheck(mut t, "-7.5::numeric / 2", "-3.7500000000000000")
+	goldenCheck(mut t, "7.5::numeric % -2", "1.5")
+	goldenCheck(mut t, "0.001::numeric / 3", "0.00033333333333333333")
+	goldenCheck(mut t, "0.0::numeric / 0.5", "0.0000000000000000")
+	goldenCheck(mut t, "1.5::numeric % 0.4", "0.3")
+	goldenCheck(mut t, "0.00000001::numeric / 3", "0.0000000033333333333333333333")
+	goldenCheck(mut t, "mod(5.5::numeric, 2::numeric)", "1.5")
+	goldenCheck(mut t, "div(5.5::numeric, 2::numeric)", "2")
+	goldenCheck(mut t, "-5.5::numeric % 2", "-1.5")
+	goldenCheck(mut t, "round(1.5::numeric)", "2")
+	goldenCheck(mut t, "round(-1.5::numeric)", "-2")
+	goldenCheck(mut t, "round(1.55::numeric, 1)", "1.6")
+	goldenCheck(mut t, "trunc(1.99::numeric)", "1")
+	goldenCheck(mut t, "trunc(2.55::numeric, 1)", "2.5")
+	goldenCheck(mut t, "ceil(1.2::numeric)", "2")
+	goldenCheck(mut t, "floor(-1.2::numeric)", "-2")
+	goldenCheck(mut t, "sign(-3.5::numeric)", "-1")
+	goldenCheck(mut t, "abs(-1.5::numeric)", "1.5")
+	goldenCheck(mut t, "1.5::numeric = 1.50", "true")
+	goldenCheck(mut t, "1.5::numeric < 2::numeric", "true")
+	goldenCheck(mut t, "'2024-01-02'::date < '2024-01-03'::date", "true")
+	goldenCheck(mut t, "'2024-01-02 10:00'::timestamp <= '2024-01-03'::timestamp", "true")
+	goldenCheck(mut t, "'10:00'::time < '12:00'::time", "true")
+	goldenCheck(mut t, "'1 day'::interval < '2 days'::interval", "true")
+	goldenCheck(mut t, "1.5::numeric / 0", "ERROR: division by zero")
+	goldenCheck(mut t, "1::int2 + 32767::int2", "ERROR: smallint out of range")
+}
+
+// TestFloatRoundingIsRint pins PostgreSQL's round(double precision) ties-to-even.
+fn TestFloatRoundingIsRint(t mut crucible.T) {
+	goldenCheck(mut t, "round(0.5::float8)", "0")
+	goldenCheck(mut t, "round(1.5::float8)", "2")
+	goldenCheck(mut t, "round(2.5::float8)", "2")
+	goldenCheck(mut t, "round(3.5::float8)", "4")
+	goldenCheck(mut t, "round(-1.5::float8)", "-2")
+	goldenCheck(mut t, "round(-2.5::float8)", "-2")
+	goldenCheck(mut t, "trunc(1.99::float8)", "1")
+	goldenCheck(mut t, "trunc(-1.99::float8)", "-1")
+	goldenCheck(mut t, "ceil(1.2::float8)", "2")
+	goldenCheck(mut t, "floor(-1.2::float8)", "-2")
+	goldenCheck(mut t, "to_hex(255)", "ff")
+	goldenCheck(mut t, "to_hex(-1::int4)", "ffffffff")
+	goldenCheck(mut t, "to_hex(-1::int8)", "ffffffffffffffff")
+}
+
+fn goldenCheck(t mut crucible.T, expression str, want str) {
+	let got = evalGoldenExpression(expression) catch err {
+		let text = "ERROR: " + ErrorMessage(err)
+		if text != want { t.Error("{expression}: got {text}, want {want}") }
+		return
+	}
+	let text = got.Text()
+	if text != want { t.Error("{expression}: got {text}, want {want}") }
+}
+
+// TestFixedArityFastPaths checks that the arity-specific entry points agree with
+// the generic slice call, so exec can resolve once at plan time.
+fn TestFixedArityFastPaths(t mut crucible.T) {
+	if let g = LookupFunc("substr", []Oid{TextOid, Int4Oid, Int4Oid}) {
+		let generic = g.Call([]Datum{FromStr(TextOid, "abcdef"), FromI64(Int4Oid, 2), FromI64(Int4Oid, 3)}) catch _ {
+			t.Error("generic substr failed")
+			return
+		}
+		let fast = g.Call3(FromStr(TextOid, "abcdef"), FromI64(Int4Oid, 2), FromI64(Int4Oid, 3)) catch _ {
+			t.Error("fast substr failed")
+			return
+		}
+		crucible.Equal(mut t, "substr Call3 matches Call", fast.Text(), generic.Text())
+		crucible.Equal(mut t, "substr value", fast.Text(), "bcd")
+	}
+	if let g = LookupFunc("strpos", []Oid{TextOid, TextOid}) {
+		let fast = g.Call2(FromStr(TextOid, "abc"), FromStr(TextOid, "b")) catch _ {
+			t.Error("fast strpos failed")
+			return
+		}
+		crucible.Equal(mut t, "strpos Call2", fast.Text(), "2")
+	}
+	if let g = LookupFunc("lower", []Oid{TextOid}) {
+		let fast = g.Call1(FromStr(TextOid, "ABC")) catch _ {
+			t.Error("fast lower failed")
+			return
+		}
+		crucible.Equal(mut t, "lower Call1", fast.Text(), "abc")
+	}
+	if let g = LookupOperator("LIKE", TextOid, TextOid) {
+		let fast = g.Call2(FromStr(TextOid, "abc"), FromStr(TextOid, "a%")) catch _ {
+			t.Error("fast LIKE failed")
+			return
+		}
+		crucible.Equal(mut t, "LIKE Call2", fast.Text(), "true")
+	}
+	if let g = LookupOperator("+", Int4Oid, Int4Oid) {
+		let fast = g.Call2(FromI64(Int4Oid, 2), FromI64(Int4Oid, 3)) catch _ {
+			t.Error("fast + failed")
+			return
+		}
+		crucible.Equal(mut t, "int4 + Call2", fast.Text(), "5")
+	}
+}

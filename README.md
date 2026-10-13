@@ -29,7 +29,7 @@ regression suite   [..............................]  0.0%   (0 of 225 tests)
 SQL syntax        [#######################.......]  75.3%   (35114 of 46623 regression-suite statements parse)
 ```
 
-_Generated 2026-10-13 at commit `83ba78b`. Unit-test counts ran on Darwin arm64; speed is Linux-only._
+_Generated 2026-10-13 at commit `b4114df`. Unit-test counts ran on Darwin arm64; speed is Linux-only._
 
 ### PostgreSQL compatibility
 
@@ -41,21 +41,36 @@ _Generated 2026-10-13 at commit `83ba78b`. Unit-test counts ran on Darwin arm64;
 
 ### Speed (Linux only, tingres vs PostgreSQL 17, same machine, same run)
 
-Not measured yet. Speed is only ever reported from a Linux run of tingres and PostgreSQL 17 side by side (interleaved, medians, ratio); there is no end-to-end query path to benchmark yet.
+**No Linux benchmark has been run yet, so no speed number is claimed.** Every row below is filled in by the Linux benchmark workflow
+(`.github/workflows/bench-linux.yml`, writes `bench/results/linux.md`): tingres and PostgreSQL 17 on the same Linux machine in the same run,
+interleaved, fsync on, medians, with the ratio (above 1.0x means tingres is faster). macOS and Docker-on-Mac numbers are never reported.
+
+| benchmark | tingres | PostgreSQL 17 | ratio | status |
+|---|---:|---:|---:|---|
+| pgbench select-only, 1 client (tps) | — | — | — | pending Linux run |
+| pgbench select-only, 16 clients (tps) | — | — | — | pending Linux run |
+| pgbench select-only, 64 clients (tps) | — | — | — | pending Linux run |
+| pgbench tpcb-like, 16 clients (tps) | — | — | — | pending Linux run |
+| primary-key point lookup, p50 / p99 latency | — | — | — | pending Linux run |
+| scan + aggregate over 10M rows (TPC-H Q1 shape) | — | — | — | pending Linux run |
+| bulk insert via COPY (rows/s) | — | — | — | pending Linux run |
+| single-row INSERT with fsync commit (commits/s, 16 clients) | — | — | — | pending Linux run |
+| connection setup + first query (connections/s) | — | — | — | pending Linux run |
+| SQL parse throughput, simple statements (statements/s) | — | — | — | pending Linux run |
 
 ### Tests and code
 
 | package | lines of Tin | unit tests |
 |---|---:|---|
-| `types` | 2249 | 7 passing |
+| `types` | 5790 | 27 passing |
 | `parse` | 6002 | 15 passing |
-| `store` | 1308 | 6 passing |
-| `txn` | 611 | 7 passing |
-| `catalog` | 397 | 2 passing |
-| `plan` | 981 | 3 passing |
-| `exec` | 4310 | FAILING |
+| `store` | 2260 | 8 passing |
+| `txn` | 1296 | 12 passing |
+| `catalog` | 408 | 2 passing |
+| `plan` | 2765 | 7 passing |
+| `exec` | 5317 | FAILING |
 | `proto` | 571 | 4 passing |
 | `server` | 141 | 1 passing |
-| **total** | **16570** | **45 passing**, 1 package(s) failing |
+| **total** | **24550** | **76 passing**, 1 package(s) failing |
 
 <!-- stats:end -->

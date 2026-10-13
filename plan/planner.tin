@@ -1,0 +1,970 @@
+package plan
+
+import "../types"
+import "../catalog"
+import "../txn"
+import "say"
+
+const SeqPageCost = 1.0
+const RandomPageCost = 4.0
+const CpuTupleCost = 0.01
+const CpuIndexTupleCost = 0.005
+const CpuOperatorCost = 0.0025
+
+fn costSeqScan(rows f64, width i64, numQuals i64) Cost {
+	let pages = f64(width * i64(rows)) / 8192.0 + 1.0
+	let total = pages * SeqPageCost + rows * (CpuTupleCost + f64(numQuals) * CpuOperatorCost)
+	return Cost{
+		Startup: 0.0,
+		Total: total,
+		Rows: rows,
+		Width: width,
+	}
+}
+
+fn costIndexScan(rows f64, width i64, numQuals i64, isUnique bool) Cost {
+	if isUnique {
+		return Cost{
+			Startup: 0.0,
+			Total: RandomPageCost * 2.0 + CpuIndexTupleCost + CpuTupleCost + f64(numQuals) * CpuOperatorCost,
+			Rows: 1.0,
+			Width: width,
+		}
+	}
+	let indexPages = f64(width * i64(rows)) / 16384.0 + 1.0
+	let tablePages = f64(width * i64(rows)) / 8192.0 + 1.0
+	let total = indexPages * RandomPageCost + tablePages * RandomPageCost + rows * (CpuIndexTupleCost + CpuTupleCost + f64(numQuals) * CpuOperatorCost)
+	return Cost{
+		Startup: 0.0,
+		Total: total,
+		Rows: rows,
+		Width: width,
+	}
+}
+
+fn costSort(child Cost, rows f64, width i64) Cost {
+	mut logRows = 1.0
+	mut r = rows
+	for r > 2.0 {
+		logRows += 1.0
+		r = r / 2.0
+	}
+	let sortCost = 2.0 * rows * CpuOperatorCost * logRows
+	return Cost{
+		Startup: child.Total + sortCost,
+		Total: child.Total + sortCost + rows * CpuTupleCost,
+		Rows: rows,
+		Width: width,
+	}
+}
+
+fn costAgg(child Cost, inRows f64, outRows f64, numAggs i64, width i64) Cost {
+	let startup = child.Total
+	let total = startup + inRows * (CpuTupleCost + f64(numAggs) * CpuOperatorCost)
+	return Cost{
+		Startup: startup,
+		Total: total,
+		Rows: outRows,
+		Width: width,
+	}
+}
+
+fn costHashJoin(left Cost, right Cost, outRows f64, width i64) Cost {
+	let hashCost = right.Total + right.Rows * CpuTupleCost
+	let total = hashCost + left.Total + left.Rows * (CpuTupleCost + CpuOperatorCost)
+	return Cost{
+		Startup: hashCost,
+		Total: total,
+		Rows: outRows,
+		Width: width,
+	}
+}
+
+fn costNestLoop(outer Cost, inner Cost, outRows f64, width i64) Cost {
+	let total = outer.Total + outer.Rows * inner.Total
+	return Cost{
+		Startup: outer.Startup + inner.Startup,
+		Total: total,
+		Rows: outRows,
+		Width: width,
+	}
+}
+
+// mkConstExpr builds a Const expression from a scalar or materialised datum.
+// The datum is always bound to a local first: constructing a value struct
+// inline inside the enum literal is miscompiled by Tin when other large locals
+// are in scope (see BUGS.md), so all constant construction goes through here.
+fn mkConstExpr(d types.Datum, typ u32) Expr {
+	let ce = ConstExpr{Value: d, Type: typ}
+	return Expr.Const(ce)
+}
+
+// mkInt4Const builds an integer Const expression of the given integer type.
+fn mkInt4Const(oid types.Oid, v i64) Expr {
+	let d = types.FromI64(oid, v)
+	return mkConstExpr(d, u32(oid))
+}
+
+// mkBoolConst builds a boolean Const expression.
+fn mkBoolConst(v bool) Expr {
+	let d = types.FromBool(v)
+	return mkConstExpr(d, u32(types.BoolOid))
+}
+
+// mkStrConst builds a text-family Const expression.
+fn mkStrConst(oid types.Oid, v str) Expr {
+	let d = types.FromStr(oid, v)
+	return mkConstExpr(d, u32(oid))
+}
+
+// mkNullConst builds a typed NULL Const expression.
+fn mkNullConst(typ u32) Expr {
+	let d = types.Null()
+	return mkConstExpr(d, typ)
+}
+
+// foldExpr performs constant folding on expression trees.
+fn foldExpr(expr Expr) Expr {
+	match expr {
+		Const(_) => { return expr }
+		Param(_) => { return expr }
+		ColRef(_) => { return expr }
+		Cast(c) => {
+			let foldedArg = foldExpr(c.Arg)
+			match foldedArg {
+				Const(lit) => {
+					let castVal = types.Cast(lit.Value, types.Oid(c.Type)) catch _ {
+						return Expr.Cast(CastExpr{Arg: foldedArg, Type: c.Type, Typmod: c.Typmod})
+					}
+					return mkConstExpr(castVal, c.Type)
+				}
+				_ => {
+					return Expr.Cast(CastExpr{Arg: foldedArg, Type: c.Type, Typmod: c.Typmod})
+				}
+			}
+		}
+		NullTest(nt) => {
+			let foldedArg = foldExpr(nt.Arg)
+			match foldedArg {
+				Const(lit) => {
+					let isNull = types.IsNull(lit.Value)
+					if nt.Test == NullTestType.IsNull {
+						return mkBoolConst(isNull)
+					} else {
+						return mkBoolConst(!isNull)
+					}
+				}
+				_ => {
+					return Expr.NullTest(NullTestExpr{Arg: foldedArg, Test: nt.Test, Type: nt.Type})
+				}
+			}
+		}
+		BoolExpr(be) => {
+			mut foldedArgs = []Expr{}
+			for a in be.Args {
+				foldedArgs = append(foldedArgs, foldExpr(a))
+			}
+			match be.Op {
+				And => {
+					mut nonConstArgs = []Expr{}
+					for fa in foldedArgs {
+						match fa {
+							Const(lit) => {
+								if !types.IsNull(lit.Value) {
+									let b = lit.Value.Text() == "t" || lit.Value.Text() == "true"
+									if !b {
+										return mkBoolConst(false)
+									}
+								} else {
+									nonConstArgs = append(nonConstArgs, fa)
+								}
+							}
+							_ => {
+								nonConstArgs = append(nonConstArgs, fa)
+							}
+						}
+					}
+					if len(nonConstArgs) == 0 {
+						return mkBoolConst(true)
+					}
+					if len(nonConstArgs) == 1 {
+						return nonConstArgs[0]
+					}
+					return Expr.BoolExpr(BoolExpr{Op: BoolOp.And, Args: nonConstArgs, Type: be.Type})
+				}
+				Or => {
+					mut nonConstArgs = []Expr{}
+					for fa in foldedArgs {
+						match fa {
+							Const(lit) => {
+								if !types.IsNull(lit.Value) {
+									let b = lit.Value.Text() == "t" || lit.Value.Text() == "true"
+									if b {
+										return mkBoolConst(true)
+									}
+								} else {
+									nonConstArgs = append(nonConstArgs, fa)
+								}
+							}
+							_ => {
+								nonConstArgs = append(nonConstArgs, fa)
+							}
+						}
+					}
+					if len(nonConstArgs) == 0 {
+						return mkBoolConst(false)
+					}
+					if len(nonConstArgs) == 1 {
+						return nonConstArgs[0]
+					}
+					return Expr.BoolExpr(BoolExpr{Op: BoolOp.Or, Args: nonConstArgs, Type: be.Type})
+				}
+				Not => {
+					if len(foldedArgs) == 1 {
+						match foldedArgs[0] {
+							Const(lit) => {
+								if !types.IsNull(lit.Value) {
+									let b = lit.Value.Text() == "t" || lit.Value.Text() == "true"
+									return mkBoolConst(!b)
+								}
+							}
+							_ => {}
+						}
+					}
+					return Expr.BoolExpr(BoolExpr{Op: BoolOp.Not, Args: foldedArgs, Type: be.Type})
+				}
+			}
+		}
+		OpCall(op) => {
+						mut foldedArgs = []Expr{}
+			mut allConst = true
+			for a in op.Args {
+								let fa = foldExpr(a)
+								foldedArgs = append(foldedArgs, fa)
+				match fa {
+					Const(_) => {}
+					_ => { allConst = false }
+				}
+			}
+						if allConst && len(foldedArgs) == 2 {
+				mut leftVal = types.Null()
+				match foldedArgs[0] {
+					Const(l) => { leftVal = l.Value }
+					_ => {}
+				}
+								mut rightVal = types.Null()
+				match foldedArgs[1] {
+					Const(r) => { rightVal = r.Value }
+					_ => {}
+				}
+								let lookedUp = types.LookupFunc(op.Func.Name, []types.Oid{types.Oid(foldedArgs[0].Type()), types.Oid(foldedArgs[1].Type())})
+				if let lf = lookedUp {
+					let res = lf.Call([]types.Datum{leftVal, rightVal}) catch _ {
+						return Expr.OpCall(OpCallExpr{Op: op.Op, Func: op.Func, Args: foldedArgs, Type: op.Type})
+					}
+					return mkConstExpr(res, op.Type)
+				}
+			}
+			return Expr.OpCall(OpCallExpr{Op: op.Op, Func: op.Func, Args: foldedArgs, Type: op.Type})
+		}
+		_ => { return expr }
+	}
+	return expr
+}
+
+// splitConjunction flattens an expression across top-level ANDs.
+fn splitConjunction(expr ?Expr) []Expr {
+	if let unwrapped = expr {
+		match unwrapped {
+			BoolExpr(b) => {
+				if b.Op == BoolOp.And {
+					mut out = []Expr{}
+					for a in b.Args {
+						let sub = splitConjunction(a)
+						for s in sub {
+							out = append(out, s)
+						}
+					}
+					return out
+				}
+				return []Expr{unwrapped}
+			}
+			_ => {
+				return []Expr{unwrapped}
+			}
+		}
+	}
+	return []Expr{}
+}
+
+// combineConjunction merges a list of predicates into an AND expression.
+fn combineConjunction(quals []Expr) ?Expr {
+	if len(quals) == 0 {
+		return nil
+	}
+	if len(quals) == 1 {
+		return quals[0]
+	}
+	return Expr.BoolExpr(BoolExpr{Op: BoolOp.And, Args: quals, Type: u32(types.BoolOid)})
+}
+
+fn exprReferencedRanges(expr Expr) []i64 {
+	match expr {
+		ColRef(col) => {
+			return []i64{col.RangeIndex}
+		}
+		OpCall(op) => {
+			mut out = []i64{}
+			for a in op.Args {
+				for r in exprReferencedRanges(a) {
+					mut found = false
+					for existing in out { if existing == r { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		FuncCall(fc) => {
+			mut out = []i64{}
+			for a in fc.Args {
+				for r in exprReferencedRanges(a) {
+					mut found = false
+					for existing in out { if existing == r { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		BoolExpr(be) => {
+			mut out = []i64{}
+			for a in be.Args {
+				for r in exprReferencedRanges(a) {
+					mut found = false
+					for existing in out { if existing == r { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		Cast(ce) => {
+			return exprReferencedRanges(ce.Arg)
+		}
+		NullTest(nt) => {
+			return exprReferencedRanges(nt.Arg)
+		}
+		Case(cs) => {
+			mut out = []i64{}
+			for w in cs.Whens {
+				for r in exprReferencedRanges(w.When) {
+					mut found = false
+					for existing in out { if existing == r { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+				for r in exprReferencedRanges(w.Then) {
+					mut found = false
+					for existing in out { if existing == r { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			if let e = cs.Else {
+				for r in exprReferencedRanges(e) {
+					mut found = false
+					for existing in out { if existing == r { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		AggRef(ag) => {
+			mut out = []i64{}
+			for a in ag.Args {
+				for r in exprReferencedRanges(a) {
+					mut found = false
+					for existing in out { if existing == r { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		WindowFuncRef(wf) => {
+			mut out = []i64{}
+			for a in wf.Args {
+				for r in exprReferencedRanges(a) {
+					mut found = false
+					for existing in out { if existing == r { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		_ => {
+			return []i64{}
+		}
+	}
+}
+
+fn isSingleTableQual(expr Expr, rangeIndex i64) bool {
+	let ranges = exprReferencedRanges(expr)
+	if len(ranges) == 0 { return true }
+	if len(ranges) == 1 && ranges[0] == rangeIndex { return true }
+	return false
+}
+
+// PlanQuery converts an AnalyzedQuery AST into an optimized physical Plan.
+fn PlanQuery(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
+	match query.Command {
+		"SELECT" => {
+			return try planSelect(c, tx, mut query)
+		}
+		"INSERT" => {
+			return try planInsert(c, tx, query)
+		}
+		"UPDATE" => {
+			return try planUpdate(c, tx, query)
+		}
+		"DELETE" => {
+			return try planDelete(c, tx, query)
+		}
+		_ => {
+			return Plan.Result(ResultNode{
+				Exprs: []Expr{},
+				Filter: nil,
+				Cols: []ColDesc{},
+				Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0},
+			})
+		}
+	}
+}
+
+fn planSelect(c catalog.Catalog, tx txn.Txn, query mut AnalyzedQuery) !Plan {
+	mut foldedWhere ?Expr = nil
+	if let w = query.Where {
+		foldedWhere = foldExpr(w)
+	}
+	let allQuals = splitConjunction(foldedWhere)
+
+	// 1. Plan FROM clause
+	mut planNode ?Plan = nil
+	if len(query.From) == 0 {
+		// Zero-table query: e.g. SELECT 1 + 2
+		mut projExprs = []Expr{}
+		mut outCols = []ColDesc{}
+		for target in query.Targets {
+			projExprs = append(projExprs, foldExpr(target.Expr))
+			outCols = append(outCols, target.Col)
+		}
+		return Plan.Result(ResultNode{
+			Exprs: projExprs,
+			Filter: foldedWhere,
+			Cols: outCols,
+			Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 8},
+		})
+	} else if len(query.From) == 1 {
+		planNode = try planFromItem(c, tx, mut query.From[0], allQuals)
+	} else {
+		// Multi-table FROM (comma joins)
+		planNode = try planFromJoinList(c, tx, mut query.From, allQuals)
+	}
+
+	mut currentPlan = Plan.Result(ResultNode{
+		Exprs: []Expr{},
+		Filter: nil,
+		Cols: []ColDesc{},
+		Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0},
+	})
+	if let p = planNode {
+		currentPlan = p
+	}
+
+	// 2. Aggregates / Group By
+	mut aggregatedPlan = currentPlan
+	if query.HasAggs || len(query.GroupBy) > 0 {
+		mut grpKeys = []Expr{}
+		for g in query.GroupBy {
+			grpKeys = append(grpKeys, foldExpr(g))
+		}
+		mut aggRefs = []AggRefExpr{}
+		for target in query.Targets {
+					for r in findAggRefs(target.Expr) {
+			mut found = false
+			for existing in aggRefs { if existing.Slot == r.Slot { found = true
+break } }
+			if !found { aggRefs = append(aggRefs, r) }
+		}
+		}
+		let numAggs = i64(len(aggRefs))
+		let aggCost = costAgg(currentPlan.Cost(), currentPlan.Cost().Rows, 1.0, numAggs, currentPlan.Cost().Width)
+		aggregatedPlan = Plan.HashAgg(HashAggNode{
+			Input: currentPlan,
+			GroupKeys: grpKeys,
+			Aggs: aggRefs,
+			Cols: currentPlan.Cols(),
+			Cost: aggCost,
+		})
+	}
+
+	// 3. HAVING
+	mut havingPlan = aggregatedPlan
+	if let h = query.Having {
+		let foldedHaving = foldExpr(h)
+		let cost = Cost{
+			Startup: havingPlan.Cost().Startup,
+			Total: havingPlan.Cost().Total + havingPlan.Cost().Rows * CpuOperatorCost,
+			Rows: havingPlan.Cost().Rows * 0.5,
+			Width: havingPlan.Cost().Width,
+		}
+		havingPlan = Plan.Filter(FilterNode{
+			Input: havingPlan,
+			Predicate: foldedHaving,
+			Cols: havingPlan.Cols(),
+			Cost: cost,
+		})
+	}
+
+	// 4. Projection
+	mut projExprs = []Expr{}
+	mut outCols = []ColDesc{}
+	for target in query.Targets {
+		projExprs = append(projExprs, foldExpr(target.Expr))
+		outCols = append(outCols, target.Col)
+	}
+	let projCost = Cost{
+		Startup: havingPlan.Cost().Startup,
+		Total: havingPlan.Cost().Total + havingPlan.Cost().Rows * CpuTupleCost,
+		Rows: havingPlan.Cost().Rows,
+		Width: i64(len(outCols) * 8),
+	}
+	let projectedPlan = Plan.Project(ProjectNode{
+		Input: havingPlan,
+		Exprs: projExprs,
+		Cols: outCols,
+		Cost: projCost,
+	})
+
+	// 5. DISTINCT
+	mut distinctPlan = projectedPlan
+	if query.Distinct {
+		let dCost = Cost{
+			Startup: projectedPlan.Cost().Total,
+			Total: projectedPlan.Cost().Total + projectedPlan.Cost().Rows * CpuTupleCost,
+			Rows: projectedPlan.Cost().Rows * 0.8,
+			Width: projectedPlan.Cost().Width,
+		}
+		distinctPlan = Plan.Unique(UniqueNode{
+			Input: projectedPlan,
+			Cols: outCols,
+			Cost: dCost,
+		})
+	}
+
+	// 6. ORDER BY
+	mut sortedPlan = distinctPlan
+	if len(query.OrderBy) > 0 {
+		mut sortKeys = []SortKey{}
+		for k in query.OrderBy {
+			sortKeys = append(sortKeys, SortKey{
+				Expr: foldExpr(k.Expr),
+				Descending: k.Descending,
+				NullsFirst: k.NullsFirst,
+			})
+		}
+		let sCost = costSort(distinctPlan.Cost(), distinctPlan.Cost().Rows, distinctPlan.Cost().Width)
+		sortedPlan = Plan.Sort(SortNode{
+			Input: distinctPlan,
+			Keys: sortKeys,
+			Limit: -1,
+			Cols: outCols,
+			Cost: sCost,
+		})
+	}
+
+	// 7. LIMIT / OFFSET
+	mut finalPlan = sortedPlan
+	if query.Limit != nil || query.Offset != nil {
+		mut foldedLimit ?Expr = nil
+		if let l = query.Limit { foldedLimit = foldExpr(l) }
+		mut foldedOffset ?Expr = nil
+		if let o = query.Offset { foldedOffset = foldExpr(o) }
+		finalPlan = Plan.Limit(LimitNode{
+			Input: sortedPlan,
+			Count: foldedLimit,
+			Offset: foldedOffset,
+			Cols: outCols,
+			Cost: sortedPlan.Cost(),
+		})
+	}
+
+	return finalPlan
+}
+
+fn findAggRefs(expr Expr) []AggRefExpr {
+	match expr {
+		AggRef(ag) => {
+			return []AggRefExpr{ag}
+		}
+		OpCall(op) => {
+			mut out = []AggRefExpr{}
+			for a in op.Args {
+				for r in findAggRefs(a) {
+					mut found = false
+					for existing in out { if existing.Slot == r.Slot { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		FuncCall(fc) => {
+			mut out = []AggRefExpr{}
+			for a in fc.Args {
+				for r in findAggRefs(a) {
+					mut found = false
+					for existing in out { if existing.Slot == r.Slot { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		BoolExpr(be) => {
+			mut out = []AggRefExpr{}
+			for a in be.Args {
+				for r in findAggRefs(a) {
+					mut found = false
+					for existing in out { if existing.Slot == r.Slot { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		Cast(ce) => {
+			return findAggRefs(ce.Arg)
+		}
+		Case(cs) => {
+			mut out = []AggRefExpr{}
+			for w in cs.Whens {
+				for r in findAggRefs(w.When) {
+					mut found = false
+					for existing in out { if existing.Slot == r.Slot { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+				for r in findAggRefs(w.Then) {
+					mut found = false
+					for existing in out { if existing.Slot == r.Slot { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			if let e = cs.Else {
+				for r in findAggRefs(e) {
+					mut found = false
+					for existing in out { if existing.Slot == r.Slot { found = true
+break } }
+					if !found { out = append(out, r) }
+				}
+			}
+			return out
+		}
+		_ => {
+			return []AggRefExpr{}
+		}
+	}
+}
+
+fn planFromItem(c catalog.Catalog, tx txn.Txn, item mut FromClauseItem, allQuals []Expr) !Plan {
+	match item {
+		Table(tbl) => {
+			return try planTableScan(c, tx, tbl, allQuals)
+		}
+		Subquery(sub) => {
+			mut subQuery = sub.Query
+			let subPlan = try PlanQuery(c, tx, mut subQuery)
+			return subPlan
+		}
+		Values(v) => {
+			mut foldedRows = [][]Expr{}
+			for row in v.Rows {
+				mut fRow = []Expr{}
+				for cell in row {
+					fRow = append(fRow, foldExpr(cell))
+				}
+				foldedRows = append(foldedRows, fRow)
+			}
+			let cost = Cost{
+				Startup: 0.0,
+				Total: f64(len(v.Rows)) * CpuTupleCost,
+				Rows: f64(len(v.Rows)),
+				Width: i64(len(v.Cols) * 8),
+			}
+			return Plan.Values(ValuesNode{
+				Rows: foldedRows,
+				Cols: v.Cols,
+				Cost: cost,
+			})
+		}
+		Join(j) => {
+			mut leftItem = j.Left
+			let leftPlan = try planFromItem(c, tx, mut leftItem, allQuals)
+			mut rightItem = j.Right
+			let rightPlan = try planFromItem(c, tx, mut rightItem, allQuals)
+			mut joinQuals = []Expr{}
+			for q in j.Quals {
+				joinQuals = append(joinQuals, foldExpr(q))
+			}
+
+			// Check if equijoin operator exists
+			mut isEqui = false
+			mut leftKeys = []Expr{}
+			mut rightKeys = []Expr{}
+			if len(joinQuals) > 0 {
+				match joinQuals[0] {
+					OpCall(op) => {
+						if op.Op == "=" && len(op.Args) == 2 {
+							isEqui = true
+							leftKeys = append(leftKeys, op.Args[0])
+							rightKeys = append(rightKeys, op.Args[1])
+						}
+					}
+					_ => {}
+				}
+			}
+
+			let totalRows = leftPlan.Cost().Rows * rightPlan.Cost().Rows * 0.1 + 1.0
+			let totalWidth = leftPlan.Cost().Width + rightPlan.Cost().Width
+
+			if isEqui {
+				let hjCost = costHashJoin(leftPlan.Cost(), rightPlan.Cost(), totalRows, totalWidth)
+				return Plan.HashJoin(HashJoinNode{
+					Left: leftPlan,
+					Right: rightPlan,
+					JoinType: j.JoinType,
+					LeftKeys: leftKeys,
+					RightKeys: rightKeys,
+					Quals: joinQuals,
+					Cols: j.Cols,
+					Cost: hjCost,
+				})
+			} else {
+				let nlCost = costNestLoop(leftPlan.Cost(), rightPlan.Cost(), totalRows, totalWidth)
+				return Plan.NestLoop(NestLoopNode{
+					Left: leftPlan,
+					Right: rightPlan,
+					JoinType: j.JoinType,
+					Quals: joinQuals,
+					Cols: j.Cols,
+					Cost: nlCost,
+				})
+			}
+		}
+		Function(_) => {
+			return Plan.Result(ResultNode{
+				Exprs: []Expr{},
+				Filter: nil,
+				Cols: []ColDesc{},
+				Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0},
+			})
+		}
+	}
+}
+
+fn planFromJoinList(c catalog.Catalog, tx txn.Txn, items mut []FromClauseItem, allQuals []Expr) !Plan {
+	mut currentPlan = try planFromItem(c, tx, mut items[0], allQuals)
+	mut i = 1
+	for i < len(items) {
+		let nextPlan = try planFromItem(c, tx, mut items[i], allQuals)
+		mut mergedCols = []ColDesc{}
+		for col in currentPlan.Cols() {
+			mergedCols = append(mergedCols, col)
+		}
+		for col in nextPlan.Cols() {
+			mergedCols = append(mergedCols, col)
+		}
+		let totalRows = currentPlan.Cost().Rows * nextPlan.Cost().Rows
+		let totalWidth = currentPlan.Cost().Width + nextPlan.Cost().Width
+		let nlCost = costNestLoop(currentPlan.Cost(), nextPlan.Cost(), totalRows, totalWidth)
+		currentPlan = Plan.NestLoop(NestLoopNode{
+			Left: currentPlan,
+			Right: nextPlan,
+			JoinType: JoinType.Inner,
+			Quals: []Expr{},
+			Cols: mergedCols,
+			Cost: nlCost,
+		})
+		i += 1
+	}
+
+	// Attach remaining multi-table quals
+	mut unpushedQuals = []Expr{}
+	for q in allQuals {
+		let ranges = exprReferencedRanges(q)
+		if len(ranges) > 1 {
+			unpushedQuals = append(unpushedQuals, foldExpr(q))
+		}
+	}
+	if len(unpushedQuals) > 0 {
+		let filterCond = combineConjunction(unpushedQuals)
+		if let fc = filterCond {
+			currentPlan = Plan.Filter(FilterNode{
+				Input: currentPlan,
+				Predicate: fc,
+				Cols: currentPlan.Cols(),
+				Cost: currentPlan.Cost(),
+			})
+		}
+	}
+	return currentPlan
+}
+
+fn planTableScan(c catalog.Catalog, tx txn.Txn, tbl FromTable, allQuals []Expr) !Plan {
+	mut tableQuals = []Expr{}
+	for q in allQuals {
+		if isSingleTableQual(q, tbl.RangeIndex) {
+			tableQuals = append(tableQuals, foldExpr(q))
+		}
+	}
+
+	let catTable = c.LookupTable(tx, tbl.Schema, tbl.Name)
+	let width = i64(len(tbl.Cols) * 8)
+	let defaultRows = 100.0
+
+	if let t = catTable {
+		// Index Scan Selection
+		if len(t.Indexes) > 0 && len(tableQuals) > 0 {
+			for idx in t.Indexes {
+				// Check for point lookup equality: col = <const> or col = $n
+				for q in tableQuals {
+					match q {
+						OpCall(op) => {
+							if op.Op == "=" && len(op.Args) == 2 {
+								match op.Args[0] {
+									ColRef(_) => {
+										let isPointLookup = idx.Unique
+										let cost = costIndexScan(defaultRows, width, i64(len(tableQuals)), isPointLookup)
+										return Plan.IndexScan(IndexScanNode{
+											Table: t,
+											Index: idx,
+											Bounds: []IndexBound{},
+											Quals: []Expr{q},
+											Direction: ScanDirection.Forward,
+											Filter: nil,
+											Cols: tbl.Cols,
+											Cost: cost,
+										})
+									}
+									_ => {}
+								}
+							}
+						}
+						_ => {}
+					}
+				}
+			}
+		}
+
+		let cost = costSeqScan(defaultRows, width, i64(len(tableQuals)))
+		let filterCond = combineConjunction(tableQuals)
+		return Plan.SeqScan(SeqScanNode{
+			Table: t,
+			Filter: filterCond,
+			Projection: []Expr{},
+			Cols: tbl.Cols,
+			Cost: cost,
+		})
+	}
+
+	fail types.ErrorFault(types.NewError("42P01", "relation \"" + tbl.Name + "\" does not exist"))
+}
+
+fn planInsert(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery) !Plan {
+	if len(query.From) == 0 {
+		fail types.ErrorFault(types.NewError("42P01", "missing target table for INSERT"))
+	}
+	let tbl = query.From[0]
+	match tbl {
+		Table(t) => {
+			if let catTable = c.LookupTable(tx, t.Schema, t.Name) {
+				return Plan.ModifyTable(ModifyTableNode{
+					Kind: ModifyKind.Insert,
+					Table: catTable,
+					Source: Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}}),
+					TargetCols: []i16{},
+					OnConflict: nil,
+					Returning: []Expr{},
+					Cols: []ColDesc{},
+					Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
+				})
+			}
+			fail types.ErrorFault(types.NewError("42P01", "relation \"" + t.Name + "\" does not exist"))
+		}
+		_ => {
+			fail types.ErrorFault(types.NewError("42P01", "invalid target table for INSERT"))
+		}
+	}
+	fail types.ErrorFault(types.NewError("42P01", "invalid target table for INSERT"))
+}
+
+fn planUpdate(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery) !Plan {
+	if len(query.From) == 0 {
+		fail types.ErrorFault(types.NewError("42P01", "missing target table for UPDATE"))
+	}
+	let tbl = query.From[0]
+	match tbl {
+		Table(t) => {
+			if let catTable = c.LookupTable(tx, t.Schema, t.Name) {
+				return Plan.ModifyTable(ModifyTableNode{
+					Kind: ModifyKind.Update,
+					Table: catTable,
+					Source: Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}}),
+					TargetCols: []i16{},
+					OnConflict: nil,
+					Returning: []Expr{},
+					Cols: []ColDesc{},
+					Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
+				})
+			}
+			fail types.ErrorFault(types.NewError("42P01", "relation \"" + t.Name + "\" does not exist"))
+		}
+		_ => {
+			fail types.ErrorFault(types.NewError("42P01", "invalid target table for UPDATE"))
+		}
+	}
+	fail types.ErrorFault(types.NewError("42P01", "invalid target table for UPDATE"))
+}
+
+fn planDelete(c catalog.Catalog, tx txn.Txn, query AnalyzedQuery) !Plan {
+	if len(query.From) == 0 {
+		fail types.ErrorFault(types.NewError("42P01", "missing target table for DELETE"))
+	}
+	let tbl = query.From[0]
+	match tbl {
+		Table(t) => {
+			if let catTable = c.LookupTable(tx, t.Schema, t.Name) {
+				return Plan.ModifyTable(ModifyTableNode{
+					Kind: ModifyKind.Delete,
+					Table: catTable,
+					Source: Plan.Result(ResultNode{Exprs: []Expr{}, Filter: nil, Cols: []ColDesc{}, Cost: Cost{Startup: 0.0, Total: 0.01, Rows: 1.0, Width: 0}}),
+					TargetCols: []i16{},
+					OnConflict: nil,
+					Returning: []Expr{},
+					Cols: []ColDesc{},
+					Cost: Cost{Startup: 0.0, Total: 1.0, Rows: 1.0, Width: 0},
+				})
+			}
+			fail types.ErrorFault(types.NewError("42P01", "relation \"" + t.Name + "\" does not exist"))
+		}
+		_ => {
+			fail types.ErrorFault(types.NewError("42P01", "invalid target table for DELETE"))
+		}
+	}
+	fail types.ErrorFault(types.NewError("42P01", "invalid target table for DELETE"))
+}

@@ -1,0 +1,303 @@
+package types
+
+import "crucible"
+import "quarry"
+import "twine"
+
+type GoldenParser value struct {
+	Source str
+	Pos i64
+}
+
+fn TestPostgreSqlFunctionGoldens(t mut crucible.T) {
+	let scalar = quarry.ReadFile("types/testdata/golden_funcs_scalar.txt") catch err {
+		t.Error("could not load scalar PostgreSQL goldens: {err}")
+		return
+	}
+	let strings = quarry.ReadFile("types/testdata/golden_funcs_strings.txt") catch err {
+		t.Error("could not load string PostgreSQL goldens: {err}")
+		return
+	}
+	let scalarCount = testGoldenFile(mut t, "scalar", scalar)
+	let stringCount = testGoldenFile(mut t, "string", strings)
+	t.True("golden corpus has at least 500 expressions", scalarCount+stringCount >= 500)
+}
+
+fn testGoldenFile(t mut crucible.T, group str, contents str) i64 {
+	mut count = i64(0)
+	mut reportedFailure = false
+	for lineNo, line in twine.Split(contents, "\n") {
+		if len(line) == 0 { continue }
+		let fields = twine.SplitN(line, "\t", 2)
+		if len(fields) != 2 {
+			t.Error("{group} golden line {lineNo+1} is not tab separated")
+			continue
+		}
+		count += 1
+		let expression = fields[0]
+		let expected = fields[1]
+		let got = evalGoldenExpression(expression) catch err {
+			let actualError = "ERROR: " + ErrorMessage(err)
+			if actualError != expected && !reportedFailure {
+				t.Error("{group} {expression}: got {actualError}, want {expected}")
+				reportedFailure = true
+			}
+			continue
+		}
+		if expected == "NULL" {
+			if !IsNull(got) && !reportedFailure {
+				t.Error("{group} {expression}: got {got.Text()}, want SQL NULL")
+				reportedFailure = true
+			}
+		} else if twine.HasPrefix(expected, "ERROR: ") {
+			if !reportedFailure {
+				t.Error("{group} {expression}: got {got.Text()}, want {expected}")
+				reportedFailure = true
+			}
+		} else if got.Text() != expected {
+			if !reportedFailure {
+				t.Error("{group} {expression}: got {got.Text()}, want {expected}")
+				reportedFailure = true
+			}
+		}
+	}
+	return count
+}
+
+fn evalGoldenExpression(source str) !Datum {
+	mut parser = GoldenParser{Source: keep(source), Pos: 0}
+	let value = try parser.parseExpression(0)
+	parser.skipSpace()
+	if parser.Pos != len(parser.Source) { fail "unexpected input at byte {parser.Pos}" }
+	return value
+}
+
+fn (parser mut GoldenParser) skipSpace() {
+	for parser.Pos < len(parser.Source) && parser.Source[parser.Pos] <= 32 { parser.Pos += 1 }
+}
+
+fn (parser GoldenParser) starts(text str) bool {
+	return len(text) <= len(parser.Source)-parser.Pos && parser.Source[parser.Pos:parser.Pos+len(text)] == text
+}
+
+fn (parser mut GoldenParser) parseExpression(minPrecedence i64) !Datum {
+	mut left = try parser.parsePrimary()
+	for {
+		parser.skipSpace()
+		if parser.starts("::") {
+			parser.Pos += 2
+			let typeName = parser.readIdentifier()
+			left = try goldenCast(left, typeName)
+			continue
+		}
+		if parser.starts("IS ") || parser.starts("IS\t") {
+			if 3 < minPrecedence { break }
+			left = try parser.parseIs(left)
+			continue
+		}
+		let (op, precedence, width) = parser.binaryOperator()
+		if width == 0 || precedence < minPrecedence { break }
+		parser.Pos += width
+		let right = try parser.parseExpression(precedence+1)
+		if op == "AND" || op == "OR" {
+			left = try booleanValues(op, left, right)
+		} else {
+			if let f = LookupOperator(op, left.Oid(), right.Oid()) {
+				left = try f.Call2(left, right)
+			} else {
+				fail "operator {op} is not defined for {left.Oid()} and {right.Oid()}"
+			}
+		}
+	}
+	return left
+}
+
+fn (parser mut GoldenParser) parsePrimary() !Datum {
+	parser.skipSpace()
+	if parser.Pos >= len(parser.Source) { fail "unexpected end of expression" }
+	if parser.starts("(") {
+		parser.Pos += 1
+		let value = try parser.parseExpression(0)
+		parser.skipSpace()
+		if !parser.starts(")") { fail "expected closing parenthesis" }
+		parser.Pos += 1
+		return value
+	}
+	if parser.starts("'") { return try parser.readString() }
+	if parser.starts("-") || parser.starts("+") {
+		let op = parser.Source[parser.Pos:parser.Pos+1]
+		parser.Pos += 1
+		let value = try parser.parseExpression(7)
+		if let f = LookupFunc(op, []Oid{value.Oid()}) { return try f.Call1(value) }
+		fail "unary operator {op} is missing"
+	}
+	let c = parser.Source[parser.Pos]
+	if c >= '0' && c <= '9' { return try parser.readNumber() }
+	let name = parser.readIdentifier()
+	if len(name) == 0 { fail "expected a literal, function, or parenthesized expression" }
+	if name == "null" { return Null() }
+	if name == "true" { return FromBool(true) }
+	if name == "false" { return FromBool(false) }
+	if name == "not" {
+		let value = try parser.parseExpression(7)
+		if let f = LookupFunc("NOT", []Oid{value.Oid()}) { return try f.Call1(value) }
+		fail "NOT requires boolean input"
+	}
+	parser.skipSpace()
+	if !parser.starts("(") { fail "unsupported name {name}" }
+	parser.Pos += 1
+	mut args = []Datum{}
+	parser.skipSpace()
+	if !parser.starts(")") {
+		for {
+			let arg = try parser.parseExpression(0)
+			args = append(args, arg)
+			parser.skipSpace()
+			if parser.starts(",") {
+				parser.Pos += 1
+				continue
+			}
+			break
+		}
+	}
+	parser.skipSpace()
+	if !parser.starts(")") { fail "expected closing function parenthesis" }
+	parser.Pos += 1
+	mut argOids = make([]Oid, 0, len(args))
+	for arg in args { argOids = append(argOids, arg.Oid()) }
+	if let f = LookupFunc(twine.ToLower(name), argOids) { return try f.Call(args) }
+	fail "function {name} is not defined for these arguments"
+}
+
+fn (parser mut GoldenParser) readString() !Datum {
+	parser.Pos += 1
+	mut out = ""
+	for parser.Pos < len(parser.Source) {
+		let c = parser.Source[parser.Pos]
+		if c == '\'' {
+			if parser.Pos+1 < len(parser.Source) && parser.Source[parser.Pos+1] == '\'' {
+				out += "'"
+				parser.Pos += 2
+				continue
+			}
+			parser.Pos += 1
+			return FromStr(UnknownLiteralOid, out)
+		}
+		out += parser.Source[parser.Pos:parser.Pos+1]
+		parser.Pos += 1
+	}
+	fail "unterminated string literal"
+}
+
+fn (parser mut GoldenParser) readNumber() !Datum {
+	let start = parser.Pos
+	mut decimal = false
+	for parser.Pos < len(parser.Source) {
+		let c = parser.Source[parser.Pos]
+		if c >= '0' && c <= '9' { parser.Pos += 1
+		} else if c == '.' || c == 'e' || c == 'E' {
+			decimal = true
+			parser.Pos += 1
+		} else { break }
+	}
+	let text = parser.Source[start:parser.Pos]
+	if decimal { return try Parse(NumericOid, text) }
+	let value = try Parse(Int8Oid, text)
+	if value.i <= 2147483647 { return FromI64(Int4Oid, value.i) }
+	return value
+}
+
+fn (parser mut GoldenParser) readIdentifier() str {
+	parser.skipSpace()
+	let start = parser.Pos
+	for parser.Pos < len(parser.Source) {
+		let c = parser.Source[parser.Pos]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' { parser.Pos += 1 } else { break }
+	}
+	return twine.ToLower(parser.Source[start:parser.Pos])
+}
+
+fn (parser mut GoldenParser) binaryOperator() (str, i64, i64) {
+	for op in []str{"NOT SIMILAR TO", "SIMILAR TO", "NOT LIKE", "NOT ILIKE", "LIKE", "ILIKE", "OR", "AND", "IS DISTINCT FROM", "!~~*", "!~~", "!~*", "!~", "~~*", "~~", "~*", "~", "<<", ">>", "<=", ">=", "<>", "=", "<", ">", "||", "+", "-", "*", "/", "%", "^", "&", "|", "#"} {
+		if isGoldenWord(op[0]) {
+			if parser.starts(op) && (parser.Pos+len(op) == len(parser.Source) || !isGoldenWord(parser.Source[parser.Pos+len(op)])) { return op, goldenPrecedence(op), len(op) }
+		} else if parser.starts(op) { return op, goldenPrecedence(op), len(op) }
+	}
+	return "", -1, 0
+}
+
+fn goldenPrecedence(op str) i64 {
+	if op == "OR" { return 1 }
+	if op == "AND" { return 2 }
+	if op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" { return 3 }
+	if op == "LIKE" || op == "ILIKE" || op == "NOT LIKE" || op == "NOT ILIKE" || op == "SIMILAR TO" || op == "NOT SIMILAR TO" || op == "~" || op == "~*" || op == "!~" || op == "!~*" || op == "~~" || op == "~~*" || op == "!~~" || op == "!~~*" || op == "IS DISTINCT FROM" { return 3 }
+	if op == "+" || op == "-" || op == "||" { return 4 }
+	if op == "<<" || op == ">>" { return 4 }
+	return 5
+}
+
+fn isGoldenWord(c u8) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+}
+
+fn (parser mut GoldenParser) parseIs(left Datum) !Datum {
+	parser.Pos += 2
+	parser.skipSpace()
+	mut negated = false
+	if parser.starts("NOT") && (parser.Pos+3 == len(parser.Source) || !isGoldenWord(parser.Source[parser.Pos+3])) {
+		negated = true
+		parser.Pos += 3
+		parser.skipSpace()
+	}
+	if parser.starts("DISTINCT") {
+		parser.Pos += 8
+		parser.skipSpace()
+		if !parser.starts("FROM") { fail "expected FROM after IS DISTINCT" }
+		parser.Pos += 4
+		let right = try parser.parseExpression(4)
+		mut op = "IS DISTINCT FROM"
+		if negated { op = "IS NOT DISTINCT FROM" }
+		if let f = LookupOperator(op, left.Oid(), right.Oid()) { return try f.Call2(left, right) }
+		fail "operator {op} is not available"
+	}
+	let predicate = parser.readIdentifier()
+	if predicate == "null" {
+		mut value = IsNull(left)
+		if negated { value = !value }
+		return FromBool(value)
+	}
+	mut op = "IS " + twine.ToUpper(predicate)
+	if negated { op = "IS NOT " + twine.ToUpper(predicate) }
+	if let f = LookupFunc(op, []Oid{left.Oid()}) { return try f.Call1(left) }
+	fail "predicate {op} is not available"
+}
+
+fn goldenCast(value Datum, typeName str) !Datum {
+	let target = match typeName {
+		"boolean", "bool" => BoolOid
+		"smallint", "int2" => Int2Oid
+		"integer", "int", "int4" => Int4Oid
+		"bigint", "int8" => Int8Oid
+		"oid" => OidOid
+		"real", "float4" => Float4Oid
+		"double", "float8" => Float8Oid
+		"text" => TextOid
+		"varchar" => VarcharOid
+		"bpchar", "char" => BpcharOid
+		"name" => NameOid
+		"bytea" => ByteaOid
+		"uuid" => UuidOid
+		"numeric" => NumericOid
+		"date" => DateOid
+		"time" => TimeOid
+		"timetz" => TimetzOid
+		"timestamp" => TimestampOid
+		"timestamptz" => TimestamptzOid
+		"interval" => IntervalOid
+		_ => Oid(0)
+	}
+	if target == 0 { fail "unsupported test cast target {typeName}" }
+	if IsNull(value) { return Datum{oid: target, null: true, i: 0, f: 0.0, b: false, s: "", bytes: []u8{}} }
+	if value.Oid() == UnknownLiteralOid { return try Parse(target, value.Text()) }
+	return try Cast(value, target)
+}

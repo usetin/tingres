@@ -85,7 +85,7 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 									}
 									let h = hTuple.Header
 									let snap = cat.Manager.Snapshot(t)
-									if cat.Manager.Visible(snap, txn.TupleHeader{Xmin: h.Xmin(), Xmax: h.Xmax(), Cid: h.Cid()}) {
+									if cat.Manager.Visible(snap, h) {
 										let decoded = types.DecodeRow(colTypes, hTuple.Payload) catch _ { []types.Datum{} }
 										if len(decoded) > 0 && len(targetRow) > 0 && !types.IsNull(targetRow[0]) && !types.IsNull(decoded[0]) {
 											if types.Compare(targetRow[0], decoded[0]) == 0 {
@@ -122,7 +122,8 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 							retCtx.Row = targetRow
 							mut retRow = []types.Datum{}
 							for expr in node.Returning {
-								let retVal = try EvalExpr(expr, mut retCtx)
+								mut eMut = expr
+								let retVal = try EvalExpr(mut eMut, mut retCtx)
 								retRow = append(retRow, retVal)
 							}
 							out.DataRow(retRow)
@@ -150,7 +151,7 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 								break
 							}
 							let h = hTuple.Header
-							if cat.Manager.Visible(snap, txn.TupleHeader{Xmin: h.Xmin(), Xmax: h.Xmax(), Cid: h.Cid()}) {
+							if cat.Manager.Visible(snap, h) {
 								let decoded = types.DecodeRow(colTypes, hTuple.Payload) catch _ { []types.Datum{} }
 								if rowsMatch(decoded, sourceRow) {
 									targetTid = hTuple.Tid
@@ -167,7 +168,8 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 								retCtx.Row = sourceRow
 								mut retRow = []types.Datum{}
 								for expr in node.Returning {
-									let retVal = try EvalExpr(expr, mut retCtx)
+									mut eMut = expr
+									let retVal = try EvalExpr(mut eMut, mut retCtx)
 									retRow = append(retRow, retVal)
 								}
 								out.DataRow(retRow)
@@ -195,7 +197,7 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 								break
 							}
 							let h = hTuple.Header
-							if cat.Manager.Visible(snap, txn.TupleHeader{Xmin: h.Xmin(), Xmax: h.Xmax(), Cid: h.Cid()}) {
+							if cat.Manager.Visible(snap, h) {
 								let decoded = types.DecodeRow(colTypes, hTuple.Payload) catch _ { []types.Datum{} }
 								if rowsMatch(decoded, sourceRow) {
 									targetTid = hTuple.Tid
@@ -226,7 +228,8 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 								retCtx.Row = updatedRow
 								mut retRow = []types.Datum{}
 								for expr in node.Returning {
-									let retVal = try EvalExpr(expr, mut retCtx)
+									mut eMut = expr
+									let retVal = try EvalExpr(mut eMut, mut retCtx)
 									retRow = append(retRow, retVal)
 								}
 								out.DataRow(retRow)

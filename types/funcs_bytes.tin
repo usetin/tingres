@@ -5,21 +5,28 @@ import "seal"
 
 fn registerByteaUuidFuncs(funcs mut []Func) {
 	for _, name in []str{"length", "octet_length"} {
-		registerFunc(mut funcs, function(name, []Oid{ByteaOid}, Int4Oid, true, false, fn(args []Datum) !Datum { return FromI64(Int4Oid, len(args[0].bytes)) }))
+		registerFunc(mut funcs, function1(name, []Oid{ByteaOid}, Int4Oid, true, false, fn(p1 Datum) !Datum { return FromI64(Int4Oid, len(p1.bytes)) }))
 	}
-	registerFunc(mut funcs, function("||", []Oid{ByteaOid, ByteaOid}, ByteaOid, true, false, fn(args []Datum) !Datum {
-		mut out = make([]u8, 0, len(args[0].bytes)+len(args[1].bytes))
-		out = append(out, args[0].bytes...)
-		out = append(out, args[1].bytes...)
+	registerFunc(mut funcs, function2("||", []Oid{ByteaOid, ByteaOid}, ByteaOid, true, false, fn(p1 Datum, p2 Datum) !Datum {
+		mut out = make([]u8, 0, len(p1.bytes)+len(p2.bytes))
+		out = append(out, p1.bytes...)
+		out = append(out, p2.bytes...)
 		return FromBytes(ByteaOid, out)
 	}))
-	registerFunc(mut funcs, function("substring", []Oid{ByteaOid, Int4Oid}, ByteaOid, true, false, fn(args []Datum) !Datum { return try byteaSubstring(args[0], args[1].i, -1) }))
-	registerFunc(mut funcs, function("substring", []Oid{ByteaOid, Int4Oid, Int4Oid}, ByteaOid, true, false, fn(args []Datum) !Datum { return try byteaSubstring(args[0], args[1].i, args[2].i) }))
-	registerFunc(mut funcs, function("get_byte", []Oid{ByteaOid, Int4Oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try byteaGetByte(args[0], args[1].i) }))
-	registerFunc(mut funcs, function("gen_random_uuid", []Oid{}, UuidOid, false, true, fn(args []Datum) !Datum { return try randomUuid() }))
-	for _, name in []str{"regexp_replace", "regexp_match", "regexp_matches", "regexp_split_to_array"} {
-		registerFunc(mut funcs, function(name, []Oid{TextOid, TextOid, TextOid}, TextOid, true, false, fn(args []Datum) !Datum { fail "regular expression functions are not supported" }))
+	for _, name in []str{"substring", "substr"} {
+		registerFunc(mut funcs, function2(name, []Oid{ByteaOid, Int4Oid}, ByteaOid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try byteaSubstring(p1, p2.i, -1) }))
+		registerFunc(mut funcs, function3(name, []Oid{ByteaOid, Int4Oid, Int4Oid}, ByteaOid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try byteaSubstring(p1, p2.i, p3.i) }))
 	}
+	registerFunc(mut funcs, function2("get_byte", []Oid{ByteaOid, Int4Oid}, Int4Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try byteaGetByte(p1, p2.i) }))
+	registerFunc(mut funcs, function3("set_byte", []Oid{ByteaOid, Int4Oid, Int4Oid}, ByteaOid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try byteaSetByte(p1, p2.i, p3.i) }))
+	registerFunc(mut funcs, function2("get_bit", []Oid{ByteaOid, Int4Oid}, Int4Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try byteaGetBit(p1, p2.i) }))
+	registerFunc(mut funcs, function3("set_bit", []Oid{ByteaOid, Int4Oid, Int4Oid}, ByteaOid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try byteaSetBit(p1, p2.i, p3.i) }))
+	registerFunc(mut funcs, function2("position", []Oid{ByteaOid, ByteaOid}, Int4Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return FromI64(Int4Oid, byteaPosition(p2.bytes, p1.bytes)) }))
+	registerFunc(mut funcs, function1("md5", []Oid{ByteaOid}, TextOid, true, false, fn(p1 Datum) !Datum { return FromStr(TextOid, md5Digest(p1.bytes)) }))
+	for _, name in []str{"sha256", "sha384", "sha512"} {
+		registerFunc(mut funcs, function1(name, []Oid{ByteaOid}, ByteaOid, true, false, fn(p1 Datum) !Datum { return try shaBytes(name, p1.bytes) }))
+	}
+	registerFunc(mut funcs, function("gen_random_uuid", []Oid{}, UuidOid, false, true, fn(args []Datum) !Datum { return try randomUuid() }))
 }
 
 fn byteaSubstring(value Datum, start i64, count i64) !Datum {
@@ -34,9 +41,64 @@ fn byteaSubstring(value Datum, start i64, count i64) !Datum {
 	return FromBytes(ByteaOid, bytes[begin:end])
 }
 
+fn byteaRangeFault(index i64, last i64) ! {
+	fail ErrorFault(NewError("2202E", "index {index} out of valid range, 0..{last}"))
+}
+
 fn byteaGetByte(value Datum, index i64) !Datum {
-	if index < 0 || index >= len(value.bytes) { fail "index {index} out of range" }
+	if index < 0 || index >= len(value.bytes) { try byteaRangeFault(index, len(value.bytes)-1) }
 	return FromI64(Int4Oid, i64(value.bytes[index]))
+}
+
+fn byteaSetByte(value Datum, index i64, byte i64) !Datum {
+	if index < 0 || index >= len(value.bytes) { try byteaRangeFault(index, len(value.bytes)-1) }
+	mut out = make([]u8, len(value.bytes))
+	copy(out, value.bytes)
+	out[index] = u8(byte)
+	return FromBytes(ByteaOid, out)
+}
+
+fn byteaGetBit(value Datum, index i64) !Datum {
+	let last = i64(len(value.bytes))*8-1
+	if index < 0 || index > last { try byteaRangeFault(index, last) }
+	let byte = value.bytes[index/8]
+	let bit = u8((i64(byte) >> u8(index%8)) & 1)
+	return FromI64(Int4Oid, i64(bit))
+}
+
+fn byteaSetBit(value Datum, index i64, bit i64) !Datum {
+	let last = i64(len(value.bytes))*8-1
+	if index < 0 || index > last { try byteaRangeFault(index, last) }
+	mut out = make([]u8, len(value.bytes))
+	copy(out, value.bytes)
+	let mask = u8(1) << u8(index%8)
+	if bit != 0 { out[index/8] = out[index/8] | mask } else { out[index/8] = out[index/8] & ^mask }
+	return FromBytes(ByteaOid, out)
+}
+
+fn byteaPosition(haystack []u8, needle []u8) i64 {
+	if len(needle) == 0 { return 1 }
+	if len(needle) > len(haystack) { return 0 }
+	for i in 0..len(haystack)-len(needle)+1 {
+		mut matched = true
+		for j in 0..len(needle) {
+			if haystack[i+j] != needle[j] {
+				matched = false
+				break
+			}
+		}
+		if matched { return i+1 }
+	}
+	return 0
+}
+
+fn shaBytes(name str, bytes []u8) !Datum {
+	let h = match name {
+		"sha256" => seal.Hash.SHA256
+		"sha384" => seal.Hash.SHA384
+		_ => seal.Hash.SHA512
+	}
+	return FromBytes(ByteaOid, seal.Sum(h, str(bytes)))
 }
 
 fn randomUuid() !Datum {

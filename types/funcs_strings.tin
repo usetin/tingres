@@ -8,39 +8,39 @@ import "seal"
 fn registerStringFuncs(funcs mut []Func) {
 	for _, oid in []Oid{TextOid, VarcharOid, BpcharOid, NameOid} {
 		for _, name in []str{"lower", "upper", "initcap", "reverse", "md5", "quote_ident", "quote_literal", "quote_nullable"} {
-			registerFunc(mut funcs, function(name, []Oid{oid}, TextOid, name != "quote_nullable", false, fn(args []Datum) !Datum { return try stringUnary(name, args[0]) }))
+			registerFunc(mut funcs, function1(name, []Oid{oid}, TextOid, name != "quote_nullable", false, fn(p1 Datum) !Datum { return try stringUnary(name, p1) }))
 		}
 		for _, name in []str{"length", "char_length", "character_length", "octet_length", "bit_length", "ascii"} {
-			registerFunc(mut funcs, function(name, []Oid{oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try stringLength(name, args[0]) }))
+			registerFunc(mut funcs, function1(name, []Oid{oid}, Int4Oid, true, false, fn(p1 Datum) !Datum { return try stringLength(name, p1) }))
 		}
-		registerFunc(mut funcs, function("||", []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringConcat(args[0], args[1]) }))
-		registerFunc(mut funcs, function("strpos", []Oid{oid, oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try stringPosition(args[0], args[1]) }))
-		registerFunc(mut funcs, function("position", []Oid{oid, oid}, Int4Oid, true, false, fn(args []Datum) !Datum { return try stringPosition(args[1], args[0]) }))
-		registerFunc(mut funcs, function("starts_with", []Oid{oid, oid}, BoolOid, true, false, fn(args []Datum) !Datum { return try stringStartsWith(args[0], args[1]) }))
+		registerFunc(mut funcs, function2("||", []Oid{oid, oid}, oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringConcat(p1, p2) }))
+		registerFunc(mut funcs, function2("strpos", []Oid{oid, oid}, Int4Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringPosition(p1, p2) }))
+		registerFunc(mut funcs, function2("position", []Oid{oid, oid}, Int4Oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringPosition(p2, p1) }))
+		registerFunc(mut funcs, function2("starts_with", []Oid{oid, oid}, BoolOid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringStartsWith(p1, p2) }))
 		for _, name in []str{"substr", "substring"} {
-			registerFunc(mut funcs, function(name, []Oid{oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringSubstr(args[0], args[1].i, -1) }))
-			registerFunc(mut funcs, function(name, []Oid{oid, Int4Oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringSubstr(args[0], args[1].i, args[2].i) }))
+			registerFunc(mut funcs, function2(name, []Oid{oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringSubstr(p1, p2.i, -1) }))
+			registerFunc(mut funcs, function3(name, []Oid{oid, Int4Oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringSubstr(p1, p2.i, p3.i) }))
 		}
-		registerFunc(mut funcs, function("left", []Oid{oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringLeftRight(args[0], args[1].i, false) }))
-		registerFunc(mut funcs, function("right", []Oid{oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringLeftRight(args[0], args[1].i, true) }))
-		registerFunc(mut funcs, function("ltrim", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTrim("ltrim", args[0], "") }))
-		registerFunc(mut funcs, function("rtrim", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTrim("rtrim", args[0], "") }))
-		registerFunc(mut funcs, function("btrim", []Oid{oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTrim("btrim", args[0], "") }))
+		registerFunc(mut funcs, function2("left", []Oid{oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringLeftRight(p1, p2.i, false) }))
+		registerFunc(mut funcs, function2("right", []Oid{oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringLeftRight(p1, p2.i, true) }))
+		registerFunc(mut funcs, function1("ltrim", []Oid{oid}, oid, true, false, fn(p1 Datum) !Datum { return try stringTrim("ltrim", p1, "") }))
+		registerFunc(mut funcs, function1("rtrim", []Oid{oid}, oid, true, false, fn(p1 Datum) !Datum { return try stringTrim("rtrim", p1, "") }))
+		registerFunc(mut funcs, function1("btrim", []Oid{oid}, oid, true, false, fn(p1 Datum) !Datum { return try stringTrim("btrim", p1, "") }))
 		for _, name in []str{"ltrim", "rtrim", "btrim", "trim"} {
-			registerFunc(mut funcs, function(name, []Oid{oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTrim(name, args[0], args[1].Text()) }))
+			registerFunc(mut funcs, function2(name, []Oid{oid, oid}, oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringTrim(name, p1, p2.Text()) }))
 		}
-		registerFunc(mut funcs, function("replace", []Oid{oid, oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringReplace(args[0], args[1], args[2]) }))
-		registerFunc(mut funcs, function("translate", []Oid{oid, oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringTranslate(args[0], args[1], args[2]) }))
-		registerFunc(mut funcs, function("repeat", []Oid{oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringRepeat(args[0], args[1].i) }))
-		registerFunc(mut funcs, function("split_part", []Oid{oid, oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringSplitPart(args[0], args[1], args[2].i) }))
-		registerFunc(mut funcs, function("overlay", []Oid{oid, oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringOverlay(args[0], args[1], args[2].i, -1) }))
+		registerFunc(mut funcs, function3("replace", []Oid{oid, oid, oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringReplace(p1, p2, p3) }))
+		registerFunc(mut funcs, function3("translate", []Oid{oid, oid, oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringTranslate(p1, p2, p3) }))
+		registerFunc(mut funcs, function2("repeat", []Oid{oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try stringRepeat(p1, p2.i) }))
+		registerFunc(mut funcs, function3("split_part", []Oid{oid, oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringSplitPart(p1, p2, p3.i) }))
+		registerFunc(mut funcs, function3("overlay", []Oid{oid, oid, Int4Oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringOverlay(p1, p2, p3.i, -1) }))
 		registerFunc(mut funcs, function("overlay", []Oid{oid, oid, Int4Oid, Int4Oid}, oid, true, false, fn(args []Datum) !Datum { return try stringOverlay(args[0], args[1], args[2].i, args[3].i) }))
-		registerFunc(mut funcs, function("lpad", []Oid{oid, Int4Oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringPad(args[0], args[1].i, args[2], false) }))
-		registerFunc(mut funcs, function("rpad", []Oid{oid, Int4Oid, oid}, oid, true, false, fn(args []Datum) !Datum { return try stringPad(args[0], args[1].i, args[2], true) }))
+		registerFunc(mut funcs, function3("lpad", []Oid{oid, Int4Oid, oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringPad(p1, p2.i, p3, false) }))
+		registerFunc(mut funcs, function3("rpad", []Oid{oid, Int4Oid, oid}, oid, true, false, fn(p1 Datum, p2 Datum, p3 Datum) !Datum { return try stringPad(p1, p2.i, p3, true) }))
 	}
-	registerFunc(mut funcs, function("chr", []Oid{Int4Oid}, TextOid, true, false, fn(args []Datum) !Datum { return try stringChr(args[0].i) }))
-	registerFunc(mut funcs, function("encode", []Oid{ByteaOid, TextOid}, TextOid, true, false, fn(args []Datum) !Datum { return try encodeBytes(args[0], args[1].Text()) }))
-	registerFunc(mut funcs, function("decode", []Oid{TextOid, TextOid}, ByteaOid, true, false, fn(args []Datum) !Datum { return try decodeBytes(args[0].Text(), args[1].Text()) }))
+	registerFunc(mut funcs, function1("chr", []Oid{Int4Oid}, TextOid, true, false, fn(p1 Datum) !Datum { return try stringChr(p1.i) }))
+	registerFunc(mut funcs, function2("encode", []Oid{ByteaOid, TextOid}, TextOid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try encodeBytes(p1, p2.Text()) }))
+	registerFunc(mut funcs, function2("decode", []Oid{TextOid, TextOid}, ByteaOid, true, false, fn(p1 Datum, p2 Datum) !Datum { return try decodeBytes(p1.Text(), p2.Text()) }))
 }
 
 fn stringUnary(name str, arg Datum) !Datum {
