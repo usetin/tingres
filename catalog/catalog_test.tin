@@ -514,3 +514,27 @@ fn TestConstraints(t mut crucible.T) {
 	crucible.Equal(mut t, "foreign key present", sawForeign, true)
 	crucible.NoFault("abort", m.Abort(mut tx))
 }
+
+fn TestSearchPathResolution(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("search-path") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let path = c.SearchPath(tx)
+	crucible.Equal(mut t, "default search path length", len(path), 3)
+	crucible.Equal(mut t, "pg_catalog implicit first", path[0], "pg_catalog")
+	crucible.Equal(mut t, "user schema second", path[1], "$user")
+	crucible.Equal(mut t, "public third", path[2], "public")
+	crucible.Equal(mut t, "public resolves", c.LookupNamespace(tx, "public"), u32(2200))
+	crucible.True("pg_temp resolves", c.LookupNamespace(tx, "pg_temp") != 0)
+	c.SetSearchPath(tx, []str{"app", "public"})
+	let custom = c.SearchPath(tx)
+	crucible.Equal(mut t, "custom search path first", custom[0], "app")
+	crucible.NoFault("abort", m.Abort(mut tx))
+}

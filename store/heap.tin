@@ -55,6 +55,8 @@ fn (s mut Store) HeapInsert(x XidCtx, rel RelId, payload []u8) !Tid {
 		fail "store: tuple too large for a page"
 	}
 	let (block, frame) = try s.findHeapFrame(rel, recordBytes)
+	// The full-page image must be the state before this operation reserves a line pointer.
+	let fpi = s.takeFpi(rel, block, frame)
 	let (slotValue, reserveErr) = s.buffers.ReserveItem(frame, recordBytes)
 	if reserveErr != nil {
 		s.releasePinnedPage(frame) catch _ { }
@@ -64,7 +66,6 @@ fn (s mut Store) HeapInsert(x XidCtx, rel RelId, payload []u8) !Tid {
 	let tid = Tid{page: u32(block), slot: slot}
 	let h = TupleHeader{xmin: x.xid, xmax: 0, cid: x.cid, infomask: 0, ctid: tid}
 	let tupleBytes = encodeTupleRecord(h, payload)
-	let fpi = s.takeFpi(rel, block, frame)
 	mut flags = u8(0)
 	if len(fpi) > 0 { flags = walFlagFpi }
 	let (lsn, walErr) = s.appendWalWithFpi(walKindHeapInsert, flags, u32(rel), u32(block), slot, fpi, tupleBytes)

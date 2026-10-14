@@ -552,8 +552,14 @@ fn (b mut Bootstrapper) writeSeedChunks(rel str, rows []SeedRow) ! {
 	}
 }
 
-// seedExtras writes pg_class/pg_attribute rows for the tingres-private relations.
+// seedExtras writes pg_class/pg_attribute rows for the tingres-private relations and the
+// pg_temp namespace.
 fn (b mut Bootstrapper) seedExtras() ! {
+	mut nsvals = make(map[str]types.Datum)
+	nsvals["oid"] = types.FromI64(26, 2201)
+	nsvals["nspname"] = types.FromStr(25, "pg_temp")
+	nsvals["nspowner"] = types.FromI64(26, 10)
+	try b.insertSeedRow("pg_namespace", b.buildRow("pg_namespace", nsvals))
 	for rel in extraRels() {
 		let nsOid = u32(11)
 		mut vals = make(map[str]types.Datum)

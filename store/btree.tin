@@ -96,6 +96,26 @@ fn (s mut Store) IndexDelete(rel RelId, key []u8, t Tid) ! {
 	try s.installPage(rel, block, p, recStart)
 }
 
+// leafLowerBoundSlot is the first 1-based slot whose key is at or above key; leaves have no dead
+// slots, so this is a binary search.
+fn leafLowerBoundSlot(page Page, key []u8) i64 {
+	let n = i64(page.Header().Slots)
+	mut lo = i64(1)
+	mut hi = n
+	mut res = n+1
+	for lo <= hi {
+		let mid = (lo+hi)/2
+		let e = page.ItemView(u16(mid)) catch _ { break }
+		if keyCmp(entryKey(e), key) < 0 {
+			lo = mid+1
+		} else {
+			res = mid
+			hi = mid-1
+		}
+	}
+	return res
+}
+
 // IndexLookupExact returns every TID stored for key, including dead ones; the caller checks
 // uniqueness.
 fn (s mut Store) IndexLookupExact(rel RelId, key []u8) ![]Tid {
@@ -105,18 +125,29 @@ fn (s mut Store) IndexLookupExact(rel RelId, key []u8) ![]Tid {
 	}
 	mut tids = []Tid{}
 	mut block = try s.btreeLeaf(rel, key)
+	mut first = true
 	for _guard in 0..1000000 {
 		let page = try s.readPageLocal(rel, block)
-		let slots = leafLiveSlots(page)
+		let n = i64(page.Header().Slots)
+		mut start = i64(1)
+		if first {
+			start = leafLowerBoundSlot(page, key)
+			first = false
+		}
 		mut stop = false
-		for _, sl in slots {
-			let e = page.Item(sl) catch _ { continue }
+		mut i = start
+		for i <= n {
+			let e = page.Item(u16(i)) catch _ {
+				i += 1
+				continue
+			}
 			let c = keyCmp(entryKey(e), key)
 			if c == 0 {
 				tids = append(tids, leafEntryTid(e))
 			} else if c > 0 {
 				stop = true
 			}
+			i += 1
 		}
 		let next = page.NextBlock()
 		if stop || next == 0 {
@@ -163,16 +194,29 @@ fn (s mut Store) indexCollect(rel RelId, lo []u8, hi []u8, flags u32) ![]IndexIt
 	if loUnbounded {
 		block = try s.btreeLeftmostLeaf(rel)
 	}
+	mut first = true
 	for _guard in 0..1000000 {
 		let page = try s.readPageLocal(rel, block)
-		let slots = leafLiveSlots(page)
+		let n = i64(page.Header().Slots)
+		mut start = i64(1)
+		if first {
+			if !loUnbounded {
+				start = leafLowerBoundSlot(page, lo)
+			}
+			first = false
+		}
 		mut pastHi = false
-		for _, sl in slots {
-			let e = page.Item(sl) catch _ { continue }
+		mut i = start
+		for i <= n {
+			let e = page.Item(u16(i)) catch _ {
+				i += 1
+				continue
+			}
 			let k = entryKey(e)
 			if !loUnbounded {
 				let cl = keyCmp(k, lo)
 				if cl < 0 || (cl == 0 && loExcl) {
+					i += 1
 					continue
 				}
 			}
@@ -182,10 +226,12 @@ fn (s mut Store) indexCollect(rel RelId, lo []u8, hi []u8, flags u32) ![]IndexIt
 					if ch > 0 {
 						pastHi = true
 					}
+					i += 1
 					continue
 				}
 			}
 			items = append(items, IndexItem{key: copyBytes(k), tid: leafEntryTid(e)})
+			i += 1
 		}
 		let next = page.NextBlock()
 		if pastHi || next == 0 {
