@@ -1,0 +1,64 @@
+name: Benchmarks (Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Base revision (empty uses selected revision's first parent)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install PostgreSQL 17 (PGDG)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q wget ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-17 postgresql-client-17
+      - name: Build Tin toolchain
+        run: |
+          git clone --depth 1 https://github.com/usetin/tin.git /tmp/tin
+          cd /tmp/tin
+          make install
+          echo "$HOME/.tin/bin" >> "$GITHUB_PATH"
+      - name: Build tingres
+        run: |
+          mkdir -p bin/server
+          tin build main.tin -o bin/server/tingres
+      - name: Build pgbench client
+        run: |
+          tin build bench/pgbench/main.tin -o bin/server/pgbench
+      - name: Run benchmark
+        run: |
+          RUN_DATE="$(date -u +%Y-%m-%d)" TINGRES_COMMIT="$(git rev-parse --short HEAD)" bash -c '
+            RUN_DATE="$RUN_DATE" TINGRES_COMMIT="$TINGRES_COMMIT" tin bench/run.tin
+          '
+          echo "### bench/results/linux.md" >> "$GITHUB_STEP_SUMMARY"
+          cat bench/results/linux.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-linux-${{ matrix.arch }}
+          path: bench/results/linux.md
+          if-no-files-found: ignore
