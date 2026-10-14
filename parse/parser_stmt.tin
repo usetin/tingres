@@ -48,6 +48,10 @@ fn (p mut Parser) parseStatementDispatch() !Stmt {
 		let value = try p.parseExplain()
 		return Stmt.Explain(value)
 	} else if first == "copy" {
+		if p.At + 2 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "(" {
+			let inner = lowerAscii(p.Tokens[p.At + 2].Text)
+			if inner == "insert" || inner == "update" || inner == "delete" || inner == "merge" { return p.utility("copy") }
+		}
 		let value = try p.parseCopy()
 		return Stmt.Copy(value)
 	} else if first == "prepare" {

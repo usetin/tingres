@@ -131,7 +131,9 @@ fn (p mut Parser) parseCreateTableBody(pos i64, temporary str) !CreateTableStmt 
 			options = []str{p.captureParenInner()}
 		} else if p.eat("on") {
 			try p.expect("commit")
-			onCommit = lowerAscii(p.take().Text)
+			mut commitAction = lowerAscii(p.take().Text)
+			if p.eat("rows") { commitAction += " rows" }
+			onCommit = commitAction
 		} else if p.eat("tablespace") {
 			let ts = try p.parseQualifiedName()
 			tablespace = nameText(ts)
@@ -172,7 +174,7 @@ fn (p mut Parser) parseCreateIndexBody(pos i64, unique bool) !CreateIndexStmt {
 		if p.eat("(") {
 			expression = try p.parseExpression(0)
 			try p.expect(")")
-		} else if p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "(" {
+		} else if p.At + 1 < len(p.Tokens) && (p.Tokens[p.At + 1].Text == "(" || lowerAscii(p.Tokens[p.At + 1].Text) == "collate") {
 			expression = try p.parseExpression(0)
 		} else { keyName = try p.parseIdentifier() }
 		mut opclass ?QualifiedName = nil
@@ -305,11 +307,18 @@ fn (p mut Parser) parseCreateSchemaBody(pos i64) !CreateSchemaStmt {
 
 fn (p mut Parser) parseCreateTypeBody(pos i64) !CreateTypeStmt {
 	let name = try p.parseQualifiedName()
-	try p.expect("as")
 	mut kind = ""
 	mut labels = []str{}
 	mut attributes = []CompositeAttribute{}
 	mut rangeOptions = ""
+	if !p.eat("as") {
+		if p.text() == "(" {
+			kind = "base"
+			rangeOptions = p.captureParenInner()
+			return CreateTypeStmt{Pos: pos, Name: name, Kind: kind, Labels: labels, Attributes: attributes, RangeOptions: rangeOptions}
+		}
+		try p.errorHere()
+	}
 	if p.eat("enum") {
 		kind = "enum"
 		try p.expect("(")
@@ -558,6 +567,11 @@ fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 				command.Kind = "raw"
 				command.Text = p.captureRest()
 			}
+		} else if lowerAscii(p.text()) == "alter" && p.At + 1 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "constraint" {
+			p.At += 2
+			command.Kind = "alter constraint"
+			command.Name = try p.parseIdentifier()
+			command.Text = p.captureRest()
 		} else if p.eat("alter") {
 			p.eat("column")
 			let name = try p.parseIdentifier()

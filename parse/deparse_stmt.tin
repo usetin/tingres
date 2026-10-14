@@ -54,6 +54,10 @@ fn deparseAlterTable(v AlterTableStmt) str {
 			if let name = cmd.Name { out += identifierText(name) }
 			out += " TO "
 			if let newName = cmd.NewName { out += identifierText(newName) }
+		} else if cmd.Kind == "alter constraint" {
+			out += "ALTER CONSTRAINT "
+			if let name = cmd.Name { out += identifierText(name) }
+			out += " " + cmd.Text
 		} else if cmd.Kind == "owner to" {
 			out += "OWNER TO "
 			if let newName = cmd.NewName { out += identifierText(newName) }
@@ -171,6 +175,7 @@ fn deparseCreateSchema(v CreateSchemaStmt) str {
 }
 
 fn deparseCreateType(v CreateTypeStmt) str {
+	if v.Kind == "base" { return "CREATE TYPE " + nameText(v.Name) + " (" + v.RangeOptions + ")" }
 	mut out = "CREATE TYPE " + nameText(v.Name) + " AS "
 	if v.Kind == "enum" {
 		out += "ENUM ("

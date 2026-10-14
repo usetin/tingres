@@ -150,6 +150,10 @@ fn (p mut Parser) parseCopy() !CopyStmt {
 		let sel = try p.parseSelect()
 		try p.expect(")")
 		query = sel
+		if p.eat("(") {
+			cols = try p.parseIdentifierList(")")
+			try p.expect(")")
+		}
 	} else {
 		let t = try p.parseQualifiedName()
 		table = t
