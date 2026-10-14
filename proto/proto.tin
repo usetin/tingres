@@ -7,7 +7,9 @@ import "fault"
 import "say"
 import "mint"
 import "seal"
+import "tide"
 import "tls"
+import "../types"
 import "twine"
 import "wire"
 
@@ -106,6 +108,7 @@ type Accepted enum {
 // methods return the byte count because a Tin shape member with a fault-only result is
 // only accepted as the last member of the shape (see BUGS.md).
 shape stream {
+	mut Read(buf mut []u8, max i64) !i64
 	mut ReadFull(n i64) !str
 	mut Write(s str) !i64
 	mut WriteBytes(b []u8) !i64
@@ -115,6 +118,7 @@ shape stream {
 
 type plainStream struct { conn wire.Conn }
 
+fn (s mut plainStream) Read(buf mut []u8, max i64) !i64 { return try s.conn.Read(mut buf, max) }
 fn (s mut plainStream) ReadFull(n i64) !str { return try s.conn.ReadFull(n) }
 fn (s mut plainStream) Write(text str) !i64 { try s.conn.Write(text)
 	return i64(len(text)) }
@@ -125,6 +129,7 @@ fn (s mut plainStream) Close() { s.conn.Close() }
 
 type tlsStream struct { conn tls.Conn }
 
+fn (s mut tlsStream) Read(buf mut []u8, max i64) !i64 { return try s.conn.Read(mut buf, max) }
 fn (s mut tlsStream) ReadFull(n i64) !str { return try s.conn.ReadFull(n) }
 fn (s mut tlsStream) Write(text str) !i64 { try s.conn.Write(text)
 	return i64(len(text)) }
@@ -132,6 +137,15 @@ fn (s mut tlsStream) WriteBytes(b []u8) !i64 { try s.conn.WriteBytes(b)
 	return i64(len(b)) }
 fn (s mut tlsStream) SetTimeout(ns i64) { s.conn.SetTimeout(ns) }
 fn (s mut tlsStream) Close() { s.conn.Close() }
+
+// ErrIdle marks a read that timed out with no message in progress: the session loop may
+// keep the connection and retry, which is how idle timeouts and shutdown wake-up work.
+let ErrIdle = fault("connection idle: no message in progress")
+
+// IsIdle reports whether a read timed out with no message in progress.
+fn IsIdle(err fault) bool {
+	return fault.Is(err, ErrIdle)
+}
 
 // Conn is an authenticated PostgreSQL frontend connection.
 type Conn struct {
@@ -142,6 +156,8 @@ type Conn struct {
 	closed bool
 	secure bool
 	out []u8
+	in []u8
+	messageTimeout i64
 }
 
 // IsProtocolError reports whether a fault is a frontend protocol violation, which the
@@ -504,7 +520,7 @@ fn Accept(sock mut wire.Conn, cfg Config) !Accepted {
 	let token = seal.RandomBytes(8)
 	mut pid = u32(be(token, 0, 4))
 	if cfg.Pid != 0 { pid = cfg.Pid }
-	mut conn = Conn{sock: transport, startup: Startup{Parameters: make(map[str]str)}, pid: pid, secretKey: u32(be(token, 4, 4)), out: make([]u8, 0, 4096)}
+	mut conn = Conn{sock: transport, startup: Startup{Parameters: make(map[str]str)}, pid: pid, secretKey: u32(be(token, 4, 4)), out: make([]u8, 0, 4096), in: make([]u8, 0, 4096), messageTimeout: 30s}
 	mut version = i64(0)
 	mut body = []u8{}
 	for {
@@ -589,16 +605,10 @@ fn Accept(sock mut wire.Conn, cfg Config) !Accepted {
 		try bad_request(mut conn, "0A000", "authentication method \"{method}\" is not supported")
 		fail "proto: unsupported authentication method"
 	}
-	mut version_text = "17.3"
-	if cfg.ServerVersion != "" { version_text = cfg.ServerVersion }
-	try conn.SendParameter("server_version", version_text)
-	try conn.SendParameter("server_encoding", "UTF8")
-	try conn.SendParameter("client_encoding", "UTF8")
-	try conn.SendParameter("DateStyle", "ISO, MDY")
-	try conn.SendParameter("integer_datetimes", "on")
-	try conn.SendParameter("standard_conforming_strings", "on")
+	// ParameterStatus is the session's business (server.send_parameters) and ReadyForQuery
+	// closes the startup: proto hands back an authenticated connection after BackendKeyData
+	// and lets the server finish the handshake with the parameters it knows.
 	try conn.send_backend_key()
-	try conn.ready('I')
 	return Accepted.Ready(conn)
 }
 
@@ -622,7 +632,7 @@ fn RejectStartup(sock mut wire.Conn, code str, message str) ! {
 			transport.Close()
 			return
 		}
-		mut c = Conn{sock: transport, startup: Startup{Parameters: make(map[str]str)}, pid: 0, secretKey: 0, out: make([]u8, 0, 256)}
+		mut c = Conn{sock: transport, startup: Startup{Parameters: make(map[str]str)}, pid: 0, secretKey: 0, out: make([]u8, 0, 256), in: make([]u8, 0, 256), messageTimeout: 30s}
 		try bad_request(mut c, code, message)
 		mut closed = c
 		closed.sock.Close()
@@ -631,13 +641,45 @@ fn RejectStartup(sock mut wire.Conn, code str, message str) ! {
 	}
 }
 
+// is_timeout reports whether a read failed because the socket's deadline passed.
+fn is_timeout(err fault) bool {
+	return twine.Contains(fault.Message(err), "timed out")
+}
+
+// read_full reads exactly n bytes into the connection's input buffer. A socket timeout with
+// no message in progress is ErrIdle, which the session loop retries; a timeout in the middle
+// of a message keeps waiting until the message timeout, so a slow client is bounded but a
+// partial message is never lost.
+fn (c mut Conn) read_full(n i64) !str {
+	if len(c.in) >= n {
+		let out = str(c.in[:n])
+		c.in = c.in[n:]
+		return out
+	}
+	let started = tide.Now()
+	for {
+		let got = c.sock.Read(mut c.in, n - len(c.in)) catch err {
+			if !is_timeout(err) { fail err }
+			if len(c.in) == 0 { fail ErrIdle }
+			if tide.Since(started) > c.messageTimeout { fail "proto: message timed out" }
+			continue
+		}
+		if got == 0 { fail "proto: unexpected end of stream" }
+		if len(c.in) >= n {
+			let out = str(c.in[:n])
+			c.in = c.in[n:]
+			return out
+		}
+	}
+}
+
 fn (c mut Conn) read_frontend() !Message {
-	let rawHead = try c.sock.ReadFull(5)
+	let rawHead = try c.read_full(5)
 	let head = []u8(rawHead)
 	let kind = head[0]
 	let n = be(head, 1, 4)
 	if n < 4 || n > maxMessage { fail "proto: invalid frontend message length" }
-	let rawBody = try c.sock.ReadFull(n-4)
+	let rawBody = try c.read_full(n-4)
 	let body = []u8(rawBody)
 	mut k = Cursor{at: 0}
 	match kind {
@@ -776,6 +818,11 @@ fn (c mut Conn) SetTimeout(ns i64) {
 	c.sock.SetTimeout(ns)
 }
 
+// SetMessageTimeout bounds how long a partially received message may take.
+fn (c mut Conn) SetMessageTimeout(ns i64) {
+	c.messageTimeout = ns
+}
+
 // SendError sends a PostgreSQL ErrorResponse.
 fn (c mut Conn) SendError(fields ErrorFields) ! {
 	try c.error(fields)
@@ -845,6 +892,48 @@ fn encode_data_row(out mut []u8, cells []Cell) {
 		for i in 0..len(cell.Value) { out = append(out, u8(cell.Value[i])) }
 	}
 	end_frame(mut out, start)
+}
+
+// SendDatumRow appends one DataRow straight into the output buffer: text values are written
+// in place (types.AppendText) and only the four length bytes are patched afterwards, and a
+// binary value is encoded with the type's binary output.
+fn (c mut Conn) SendDatumRow(r types.Row, formats []i16) ! {
+	let start = begin_frame(mut c.out, 'D')
+	putbe(mut c.out, len(r), 2)
+	for i, d in r {
+		if types.IsNull(d) {
+			putbe(mut c.out, -1, 4)
+			continue
+		}
+		mut format = i16(0)
+		if i < len(formats) { format = formats[i] }
+		if format == 1 {
+			mut buf = []u8{}
+			types.EncodeBinary(d, mut buf)
+			putbe(mut c.out, len(buf), 4)
+			c.out = append(c.out, buf...)
+			continue
+		}
+		let lenAt = len(c.out)
+		putbe(mut c.out, 0, 4)
+		let before = len(c.out)
+		// PostgreSQL's boolean text output is t/f; types.AppendText says true/false.
+		if d.Oid() == 16 {
+			if d.Text() == "true" { c.out = append(c.out, 't') } else { c.out = append(c.out, 'f') }
+		} else {
+			types.AppendText(d, mut c.out)
+		}
+		put_length(mut c.out, lenAt, len(c.out) - before)
+	}
+	end_frame(mut c.out, start)
+}
+
+// put_length patches a four-byte big-endian length in the output buffer.
+fn put_length(out mut []u8, at i64, n i64) {
+	out[at] = u8(n >> 24)
+	out[at+1] = u8(n >> 16)
+	out[at+2] = u8(n >> 8)
+	out[at+3] = u8(n)
 }
 
 // SendRowDescription sends a text-format RowDescription into the reusable output buffer.

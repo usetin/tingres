@@ -7,7 +7,7 @@ import "crucible"
 // it ended in an error instead of an answer. This is the statement boundary the old
 // hand-written M1 handler used to draw; the conformance engine draws it now.
 fn conformanceFails(sql str) bool {
-	mut s = NewFakeSession("postgres", "postgres", 100)
+	mut s = NewFakeSession("postgres", "postgres", 100, NewCancelHandle())
 	mut sink = exec.NewRecordSink()
 	mut broken = false
 	s.Simple(sql, mut sink) catch _ { broken = true }
@@ -16,7 +16,7 @@ fn conformanceFails(sql str) bool {
 
 // conformanceTags runs one statement and returns its command tags.
 fn conformanceTags(sql str) []str {
-	mut s = NewFakeSession("postgres", "postgres", 100)
+	mut s = NewFakeSession("postgres", "postgres", 100, NewCancelHandle())
 	mut sink = exec.NewRecordSink()
 	s.Simple(sql, mut sink) catch _ {
 	}
@@ -40,7 +40,7 @@ fn TestServerHelpers(t mut crucible.T) {
 }
 
 fn TestFakeSessionBasics(t mut crucible.T) {
-	mut s = NewFakeSession("postgres", "postgres", 100)
+	mut s = NewFakeSession("postgres", "postgres", 100, NewCancelHandle())
 	crucible.Equal(mut t, "status char idle", s.StatusChar(), u8('I'))
 	t.True("cancel not set", !s.IsCanceled())
 	s.Cancel()

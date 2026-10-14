@@ -17,6 +17,26 @@ type ParamStatus struct {
 	Value str
 }
 
+// QuerySession is the session interface the message loop uses. The loop calls it through
+// `dyn` on purpose: the session holds the long-lived engine, and a direct call would make
+// the compiler treat every store into the session as request memory escaping into
+// long-lived memory (E312). The methods that cannot fail still return a value because a
+// Tin shape accepts a fault-only member only as its last one (see BUGS.md).
+shape QuerySession {
+	mut Simple(sql str, out mut dyn exec.Sink) !i64
+	mut Parse(name str, sql str, paramOids []u32) !i64
+	mut BindBytes(portalName str, prepName str, paramFormats mut []i16, paramValues mut [][]u8, resultFormats mut []i16) !i64
+	mut Execute(portalName str, maxRows i64, out mut dyn exec.Sink) !i64
+	Describe(kind u8, name str) !exec.Description
+	mut Close(kind u8, name str) !i64
+	mut Sync(out mut dyn exec.Sink) !i64
+	Cancel()
+	ResetCancel()
+	IsCanceled() bool
+	StatusChar() u8
+	GetGuc(name str) ?str
+}
+
 // Session wraps the two session implementations behind one API. Exactly one is set.
 type Session struct {
 	Real ?exec.Session
@@ -34,34 +54,36 @@ fn FakeSessionOf(s FakeSession) Session {
 }
 
 // Simple runs every statement in a simple-query string.
-fn (s mut Session) Simple(sql str, out mut dyn exec.Sink) ! {
+fn (s mut Session) Simple(sql str, out mut dyn exec.Sink) !i64 {
 	if let r = s.Real {
 		try r.Simple(sql, mut out)
-		return
+		return 1
 	}
 	if let f = s.Fake {
 		try f.Simple(sql, mut out)
-		return
+		return 1
 	}
+	return 1
 }
 
 // Parse prepares an extended-protocol statement.
-fn (s mut Session) Parse(name str, sql str, paramOids []u32) ! {
+fn (s mut Session) Parse(name str, sql str, paramOids []u32) !i64 {
 	if let r = s.Real {
 		try r.Parse(name, sql, paramOids)
-		return
+		return 1
 	}
 	if let f = s.Fake {
 		try f.Parse(name, sql, paramOids)
-		return
+		return 1
 	}
+	return 1
 }
 
 // BindBytes binds raw parameter bytes to a prepared statement. The decoding lives here
 // rather than in exec.Session.BindBytes because exec's copy trips the compiler's
 // mut-parameter aliasing rule (see BUGS.md); this also keeps a NULL apart from an empty
 // parameter value, which exec's version cannot.
-fn (s mut Session) BindBytes(portalName str, prepName str, paramFormats mut []i16, paramValues mut [][]u8, resultFormats mut []i16) ! {
+fn (s mut Session) BindBytes(portalName str, prepName str, paramFormats mut []i16, paramValues mut [][]u8, resultFormats mut []i16) !i64 {
 	if let r = s.Real {
 		mut oids = []u32{}
 		let prepared = r.GetPreparedStatement(prepName)
@@ -70,12 +92,13 @@ fn (s mut Session) BindBytes(portalName str, prepName str, paramFormats mut []i1
 		mut formats = []i16{}
 		for f in resultFormats { formats = append(formats, f) }
 		try r.Bind(portalName, prepName, mut params, mut formats)
-		return
+		return 1
 	}
 	if let f = s.Fake {
 		try f.BindBytes(portalName, prepName, mut paramFormats, mut paramValues, mut resultFormats)
-		return
+		return 1
 	}
+	return 1
 }
 
 // decode_params turns the extended protocol's parameter bytes into datums: a truly empty
@@ -105,15 +128,16 @@ fn decode_params(oids []u32, paramFormats mut []i16, paramValues mut [][]u8) ![]
 }
 
 // Execute runs a portal, stopping after maxRows rows (0 means all of them).
-fn (s mut Session) Execute(portalName str, maxRows i64, out mut dyn exec.Sink) ! {
+fn (s mut Session) Execute(portalName str, maxRows i64, out mut dyn exec.Sink) !i64 {
 	if let r = s.Real {
 		try r.Execute(portalName, maxRows, mut out)
-		return
+		return 1
 	}
 	if let f = s.Fake {
 		try f.Execute(portalName, maxRows, mut out)
-		return
+		return 1
 	}
+	return 1
 }
 
 // Describe describes a statement or portal.
@@ -128,27 +152,29 @@ fn (s Session) Describe(kind u8, name str) !exec.Description {
 }
 
 // Close drops a prepared statement or portal.
-fn (s mut Session) Close(kind u8, name str) ! {
+fn (s mut Session) Close(kind u8, name str) !i64 {
 	if let r = s.Real {
 		try r.Close(kind, name)
-		return
+		return 1
 	}
 	if let f = s.Fake {
 		try f.Close(kind, name)
-		return
+		return 1
 	}
+	return 1
 }
 
 // Sync ends the extended-query cycle.
-fn (s mut Session) Sync(out mut dyn exec.Sink) ! {
+fn (s mut Session) Sync(out mut dyn exec.Sink) !i64 {
 	if let r = s.Real {
 		try r.Sync(mut out)
-		return
+		return 1
 	}
 	if let f = s.Fake {
 		try f.Sync(mut out)
-		return
+		return 1
 	}
+	return 1
 }
 
 // Cancel flags the session for cancellation; safe from the accept loop's task.
@@ -205,6 +231,27 @@ fn parameter_order() []str {
 	return []str{"server_version", "server_encoding", "client_encoding", "application_name", "DateStyle", "IntervalStyle", "TimeZone", "integer_datetimes", "standard_conforming_strings", "scram_iterations", "in_hot_standby", "is_superuser", "session_authorization", "default_transaction_read_only", "default_transaction_deferrable"}
 }
 
+// parameter_fallback is the PostgreSQL 17 default of a reported GUC the executor does not
+// model, so a driver always sees the whole set it expects.
+fn parameter_fallback(name str) str {
+	if name == "scram_iterations" { return "4096" }
+	if name == "in_hot_standby" { return "off" }
+	if name == "default_transaction_read_only" { return "off" }
+	if name == "default_transaction_deferrable" { return "off" }
+	if name == "DateStyle" { return "ISO, MDY" }
+	if name == "IntervalStyle" { return "postgres" }
+	if name == "TimeZone" { return "UTC" }
+	if name == "application_name" { return "" }
+	if name == "integer_datetimes" { return "on" }
+	if name == "standard_conforming_strings" { return "on" }
+	if name == "client_encoding" { return "UTF8" }
+	if name == "server_encoding" { return "UTF8" }
+	if name == "is_superuser" { return "on" }
+	if name == "session_authorization" { return "postgres" }
+	if name == "server_version" { return "17.3" }
+	return ""
+}
+
 // GetGuc reads one GUC value.
 fn (s Session) GetGuc(name str) ?str {
 	if let r = s.Real { return r.GetGuc(name) }
@@ -258,23 +305,8 @@ fn (s mut SessionSink) RowDescription(cols []exec.ColDesc, formats []i16) {
 }
 
 fn (s mut SessionSink) DataRow(r types.Row) {
-	mut cells = make([]proto.Cell, 0, len(r))
-	for i, d in r {
-		if types.IsNull(d) {
-			cells = append(cells, proto.Cell{Null: true})
-			continue
-		}
-		mut format = i16(0)
-		if i < len(s.Formats) { format = s.Formats[i] }
-		if format == 1 {
-			mut buf = []u8{}
-			types.EncodeBinary(d, mut buf)
-			cells = append(cells, proto.Cell{Binary: true, Bytes: buf})
-		} else {
-			cells = append(cells, proto.Cell{Value: d.Text()})
-		}
-	}
-	s.Conn.SendDataRow(cells) catch err { s.note(err) }
+	// Zero copy: the row is encoded straight into the connection's output buffer.
+	s.Conn.SendDatumRow(r, s.Formats) catch err { s.note(err) }
 }
 
 fn (s mut SessionSink) CommandComplete(tag str) {

@@ -1,0 +1,1 @@
+SELECT 1; SELECT 'two'; SELECT 3.5;

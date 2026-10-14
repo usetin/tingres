@@ -1,0 +1,1 @@
+SELECT 1 AS a; SELECT 'x' AS b;

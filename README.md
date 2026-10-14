@@ -74,3 +74,33 @@ interleaved, fsync on, medians, with the ratio (above 1.0x means tingres is fast
 | **total** | **24550** | **76 passing**, 1 package(s) failing |
 
 <!-- stats:end -->
+
+## Engines: real and conformance
+
+`tingres` starts with `--engine auto` (the default): it opens `store -> txn -> catalog` and
+probes `exec.Session.Simple`. While the executor cannot run SQL end to end, auto selects the
+built-in **conformance engine** (`--engine fake` forces it, `--engine real` forces the
+executor) and says so at startup. The conformance engine answers the SQL subset that keeps
+the protocol, the drivers and the differential harness honest — literals and simple
+functions, `SHOW`/`SET`/`RESET`, transaction control, `generate_series`, `pg_sleep`,
+`COPY (SELECT ...) TO STDOUT` — and answers everything else with a clean `0A000`, never a
+wrong answer.
+
+## Known gaps
+
+- The executor (`exec`) still answers most statements with an `OK` tag: `SELECT 1` through
+  the real engine is not a `SELECT 1` result yet, so `--engine auto` keeps choosing the
+  conformance engine. `psql` therefore cannot `CREATE TABLE`/`INSERT`/`SELECT` real data
+  until the executor lands; the moment it does, `--engine auto` picks it up (the probe is a
+  single `SELECT 1`).
+- Cancellation reaches the executor at its next cancellation point: the conformance engine
+  observes it inside `pg_sleep`, the executor only between statements.
+- `COPY FROM STDIN` is parsed and acknowledged but stores nothing: the executor has no COPY
+  storage path yet (the wire sub-protocol is complete and tested).
+- A NULL extended-protocol parameter and an empty string are both sent as an empty value by
+  some clients; the server decodes a length of -1 as NULL (which is what `psql` and the Tin
+  `postgres` client send), and exec's own `BindBytes` cannot tell them apart.
+- Signals: `SIGTERM`/`SIGHUP` cannot be taken from Tin yet (see BUGS.md), so
+  `--shutdown-file` and `--reload-file` stand in for them; `server.Shutdown()` is the API.
+- `types.AppendText` prints booleans as `true`/`false`; PostgreSQL prints `t`/`f`, so the
+  server patches the boolean text form itself (noted for the `types` owner).

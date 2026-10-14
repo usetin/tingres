@@ -1,0 +1,1 @@
+SELECT 'don''t';

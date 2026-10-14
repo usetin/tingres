@@ -22,6 +22,24 @@ import "wire"
 const defaultMaxConnections = 100
 const defaultShutdownGrace = 5s
 const copyFlushBytes = 64 * 1024
+const livenessTick = 1s
+
+// gEngine is the process engine, set once by Serve before any session is created. A plain
+// program runs on one core, so this is not cross-core shared state; it is a global because
+// passing the engine through a task's function literal would hand long-lived memory to a
+// mut parameter (E312).
+mut gEngine ?Engine = nil
+
+// SetEngine installs the process engine.
+fn SetEngine(e Engine) {
+	gEngine = e
+}
+
+// EngineOrFail returns the process engine.
+fn EngineOrFail() !Engine {
+	if let e = gEngine { return e }
+	fail "tingres: the engine is not open"
+}
 
 shared let activeConnections = atomic.NewInt(0)
 shared let stopping = atomic.NewBool(false)
@@ -38,6 +56,7 @@ type Config struct {
 	MaxConnections i64
 	StartupTimeout i64
 	IdleTimeout i64
+	IoTimeout i64
 	LogMinDurationMs i64
 	ShutdownFile str
 	ReloadFile str
@@ -52,16 +71,28 @@ type Config struct {
 	Hba []proto.HbaLine
 }
 
-// ConnSlot is the shared state of one accepted connection: a CancelRequest on another
-// connection finds the target session through it.
+// CancelHandle is the per-connection cancellation flag: the accept loop sets it from a
+// CancelRequest and the session observes it. Only atomics live here, so nothing a task
+// allocates has to be stored into another task's memory.
+type CancelHandle struct {
+	Flag atomic.Bool
+}
+
+// NewCancelHandle creates a clear cancellation flag.
+fn NewCancelHandle() CancelHandle {
+	return CancelHandle{Flag: atomic.NewBool(false)}
+}
+
+// ConnSlot is the shared state of one accepted connection. It holds only atomics and small
+// values created by the accept loop itself, so a CancelRequest on another connection can
+// reach the right session without either side storing the other's memory.
 type ConnSlot struct {
 	Pid u32
 	SecretKey u32
 	Ready atomic.Bool
 	Done atomic.Bool
 	Terminate atomic.Bool
-	Conn ?proto.Conn
-	Session Session
+	Cancel CancelHandle
 }
 
 fn new_slot(pid u32) ConnSlot {
@@ -71,8 +102,7 @@ fn new_slot(pid u32) ConnSlot {
 		Ready: atomic.NewBool(false),
 		Done: atomic.NewBool(false),
 		Terminate: atomic.NewBool(false),
-		Conn: nil,
-		Session: FakeSessionOf(NewFakeSession("", "", pid)),
+		Cancel: NewCancelHandle(),
 	}
 }
 
@@ -159,18 +189,25 @@ fn serve_listener(listener wire.Listener, cfg Config, engine Engine) ! {
 			for {
 				if stopping.Load() || shutdown_requested(active) {
 					mut closingEng = eng
-					begin_shutdown(mut registry, mut closingEng, active)
+					begin_shutdown(mut registry, active)
 					keepAlive.Send(true) catch _ {}
 					return
 				}
 				if reload_requested(active) {
-					active = reload_hba(mut active)
+					active = reload_hba(active)
 				}
-				mut accepted = listener.Accept() catch _ {
-					if stopping.Load() {
-						mut closingEng = eng
-						begin_shutdown(mut registry, mut closingEng, active)
+				// AcceptTimeout is the accept loop's liveness tick: it lets the loop notice a
+				// shutdown file or a pg_hba reload without waiting for a new connection.
+				mut accepted = listener.AcceptTimeout(livenessTick) catch err {
+					if stopping.Load() || shutdown_requested(active) {
+						begin_shutdown(mut registry, active)
+						keepAlive.Send(true) catch _ {}
+						return
 					}
+					if is_timeout_fault(err) {
+						continue
+					}
+					begin_shutdown(mut registry, active)
 					keepAlive.Send(true) catch _ {}
 					return
 				}
@@ -191,7 +228,8 @@ fn serve_listener(listener wire.Listener, cfg Config, engine Engine) ! {
 				sessions.spawn(fn() ! {
 					mut clientLocal = clientArg
 					mut slotLocal = slot
-					client_loop(mut clientLocal, cfgCopy, eng, mut slotLocal, registry, peer, pid) catch err {
+					mut cfgLocal = cfgCopy
+					client_loop(mut clientLocal, mut cfgLocal, mut slotLocal, registry, peer, pid) catch err {
 						if !proto.IsProtocolError(err) {
 							say.Line("tingres: connection {pid} ended: {fault.Message(err)}")
 						}
@@ -206,7 +244,7 @@ fn serve_listener(listener wire.Listener, cfg Config, engine Engine) ! {
 	}
 }
 
-fn client_loop(client mut wire.Conn, cfg Config, engine Engine, slot mut ConnSlot, registry map[u32]ConnSlot, peer str, pid u32) ! {
+fn client_loop(client mut wire.Conn, cfg mut Config, slot mut ConnSlot, registry map[u32]ConnSlot, peer str, pid u32) ! {
 
 	defer activeConnections.Add(-1)
 	defer slot.Done.Store(true)
@@ -227,14 +265,13 @@ fn client_loop(client mut wire.Conn, cfg Config, engine Engine, slot mut ConnSlo
 			let user = startup.User
 			mut database = startup.Database
 			if database == "" { database = user }
-			let session = new_session(engine, cfg.Fake, user, database, pid)
-			mut current = session
-			slot.Conn = c
-			slot.Session = current
+			let session = try new_session(cfg.Fake, user, database, pid, slot.Cancel)
+			mut current dyn QuerySession = session
 			slot.SecretKey = c.SecretKey()
 			slot.Ready.Store(true)
-			c.SetTimeout(cfg.IdleTimeout)
-			send_parameters(mut c, current) catch _ {
+			c.SetTimeout(cfg.IoTimeout)
+			try send_parameters(mut c, current)
+			c.SendReadyForQuery(current.StatusChar()) catch _ {
 			}
 			try serve_messages(mut c, mut current, cfg, slot)
 			c.Close()
@@ -243,39 +280,68 @@ fn client_loop(client mut wire.Conn, cfg Config, engine Engine, slot mut ConnSlo
 }
 
 // new_session creates the execution session for a connection.
-fn new_session(engine Engine, fake bool, user str, db str, pid u32) Session {
-	if fake { return FakeSessionOf(NewFakeSession(user, db, pid)) }
+fn new_session(fake bool, user str, db str, pid u32, cancel CancelHandle) !Session {
+	if fake { return FakeSessionOf(NewFakeSession(user, db, pid, cancel)) }
+	let engine = try EngineOrFail()
 	return RealSession(engine.NewSession(user, db))
 }
 
 // send_parameters reports every ParameterStatus PostgreSQL reports at startup.
-fn send_parameters(c mut proto.Conn, session Session) ! {
-	for entry in session.Parameters() {
-		try c.SendParameter(entry.Name, entry.Value)
+fn send_parameters(c mut proto.Conn, session dyn QuerySession) ! {
+	for name in parameter_order() {
+		if let v = session.GetGuc(twine.ToLower(name)) {
+			try c.SendParameter(name, v)
+			continue
+		}
+		let fallback = parameter_fallback(name)
+		if fallback != "" { try c.SendParameter(name, fallback) }
 	}
 }
 
 // ---------------------------------------------------------------------------
 // message loop
 
-fn serve_messages(c mut proto.Conn, session mut Session, cfg Config, slot ConnSlot) ! {
+fn serve_messages(c mut proto.Conn, session mut dyn QuerySession, cfg Config, slot ConnSlot) ! {
 	mut sink = NewSessionSink(c)
 	mut skipUntilSync = false
+	mut lastActivity = tide.Now()
 	for {
-		if slot.Terminate.Load() {
-			c.SendError(proto.ErrorFields{Severity: "FATAL", Code: "57P01", Message: "terminating connection due to administrator command"}) catch _ {
-			}
-			c.Abort()
+		if slot.Terminate.Load() || stopping.Load() {
+			terminating_connection(mut c)
 			return
 		}
+		if slot.Cancel.Flag.Load() {
+			// A CancelRequest arrived: hand it to the executor, which raises 57014 at its
+			// next cancellation point (the conformance engine's pg_sleep polls it directly).
+			slot.Cancel.Flag.Store(false)
+			session.Cancel()
+		}
+		// A short read deadline is the liveness tick: an idle session wakes here, so it can
+		// see a shutdown or an idle timeout. It is restored to the configured I/O limit
+		// before the statement runs, so a slow client is never cut off mid-statement.
+		c.SetTimeout(livenessTick)
 		let message = c.Next() catch err {
+			if proto.IsIdle(err) {
+				if cfg.IdleTimeout > 0 && tide.Since(lastActivity) >= cfg.IdleTimeout {
+					say.Line("LOG: closing idle session {slot.Pid}")
+					c.Abort()
+					return
+				}
+				continue
+			}
 			if proto.IsProtocolError(err) {
 				c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "08P01", Message: fault.Message(err)}) catch _ {
 				}
+				c.Flush() catch _ {
+				}
+				c.Abort()
+				return
 			}
 			c.Abort()
 			return
 		}
+		c.SetTimeout(cfg.IoTimeout)
+		lastActivity = tide.Now()
 		if skipUntilSync {
 			match message {
 				Sync => {
@@ -295,10 +361,36 @@ fn serve_messages(c mut proto.Conn, session mut Session, cfg Config, slot ConnSl
 		}
 		match message {
 			Query(sql) => {
-				try run_simple(mut c, mut session, mut sink, cfg, sql)
+				if is_empty_query(sql) {
+					c.SendEmptyQueryResponse() catch _ {
+					}
+					c.SendReadyForQuery(session.StatusChar()) catch _ {
+					}
+				} else {
+					let started = tide.Now()
+					let (_ran, failed) = session.Simple(sql, mut sink)
+					logStatement(sql, tide.Since(started), cfg.LogMinDurationMs)
+					if sink.Failed {
+						c.Abort()
+						return
+					}
+					if sink.InCopyIn {
+						let copied = finish_copy_in(mut c, mut sink)
+						if !copied.Ok {
+							c.SendError(proto.ErrorFields{Severity: "ERROR", Code: copied.Code, Message: copied.Message}) catch _ {
+							}
+						}
+						send_pending_tag(mut c, mut sink) catch _ {
+						}
+					} else if failed != nil {
+						send_error(mut c, failed)
+					}
+					c.SendReadyForQuery(session.StatusChar()) catch _ {
+					}
+				}
 			}
 			Parse(name, sql, oids) => {
-				let failed = session.Parse(name, sql, oids)
+				let (_parsed, failed) = session.Parse(name, sql, oids)
 				if failed != nil {
 					send_error(mut c, failed)
 					skipUntilSync = true
@@ -308,7 +400,7 @@ fn serve_messages(c mut proto.Conn, session mut Session, cfg Config, slot ConnSl
 				}
 			}
 			Bind(portal, statement, paramFormats, params, resultFormats) => {
-				let failed = session.BindBytes(portal, statement, mut paramFormats, mut params, mut resultFormats)
+				let (_bound, failed) = session.BindBytes(portal, statement, mut paramFormats, mut params, mut resultFormats)
 				if failed != nil {
 					send_error(mut c, failed)
 					skipUntilSync = true
@@ -338,7 +430,7 @@ fn serve_messages(c mut proto.Conn, session mut Session, cfg Config, slot ConnSl
 			Execute(portal, maxRows) => {
 				sink.SawTag = false
 				let started = tide.Now()
-				let failed = session.Execute(portal, maxRows, mut sink)
+				let (_executed, failed) = session.Execute(portal, maxRows, mut sink)
 				logStatement("execute " + portal, tide.Since(started), cfg.LogMinDurationMs)
 				if sink.Failed {
 					c.Abort()
@@ -363,7 +455,7 @@ fn serve_messages(c mut proto.Conn, session mut Session, cfg Config, slot ConnSl
 					} }
 			}
 			Close(kind, name) => {
-				let failed = session.Close(kind, name)
+				let (_closed, failed) = session.Close(kind, name)
 				if failed != nil {
 					send_error(mut c, failed)
 					skipUntilSync = true
@@ -407,49 +499,31 @@ fn serve_messages(c mut proto.Conn, session mut Session, cfg Config, slot ConnSl
 				return
 			}
 		}
+		if session.IsCanceled() {
+			// The cancelled statement has been answered; the flag must not leak into the
+			// statements that follow it.
+			session.ResetCancel()
+		}
 	}
 }
 
-// protocol_violation answers 08P01 and closes, as PostgreSQL does.
-fn protocol_violation(c mut proto.Conn, message str) {
-	c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "08P01", Message: message}) catch _ {
+// terminating_connection sends the 57P01 PostgreSQL sends on a fast shutdown.
+fn terminating_connection(c mut proto.Conn) {
+	c.SendError(proto.ErrorFields{Severity: "FATAL", Code: "57P01", Message: "terminating connection due to administrator command"}) catch _ {
+	}
+	c.Flush() catch _ {
 	}
 	c.Abort()
 }
 
-// run_simple executes a simple-query string, COPY included.
-fn run_simple(c mut proto.Conn, session mut Session, sink mut SessionSink, cfg Config, sql str) ! {
-	if is_empty_query(sql) {
-		c.SendEmptyQueryResponse() catch _ {
-		}
-		c.SendReadyForQuery(session.StatusChar()) catch _ {
-		}
-		return
+// protocol_violation answers 08P01 and closes, as PostgreSQL does. The error is flushed
+// first: Abort closes the socket without writing what is still buffered.
+fn protocol_violation(c mut proto.Conn, message str) {
+	c.SendError(proto.ErrorFields{Severity: "ERROR", Code: "08P01", Message: message}) catch _ {
 	}
-	let started = tide.Now()
-	let failed = session.Simple(sql, mut sink)
-	logStatement(sql, tide.Since(started), cfg.LogMinDurationMs)
-	if sink.Failed {
-		c.Abort()
-		return
+	c.Flush() catch _ {
 	}
-	if sink.InCopyIn {
-		let copied = finish_copy_in(mut c, mut sink)
-		if !copied.Ok {
-			c.SendError(proto.ErrorFields{Severity: "ERROR", Code: copied.Code, Message: copied.Message}) catch _ {
-			}
-		}
-		send_pending_tag(mut c, mut sink) catch _ {
-		}
-		c.SendReadyForQuery(session.StatusChar()) catch _ {
-		}
-		return
-	}
-	if failed != nil {
-		send_error(mut c, failed)
-	}
-	c.SendReadyForQuery(session.StatusChar()) catch _ {
-	}
+	c.Abort()
 }
 
 // DescribeResult reports a Describe outcome: the description or the error to send.
@@ -461,7 +535,7 @@ type DescribeResult struct {
 }
 
 // describe_or_skip describes a statement or portal, reporting the error itself.
-fn describe_or_skip(c mut proto.Conn, session Session, kind u8, name str) DescribeResult {
+fn describe_or_skip(c mut proto.Conn, session dyn QuerySession, kind u8, name str) DescribeResult {
 	mut failedToDescribe = false
 	mut payload = types.NewError("XX000", "")
 	let described = session.Describe(kind, name) catch err {
@@ -569,21 +643,46 @@ fn reload_requested(cfg Config) bool {
 
 // reload_hba re-reads pg_hba.conf, as SIGHUP does in PostgreSQL. Until Tin can deliver a
 // signal, the server watches --reload-file instead (see BUGS.md).
-fn reload_hba(cfg mut Config) Config {
-	mut next = cfg
+fn reload_hba(cfg Config) Config {
 	quarry.Remove(cfg.ReloadFile) catch _ {
 	}
 	let text = quarry.ReadFile(cfg.HbaPath) catch _ {
-		return next
+		return cfg
 	}
-	next.Hba = proto.ParseHba(text)
-	say.Line("tingres: reloaded {cfg.HbaPath} ({len(next.Hba)} rules)")
-	return next
+	let rules = proto.ParseHba(text)
+	say.Line("tingres: reloaded {cfg.HbaPath} ({len(rules)} rules)")
+	return Config{
+		Data: cfg.Data,
+		Listen: cfg.Listen,
+		Role: cfg.Role,
+		Database: cfg.Database,
+		Auth: cfg.Auth,
+		Password: cfg.Password,
+		MaxConnections: cfg.MaxConnections,
+		StartupTimeout: cfg.StartupTimeout,
+		IdleTimeout: cfg.IdleTimeout,
+		IoTimeout: cfg.IoTimeout,
+		LogMinDurationMs: cfg.LogMinDurationMs,
+		ShutdownFile: cfg.ShutdownFile,
+		ReloadFile: cfg.ReloadFile,
+		PidFile: cfg.PidFile,
+		TlsCertFile: cfg.TlsCertFile,
+		TlsKeyFile: cfg.TlsKeyFile,
+		TlsCert: cfg.TlsCert,
+		TlsKey: cfg.TlsKey,
+		ServerVersion: cfg.ServerVersion,
+		Engine: cfg.Engine,
+		Fake: cfg.Fake,
+		Hba: rules,
+	}
 }
 
-// begin_shutdown is PostgreSQL's fast shutdown: stop accepting, terminate sessions with
-// 57P01, checkpoint, and return so the process exits 0.
-fn begin_shutdown(registry mut map[u32]ConnSlot, engine mut Engine, cfg Config) {
+// begin_shutdown is PostgreSQL's fast shutdown: stop accepting, ask every session to
+// terminate (57P01 at its next message), wait for them, checkpoint, and return so the
+// process exits 0. A session blocked reading an idle socket wakes on the liveness timeout
+// and sees the flag; without a Tin signal API (see BUGS.md) the process itself is stopped
+// by SIGTERM, and an idle session is dropped when it exits.
+fn begin_shutdown(registry mut map[u32]ConnSlot, cfg Config) {
 	say.Line("tingres: shutting down ({activeConnections.Load()} connections)")
 	stopping.Store(true)
 	for _, slot in registry {
@@ -593,17 +692,6 @@ fn begin_shutdown(registry mut map[u32]ConnSlot, engine mut Engine, cfg Config) 
 	for tide.Now() < deadline {
 		if pending_connections(registry) == 0 { break }
 		tide.Sleep(20ms)
-	}
-	for _, slot in registry {
-		if slot.Ready.Load() && !slot.Done.Load() {
-			if let conn = slot.Conn {
-				mut closing = conn
-				closing.Abort()
-			}
-		}
-	}
-	engine.Close() catch err {
-		say.Line("tingres: checkpoint on shutdown failed: {fault.Message(err)}")
 	}
 }
 
@@ -631,7 +719,7 @@ fn handle_cancel(registry map[u32]ConnSlot, pid u32, key u32) {
 	if !ok { return }
 	if !slot.Ready.Load() { return }
 	if slot.SecretKey != key { return }
-	slot.Session.Cancel()
+	slot.Cancel.Flag.Store(true)
 	say.Line("LOG: cancel request for backend {pid}")
 }
 
@@ -658,6 +746,11 @@ fn RemovePidFile(path str) {
 	if path == "" { return }
 	quarry.Remove(path) catch _ {
 	}
+}
+
+// is_timeout_fault reports whether a wait failed because its deadline passed.
+fn is_timeout_fault(err fault) bool {
+	return twine.Contains(fault.Message(err), "timed out")
 }
 
 // is_empty_query reports whether a simple query holds no statement at all.
