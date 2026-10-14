@@ -7,6 +7,7 @@ import "../txn"
 import "../store"
 import "crucible"
 import "quarry"
+import "twine"
 
 fn createTestSession(name str) !(Session, txn.Manager) {
 	let dir = quarry.TempDir() + "/tingres-util-" + name
@@ -130,4 +131,41 @@ fn TestSystemFunctions(t mut crucible.T) {
 		return
 	}
 	t.True("current_database() returned row", len(sink2.Rows) > 0)
+}
+
+fn TestUtilityExplainAnalyze(t mut crucible.T) {
+	let (sess, _) = createTestSession("explain_analyze") catch err {
+		t.Error("session setup failed: {err}")
+		return
+	}
+	mut s = sess
+	mut sink = NewRecordSink()
+	s.Simple("CREATE TABLE ea (a int);", mut sink) catch err {
+		t.Error("CREATE TABLE failed: {err}")
+		return
+	}
+	s.Simple("INSERT INTO ea VALUES (1); INSERT INTO ea VALUES (2);", mut sink) catch err {
+		t.Error("INSERT failed: {err}")
+		return
+	}
+	mut esink = NewRecordSink()
+	s.Simple("EXPLAIN ANALYZE SELECT a FROM ea;", mut esink) catch err {
+		t.Error("EXPLAIN ANALYZE failed: {err}")
+		return
+	}
+	t.True("EXPLAIN tag", len(esink.Tags) > 0 && esink.Tags[len(esink.Tags)-1] == "EXPLAIN")
+	mut hasActual = false
+	mut hasRows2 = false
+	for row in esink.Rows {
+		if len(row) > 0 {
+			if twine.Index(row[0].Text(), "actual") >= 0 {
+				hasActual = true
+			}
+			if twine.Index(row[0].Text(), "rows=2") >= 0 {
+				hasRows2 = true
+			}
+		}
+	}
+	t.True("EXPLAIN ANALYZE reports actual rows", hasActual)
+	t.True("EXPLAIN ANALYZE reports rows=2", hasRows2)
 }

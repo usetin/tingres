@@ -102,8 +102,14 @@ directory and checks the committed rows survived and a fresh session works.
 - `Sink` methods take `out mut dyn Sink` rather than a bare `out Sink`, and `Simple`/
   `Parse`/`Bind`/`Execute` take `mut` receivers. This is the compiler's `mut`-parameter
   rule (see BUGS.md); the semantic contract is unchanged.
-- `Explain` output is produced by `plan.ExplainPlan`; `EXPLAIN ANALYZE` reports the plan
-  with actual rows/time placeholders, not measured execution counters.
+- `Explain` output is produced by `plan.ExplainPlan`; `EXPLAIN ANALYZE` runs the plan and
+  reports the root node's actual rows and elapsed time through `plan.NodeStat`/`plan.ExplainAnalyze`
+  (per-node child statistics are not collected yet).
+- Joins: the analyzer numbers executor slots globally, so a right-side hash/merge join key is
+  evaluated against the right row padded with the left side's NULLs; a heap-scan fallback serves
+  `IndexScan`/`IndexOnlyScan` because `store` has no usable B-tree yet.
+- SQL string constants: `plan` keeps the literal's quoted spelling in the constant datum, so exec
+  decodes it in `normalizeConst` (see NEEDS-OTHER).
 - Catalog metadata is in memory (upstream `catalog`), so after a restart a user table
   cannot be resolved by name. `TestEndToEndOnRealStore` verifies durability at the heap
   relation level and that a fresh session can run SQL. See NEEDS-OTHER in BUGS.md.
