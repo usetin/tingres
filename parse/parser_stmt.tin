@@ -703,6 +703,7 @@ fn (p mut Parser) parseAssignments() ![]Assignment {
 fn (p mut Parser) parseUpdate(withClause ?WithClause) !UpdateStmt {
 	let pos = p.Tokens[p.At].Pos
 	try p.expect("update")
+	p.eat("only")
 	let table = try p.parseQualifiedName()
 	let alias = try p.parseAlias()
 	try p.expect("set")
@@ -726,6 +727,7 @@ fn (p mut Parser) parseDelete(withClause ?WithClause) !DeleteStmt {
 	let pos = p.Tokens[p.At].Pos
 	try p.expect("delete")
 	try p.expect("from")
+	p.eat("only")
 	let table = try p.parseQualifiedName()
 	let alias = try p.parseAlias()
 	mut using = []FromItem{}
@@ -880,7 +882,13 @@ fn (p mut Parser) parseTableConstraint(pos i64, name ?Identifier) !TableConstrai
 	if p.eat("primary") {
 		try p.expect("key")
 		kind = "primary key"
-	} else if p.eat("unique") { kind = "unique" } else if p.eat("check") {
+	} else if p.eat("unique") {
+		if p.eat("nulls") {
+			let _ = p.eat("not")
+			try p.expect("distinct")
+		}
+		kind = "unique"
+	} else if p.eat("check") {
 		kind = "check"
 		try p.expect("(")
 		let expression = try p.parseExpression(0)

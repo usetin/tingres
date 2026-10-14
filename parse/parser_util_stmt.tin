@@ -334,7 +334,10 @@ fn (p mut Parser) parseVacuum() !VacuumStmt {
 				let expr = try p.parseExpression(0)
 				parallelExpr = expr
 			} else {
-				try p.errorHere()
+				// Other options (SKIP_LOCKED, INDEX_CLEANUP, BUFFER_USAGE_LIMIT, ...) plus an
+				// optional value; consume the option and its value verbatim.
+				let _ = p.take()
+				for !p.done() && p.text() != "," && p.text() != ")" { p.At += 1 }
 			}
 			if !p.eat(",") {
 				break

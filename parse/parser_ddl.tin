@@ -203,6 +203,10 @@ fn (p mut Parser) parseCreateIndexBody(pos i64, unique bool) !CreateIndexStmt {
 		if !p.eat(",") { break }
 	}
 	try p.expect(")")
+	if p.eat("nulls") {
+		let _ = p.eat("not")
+		try p.expect("distinct")
+	}
 	mut include = []IndexElement{}
 	if p.eat("include") {
 		try p.expect("(")
@@ -432,7 +436,7 @@ fn (p mut Parser) parseCreateRoleBody(pos i64) !CreateRoleStmt {
 	mut options = []RoleOption{}
 	for !p.done() {
 		let optionPos = p.pos()
-		if p.eat("login") || p.eat("nologin") || p.eat("superuser") || p.eat("nosuperuser") || p.eat("createdb") || p.eat("nocreatedb") || p.eat("createrole") || p.eat("nocreaterole") || p.eat("inherit") || p.eat("noinherit") || p.eat("replication") || p.eat("noreplication") {
+		if p.eat("login") || p.eat("nologin") || p.eat("superuser") || p.eat("nosuperuser") || p.eat("createdb") || p.eat("nocreatedb") || p.eat("createrole") || p.eat("nocreaterole") || p.eat("inherit") || p.eat("noinherit") || p.eat("replication") || p.eat("noreplication") || p.eat("bypassrls") || p.eat("nobypassrls") || p.eat("sysid") || p.eat("nosysid") {
 			options = append(options, RoleOption{Pos: optionPos, Name: lowerAscii(p.Tokens[p.At - 1].Text)})
 		} else if p.eat("password") || p.eat("connection") || p.eat("valid") || p.eat("in") {
 			let option = lowerAscii(p.Tokens[p.At - 1].Text)
@@ -494,7 +498,7 @@ fn (p mut Parser) parseAlterRoleBody(pos i64) !AlterRoleStmt {
 	for !p.done() {
 		let optionPos = p.pos()
 		let w = lowerAscii(p.text())
-		if w == "login" || w == "nologin" || w == "superuser" || w == "nosuperuser" || w == "createdb" || w == "nocreatedb" || w == "createrole" || w == "nocreaterole" || w == "inherit" || w == "noinherit" || w == "replication" || w == "noreplication" {
+		if w == "login" || w == "nologin" || w == "superuser" || w == "nosuperuser" || w == "createdb" || w == "nocreatedb" || w == "createrole" || w == "nocreaterole" || w == "inherit" || w == "noinherit" || w == "replication" || w == "noreplication" || w == "bypassrls" || w == "nobypassrls" {
 			p.At += 1
 			options = append(options, RoleOption{Pos: optionPos, Name: w})
 		} else if w == "password" || w == "connection" || w == "valid" {
