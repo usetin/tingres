@@ -1,0 +1,112 @@
+package types
+
+import "crucible"
+
+// TestNumericFastPathEquivalence checks that the i64-mantissa fast path and the
+// canonical base-10000 slow path agree for random eligible values. The slow
+// path is forced by first converting each value to its canonical text form,
+// which makes numeric_fast_pair report ok=false.
+fn TestNumericFastPathEquivalence(t mut crucible.T) {
+	mut rng = Rng{state: 0x1234abcd5678ef90}
+	mut checked = i64(0)
+	mut failures = i64(0)
+	for i in 0..600 {
+		let aText = random_decimal_text(mut rng)
+		let bText = random_decimal_text(mut rng)
+		let a = ParseNumeric(aText) catch _ { continue }
+		let b = ParseNumeric(bText) catch _ { continue }
+		let (_, _, fastOk) = numeric_fast_pair(a)
+		if !fastOk { continue }
+		let aSlow = FromStr(NumericOid, a.Text())
+		let bSlow = FromStr(NumericOid, b.Text())
+		let (_, _, nowSlow) = numeric_fast_pair(aSlow)
+		t.True("text form is the slow path", !nowSlow)
+		if sign_of(CompareNumeric(a, b)) != sign_of(CompareNumeric(aSlow, bSlow)) {
+			if failures < 10 { t.Error("compare {aText} vs {bText}: fast and slow disagree") }
+			failures += 1
+		}
+		for op in []str{"+", "-", "*"} {
+			let fast = numeric_op(op, a, b) catch err {
+				if failures < 10 { t.Error("{aText} {op} {bText}: fast path faulted: {ErrorMessage(err)}") }
+				failures += 1
+				Null()
+			}
+			let slow = numeric_op(op, aSlow, bSlow) catch _ { Null() }
+			if fast.Text() != slow.Text() {
+				if failures < 10 { t.Error("{aText} {op} {bText}: fast {fast.Text()}, slow {slow.Text()}") }
+				failures += 1
+			}
+		}
+		for scale in []i64{-1, 0, 1, 2, 4} {
+			let fastRound = NumericRound(a, scale) catch _ { Null() }
+			let slowRound = NumericRound(aSlow, scale) catch _ { Null() }
+			if fastRound.Text() != slowRound.Text() {
+				if failures < 10 { t.Error("round({aText}, {scale}): fast {fastRound.Text()}, slow {slowRound.Text()}") }
+				failures += 1
+			}
+			if NumericTrunc(a, scale).Text() != NumericTrunc(aSlow, scale).Text() {
+				if failures < 10 { t.Error("trunc({aText}, {scale}): fast and slow disagree") }
+				failures += 1
+			}
+		}
+		checked += 1
+		_ = i
+	}
+	t.True("checked at least 100 eligible pairs", checked >= 100)
+	t.True("no fast/slow mismatches", failures == 0)
+}
+
+fn numeric_op(op str, a Datum, b Datum) !Datum {
+	if op == "+" { return try NumericAdd(a, b) }
+	if op == "-" { return try NumericSub(a, b) }
+	if op == "*" { return try NumericMul(a, b) }
+	if op == "%" { return try NumericMod(a, b) }
+	fail "unknown numeric operator"
+}
+
+// random_decimal_text builds a small decimal literal: at most nine significant
+// digits and a scale of at most three, so ParseNumeric takes the fast path.
+fn random_decimal_text(r mut Rng) str {
+	mut out = ""
+	if r.below(3) == 0 { out += "-" }
+	let intDigits = r.below(6)
+	mut wroteInt = false
+	for j in 0..intDigits {
+		out += str([]u8{u8('0'+r.below(10))})
+		wroteInt = true
+		_ = j
+	}
+	if !wroteInt { out += "0" }
+	let fracDigits = r.below(4)
+	if fracDigits > 0 {
+		out += "."
+		for j in 0..fracDigits {
+			out += str([]u8{u8('0'+r.below(10))})
+			_ = j
+		}
+	}
+	return out
+}
+
+// TestDatumCopiesCarryNoHeapPointerForScalars confirms the layout the copy
+// benchmark relies on: numeric, integer, float, bool, date, time and timestamp
+// Datums hold their value inline and reference no heap text or bytes.
+fn TestDatumCopiesCarryNoHeapPointerForScalars(t mut crucible.T) {
+	let values = []Datum{
+		FromI64(Int2Oid, -7),
+		FromI64(Int4Oid, 42),
+		FromI64(Int8Oid, 9876543210),
+		FromF64(Float8Oid, 1.5),
+		FromBool(true),
+		FromI64(DateOid, 19782),
+		FromI64(TimeOid, 45296000000),
+		FromI64(TimestampOid, 1000000*microsPerDay),
+		FromI64(TimestamptzOid, 1000000*microsPerDay),
+	}
+	for v in values {
+		t.True("inline s for {sql_type_name(v.Oid())}", v.s == "")
+		t.True("no bytes for {sql_type_name(v.Oid())}", len(v.bytes) == 0)
+		let copy = v
+		t.True("copy compares equal for {sql_type_name(v.Oid())}", Compare(copy, v) == 0)
+	}
+}

@@ -4,6 +4,8 @@ import "crucible"
 import "../store"
 import "quarry"
 import "hearth"
+import "say"
+import "tide"
 
 type VisibilityCase struct {
 	Name str
@@ -298,6 +300,7 @@ fn TestRelationLocks(t mut crucible.T) {
 		return
 	}
 	mut m = manager
+	m.SetLockTimeout(20ms)
 	let first = beginForTest(mut t, mut m, Isolation.ReadCommitted)
 	mut second = beginForTest(mut t, mut m, Isolation.ReadCommitted)
 	crucible.NoFault("compatible access share locks", m.LockRelation(first, 42, LockMode.AccessShare))
@@ -312,6 +315,7 @@ fn TestTupleLocks(t mut crucible.T) {
 		return
 	}
 	mut m = manager
+	m.SetLockTimeout(20ms)
 	mut first = beginForTest(mut t, mut m, Isolation.ReadCommitted)
 	mut second = beginForTest(mut t, mut m, Isolation.ReadCommitted)
 	crucible.NoFault("lock tuple", m.LockTuple(first, 7, 0, 1, TupleLock.ForUpdate))
@@ -604,4 +608,239 @@ fn BenchmarkContendedLockAcquire(b mut crucible.B) {
 	m.Abort(mut waiter) catch _ { }
 	m.Abort(mut holder) catch _ { }
 	hearth.Reset()
+}
+
+fn TestSavepointsAndSubtransactions(t mut crucible.T) {
+	let (_, db0, manager) = testManager("savepoints") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create heap", db.CreateHeap(77))
+	mut w = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let parentTid = m.HeapInsert(w, 77, []u8{1}) catch err {
+		t.Error("insert parent: {err}")
+		return
+	}
+	crucible.NoFault("savepoint s1", m.Savepoint(mut w, "s1"))
+	let sub1 = w.WriteXid()
+	let subTid = m.HeapInsert(w, 77, []u8{2}) catch err {
+		t.Error("insert sub: {err}")
+		return
+	}
+	w.CommandCounterIncrement()
+	let parentRow = db.HeapFetch(77, parentTid, []u8{}) catch err {
+		t.Error("fetch parent: {err}")
+		return
+	}
+	let subRow = db.HeapFetch(77, subTid, []u8{}) catch err {
+		t.Error("fetch sub: {err}")
+		return
+	}
+	let before = m.Snapshot(w)
+	crucible.Equal(mut t, "subtransaction insert visible before rollback", m.VisibleTuple(before, 77, subRow), true)
+	crucible.NoFault("rollback to s1", m.RollbackTo(mut w, "s1"))
+	w.CommandCounterIncrement()
+	let after = m.Snapshot(w)
+	crucible.Equal(mut t, "rolled-back subtransaction row invisible", m.VisibleTuple(after, 77, subRow), false)
+	crucible.Equal(mut t, "parent row survives rollback", m.VisibleTuple(after, 77, parentRow), true)
+	crucible.Equal(mut t, "aborted subxid state", m.State(sub1), XidState.Aborted)
+	// A released subtransaction commits with its parent.
+	crucible.NoFault("savepoint s2", m.Savepoint(mut w, "s2"))
+	let releasedTid = m.HeapInsert(w, 77, []u8{3}) catch err {
+		t.Error("insert released: {err}")
+		return
+	}
+	crucible.NoFault("release s2", m.Release(mut w, "s2"))
+	crucible.NoFault("commit writer", m.Commit(mut w))
+	mut reader = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let readerSnap = m.Snapshot(reader)
+	let releasedRow = db.HeapFetch(77, releasedTid, []u8{}) catch err {
+		t.Error("fetch released: {err}")
+		return
+	}
+	crucible.Equal(mut t, "released subtransaction row visible after commit", m.VisibleTuple(readerSnap, 77, releasedRow), true)
+	crucible.Equal(mut t, "aborted subtransaction row still invisible", m.VisibleTuple(readerSnap, 77, subRow), false)
+	abortForTest(mut t, mut m, mut reader)
+}
+
+fn TestCrashRecoveryAbortsInFlightTuples(t mut crucible.T) {
+	let (dir, db0, manager) = testManager("crash-tuples") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create heap", db.CreateHeap(88))
+	mut committed = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let committedTid = m.HeapInsert(committed, 88, []u8{1}) catch err {
+		t.Error("insert committed: {err}")
+		return
+	}
+	crucible.NoFault("commit", m.Commit(mut committed))
+	mut inflight = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let inflightXid = inflight.Xid()
+	let inflightTid = m.HeapInsert(inflight, 88, []u8{2}) catch err {
+		t.Error("insert inflight: {err}")
+		return
+	}
+	crucible.NoFault("close before simulated crash", db.Close())
+	mut reopened = store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false}) catch err {
+		t.Error("reopen: {err}")
+		return
+	}
+	mut recovered = NewManager(mut reopened) catch err {
+		t.Error("recover: {err}")
+		return
+	}
+	crucible.Equal(mut t, "in-flight xid aborted at restart", recovered.State(inflightXid), XidState.Aborted)
+	mut reader = recovered.Begin(Isolation.ReadCommitted) catch err {
+		t.Error("reader begin: {err}")
+		return
+	}
+	let snap = recovered.Snapshot(reader)
+	let committedRow = reopened.HeapFetch(88, committedTid, []u8{}) catch err {
+		t.Error("fetch committed: {err}")
+		return
+	}
+	let inflightRow = reopened.HeapFetch(88, inflightTid, []u8{}) catch err {
+		t.Error("fetch inflight: {err}")
+		return
+	}
+	crucible.Equal(mut t, "committed tuple visible after restart", recovered.VisibleTuple(snap, 88, committedRow), true)
+	crucible.Equal(mut t, "in-flight tuple invisible after restart", recovered.VisibleTuple(snap, 88, inflightRow), false)
+	recovered.Abort(mut reader) catch _ { }
+	reopened.Close() catch _ { }
+}
+
+fn relLockCode(m mut Manager, tx Txn, rel u32, mode LockMode) str {
+	m.LockRelation(tx, rel, mode) catch err { return codeOf(err) }
+	return ""
+}
+
+fn xidLockCode(m mut Manager, tx Txn, xid u32) str {
+	m.LockXid(tx, xid) catch err { return codeOf(err) }
+	return ""
+}
+
+fn codeOf(err fault) str {
+	let text = say.Fmt("%v", err)
+	if len(text) >= 5 {
+		return text[0:5]
+	}
+	return text
+}
+
+// lockWaitWakeup has one task hold a relation lock and a second wait for it, then
+// releases the lock; the waiter must wake and acquire it.
+fn lockWaitWakeup(t mut crucible.T, base Manager) ! {
+	scope s {
+		let holder = s.spawn(fn() ! {
+			mut mgr = base
+			mut h = mgr.Begin(Isolation.ReadCommitted) catch _ { return }
+			mgr.LockRelation(h, 100, LockMode.AccessExclusive) catch _ { return }
+			tide.Sleep(60ms)
+			mgr.Commit(mut h) catch _ { }
+		})
+		let waiter = s.spawn(fn() !bool {
+			mut mgr = base
+			mut w = mgr.Begin(Isolation.ReadCommitted) catch _ { return false }
+			mgr.LockRelation(w, 100, LockMode.AccessExclusive) catch _ { return false }
+			mgr.Commit(mut w) catch _ { }
+			return true
+		})
+		let ok = try waiter.wait()
+		crucible.Equal(mut t, "waiter acquired the lock after release", ok, true)
+		try holder.wait()
+	}
+}
+
+// lockDeadlock has two tasks lock one relation each and wait for the other; the
+// deadlock detector must abort exactly one with 40P01.
+fn lockDeadlock(t mut crucible.T, base Manager) ! {
+	scope s {
+		let first = s.spawn(fn() !str {
+			mut mgr = base
+			mut tx = mgr.Begin(Isolation.ReadCommitted) catch _ { return "" }
+			mgr.LockRelation(tx, 200, LockMode.AccessExclusive) catch _ { return "" }
+			tide.Sleep(10ms)
+			mgr.LockRelation(tx, 201, LockMode.AccessExclusive) catch err {
+				mgr.Abort(mut tx) catch _ { }
+				return codeOf(err)
+			}
+			mgr.Commit(mut tx) catch _ { }
+			return ""
+		})
+		let second = s.spawn(fn() !str {
+			mut mgr = base
+			mut tx = mgr.Begin(Isolation.ReadCommitted) catch _ { return "" }
+			mgr.LockRelation(tx, 201, LockMode.AccessExclusive) catch _ { return "" }
+			tide.Sleep(10ms)
+			mgr.LockRelation(tx, 200, LockMode.AccessExclusive) catch err {
+				mgr.Abort(mut tx) catch _ { }
+				return codeOf(err)
+			}
+			mgr.Commit(mut tx) catch _ { }
+			return ""
+		})
+		let a = try first.wait()
+		let b = try second.wait()
+		mut deadlocks = 0
+		if a == "40P01" { deadlocks += 1 }
+		if b == "40P01" { deadlocks += 1 }
+		crucible.Equal(mut t, "exactly one deadlock victim", deadlocks, 1)
+	}
+}
+
+fn TestLockWaitAndDeadlock(t mut crucible.T) {
+	let (_, _, manager) = testManager("lock-wait") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut m = manager
+	m.SetLockTimeout(2s)
+	m.SetDeadlockTimeout(40ms)
+	lockWaitWakeup(mut t, m) catch err {
+		t.Error("wakeup: {err}")
+		return
+	}
+	lockDeadlock(mut t, m) catch err {
+		t.Error("deadlock: {err}")
+		return
+	}
+}
+
+fn TestLockTimeoutAndCancel(t mut crucible.T) {
+	let (_, _, manager) = testManager("lock-timeout") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut m = manager
+	mut holder = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("hold", m.LockRelation(holder, 300, LockMode.AccessExclusive))
+	mut waiter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	m.SetLockTimeout(20ms)
+	crucible.Equal(mut t, "lock timeout 55P03", relLockCode(mut m, waiter, 300, LockMode.AccessShare), "55P03")
+	m.SetLockTimeout(0)
+	// A cancel wakeup: cancel the waiter's xid while it would block.
+	m.Cancel(waiter.Xid())
+	crucible.Equal(mut t, "cancel 57014", relLockCode(mut m, waiter, 300, LockMode.AccessShare), "57014")
+	abortForTest(mut t, mut m, mut holder)
+	abortForTest(mut t, mut m, mut waiter)
+}
+
+fn TestXidLockWaits(t mut crucible.T) {
+	let (_, _, manager) = testManager("xid-lock") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut m = manager
+	mut blocker = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	mut waiter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	m.SetLockTimeout(20ms)
+	crucible.Equal(mut t, "waiting for an in-progress xid times out 55P03", xidLockCode(mut m, waiter, blocker.Xid()), "55P03")
+	crucible.NoFault("commit blocker", m.Commit(mut blocker))
+	crucible.NoFault("xid lock returns once committed", m.LockXid(waiter, blocker.Xid()))
+	abortForTest(mut t, mut m, mut waiter)
 }

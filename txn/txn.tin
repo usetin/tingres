@@ -1,6 +1,7 @@
 package txn
 
 import "../store"
+import "tide"
 
 const xactRel store.RelId = 4294967294
 const xidBlockSize u32 = 256
@@ -8,6 +9,7 @@ const walXidReserve u8 = 16
 const walXidCommit u8 = 17
 const walXidAbort u8 = 18
 const walClogPage u8 = 19
+const walXidSubCommit u8 = 20
 const clogPageXids u32 = 256
 const clogPageBytes i64 = 64
 
@@ -37,6 +39,17 @@ type Txn struct {
 	startXmax u32
 	startXip []u32
 	active bool
+	// xids is the transaction's own xid plus every live subtransaction xid.
+	xids []u32
+	// writeXid is the xid stamped on new tuple versions (the innermost subtransaction).
+	writeXid u32
+	savepoints []SavepointEntry
+}
+
+// SavepointEntry records one open savepoint and its subtransaction xid.
+type SavepointEntry struct {
+	Name str
+	Subxid u32
 }
 
 // Snapshot is the MVCC horizon and active transaction set for one statement.
@@ -46,6 +59,8 @@ type Snapshot struct {
 	Xip []u32
 	Xid u32
 	Cid u32
+	// Xids is the reading transaction's own xid and subtransaction xids.
+	Xids []u32
 }
 
 type SnapshotHandle struct {
@@ -119,6 +134,18 @@ type TupleLockHolder struct {
 	mode TupleLock
 }
 
+// LockWaiter is one transaction's queued relation lock request (FIFO).
+type LockWaiter struct {
+	xid u32
+	mode LockMode
+}
+
+// TupleLockWaiter is one transaction's queued tuple lock request (FIFO).
+type TupleLockWaiter struct {
+	xid u32
+	mode TupleLock
+}
+
 type DeleteCommand struct {
 	xid u32
 	cid u32
@@ -141,9 +168,16 @@ type Manager struct {
 	reservedUntil u32
 	clog map[u32][]u8
 	active map[u32]bool
+	subxids map[u32][]u32
 	txnXmin map[u32]u32
 	locks map[LockKey][]LockHolder
 	tupleLocks map[TupleLockKey][]TupleLockHolder
+	relWaiters map[LockKey][]LockWaiter
+	tupleWaiters map[TupleLockKey][]TupleLockWaiter
+	waitFor map[u32]u32
+	canceledXids map[u32]bool
+	deadlockTimeoutNs i64
+	lockTimeoutNs i64
 	deleteCommands map[TupleLockKey]DeleteCommand
 	snapshots map[u64]Snapshot
 	publishedXip []u32
@@ -166,8 +200,9 @@ fn NewManager(s mut store.Store) !Manager {
 	try s.RegisterRecordKind(walXidCommit, "txn commit")
 	try s.RegisterRecordKind(walXidAbort, "txn abort")
 	try s.RegisterRecordKind(walClogPage, "txn clog page")
+	try s.RegisterRecordKind(walXidSubCommit, "txn subcommit")
 	s.CreateHeap(xactRel) catch _ { }
-	mut m = Manager{store: s, nextXid: 3, reservedUntil: 3, clog: make(map[u32][]u8), active: make(map[u32]bool), txnXmin: make(map[u32]u32), locks: make(map[LockKey][]LockHolder), tupleLocks: make(map[TupleLockKey][]TupleLockHolder), deleteCommands: make(map[TupleLockKey]DeleteCommand), snapshots: make(map[u64]Snapshot), publishedXip: []u32{}, publishedXmin: 3, allVisiblePages: make(map[TuplePageKey]PageVisibility), nextSnapshot: 1, version: 1}
+	mut m = Manager{store: s, nextXid: 3, reservedUntil: 3, clog: make(map[u32][]u8), active: make(map[u32]bool), subxids: make(map[u32][]u32), txnXmin: make(map[u32]u32), locks: make(map[LockKey][]LockHolder), tupleLocks: make(map[TupleLockKey][]TupleLockHolder), relWaiters: make(map[LockKey][]LockWaiter), tupleWaiters: make(map[TupleLockKey][]TupleLockWaiter), waitFor: make(map[u32]u32), canceledXids: make(map[u32]bool), deadlockTimeoutNs: 1000000000, lockTimeoutNs: 0, deleteCommands: make(map[TupleLockKey]DeleteCommand), snapshots: make(map[u64]Snapshot), publishedXip: []u32{}, publishedXmin: 3, allVisiblePages: make(map[TuplePageKey]PageVisibility), nextSnapshot: 1, version: 1}
 	mut scan = s.HeapScan(xactRel)
 	for {
 		let (tuple, ok) = scan.Next()
@@ -201,7 +236,7 @@ fn (m mut Manager) Begin(iso Isolation) !Txn {
 	if iso == Isolation.ReadCommitted { m.txnXmin[xid] = xid } else { m.txnXmin[xid] = xmin }
 	m.refreshPublishedXip()
 	m.version += 1
-	return Txn{xid: xid, iso: iso, cid: 0, startXmin: xmin, startXmax: xid, startXip: activeXids, active: true}
+	return Txn{xid: xid, iso: iso, cid: 0, startXmin: xmin, startXmax: xid, startXip: activeXids, active: true, xids: []u32{xid}, writeXid: xid, savepoints: []SavepointEntry{}}
 }
 
 // Xid returns the transaction id.
@@ -209,9 +244,22 @@ fn (t Txn) Xid() u32 {
 	return t.xid
 }
 
-// CommandID returns the active command counter.
+// WriteXid returns the xid stamped on new tuple versions (the innermost subtransaction).
+fn (t Txn) WriteXid() u32 {
+	return t.writeXid
+}
+
+// Subxids returns the transaction's subtransaction xids.
+fn (t Txn) Subxids() []u32 {
+	return t.xids
+}
 fn (t Txn) CommandID() u32 {
 	return t.cid
+}
+
+// NextXid returns the next transaction id the manager will allocate.
+fn (m Manager) NextXid() u32 {
+	return m.nextXid
 }
 
 // CommandCounterIncrement advances the current transaction's command id.
@@ -222,9 +270,9 @@ fn (t mut Txn) CommandCounterIncrement() {
 // Snapshot returns a fresh statement snapshot for read committed and a stable one otherwise.
 fn (m Manager) Snapshot(t Txn) Snapshot {
 	if t.iso != Isolation.ReadCommitted {
-		return Snapshot{Xmin: t.startXmin, Xmax: t.startXmax, Xip: t.startXip, Xid: t.xid, Cid: t.cid}
+		return Snapshot{Xmin: t.startXmin, Xmax: t.startXmax, Xip: t.startXip, Xid: t.xid, Cid: t.cid, Xids: t.xids}
 	}
-	return Snapshot{Xmin: m.publishedXmin, Xmax: m.nextXid, Xip: m.publishedXip, Xid: t.xid, Cid: t.cid}
+	return Snapshot{Xmin: m.publishedXmin, Xmax: m.nextXid, Xip: m.publishedXip, Xid: t.xid, Cid: t.cid, Xids: t.xids}
 }
 
 // AcquireSnapshot registers a statement snapshot until ReleaseSnapshot is called.
@@ -277,15 +325,13 @@ fn (m mut Manager) Commit(t mut Txn) ! {
 		fail "25000 transaction is not active"
 	}
 	let lsn = try m.persistState(t.xid, XidState.Committed, walXidCommit)
+	for sub in t.xids {
+		if sub != t.xid {
+			_ = try m.persistState(sub, XidState.Committed, walXidSubCommit)
+		}
+	}
 	try m.store.Sync(lsn)
-	delete(m.active, t.xid)
-	delete(m.txnXmin, t.xid)
-	m.refreshPublishedXip()
-	m.releaseTxnSnapshots(t.xid)
-	m.releaseDeleteCommands(t.xid)
-	t.active = false
-	m.version += 1
-	m.releaseLocks(t.xid)
+	m.clearTxn(mut t)
 	return
 }
 
@@ -295,16 +341,146 @@ fn (m mut Manager) Abort(t mut Txn) ! {
 		return
 	}
 	_ = try m.persistState(t.xid, XidState.Aborted, walXidAbort)
+	for sub in t.xids {
+		if sub != t.xid {
+			_ = try m.persistState(sub, XidState.Aborted, walXidAbort)
+		}
+	}
+	m.clearTxn(mut t)
+}
+
+fn (m mut Manager) clearTxn(t mut Txn) {
+	for xid in t.xids {
+		delete(m.active, xid)
+		delete(m.subxids, xid)
+	}
 	delete(m.active, t.xid)
+	delete(m.subxids, t.xid)
 	delete(m.txnXmin, t.xid)
+	t.active = false
 	m.refreshPublishedXip()
+	for xid in t.xids {
+		m.releaseTxnSnapshots(xid)
+		m.releaseDeleteCommands(xid)
+	}
 	m.releaseTxnSnapshots(t.xid)
 	m.releaseDeleteCommands(t.xid)
-	t.active = false
 	m.version += 1
+	for xid in t.xids {
+		m.releaseLocks(xid)
+	}
 	m.releaseLocks(t.xid)
 }
 
+// Savepoint allocates a subtransaction xid and records a savepoint name.
+fn (m mut Manager) Savepoint(t mut Txn, name str) ! {
+	if !t.active {
+		fail "25000 transaction is not active"
+	}
+	if m.nextXid >= m.reservedUntil {
+		try m.reserveXids()
+	}
+	let sub = m.nextXid
+	m.nextXid += 1
+	m.active[sub] = true
+	let list = m.subxids[t.xid]
+	m.subxids[t.xid] = append(list, sub)
+	t.xids = append(t.xids, sub)
+	t.writeXid = sub
+	t.savepoints = append(t.savepoints, SavepointEntry{Name: name, Subxid: sub})
+	m.version += 1
+	return
+}
+
+// RollbackTo aborts every subtransaction established after the named savepoint and
+// restarts it with a fresh subtransaction xid.
+fn (m mut Manager) RollbackTo(t mut Txn, name str) ! {
+	let idx = lastSavepoint(t, name)
+	if idx < 0 {
+		fail "3B001 savepoint \"{name}\" does not exist"
+	}
+	let keepSub = t.savepoints[idx].Subxid
+	mut keptXids = []u32{t.xid}
+	mut aborted = []u32{}
+	for xid in t.xids {
+		if xid == t.xid {
+			continue
+		}
+		if xid < keepSub {
+			keptXids = append(keptXids, xid)
+		} else {
+			aborted = append(aborted, xid)
+		}
+	}
+	if m.nextXid >= m.reservedUntil {
+		try m.reserveXids()
+	}
+	let fresh = m.nextXid
+	m.nextXid += 1
+	m.active[fresh] = true
+	let list = m.subxids[t.xid]
+	m.subxids[t.xid] = append(list, fresh)
+	keptXids = append(keptXids, fresh)
+	for sub in aborted {
+		_ = try m.persistState(sub, XidState.Aborted, walXidAbort)
+		delete(m.active, sub)
+		m.releaseLocks(sub)
+		m.releaseTxnSnapshots(sub)
+		m.releaseDeleteCommands(sub)
+	}
+	t.xids = keptXids
+	mut keptSp = []SavepointEntry{}
+	for i, sp in t.savepoints {
+		if i < idx {
+			keptSp = append(keptSp, sp)
+		} else if i == idx {
+			keptSp = append(keptSp, SavepointEntry{Name: sp.Name, Subxid: fresh})
+		}
+	}
+	t.savepoints = keptSp
+	t.writeXid = fresh
+	m.version += 1
+	return
+}
+
+// Release drops the named savepoint and every savepoint established after it.
+fn (m mut Manager) Release(t mut Txn, name str) ! {
+	let idx = lastSavepoint(t, name)
+	if idx < 0 {
+		fail "3B001 savepoint \"{name}\" does not exist"
+	}
+	let sub = t.savepoints[idx].Subxid
+	_ = try m.persistState(sub, XidState.SubCommitted, walXidSubCommit)
+	mut keptSp = []SavepointEntry{}
+	for i, sp in t.savepoints {
+		if i < idx {
+			keptSp = append(keptSp, sp)
+		}
+	}
+	t.savepoints = keptSp
+	mut writeXid = t.xid
+	if len(t.savepoints) > 0 {
+		writeXid = t.savepoints[len(t.savepoints)-1].Subxid
+	}
+	t.writeXid = writeXid
+	m.version += 1
+	return
+}
+
+fn lastSavepoint(t Txn, name str) i64 {
+	mut idx = i64(-1)
+	for i, sp in t.savepoints {
+		if sp.Name == name {
+			idx = i64(i)
+		}
+	}
+	return idx
+}
+
+// IsOwnXid reports whether xid belongs to the transaction itself or a subtransaction.
+fn (t Txn) IsOwnXid(xid u32) bool {
+	return xidIn(xid, t.xids)
+}
 // State returns the known outcome of xid, treating an unknown id as aborted.
 fn (m Manager) State(xid u32) XidState {
 	if xid < 3 { return XidState.Committed }
@@ -434,6 +610,25 @@ fn (m Manager) Visible(snap Snapshot, h store.TupleHeader) bool {
 	return visible
 }
 
+// HeapTupleVisible applies MVCC visibility to a tuple with its own TID, using the
+// recorded delete command id so a transaction still sees its own delete.
+fn (m Manager) HeapTupleVisible(snap Snapshot, rel store.RelId, h store.TupleHeader, tid store.Tid) bool {
+	return m.TupleHeaderVisible(snap, rel, h.Xmin(), h.Xmax(), h.Cid(), h.Infomask(), tid)
+}
+
+// TupleHeaderVisible is HeapTupleVisible over plain header fields, so a caller that
+// decodes rows itself needs no store.TupleHeader value.
+fn (m Manager) TupleHeaderVisible(snap Snapshot, rel store.RelId, xmin u32, xmax u32, cid u32, infomask u16, tid store.Tid) bool {
+	mut cmax = snap.Cid
+	if xidIn(xmax, snap.Xids) {
+		let key = tupleLockKey(rel, tid)
+		let (deleteCommand, ok) = m.deleteCommands[key]
+		if ok && deleteCommand.xid == snap.Xid { cmax = deleteCommand.cid }
+	}
+	let (visible, _) = m.visibleHeaderFields(snap, xmin, xmax, cid, infomask, cmax)
+	return visible
+}
+
 // VisibleHeader applies MVCC visibility to a decoded value header.
 fn (m Manager) VisibleHeader(snap Snapshot, h TupleHeader) bool {
 	let (visible, _) = m.visibleHeaderFields(snap, h.Xmin, h.Xmax, h.Cid, h.Infomask, snap.Cid)
@@ -453,7 +648,7 @@ fn (m mut Manager) VisibleTuple(snap Snapshot, rel store.RelId, tuple store.Heap
 		return true
 	}
 	mut cmax = snap.Cid
-	if tuple.Header.Xmax() == snap.Xid {
+	if xidIn(tuple.Header.Xmax(), snap.Xids) {
 		let key = tupleLockKey(rel, tuple.Tid)
 		let (deleteCommand, hasDeleteCid) = m.deleteCommands[key]
 		if hasDeleteCid && deleteCommand.xid == snap.Xid { cmax = deleteCommand.cid }
@@ -469,7 +664,7 @@ fn (m mut Manager) VisibleTuple(snap Snapshot, rel store.RelId, tuple store.Heap
 // HeapInsert writes a tuple with the transaction's current xid and command id.
 fn (m mut Manager) HeapInsert(t Txn, rel store.RelId, payload []u8) !store.Tid {
 	if !t.active { fail "25000 transaction is not active" }
-	let tid = try m.store.HeapInsert(store.NewXidCtx(t.xid, t.cid), rel, payload)
+	let tid = try m.store.HeapInsert(store.NewXidCtx(t.writeXid, t.cid), rel, payload)
 	delete(m.allVisiblePages, TuplePageKey{rel: u32(rel), page: u32(tid.Page())})
 	return tid
 }
@@ -477,7 +672,7 @@ fn (m mut Manager) HeapInsert(t Txn, rel store.RelId, payload []u8) !store.Tid {
 // HeapDelete records the current command id for own-delete visibility and updates xmax.
 fn (m mut Manager) HeapDelete(t Txn, rel store.RelId, tid store.Tid) ! {
 	if !t.active { fail "25000 transaction is not active" }
-	try m.store.HeapDelete(store.NewXidCtx(t.xid, t.cid), rel, tid)
+	try m.store.HeapDelete(store.NewXidCtx(t.writeXid, t.cid), rel, tid)
 	delete(m.allVisiblePages, TuplePageKey{rel: u32(rel), page: u32(tid.Page())})
 	m.deleteCommands[tupleLockKey(rel, tid)] = DeleteCommand{xid: t.xid, cid: t.cid}
 }
@@ -497,7 +692,7 @@ fn (m Manager) visibleHeaderFields(snap Snapshot, xmin u32, xmax u32, cid u32, i
 	mut hints = u16(0)
 	let xminBits = infomask & infXminFrozen
 	if xmin == 0 || xminBits == infXminInvalid { return false, hints }
-	if xmin == snap.Xid {
+	if xidIn(xmin, snap.Xids) {
 		if cid >= snap.Cid { return false, hints }
 	} else {
 		mut committed = xminBits == infXminFrozen || xminBits&infXminCommitted != 0
@@ -517,7 +712,7 @@ fn (m Manager) visibleHeaderFields(snap Snapshot, xmin u32, xmax u32, cid u32, i
 	}
 	let xmaxBits = infomask
 	if xmax == 0 || xmaxBits&infXmaxInvalid != 0 || xmaxBits&infXmaxLockOnly != 0 { return true, hints }
-	if xmax == snap.Xid {
+	if xidIn(xmax, snap.Xids) {
 		return cmax >= snap.Cid, hints
 	}
 	if xmaxBits&infXmaxCommitted != 0 {
@@ -548,10 +743,10 @@ fn (m Manager) HeapTupleSatisfiesDirty(t Txn, h store.TupleHeader) TupleCheck {
 	if xmin == 0 || xminBits == infXminInvalid || xminState == XidState.Aborted {
 		return TupleCheck{Code: TupleCheckCode.Invisible, By: 0, Ctid: h.Ctid()}
 	}
-	if xmin == t.xid && h.Cid() >= t.cid {
+	if t.IsOwnXid(xmin) && h.Cid() >= t.cid {
 		return TupleCheck{Code: TupleCheckCode.Invisible, By: 0, Ctid: h.Ctid()}
 	}
-	if xmin != t.xid && (xminState == XidState.InProgress || xminState == XidState.SubCommitted) {
+	if !t.IsOwnXid(xmin) && (xminState == XidState.InProgress || xminState == XidState.SubCommitted) {
 		return TupleCheck{Code: TupleCheckCode.BeingModified, By: xmin, Ctid: h.Ctid()}
 	}
 	let xmax = h.Xmax()
@@ -559,7 +754,7 @@ fn (m Manager) HeapTupleSatisfiesDirty(t Txn, h store.TupleHeader) TupleCheck {
 	if xmax == 0 || xmaxBits&infXmaxInvalid != 0 {
 		return TupleCheck{Code: TupleCheckCode.Ok, By: 0, Ctid: h.Ctid()}
 	}
-	if xmax == t.xid {
+	if t.IsOwnXid(xmax) {
 		return TupleCheck{Code: TupleCheckCode.SelfModified, By: xmax, Ctid: h.Ctid()}
 	}
 	let xmaxState = m.State(xmax)
@@ -629,40 +824,293 @@ fn tupleLockKey(rel store.RelId, tid store.Tid) TupleLockKey {
 	return TupleLockKey{rel: u32(rel), page: u32(tid.Page()), slot: tid.Slot()}
 }
 
-// LockRelation acquires a relation lock if no incompatible holder exists.
-fn (m mut Manager) LockRelation(t Txn, rel u32, mode LockMode) ! {
-	if !m.TryLockRelation(t, rel, mode) {
-		fail "55P03 could not obtain lock on relation"
-	}
-	return
+// SetLockTimeout sets how long a lock request waits before failing with 55P03 (0 = forever).
+fn (m mut Manager) SetLockTimeout(ns i64) {
+	m.lockTimeoutNs = ns
 }
 
-// TryLockRelation checks and acquires without allocating an error on contention.
+// SetDeadlockTimeout sets how long a request waits before a deadlock check runs.
+fn (m mut Manager) SetDeadlockTimeout(ns i64) {
+	m.deadlockTimeoutNs = ns
+}
+
+// Cancel marks a transaction so its waiting lock requests fail with 57014.
+fn (m mut Manager) Cancel(xid u32) {
+	m.canceledXids[xid] = true
+}
+
+fn (m Manager) isCanceled(xid u32) bool {
+	let (v, ok) = m.canceledXids[xid]
+	return ok && v
+}
+
+// LockRelation acquires a relation lock, waiting in FIFO order while another
+// transaction holds an incompatible mode.
+fn (m mut Manager) LockRelation(t Txn, rel u32, mode LockMode) ! {
+	let xid = t.writeXid
+	if m.tryGrantRelation(xid, rel, mode) {
+		return
+	}
+	m.enqueueRelation(xid, rel, mode)
+	let start = tide.Now()
+	for {
+		if m.tryGrantRelation(xid, rel, mode) {
+			m.dequeueRelation(xid, rel)
+			return
+		}
+		if m.isCanceled(xid) {
+			m.dequeueRelation(xid, rel)
+			fail "57014 canceling statement due to user request"
+		}
+		let waited = tide.Now() - start
+		if m.lockTimeoutNs > 0 && waited >= m.lockTimeoutNs {
+			m.dequeueRelation(xid, rel)
+			fail "55P03 canceling statement due to lock timeout"
+		}
+		if m.deadlockTimeoutNs > 0 && waited >= m.deadlockTimeoutNs && m.deadlockAt(xid) {
+			m.dequeueRelation(xid, rel)
+			fail "40P01 deadlock detected\nDETAIL: Process {xid} waits for {lockModeName(mode)} on relation {rel}; blocked by process {m.blockerOf(xid)}."
+		}
+		tide.Sleep(200000)
+	}
+}
+
+// TryLockRelation checks and acquires without waiting.
 fn (m mut Manager) TryLockRelation(t Txn, rel u32, mode LockMode) bool {
+	return m.tryGrantRelation(t.writeXid, rel, mode)
+}
+
+fn (m mut Manager) tryGrantRelation(xid u32, rel u32, mode LockMode) bool {
 	let key = LockKey{rel: rel}
 	let holders = m.locks[key]
+	mut blocker = u32(0)
+	mut held = false
 	for h in holders {
-		if h.xid == t.xid && h.mode == mode { return true }
-		if h.xid != t.xid && conflicts(mode, h.mode) {
+		if h.xid == xid {
+			held = true
+			if h.mode == mode {
+				return true
+			}
+		} else if conflicts(mode, h.mode) {
+			if blocker == 0 {
+				blocker = h.xid
+			}
+		}
+	}
+	if blocker != 0 {
+		m.waitFor[xid] = blocker
+		return false
+	}
+	// A conflicting request queued earlier goes first (FIFO fairness).
+	let queue = m.relWaiters[key]
+	for w in queue {
+		if w.xid == xid {
+			break
+		}
+		if w.xid != xid && conflicts(mode, w.mode) {
+			m.waitFor[xid] = w.xid
 			return false
 		}
 	}
-	m.locks[key] = append(holders, LockHolder{xid: t.xid, mode: mode})
+	mut kept = []LockHolder{}
+	if held {
+		for h in holders {
+			if h.xid != xid {
+				kept = append(kept, h)
+			}
+		}
+	} else {
+		kept = append(kept, holders...)
+	}
+	m.locks[key] = append(kept, LockHolder{xid: xid, mode: mode})
+	delete(m.waitFor, xid)
 	return true
 }
 
-// LockTuple acquires a tuple lock if no incompatible holder owns that tuple.
-fn (m mut Manager) LockTuple(t Txn, rel u32, page u32, slot u16, mode TupleLock) ! {
-	let key = TupleLockKey{rel: rel, page: page, slot: slot}
-	let holders = m.tupleLocks[key]
-	for h in holders {
-		if h.xid == t.xid && h.mode == mode { return }
-		if h.xid != t.xid && tupleConflicts(mode, h.mode) {
-			fail "55P03 could not obtain lock on tuple"
+fn (m mut Manager) enqueueRelation(xid u32, rel u32, mode LockMode) {
+	let key = LockKey{rel: rel}
+	let queue = m.relWaiters[key]
+	for w in queue {
+		if w.xid == xid {
+			return
 		}
 	}
-	m.tupleLocks[key] = append(holders, TupleLockHolder{xid: t.xid, mode: mode})
-	return
+	m.relWaiters[key] = append(queue, LockWaiter{xid: xid, mode: mode})
+}
+
+fn (m mut Manager) dequeueRelation(xid u32, rel u32) {
+	let key = LockKey{rel: rel}
+	mut kept = []LockWaiter{}
+	for w in m.relWaiters[key] {
+		if w.xid != xid {
+			kept = append(kept, w)
+		}
+	}
+	m.relWaiters[key] = kept
+	delete(m.waitFor, xid)
+}
+
+fn (m Manager) blockerOf(xid u32) u32 {
+	let (blocker, ok) = m.waitFor[xid]
+	if ok {
+		return blocker
+	}
+	return 0
+}
+
+// LockTuple acquires a tuple lock, waiting in FIFO order on conflict.
+fn (m mut Manager) LockTuple(t Txn, rel u32, page u32, slot u16, mode TupleLock) ! {
+	let xid = t.writeXid
+	if m.tryGrantTuple(xid, rel, page, slot, mode) {
+		return
+	}
+	m.enqueueTuple(xid, rel, page, slot, mode)
+	let start = tide.Now()
+	for {
+		if m.tryGrantTuple(xid, rel, page, slot, mode) {
+			m.dequeueTuple(xid, rel, page, slot)
+			return
+		}
+		if m.isCanceled(xid) {
+			m.dequeueTuple(xid, rel, page, slot)
+			fail "57014 canceling statement due to user request"
+		}
+		let waited = tide.Now() - start
+		if m.lockTimeoutNs > 0 && waited >= m.lockTimeoutNs {
+			m.dequeueTuple(xid, rel, page, slot)
+			fail "55P03 canceling statement due to lock timeout"
+		}
+		if m.deadlockTimeoutNs > 0 && waited >= m.deadlockTimeoutNs && m.deadlockAt(xid) {
+			m.dequeueTuple(xid, rel, page, slot)
+			fail "40P01 deadlock detected\nDETAIL: Process {xid} waits for a tuple lock on relation {rel}; blocked by process {m.blockerOf(xid)}."
+		}
+		tide.Sleep(200000)
+	}
+}
+
+fn (m mut Manager) tryGrantTuple(xid u32, rel u32, page u32, slot u16, mode TupleLock) bool {
+	let key = TupleLockKey{rel: rel, page: page, slot: slot}
+	let holders = m.tupleLocks[key]
+	mut blocker = u32(0)
+	mut held = false
+	for h in holders {
+		if h.xid == xid {
+			held = true
+			if h.mode == mode {
+				return true
+			}
+		} else if tupleConflicts(mode, h.mode) {
+			if blocker == 0 {
+				blocker = h.xid
+			}
+		}
+	}
+	if blocker != 0 {
+		m.waitFor[xid] = blocker
+		return false
+	}
+	let queue = m.tupleWaiters[key]
+	for w in queue {
+		if w.xid == xid {
+			break
+		}
+		if w.xid != xid && tupleConflicts(mode, w.mode) {
+			m.waitFor[xid] = w.xid
+			return false
+		}
+	}
+	mut kept = []TupleLockHolder{}
+	if held {
+		for h in holders {
+			if h.xid != xid {
+				kept = append(kept, h)
+			}
+		}
+	} else {
+		kept = append(kept, holders...)
+	}
+	m.tupleLocks[key] = append(kept, TupleLockHolder{xid: xid, mode: mode})
+	delete(m.waitFor, xid)
+	return true
+}
+
+fn (m mut Manager) enqueueTuple(xid u32, rel u32, page u32, slot u16, mode TupleLock) {
+	let key = TupleLockKey{rel: rel, page: page, slot: slot}
+	let queue = m.tupleWaiters[key]
+	for w in queue {
+		if w.xid == xid {
+			return
+		}
+	}
+	m.tupleWaiters[key] = append(queue, TupleLockWaiter{xid: xid, mode: mode})
+}
+
+fn (m mut Manager) dequeueTuple(xid u32, rel u32, page u32, slot u16) {
+	let key = TupleLockKey{rel: rel, page: page, slot: slot}
+	mut kept = []TupleLockWaiter{}
+	for w in m.tupleWaiters[key] {
+		if w.xid != xid {
+			kept = append(kept, w)
+		}
+	}
+	m.tupleWaiters[key] = kept
+	delete(m.waitFor, xid)
+}
+
+// LockXid waits until a transaction id is no longer in progress.
+fn (m mut Manager) LockXid(t Txn, xid u32) ! {
+	let self = t.writeXid
+	let start = tide.Now()
+	for {
+		let state = m.State(xid)
+		if state != XidState.InProgress && state != XidState.SubCommitted {
+			delete(m.waitFor, self)
+			return
+		}
+		m.waitFor[self] = xid
+		if m.isCanceled(self) {
+			fail "57014 canceling statement due to user request"
+		}
+		let waited = tide.Now() - start
+		if m.lockTimeoutNs > 0 && waited >= m.lockTimeoutNs {
+			fail "55P03 canceling statement due to lock timeout"
+		}
+		if m.deadlockTimeoutNs > 0 && waited >= m.deadlockTimeoutNs && m.deadlockAt(self) {
+			fail "40P01 deadlock detected\nDETAIL: Process {self} waits for transaction {xid}; blocked by process {xid}."
+		}
+		tide.Sleep(200000)
+	}
+}
+
+// deadlockAt reports whether following wait-for edges from xid returns to xid.
+fn (m Manager) deadlockAt(xid u32) bool {
+	mut cur = xid
+	mut hops = 0
+	for hops < 64 {
+		let (next, ok) = m.waitFor[cur]
+		if !ok {
+			return false
+		}
+		if next == xid {
+			return true
+		}
+		cur = next
+		hops += 1
+	}
+	return false
+}
+
+fn lockModeName(mode LockMode) str {
+	match mode {
+		AccessShare => return "AccessShareLock"
+		RowShare => return "RowShareLock"
+		RowExclusive => return "RowExclusiveLock"
+		ShareUpdateExclusive => return "ShareUpdateExclusiveLock"
+		Share => return "ShareLock"
+		ShareRowExclusive => return "ShareRowExclusiveLock"
+		Exclusive => return "ExclusiveLock"
+		AccessExclusive => return "AccessExclusiveLock"
+	}
 }
 
 fn tupleConflicts(a TupleLock, b TupleLock) bool {
@@ -706,4 +1154,24 @@ fn (m mut Manager) releaseLocks(xid u32) {
 		}
 		m.tupleLocks[key] = kept
 	}
+	for key, waiters in m.relWaiters {
+		mut kept = []LockWaiter{}
+		for w in waiters {
+			if w.xid != xid {
+				kept = append(kept, w)
+			}
+		}
+		m.relWaiters[key] = kept
+	}
+	for key, waiters in m.tupleWaiters {
+		mut kept = []TupleLockWaiter{}
+		for w in waiters {
+			if w.xid != xid {
+				kept = append(kept, w)
+			}
+		}
+		m.tupleWaiters[key] = kept
+	}
+	delete(m.waitFor, xid)
+	delete(m.canceledXids, xid)
 }

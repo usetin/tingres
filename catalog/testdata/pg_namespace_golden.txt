@@ -1,0 +1,3 @@
+11	pg_catalog	10
+99	pg_toast	10
+2200	public	6171

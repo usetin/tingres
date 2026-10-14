@@ -7,7 +7,7 @@ fn (p mut Parser) parseStatementDispatch() !Stmt {
 		withClause = wc
 	}
 	let first = lowerAscii(p.text())
-	if first == "select" || first == "values" || first == "table" {
+	if first == "select" || first == "values" || first == "table" || first == "(" {
 		let value = try p.parseSelectAfterWith(withClause, p.pos())
 		return Stmt.Select(value)
 	} else if first == "insert" {
@@ -93,7 +93,7 @@ fn (p mut Parser) parseStatementDispatch() !Stmt {
 		let value = try p.parseCall()
 		return Stmt.Call(value)
 	}
-	fail unsupportedMessage(p.Source, p.pos(), "statement " + first)
+	fail unsupportedMessage(p.Source, p.bytePos(), "statement " + first)
 }
 
 fn parseStatement(sql str, tokens []Token) !Stmt {
@@ -284,6 +284,11 @@ fn (p mut Parser) parseSelectCore(pos i64) !SelectCore {
 
 fn (p mut Parser) parseTargetList() ![]TargetEntry {
 	mut targets = []TargetEntry{}
+	// PostgreSQL accepts an empty target list (SELECT with no columns), and a clause keyword
+	// right after SELECT starts that clause; the clause parser then reports the position.
+	if p.done() { return targets }
+	let firstWord = lowerAscii(p.text())
+	if isSelectClause(firstWord) || firstWord == "into" { return targets }
 	for {
 		mut pos = len(p.Source)
 		if !p.done() { pos = p.Tokens[p.At].Pos }
@@ -372,7 +377,12 @@ fn (p mut Parser) parseFromAtom(lateral bool) !FromItem {
 		let name = try p.parseQualifiedName()
 		if p.text() == "(" {
 			let function = try p.parseFunction(name.Pos, name)
-			item = FromItem.Function(FunctionRef{Pos: name.Pos, Function: function, Alias: nil, Lateral: lateral})
+			mut withOrdinality = false
+			if p.eat("with") {
+				try p.expect("ordinality")
+				withOrdinality = true
+			}
+			item = FromItem.Function(FunctionRef{Pos: name.Pos, Function: function, Alias: nil, Lateral: lateral, WithOrdinality: withOrdinality})
 		} else {
 			item = FromItem.Table(TableRef{Pos: name.Pos, Name: name})
 		}
@@ -641,6 +651,7 @@ fn (p mut Parser) parseColumnDef() !ColumnDef {
 	mut generated = ""
 	mut generatedExpr ?Expr = nil
 	mut identity = ""
+	mut pendingName ?Identifier = nil
 	for !p.done() {
 		if p.eat("collate") {
 			let c = try p.parseQualifiedName()
@@ -655,14 +666,23 @@ fn (p mut Parser) parseColumnDef() !ColumnDef {
 			nullability = "null"
 		} else if p.eat("primary") {
 			try p.expect("key")
-			constraints = append(constraints, TableConstraint{Pos: name.Pos, Kind: "primary key", Columns: []Identifier{name}})
+			mut cons = TableConstraint{Pos: name.Pos, Kind: "primary key", Columns: []Identifier{name}}
+			if let pending = pendingName { cons.Name = pending }
+			pendingName = nil
+			constraints = append(constraints, cons)
 		} else if p.eat("unique") {
-			constraints = append(constraints, TableConstraint{Pos: name.Pos, Kind: "unique", Columns: []Identifier{name}})
+			mut cons = TableConstraint{Pos: name.Pos, Kind: "unique", Columns: []Identifier{name}}
+			if let pending = pendingName { cons.Name = pending }
+			pendingName = nil
+			constraints = append(constraints, cons)
 		} else if p.eat("check") {
 			try p.expect("(")
 			let expr = try p.parseExpression(0)
 			try p.expect(")")
-			constraints = append(constraints, TableConstraint{Pos: name.Pos, Kind: "check", Expressions: []Expr{expr}})
+			mut cons = TableConstraint{Pos: name.Pos, Kind: "check", Expressions: []Expr{expr}}
+			if let pending = pendingName { cons.Name = pending }
+			pendingName = nil
+			constraints = append(constraints, cons)
 		} else if p.eat("references") {
 			let refTable = try p.parseQualifiedName()
 			mut refCols = []Identifier{}
@@ -670,7 +690,10 @@ fn (p mut Parser) parseColumnDef() !ColumnDef {
 				refCols = try p.parseIdentifierList(")")
 				try p.expect(")")
 			}
-			constraints = append(constraints, TableConstraint{Pos: name.Pos, Kind: "foreign key", Columns: []Identifier{name}, References: refTable, ReferenceColumns: refCols})
+			mut cons = TableConstraint{Pos: name.Pos, Kind: "foreign key", Columns: []Identifier{name}, References: refTable, ReferenceColumns: refCols}
+			if let pending = pendingName { cons.Name = pending }
+			pendingName = nil
+			constraints = append(constraints, cons)
 		} else if p.eat("generated") {
 			mut idKind = ""
 			if p.eat("always") {
@@ -696,6 +719,8 @@ fn (p mut Parser) parseColumnDef() !ColumnDef {
 			} else {
 				try p.errorHere()
 			}
+		} else if p.eat("constraint") {
+			pendingName = try p.parseIdentifier()
 		} else {
 			break
 		}

@@ -25,6 +25,14 @@
   and positional `quarry.ReadAt` only through `tin2/sysprim`, with no `WriteAt`/`fdatasync` API. Until then
   `store` rewrites a relation through a synced replacement file, which copies the whole relation on every page
   write and is far too costly for a database buffer pool. Blocked file: `store/file.tin`.
+- NEEDS-TIN: fix the inline value-struct-in-enum-literal miscompile (repro
+  `tests/compiler_bugs/inline_value_struct_enum_const.tin`, expected `a 23 1` / `b 23 2`). Blocked:
+  `plan/analyze.tin` and `plan/planner.tin` constant construction (worked around by always materialising the
+  datum into a local first).
+- NEEDS-TIN: a package-level `const` with a composite value crashes the compiler with
+  `index out of range [-1] with length 0` in `check_const_value` (repro `tests/compiler_bugs/const_slice_str.tin`,
+  `const xs = []str{"a"}`). Use a function returning the value or a package-level `let` meanwhile; the catalog seed
+  is a function. Blocked file: `catalog/seed.tin`.
 
 ## Compiler diagnostics that shaped the code (not bugs, but worth knowing)
 
@@ -43,3 +51,21 @@
 - `tests/compiler_bugs/forward_map_struct_key.tin`: Tin segfaults when a struct declares a map whose struct key and
   struct value types are declared later in the package. The transaction manager avoids the compiler bug by
   declaring `LockMode`, `LockKey` and `LockHolder` before `Manager`.
+- `tests/compiler_bugs/inline_value_struct_enum_const.tin`: Tin miscompiles an inline value-struct constructor
+  used as an enum-variant struct field once two such locals are live
+  (`plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), ...})` reads back with `oid == 1`
+  instead of 23). It is stack-layout dependent: construction through a helper that binds the datum to a local
+  first is correct. All constant construction in `plan/` goes through `mkConstExpr`/`mkInt4Const`/`mkBoolConst`/
+  `mkStrConst`/`mkNullConst` to avoid it.
+- `tests/compiler_bugs/const_slice_str.tin`: a package-level `const` whose value is a composite (for example
+  `const xs = []str{"a"}`) crashes the compiler with `index out of range [-1] with length 0` in
+  `check_const_value`. `catalog/seed.tin` therefore returns its generated seed from a function.
+
+## Reproduced bugs in other tingres packages
+
+- `parse`: the lexer's `Token.Pos` is not a character offset. `parse/lexer.tin` initialises `charPos = 1` and then
+  adds only `countCharacters(sql, previousByte, BytePos)` (the whitespace gap) per token, never the token length,
+  so `Pos` is a token-gap ordinal (for `SELECT foo FROM users` the `foo` token reports `Pos == 2`). `plan/`
+  therefore cannot produce PostgreSQL-compatible error positions (`PgError.Position`) and emits analyzer errors
+  with position 0. Fix: `charPos = 1 + countCharacters(sql, 0, tokens[i].BytePos)`. Blocked: PostgreSQL-exact
+  error positions from `plan/analyze.tin`.

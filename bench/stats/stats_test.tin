@@ -1,0 +1,18 @@
+package stats
+
+import "crucible"
+
+fn TestMedianOdd(t mut crucible.T) {
+	let v = []f64{1, 2, 3}
+	crucible.Equal(mut t, "median odd", median(v), 2.0)
+}
+
+fn TestMedianEven(t mut crucible.T) {
+	let v = []f64{1, 2, 3, 4}
+	crucible.Equal(mut t, "median even", median(v), 2.5)
+}
+
+fn TestReportRow(t mut crucible.T) {
+	let got = reportRow("x", "1", "2", "0.5", "measured")
+	crucible.Equal(mut t, "row", got, "| x | 1 | 2 | 0.5 | measured |")
+}

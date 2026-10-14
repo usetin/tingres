@@ -453,6 +453,71 @@ fn TestTopNSort(t mut crucible.T) {
 	cleanupTestEnv(env)
 }
 
+fn TestIndexOrderAndSortedAgg(t mut crucible.T) {
+	let envOpt = setupTestEnv(mut t, "index_order")
+	if envOpt == nil { return }
+	let env = envOpt
+	if let tbl = env.Cat.LookupTable(env.Txn, "public", "users") {
+		_ = env.Cat.CreateIndex(env.Txn, catalog.IndexDef{Table: tbl, Name: "users_age_idx", Unique: false}) catch _ { return }
+		env.Txn.CommandCounterIncrement()
+	}
+
+	// ORDER BY on an indexed column is an ordered index scan, no Sort.
+	let stmt1 = parseSql("SELECT * FROM users ORDER BY age") catch err {
+		t.Error("parse order: " + types.ErrorMessage(err))
+		return
+	}
+	let prep1 = Prepare(env.Cat, env.Txn, stmt1, []u32{}) catch err {
+		t.Error("prepare order: " + types.ErrorMessage(err))
+		return
+	}
+	match prep1.Plan {
+		IndexScan(idx) => {
+			crucible.Equal(mut t, "ordered index name", idx.Index.Name, "users_age_idx")
+			crucible.Equal(mut t, "ordered direction", idx.Direction, ScanDirection.Forward)
+		}
+		_ => { t.Error("expected IndexScan for ORDER BY indexed column") }
+	}
+
+	// DESC order uses a backward index scan.
+	let stmt2 = parseSql("SELECT * FROM users ORDER BY age DESC") catch err {
+		t.Error("parse order desc: " + types.ErrorMessage(err))
+		return
+	}
+	let prep2 = Prepare(env.Cat, env.Txn, stmt2, []u32{}) catch err {
+		t.Error("prepare order desc: " + types.ErrorMessage(err))
+		return
+	}
+	match prep2.Plan {
+		IndexScan(idx) => {
+			crucible.Equal(mut t, "desc direction", idx.Direction, ScanDirection.Backward)
+		}
+		_ => { t.Error("expected backward IndexScan for DESC") }
+	}
+
+	// GROUP BY on an index-ordered input uses sorted aggregation.
+	let stmt3 = parseSql("SELECT age, count(*) FROM users GROUP BY age") catch err {
+		t.Error("parse sorted agg: " + types.ErrorMessage(err))
+		return
+	}
+	let prep3 = Prepare(env.Cat, env.Txn, stmt3, []u32{}) catch err {
+		t.Error("prepare sorted agg: " + types.ErrorMessage(err))
+		return
+	}
+	match prep3.Plan {
+		Project(p) => {
+			match p.Input {
+				GroupAgg(_) => {}
+				_ => { t.Error("expected GroupAgg under Project for indexed GROUP BY") }
+			}
+		}
+		GroupAgg(_) => {}
+		_ => { t.Error("expected GroupAgg for indexed GROUP BY") }
+	}
+
+	cleanupTestEnv(env)
+}
+
 fn TestPlannerAdditionalQueryShapes(t mut crucible.T) {
 	let envOpt = setupTestEnv(mut t, "planner_shapes")
 	if envOpt == nil { return }

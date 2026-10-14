@@ -1,0 +1,156 @@
+package main
+
+import "say"
+import "quarry"
+import "../../parse"
+
+// parseerr SQL.txt EXPECTED.txt: compare tingres parse errors (position|code|message)
+// against PostgreSQL's captured error fields. Prints each mismatch and a summary.
+// EXPECTED lines are TAB-separated: <pos>\t<code>\t<message>. SQL entries in SQL.txt are
+// separated by lines containing only @@ (so a single entry may span multiple lines).
+
+fn main() {
+	let args = quarry.Args()
+	if len(args) < 3 {
+		say.Line("usage: parseerr SQL.txt EXPECTED.txt")
+		return
+	}
+	let sqlText = quarry.ReadFile(args[1]) catch err {
+		say.Line("read {args[1]}: {err}")
+		return
+	}
+	let expText = quarry.ReadFile(args[2]) catch err {
+		say.Line("read {args[2]}: {err}")
+		return
+	}
+	let entries = chooseEntries(sqlText)
+	let expected = splitLines(expText)
+	mut mismatches i64 = 0
+	mut accepted i64 = 0
+	for i in 0..len(entries) {
+		let sql = entries[i]
+		if len(trimmed(sql)) == 0 { continue }
+		mut expPos i64 = -1
+		mut expCode = ""
+		mut expMsg = ""
+		if i < len(expected) {
+			let (p, c, m) = parseExpected(expected[i])
+			expPos = p
+			expCode = c
+			expMsg = m
+		}
+		let parsed = parse.Parse(sql) catch err {
+			let pe = parse.ToParseError(err)
+			if pe.Pos != expPos || pe.Code != expCode || pe.Message != expMsg {
+				mismatches += 1
+				say.Line("MISMATCH {i}: {singleLine(sql)}")
+				say.Line("  got {pe.Pos}\t{pe.Code}\t{pe.Message}")
+				say.Line("  exp {expPos}\t{expCode}\t{expMsg}")
+			}
+			[]parse.Stmt{}
+		}
+		if len(parsed) > 0 {
+			accepted += 1
+			if accepted <= 20 {
+				say.Line("ACCEPTED {i}: {singleLine(sql)}")
+			}
+		}
+	}
+	say.Line("SUMMARY entries={len(entries)} mismatches={mismatches} accepted={accepted}")
+}
+
+fn parseExpected(line str) (i64, str, str) {
+	let tabs = delimiterPositions(line, 9)
+	mut seps = tabs
+	if len(tabs) < 2 { seps = delimiterPositions(line, 124) }
+	if len(seps) < 2 { return -1, "", line }
+	let posText = line[:seps[0]]
+	mut pos i64 = 0
+	for i in 0..len(posText) {
+		let c = posText[i]
+		if c < '0' || c > '9' { pos = -1
+			break }
+		pos = pos * 10 + i64(c - '0')
+	}
+	return pos, line[seps[0] + 1:seps[1]], line[seps[1] + 1:]
+}
+
+fn delimiterPositions(line str, d u8) []i64 {
+	mut out = []i64{}
+	for i in 0..len(line) {
+		if line[i] == d { out = append(out, i) }
+	}
+	return out
+}
+
+fn chooseEntries(text str) []str {
+	for i in 0..len(text) - 1 {
+		if text[i] == 10 && i + 2 <= len(text) && text[i + 1:i + 3] == "@@" { return splitBySentinel(text) }
+		if i == 0 && i + 2 <= len(text) && text[0:2] == "@@" { return splitBySentinel(text) }
+	}
+	return splitLines(text)
+}
+
+fn splitBySentinel(text str) []str {
+	mut out = []str{}
+	mut start = 0
+	mut i = 0
+	let n = len(text)
+	for i < n {
+		if i + 2 <= n && text[i:i + 2] == "@@" && (i + 2 == n || text[i + 2] == 10 || text[i + 2] == 13) {
+			out = append(out, trimTrailingNewline(text[start:i]))
+			i += 2
+			if i < n && text[i] == 13 { i += 1 }
+			if i < n && text[i] == 10 { i += 1 }
+			start = i
+			continue
+		}
+		i += 1
+	}
+	if start < n { out = append(out, trimTrailingNewline(text[start:])) }
+	return out
+}
+
+fn trimTrailingNewline(s str) str {
+	mut b = len(s)
+	if b > 0 && s[b - 1] == 10 { b -= 1 }
+	if b > 0 && s[b - 1] == 13 { b -= 1 }
+	return s[:b]
+}
+
+fn splitLines(s str) []str {
+	mut out = []str{}
+	mut start = 0
+	for i in 0..len(s) + 1 {
+		if i == len(s) || s[i] == 10 {
+			let line = s[start:i]
+			if len(trimCarriage(line)) > 0 { out = append(out, trimCarriage(line)) }
+			start = i + 1
+		}
+	}
+	return out
+}
+
+fn trimCarriage(s str) str {
+	if len(s) > 0 && s[len(s) - 1] == 13 { return s[:len(s) - 1] }
+	return s
+}
+
+fn trimmed(s str) str {
+	mut a = 0
+	mut b = len(s)
+	for a < b && isWs(s[a]) { a += 1 }
+	for b > a && isWs(s[b - 1]) { b -= 1 }
+	return s[a:b]
+}
+
+fn isWs(c u8) bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 }
+
+fn singleLine(s str) str {
+	mut out = ""
+	for i in 0..len(s) {
+		if s[i] == 10 { out += "\\n" } else { out += str(s[i]) }
+	}
+	if len(out) > 80 { return out[:80] + "..." }
+	return out
+}

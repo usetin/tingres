@@ -1,0 +1,962 @@
+package catalog
+
+import "../store"
+import "../txn"
+import "../types"
+import "mint"
+import "twine"
+
+// DDL writes rows into the pg_catalog heaps. Every change is an MVCC tuple, so a
+// rolled-back transaction leaves no committed catalog state behind.
+
+fn (c mut Catalog) insertRow(t txn.Txn, rel str, row []types.Datum) !store.Tid {
+	mut payload = []u8{}
+	types.EncodeRow(c.storageTypes(rel), row, mut payload)
+	return try c.Store.HeapInsert(store.NewXidCtx(t.Xid(), t.CommandID()), store.RelId(c.relIdOf(rel)), payload)
+}
+
+fn (c mut Catalog) deleteRow(t txn.Txn, rel str, row RawRow) ! {
+	mut manager = c.Manager
+	try manager.HeapDelete(t, store.RelId(c.relIdOf(rel)), row.Tid)
+}
+
+fn (c Catalog) valsFromRow(rel str, row RawRow) map[str]types.Datum {
+	mut vals = make(map[str]types.Datum)
+	let cols = c.sysCols[rel]
+	for i, col in cols {
+		if i < len(row.Values) {
+			vals[col.Name] = row.Values[i]
+		}
+	}
+	return vals
+}
+
+fn (c Catalog) classRowFor(snap txn.Snapshot, oid u32) ?RawRow {
+	for row in c.rows["pg_class"] {
+		if !c.visible(snap, "pg_class", row) {
+			continue
+		}
+		if u32(c.intField("pg_class", row, "oid")) == oid && isRelationKind(c.textField("pg_class", row, "relkind")) {
+			return row
+		}
+	}
+	return nil
+}
+
+fn (c Catalog) attributeRowFor(snap txn.Snapshot, oid u32, name str) ?RawRow {
+	for row in c.rows["pg_attribute"] {
+		if !c.visible(snap, "pg_attribute", row) {
+			continue
+		}
+		if u32(c.intField("pg_attribute", row, "attrelid")) != oid {
+			continue
+		}
+		if c.boolField("pg_attribute", row, "attisdropped") {
+			continue
+		}
+		if c.textField("pg_attribute", row, "attname") == name {
+			return row
+		}
+	}
+	return nil
+}
+
+fn (c Catalog) requireClassRow(snap txn.Snapshot, oid u32, msg str) !RawRow {
+	if let row = c.classRowFor(snap, oid) {
+		return row
+	}
+	fail msg
+}
+
+fn (c Catalog) requireAttributeRow(snap txn.Snapshot, oid u32, name str, msg str) !RawRow {
+	if let row = c.attributeRowFor(snap, oid, name) {
+		return row
+	}
+	fail msg
+}
+
+fn (c mut Catalog) writeAttributeRow(t txn.Txn, attrelid u32, col Column) ! {
+	let colName = twine.Clone(col.Name)
+	let cd = ColDef{Name: colName, Type: col.Type, Storage: storeOid(col.Type), Number: col.Number, NotNull: !col.Nullable, HasDefault: col.HasDefault, Identity: twine.Clone(col.Identity), Generated: twine.Clone(col.Generated), Collation: col.Collation}
+	let row = c.attributeRow(attrelid, colName, cd)
+	_ = try c.insertRow(t, "pg_attribute", row)
+}
+
+fn (c mut Catalog) writeAttributeRowNum(t txn.Txn, attrelid u32, name str, col ColDef) ! {
+	let row = c.attributeRow(attrelid, name, col)
+	_ = try c.insertRow(t, "pg_attribute", row)
+}
+
+fn (c mut Catalog) writeAttrdefRow(t txn.Txn, relid u32, num i16, expr str) ! {
+	let oid = c.nextOid
+	c.nextOid += 1
+	mut vals = make(map[str]types.Datum)
+	vals["oid"] = types.FromI64(26, i64(oid))
+	vals["adrelid"] = types.FromI64(26, i64(relid))
+	vals["adnum"] = types.FromI64(21, i64(num))
+	vals["adbin"] = types.FromStr(25, twine.Clone(expr))
+	let row = c.buildRow("pg_attrdef", vals)
+	_ = try c.insertRow(t, "pg_attrdef", row)
+}
+
+fn (c mut Catalog) writeClass(t txn.Txn, oid u32, name str, ns u32, kind str, rel u32, natts i16, rowType u32) ! {
+	mut vals = make(map[str]types.Datum)
+	vals["oid"] = types.FromI64(26, i64(oid))
+	vals["relname"] = types.FromStr(25, twine.Clone(name))
+	vals["relnamespace"] = types.FromI64(26, i64(ns))
+	vals["reltype"] = types.FromI64(26, i64(rowType))
+	vals["reloftype"] = types.FromI64(26, 0)
+	vals["relowner"] = types.FromI64(26, 10)
+	vals["relam"] = types.FromI64(26, 0)
+	vals["relfilenode"] = types.FromI64(26, i64(rel))
+	vals["reltablespace"] = types.FromI64(26, 0)
+	vals["relpages"] = types.FromI64(23, 0)
+	vals["reltuples"] = types.FromF64(701, 0.0)
+	vals["relallvisible"] = types.FromI64(23, 0)
+	vals["reltoastrelid"] = types.FromI64(26, 0)
+	vals["relhasindex"] = types.FromBool(false)
+	vals["relisshared"] = types.FromBool(false)
+	vals["relpersistence"] = types.FromStr(25, "p")
+	vals["relkind"] = types.FromStr(25, twine.Clone(kind))
+	vals["relnatts"] = types.FromI64(21, i64(natts))
+	vals["relchecks"] = types.FromI64(21, 0)
+	vals["relhasrules"] = types.FromBool(false)
+	vals["relhastriggers"] = types.FromBool(false)
+	vals["relhassubclass"] = types.FromBool(false)
+	vals["relrowsecurity"] = types.FromBool(false)
+	vals["relforcerowsecurity"] = types.FromBool(false)
+	vals["relispopulated"] = types.FromBool(true)
+	vals["relreplident"] = types.FromStr(25, "n")
+	vals["relispartition"] = types.FromBool(false)
+	vals["relrewrite"] = types.FromI64(26, 0)
+	vals["relfrozenxid"] = types.FromI64(26, 0)
+	vals["relminmxid"] = types.FromI64(26, 0)
+	let row = c.buildRow("pg_class", vals)
+	_ = try c.insertRow(t, "pg_class", row)
+}
+
+fn (c mut Catalog) writeType(t txn.Txn, oid u32, name str, ns u32, relid u32, typtype str) ! {
+	mut vals = make(map[str]types.Datum)
+	vals["oid"] = types.FromI64(26, i64(oid))
+	vals["typname"] = types.FromStr(25, twine.Clone(name))
+	vals["typnamespace"] = types.FromI64(26, i64(ns))
+	vals["typowner"] = types.FromI64(26, 10)
+	vals["typlen"] = types.FromI64(21, -1)
+	vals["typbyval"] = types.FromBool(false)
+	vals["typtype"] = types.FromStr(25, twine.Clone(typtype))
+	vals["typcategory"] = types.FromStr(25, "C")
+	vals["typispreferred"] = types.FromBool(false)
+	vals["typisdefined"] = types.FromBool(true)
+	vals["typdelim"] = types.FromStr(25, ",")
+	vals["typrelid"] = types.FromI64(26, i64(relid))
+	vals["typelem"] = types.FromI64(26, 0)
+	vals["typarray"] = types.FromI64(26, 0)
+	vals["typalign"] = types.FromStr(25, "i")
+	vals["typstorage"] = types.FromStr(25, "x")
+	vals["typnotnull"] = types.FromBool(false)
+	vals["typbasetype"] = types.FromI64(26, 0)
+	vals["typndims"] = types.FromI64(23, 0)
+	vals["typcollation"] = types.FromI64(26, 0)
+	let row = c.buildRow("pg_type", vals)
+	_ = try c.insertRow(t, "pg_type", row)
+}
+
+fn (c mut Catalog) writeIndex(t txn.Txn, indexOid u32, tableOid u32, natts i16, nkeyatts i16, unique bool, primary bool) ! {
+	mut vals = make(map[str]types.Datum)
+	vals["indexrelid"] = types.FromI64(26, i64(indexOid))
+	vals["indrelid"] = types.FromI64(26, i64(tableOid))
+	vals["indnatts"] = types.FromI64(21, i64(natts))
+	vals["indnkeyatts"] = types.FromI64(21, i64(nkeyatts))
+	vals["indisunique"] = types.FromBool(unique)
+	vals["indisprimary"] = types.FromBool(primary)
+	vals["indisexclusion"] = types.FromBool(false)
+	vals["indimmediate"] = types.FromBool(true)
+	vals["indisclustered"] = types.FromBool(false)
+	vals["indisvalid"] = types.FromBool(true)
+	vals["indcheckxmin"] = types.FromBool(false)
+	vals["indisready"] = types.FromBool(true)
+	vals["indislive"] = types.FromBool(true)
+	vals["indisreplident"] = types.FromBool(false)
+	_ = try c.insertRow(t, "pg_index", c.buildRow("pg_index", vals))
+}
+
+fn (c mut Catalog) writeDepend(t txn.Txn, classid u32, objid u32, objsubid i64, refclassid u32, refobjid u32, refsub i64, deptype str) ! {
+	mut vals = make(map[str]types.Datum)
+	vals["classid"] = types.FromI64(26, i64(classid))
+	vals["objid"] = types.FromI64(26, i64(objid))
+	vals["objsubid"] = types.FromI64(23, objsubid)
+	vals["refclassid"] = types.FromI64(26, i64(refclassid))
+	vals["refobjid"] = types.FromI64(26, i64(refobjid))
+	vals["refobjsubid"] = types.FromI64(23, refsub)
+	vals["deptype"] = types.FromStr(25, twine.Clone(deptype))
+	let row = c.buildRow("pg_depend", vals)
+	_ = try c.insertRow(t, "pg_depend", row)
+}
+
+// CreateTable allocates an oid and relfilenode, creates the heap, and writes
+// pg_class, pg_attribute, pg_type (rowtype) and pg_depend rows.
+fn (c mut Catalog) CreateTable(t txn.Txn, def TableDef) !Table {
+	let snap = c.Manager.Snapshot(t)
+	mut schema = def.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	let ns = c.namespaceOid(snap, schema)
+	if ns == 0 {
+		fail "3F000 schema \"{schema}\" does not exist"
+	}
+	if def.Name == "" {
+		fail "42602 relation name must not be empty"
+	}
+	if c.lookupInSchema(snap, schema, def.Name) != nil {
+		fail "42P07 relation \"{def.Name}\" already exists"
+	}
+	mut cols = []Column{}
+	for i, cd in def.Columns {
+		if cd.Name == "" {
+			fail "42602 column name must not be empty"
+		}
+		for prior in cols {
+			if prior.Name == cd.Name {
+				fail "42701 column \"{cd.Name}\" specified more than once"
+			}
+		}
+		mut col = Column{Name: cd.Name, Type: cd.Type, Typmod: cd.Typmod, Number: i16(i + 1), Nullable: cd.Nullable && !cd.NotNull, HasDefault: cd.DefaultText != "", DefaultText: cd.DefaultText}
+		cols = append(cols, col)
+	}
+	let oid = c.nextOid
+	let rel = c.nextRel
+	let rowType = c.nextOid + 1
+	let tableName = twine.Clone(def.Name)
+	c.nextOid += 2
+	c.nextRel += 1
+	let relId = store.RelId(rel)
+	try c.Store.CreateHeap(relId)
+	try c.writeClass(t, oid, tableName, ns, "r", rel, i16(len(cols)), rowType)
+	for col in cols {
+		try c.writeAttributeRow(t, oid, col)
+		if col.HasDefault {
+			try c.writeAttrdefRow(t, oid, col.Number, col.DefaultText)
+		}
+	}
+	try c.writeType(t, rowType, tableName, ns, oid, "c")
+	if len(def.PrimaryKey) > 0 {
+		let idxName = tableName + "_pkey"
+		let idx = try c.createIndex(t, snap, oid, idxName, true, true, def.PrimaryKey, []IndexKey{})
+		_ = idx
+	}
+	c.version += 1
+	c.reload()
+	return Table{Oid: oid, Schema: schema, Name: tableName, Cols: cols, Rel: rel, Indexes: []Index{}, System: false, Owner: 10, Kind: "r", RowType: rowType}
+}
+
+fn (c mut Catalog) createIndex(t txn.Txn, snap txn.Snapshot, tableOid u32, name str, unique bool, primary bool, cols []i16, keys []IndexKey) !Index {
+	let ns = c.relationNamespace(snap, tableOid)
+	let oid = c.nextOid
+	let rel = c.nextRel
+	c.nextOid += 1
+	c.nextRel += 1
+	c.Store.CreateIndex(store.RelId(rel), unique) catch _ { }
+	let indexName = twine.Clone(name)
+	try c.writeClass(t, oid, indexName, ns, "i", rel, i16(len(cols)), 0)
+	try c.writeIndex(t, oid, tableOid, i16(len(cols)), i16(len(cols)), unique, primary)
+	for i, attnum in cols {
+		mut vals = make(map[str]types.Datum)
+		vals["attrelid"] = types.FromI64(26, i64(oid))
+		vals["attname"] = types.FromStr(25, "att" + mint.Itoa(i64(i+1)))
+		vals["atttypid"] = types.FromI64(26, 0)
+		vals["attlen"] = types.FromI64(21, 4)
+		vals["attnum"] = types.FromI64(21, i64(i+1))
+		vals["attcacheoff"] = types.FromI64(23, -1)
+		vals["atttypmod"] = types.FromI64(23, -1)
+		vals["attndims"] = types.FromI64(21, 0)
+		vals["attbyval"] = types.FromBool(true)
+		vals["attalign"] = types.FromStr(25, "i")
+		vals["attstorage"] = types.FromStr(25, "p")
+		vals["attnotnull"] = types.FromBool(false)
+		vals["atthasdef"] = types.FromBool(false)
+		vals["attisdropped"] = types.FromBool(false)
+		vals["attislocal"] = types.FromBool(true)
+		vals["attinhcount"] = types.FromI64(21, 0)
+		vals["attcollation"] = types.FromI64(26, 0)
+		vals["attstattarget"] = types.FromI64(21, -1)
+		vals["attnum"] = types.FromI64(21, i64(i+1))
+		_ = attnum
+		_ = try c.insertRow(t, "pg_attribute", c.buildRow("pg_attribute", vals))
+	}
+	try c.writeDepend(t, 1259, tableOid, 0, 2610, oid, 0, "a")
+	// Mark the parent relation as indexed.
+	if let classRow = c.classRowFor(snap, tableOid) {
+		mut vals = c.valsFromRow("pg_class", classRow)
+		vals["relhasindex"] = types.FromBool(true)
+		try c.deleteRow(t, "pg_class", classRow)
+		_ = try c.insertRow(t, "pg_class", c.buildRow("pg_class", vals))
+	}
+	let indexKeys = c.normalizeKeys(cols, keys)
+	return Index{Oid: oid, Name: name, Rel: rel, Unique: unique, Primary: primary, Cols: cols, Keys: indexKeys}
+}
+
+fn (c Catalog) relationNamespace(snap txn.Snapshot, oid u32) u32 {
+	for row in c.rows["pg_class"] {
+		if !c.visible(snap, "pg_class", row) {
+			continue
+		}
+		if u32(c.intField("pg_class", row, "oid")) == oid {
+			return u32(c.intField("pg_class", row, "relnamespace"))
+		}
+	}
+	return pgCatalogOid
+}
+
+// CreateIndex records an index on a table.
+fn (c mut Catalog) CreateIndex(t txn.Txn, def IndexDef) !Index {
+	let snap = c.Manager.Snapshot(t)
+	if c.findClassRow(snap, def.Table.Oid) == nil {
+		fail "42P01 relation \"{def.Table.Name}\" does not exist"
+	}
+	if def.Name == "" {
+		fail "42602 index name must not be empty"
+	}
+	let ns = c.relationNamespace(snap, def.Table.Oid)
+	if c.namespaceOid(snap, c.namespaceName(snap, ns)) != 0 && c.relationNamed(snap, ns, def.Name) != 0 {
+		fail "42P07 relation \"{def.Name}\" already exists"
+	}
+	let idx = try c.createIndex(t, snap, def.Table.Oid, def.Name, def.Unique, def.Primary, def.Cols, def.Keys)
+	c.version += 1
+	c.reload()
+	return idx
+}
+
+fn (c Catalog) normalizeKeys(cols []i16, keys []IndexKey) []IndexKey {
+	if len(keys) > 0 {
+		return keys
+	}
+	mut out = []IndexKey{}
+	for col in cols {
+		out = append(out, IndexKey{Attnum: col, Desc: false, NullsFirst: false})
+	}
+	return out
+}
+
+fn (c Catalog) relationNamed(snap txn.Snapshot, ns u32, name str) u32 {
+	for row in c.rows["pg_class"] {
+		if !c.visible(snap, "pg_class", row) {
+			continue
+		}
+		if u32(c.intField("pg_class", row, "relnamespace")) == ns && c.textField("pg_class", row, "relname") == name {
+			return u32(c.intField("pg_class", row, "oid"))
+		}
+	}
+	return 0
+}
+
+// DropIndex removes an index and its pg_index/pg_attribute rows.
+fn (c mut Catalog) DropIndex(t txn.Txn, indexOid u32) ! {
+	let snap = c.Manager.Snapshot(t)
+	let classRow = try c.requireClassRow(snap, indexOid, "42704 index does not exist")
+	try c.deleteRow(t, "pg_class", classRow)
+	for row in c.rows["pg_index"] {
+		if c.visible(snap, "pg_index", row) && u32(c.intField("pg_index", row, "indexrelid")) == indexOid {
+			try c.deleteRow(t, "pg_index", row)
+		}
+	}
+	for row in c.rows["pg_attribute"] {
+		if c.visible(snap, "pg_attribute", row) && u32(c.intField("pg_attribute", row, "attrelid")) == indexOid {
+			try c.deleteRow(t, "pg_attribute", row)
+		}
+	}
+	c.version += 1
+	c.reload()
+}
+
+// DropTable removes a table and its attributes; RESTRICT fails with 2BP01 when
+// dependent objects exist and cascade is not requested.
+fn (c mut Catalog) DropTable(t txn.Txn, tbl Table, cascade bool) ! {
+	let snap = c.Manager.Snapshot(t)
+	let classRow = try c.requireClassRow(snap, tbl.Oid, "42P01 relation \"{tbl.Name}\" does not exist")
+	mut dependents = []u32{}
+	for row in c.rows["pg_index"] {
+		if c.visible(snap, "pg_index", row) && u32(c.intField("pg_index", row, "indrelid")) == tbl.Oid {
+			dependents = append(dependents, u32(c.intField("pg_index", row, "indexrelid")))
+		}
+	}
+	for row in c.rows["pg_constraint"] {
+		if c.visible(snap, "pg_constraint", row) && u32(c.intField("pg_constraint", row, "conrelid")) == tbl.Oid {
+			dependents = append(dependents, u32(c.intField("pg_constraint", row, "oid")))
+		}
+	}
+	if len(dependents) > 0 && !cascade {
+		fail "2BP01 cannot drop relation \"{tbl.Name}\" because other objects depend on it"
+	}
+	if cascade {
+		for dep in dependents {
+			if let depRow = c.classRowFor(snap, dep) {
+				try c.deleteRow(t, "pg_class", depRow)
+			}
+		}
+	}
+	if c.isSystemTable(tbl.Oid) {
+		fail "42501 permission denied: cannot drop a system relation"
+	}
+	try c.deleteRow(t, "pg_class", classRow)
+	for row in c.rows["pg_attribute"] {
+		if c.visible(snap, "pg_attribute", row) && u32(c.intField("pg_attribute", row, "attrelid")) == tbl.Oid {
+			try c.deleteRow(t, "pg_attribute", row)
+		}
+	}
+	for row in c.rows["pg_attrdef"] {
+		if c.visible(snap, "pg_attrdef", row) && u32(c.intField("pg_attrdef", row, "adrelid")) == tbl.Oid {
+			try c.deleteRow(t, "pg_attrdef", row)
+		}
+	}
+	for row in c.rows["pg_depend"] {
+		if c.visible(snap, "pg_depend", row) && u32(c.intField("pg_depend", row, "refobjid")) == tbl.Oid {
+			try c.deleteRow(t, "pg_depend", row)
+		}
+	}
+	c.version += 1
+	c.reload()
+}
+
+fn (c Catalog) isSystemTable(oid u32) bool {
+	for rel in sysRels() {
+		if rel.Oid == oid {
+			return true
+		}
+	}
+	for rel in extraRels() {
+		if rel.Oid == oid {
+			return true
+		}
+	}
+	return false
+}
+
+// CreateSchema adds a namespace.
+fn (c mut Catalog) CreateSchema(t txn.Txn, name str) !Oid {
+	let schemaName = name + ""
+	let snap = c.Manager.Snapshot(t)
+	if schemaName == "" {
+		fail "42602 schema name must not be empty"
+	}
+	if c.namespaceOid(snap, schemaName) != 0 {
+		fail "42P06 schema \"{schemaName}\" already exists"
+	}
+	let oid = c.nextOid
+	c.nextOid += 1
+	mut vals = make(map[str]types.Datum)
+	vals["oid"] = types.FromI64(26, i64(oid))
+	vals["nspname"] = types.FromStr(25, schemaName)
+	vals["nspowner"] = types.FromI64(26, 10)
+	_ = try c.insertRow(t, "pg_namespace", c.buildRow("pg_namespace", vals))
+	c.version += 1
+	c.reload()
+	return oid
+}
+
+// DropSchema removes a namespace; RESTRICT fails with 2BP01 if it holds relations.
+fn (c mut Catalog) DropSchema(t txn.Txn, name str, cascade bool) ! {
+	let snap = c.Manager.Snapshot(t)
+	let oid = c.namespaceOid(snap, name)
+	if oid == 0 {
+		fail "3F000 schema \"{name}\" does not exist"
+	}
+	if oid == pgCatalogOid || oid == publicOid || name == "information_schema" {
+		fail "42501 permission denied: cannot drop schema \"{name}\""
+	}
+	mut members = []RawRow{}
+	for row in c.rows["pg_class"] {
+		if c.visible(snap, "pg_class", row) && u32(c.intField("pg_class", row, "relnamespace")) == oid {
+			members = append(members, row)
+		}
+	}
+	if len(members) > 0 && !cascade {
+		fail "2BP01 cannot drop schema \"{name}\" because other objects depend on it"
+	}
+	for row in members {
+		if let tbl = c.tableFromClass(snap, row) {
+			c.DropTable(t, tbl, true) catch _ { }
+		}
+	}
+	for row in c.rows["pg_namespace"] {
+		if c.visible(snap, "pg_namespace", row) && u32(c.intField("pg_namespace", row, "oid")) == oid {
+			try c.deleteRow(t, "pg_namespace", row)
+		}
+	}
+	c.version += 1
+	c.reload()
+}
+
+// AlterTableAddColumn appends a column.
+fn (c mut Catalog) AlterTableAddColumn(t txn.Txn, tbl Table, def ColumnDef) !Column {
+	let snap = c.Manager.Snapshot(t)
+	let classRow = try c.requireClassRow(snap, tbl.Oid, "42P01 relation \"{tbl.Name}\" does not exist")
+	mut maxNum = i16(0)
+	for col in tbl.Cols {
+		if col.Name == def.Name {
+			fail "42701 column \"{def.Name}\" of relation \"{tbl.Name}\" already exists"
+		}
+		if col.Number > maxNum {
+			maxNum = col.Number
+		}
+	}
+	let num = maxNum + 1
+	let col = Column{Name: def.Name, Type: def.Type, Typmod: def.Typmod, Number: num, Nullable: def.Nullable && !def.NotNull, HasDefault: def.DefaultText != "", DefaultText: def.DefaultText}
+	try c.writeAttributeRow(t, tbl.Oid, col)
+	if col.HasDefault {
+		try c.writeAttrdefRow(t, tbl.Oid, num, col.DefaultText)
+	}
+	mut vals = c.valsFromRow("pg_class", classRow)
+	vals["relnatts"] = types.FromI64(21, i64(maxNum+1))
+	try c.deleteRow(t, "pg_class", classRow)
+	_ = try c.insertRow(t, "pg_class", c.buildRow("pg_class", vals))
+	c.version += 1
+	c.reload()
+	return col
+}
+
+// AlterTableDropColumn removes a column by name.
+fn (c mut Catalog) AlterTableDropColumn(t txn.Txn, tbl Table, name str, cascade bool) ! {
+	let snap = c.Manager.Snapshot(t)
+	let classRow = try c.requireClassRow(snap, tbl.Oid, "42P01 relation \"{tbl.Name}\" does not exist")
+	mut found = false
+	mut droppedNum = i16(0)
+	for row in c.rows["pg_attribute"] {
+		if !c.visible(snap, "pg_attribute", row) {
+			continue
+		}
+		if u32(c.intField("pg_attribute", row, "attrelid")) != tbl.Oid {
+			continue
+		}
+		if c.textField("pg_attribute", row, "attname") != name {
+			continue
+		}
+		found = true
+		droppedNum = i16(c.intField("pg_attribute", row, "attnum"))
+		try c.deleteRow(t, "pg_attribute", row)
+	}
+	if !found {
+		fail "42703 column \"{name}\" of relation \"{tbl.Name}\" does not exist"
+	}
+	_ = cascade
+	_ = droppedNum
+	mut vals = c.valsFromRow("pg_class", classRow)
+	vals["relnatts"] = types.FromI64(21, i64(len(tbl.Cols)-1))
+	try c.deleteRow(t, "pg_class", classRow)
+	_ = try c.insertRow(t, "pg_class", c.buildRow("pg_class", vals))
+	c.version += 1
+	c.reload()
+}
+
+// AlterTableRenameColumn renames a column.
+fn (c mut Catalog) AlterTableRenameColumn(t txn.Txn, tbl Table, oldName str, renamedTo str) ! {
+	let newName = renamedTo + ""
+	let oldCol = oldName + ""
+	let snap = c.Manager.Snapshot(t)
+	let row = try c.requireAttributeRow(snap, tbl.Oid, oldCol, "42703 column \"{oldCol}\" does not exist")
+	let existing = c.attributeRowFor(snap, tbl.Oid, newName)
+	if existing != nil {
+		fail "42701 column \"{newName}\" of relation \"{tbl.Name}\" already exists"
+	}
+	mut vals = c.valsFromRow("pg_attribute", row)
+	vals["attname"] = types.FromStr(25, newName)
+	try c.deleteRow(t, "pg_attribute", row)
+	_ = try c.insertRow(t, "pg_attribute", c.buildRow("pg_attribute", vals))
+	c.version += 1
+	c.reload()
+}
+
+// AlterTableRename renames a relation.
+fn (c mut Catalog) AlterTableRename(t txn.Txn, tbl Table, renamedTo str) ! {
+	let newName = renamedTo + ""
+	let snap = c.Manager.Snapshot(t)
+	let row = try c.requireClassRow(snap, tbl.Oid, "42P01 relation \"{tbl.Name}\" does not exist")
+	mut vals = c.valsFromRow("pg_class", row)
+	vals["relname"] = types.FromStr(25, newName)
+	try c.deleteRow(t, "pg_class", row)
+	_ = try c.insertRow(t, "pg_class", c.buildRow("pg_class", vals))
+	c.version += 1
+	c.reload()
+}
+
+// AlterTableSetNotNull marks a column NOT NULL.
+fn (c mut Catalog) AlterTableSetNotNull(t txn.Txn, tbl Table, name str, notnull bool) ! {
+	let snap = c.Manager.Snapshot(t)
+	let row = try c.requireAttributeRow(snap, tbl.Oid, name, "42703 column \"{name}\" does not exist")
+	mut vals = c.valsFromRow("pg_attribute", row)
+	vals["attnotnull"] = types.FromBool(notnull)
+	try c.deleteRow(t, "pg_attribute", row)
+	_ = try c.insertRow(t, "pg_attribute", c.buildRow("pg_attribute", vals))
+	c.version += 1
+	c.reload()
+}
+
+// AlterTableSetDefault sets a column default expression.
+fn (c mut Catalog) AlterTableSetDefault(t txn.Txn, tbl Table, name str, expr str) ! {
+	let snap = c.Manager.Snapshot(t)
+	let row = try c.requireAttributeRow(snap, tbl.Oid, name, "42703 column \"{name}\" does not exist")
+	let num = i16(c.intField("pg_attribute", row, "attnum"))
+	for defRow in c.rows["pg_attrdef"] {
+		if c.visible(snap, "pg_attrdef", defRow) && u32(c.intField("pg_attrdef", defRow, "adrelid")) == tbl.Oid && i16(c.intField("pg_attrdef", defRow, "adnum")) == num {
+			try c.deleteRow(t, "pg_attrdef", defRow)
+		}
+	}
+	if expr != "" {
+		try c.writeAttrdefRow(t, tbl.Oid, num, expr)
+	}
+	mut vals = c.valsFromRow("pg_attribute", row)
+	vals["atthasdef"] = types.FromBool(expr != "")
+	try c.deleteRow(t, "pg_attribute", row)
+	_ = try c.insertRow(t, "pg_attribute", c.buildRow("pg_attribute", vals))
+	c.version += 1
+	c.reload()
+}
+
+// CreateSequence creates a sequence relation, pg_sequence row, and initial value.
+fn (c mut Catalog) CreateSequence(t txn.Txn, def SequenceDef) !Table {
+	let snap = c.Manager.Snapshot(t)
+	mut schema = def.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	let ns = c.namespaceOid(snap, schema)
+	if ns == 0 {
+		fail "3F000 schema \"{schema}\" does not exist"
+	}
+	if c.lookupInSchema(snap, schema, def.Name) != nil {
+		fail "42P07 relation \"{def.Name}\" already exists"
+	}
+	let oid = c.nextOid
+	let rel = c.nextRel
+	c.nextOid += 1
+	c.nextRel += 1
+	try c.Store.CreateHeap(store.RelId(rel))
+	try c.writeClass(t, oid, def.Name, ns, "S", rel, 3, 0)
+	let cols = []Column{
+		Column{Name: "last_value", Type: 20, Number: 1, Nullable: false},
+		Column{Name: "log_cnt", Type: 20, Number: 2, Nullable: false},
+		Column{Name: "is_called", Type: 16, Number: 3, Nullable: false},
+	}
+	for col in cols {
+		try c.writeAttributeRow(t, oid, col)
+	}
+	mut vals = make(map[str]types.Datum)
+	vals["seqrelid"] = types.FromI64(26, i64(oid))
+	vals["seqtypid"] = types.FromI64(26, i64(def.Type))
+	vals["seqstart"] = types.FromI64(20, def.Start)
+	vals["seqincrement"] = types.FromI64(20, def.Increment)
+	vals["seqmax"] = types.FromI64(20, def.Max)
+	vals["seqmin"] = types.FromI64(20, def.Min)
+	vals["seqcache"] = types.FromI64(20, def.Cache)
+	vals["seqcycle"] = types.FromBool(def.Cycle)
+	_ = try c.insertRow(t, "pg_sequence", c.buildRow("pg_sequence", vals))
+	try c.writeSequenceValue(rel, def.Start, false)
+	c.version += 1
+	c.reload()
+	return Table{Oid: oid, Schema: schema, Name: def.Name, Cols: cols, Rel: rel, Indexes: []Index{}, System: false, Owner: 10, Kind: "S"}
+}
+
+fn (c mut Catalog) writeSequenceValue(rel u32, value i64, called bool) ! {
+	mut payload = i64Bytes(value)
+	if called {
+		payload = append(payload, 1)
+	} else {
+		payload = append(payload, 0)
+	}
+	_ = try c.Store.HeapInsert(store.NewXidCtx(2, 0), store.RelId(rel), payload)
+}
+
+fn i64Bytes(value i64) []u8 {
+	let v = u64(value)
+	return []u8{u8(v >> 56), u8(v >> 48), u8(v >> 40), u8(v >> 32), u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)}
+}
+
+fn readI64(payload []u8) i64 {
+	if len(payload) < 8 {
+		return 0
+	}
+	let v = u64(payload[0]) << 56 | u64(payload[1]) << 48 | u64(payload[2]) << 40 | u64(payload[3]) << 32 | u64(payload[4]) << 24 | u64(payload[5]) << 16 | u64(payload[6]) << 8 | u64(payload[7])
+	return i64(v)
+}
+
+// sequenceValue returns the latest (value, is_called) written for a sequence.
+fn (c mut Catalog) sequenceValue(rel u32) (i64, bool, bool) {
+	let mutScan = c.Store.HeapScan(store.RelId(rel))
+	mut scan = mutScan
+	mut found = false
+	mut value = i64(0)
+	mut called = false
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		value = readI64(tuple.Payload)
+		called = len(tuple.Payload) >= 9 && tuple.Payload[8] != 0
+		found = true
+	}
+	return value, called, found
+}
+
+fn (c Catalog) sequenceIncrement(snap txn.Snapshot, oid u32) i64 {
+	for row in c.rows["pg_sequence"] {
+		if !c.visible(snap, "pg_sequence", row) {
+			continue
+		}
+		if u32(c.intField("pg_sequence", row, "seqrelid")) == oid {
+			return c.intField("pg_sequence", row, "seqincrement")
+		}
+	}
+	return 1
+}
+
+// Nextval advances a sequence and returns the new value, with PostgreSQL's rule that
+// the first call returns the start value. Sequence changes are not transactional.
+fn (c mut Catalog) Nextval(t txn.Txn, seq Table) !i64 {
+	let snap = c.Manager.Snapshot(t)
+	let (value, called, ok) = c.sequenceValue(seq.Rel)
+	mut next = value
+	if !ok {
+		next = 0
+	} else if called {
+		next = value + c.sequenceIncrement(snap, seq.Oid)
+	}
+	try c.writeSequenceValue(seq.Rel, next, true)
+	return next
+}
+
+// Currval returns the current value of a sequence without advancing it.
+fn (c mut Catalog) Currval(seq Table) !i64 {
+	let (value, called, ok) = c.sequenceValue(seq.Rel)
+	if !ok || !called {
+		fail "55000 currval of sequence \"{seq.Name}\" is not yet defined in this session"
+	}
+	return value
+}
+
+// Setval sets the current value of a sequence.
+fn (c mut Catalog) Setval(t txn.Txn, seq Table, value i64) ! {
+	_ = t
+	try c.writeSequenceValue(seq.Rel, value, true)
+}
+
+// Truncate empties a table's heap.
+fn (c mut Catalog) Truncate(t txn.Txn, tbl Table) ! {
+	_ = t
+	try c.Store.DropRel(store.RelId(tbl.Rel))
+	try c.Store.CreateHeap(store.RelId(tbl.Rel))
+	c.version += 1
+	c.reload()
+}
+
+// CreateView stores a view definition and its query text.
+fn (c mut Catalog) CreateView(t txn.Txn, def ViewDef) !Table {
+	let snap = c.Manager.Snapshot(t)
+	mut schema = def.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	let ns = c.namespaceOid(snap, schema)
+	if ns == 0 {
+		fail "3F000 schema \"{schema}\" does not exist"
+	}
+	if c.lookupInSchema(snap, schema, def.Name) != nil {
+		fail "42P07 relation \"{def.Name}\" already exists"
+	}
+	let oid = c.nextOid
+	let rowType = c.nextOid + 1
+	c.nextOid += 2
+	try c.writeClass(t, oid, def.Name, ns, "v", 0, i16(len(def.Columns)), rowType)
+	mut cols = []Column{}
+	for i, cd in def.Columns {
+		let col = Column{Name: cd.Name, Type: cd.Type, Typmod: cd.Typmod, Number: i16(i + 1), Nullable: true}
+		cols = append(cols, col)
+		try c.writeAttributeRow(t, oid, col)
+	}
+	// pg_rewrite row carrying the view query text.
+	let ruleOid = c.nextOid
+	c.nextOid += 1
+	mut vals = make(map[str]types.Datum)
+	vals["oid"] = types.FromI64(26, i64(ruleOid))
+	vals["rulename"] = types.FromStr(25, "_RETURN")
+	vals["ev_class"] = types.FromI64(26, i64(oid))
+	vals["ev_type"] = types.FromStr(25, "1")
+	vals["ev_enabled"] = types.FromStr(25, "O")
+	vals["is_instead"] = types.FromBool(true)
+	vals["ev_qual"] = types.FromStr(25, "")
+	vals["ev_action"] = types.FromStr(25, def.Query)
+	_ = try c.insertRow(t, "pg_rewrite", c.buildRow("pg_rewrite", vals))
+	c.version += 1
+	c.reload()
+	return Table{Oid: oid, Schema: schema, Name: def.Name, Cols: cols, Rel: 0, Indexes: []Index{}, System: false, Owner: 10, Kind: "v", RowType: rowType}
+}
+
+// ViewQuery returns the stored query text of a view.
+fn (c Catalog) ViewQuery(t txn.Txn, tbl Table) ?str {
+	let snap = c.Manager.Snapshot(t)
+	for row in c.rows["pg_rewrite"] {
+		if !c.visible(snap, "pg_rewrite", row) {
+			continue
+		}
+		if u32(c.intField("pg_rewrite", row, "ev_class")) == tbl.Oid {
+			return c.textField("pg_rewrite", row, "ev_action")
+		}
+	}
+	return nil
+}
+
+// CreateEnum creates an enum type with its labels.
+fn (c mut Catalog) CreateEnum(t txn.Txn, schema str, name str, labels []str) !Oid {
+	let snap = c.Manager.Snapshot(t)
+	mut sch = schema
+	if sch == "" {
+		sch = "public"
+	}
+	let ns = c.namespaceOid(snap, sch)
+	if ns == 0 {
+		fail "3F000 schema \"{sch}\" does not exist"
+	}
+	let oid = c.nextOid
+	c.nextOid += 1
+	try c.writeType(t, oid, name, ns, 0, "e")
+	for i, label in labels {
+		let eoid = c.nextOid
+		c.nextOid += 1
+		mut vals = make(map[str]types.Datum)
+		vals["oid"] = types.FromI64(26, i64(eoid))
+		vals["enumtypid"] = types.FromI64(26, i64(oid))
+		vals["enumsortorder"] = types.FromF64(701, f64(i + 1))
+		vals["enumlabel"] = types.FromStr(25, label)
+		_ = try c.insertRow(t, "pg_enum", c.buildRow("pg_enum", vals))
+	}
+	c.version += 1
+	c.reload()
+	return oid
+}
+
+// EnumLabels returns the labels of an enum type.
+fn (c Catalog) EnumLabels(t txn.Txn, typeOid Oid) []str {
+	let snap = c.Manager.Snapshot(t)
+	mut out = []str{}
+	for row in c.rows["pg_enum"] {
+		if !c.visible(snap, "pg_enum", row) {
+			continue
+		}
+		if u32(c.intField("pg_enum", row, "enumtypid")) == typeOid {
+			out = append(out, c.textField("pg_enum", row, "enumlabel"))
+		}
+	}
+	return out
+}
+
+// AnalyzeTable writes pg_statistic rows with a row count and per-column null fraction.
+fn (c mut Catalog) AnalyzeTable(t txn.Txn, tbl Table) ! {
+	_ = t
+	mut colTypes = []Oid{}
+	for col in tbl.Cols {
+		colTypes = append(colTypes, col.Type)
+	}
+	mut total = i64(0)
+	mut nulls = make([]i64, len(tbl.Cols))
+	let mutScan = c.Store.HeapScan(store.RelId(tbl.Rel))
+	mut scan = mutScan
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		total += 1
+		let row = types.DecodeRow(colTypes, tuple.Payload) catch _ { continue }
+		for i, d in row {
+			if types.IsNull(d) {
+				nulls[i] += 1
+			}
+		}
+	}
+	for col in tbl.Cols {
+		mut frac = f64(0.0)
+		if total > 0 {
+			frac = f64(nulls[col.Number-1]) / f64(total)
+		}
+		let oid = c.nextOid
+		c.nextOid += 1
+		_ = oid
+		mut vals = make(map[str]types.Datum)
+		vals["starelid"] = types.FromI64(26, i64(tbl.Oid))
+		vals["staattnum"] = types.FromI64(21, i64(col.Number))
+		vals["stainherit"] = types.FromBool(false)
+		vals["stanullfrac"] = types.FromF64(701, frac)
+		vals["stawidth"] = types.FromI64(23, 0)
+		vals["stadistinct"] = types.FromF64(701, -1.0)
+		vals["stakind1"] = types.FromI64(21, 0)
+		vals["stanumbers1"] = types.FromStr(25, "")
+		vals["stavalues1"] = types.FromStr(25, "")
+		_ = try c.insertRow(t, "pg_statistic", c.buildRow("pg_statistic", vals))
+	}
+	c.version += 1
+	c.reload()
+}
+
+// ColumnStatistics returns pg_statistic-shaped slots for a relation's columns.
+fn (c Catalog) ColumnStatistics(t txn.Txn, tableOid Oid) []ColumnStat {
+	let snap = c.Manager.Snapshot(t)
+	mut out = []ColumnStat{}
+	for row in c.rows["pg_statistic"] {
+		if !c.visible(snap, "pg_statistic", row) {
+			continue
+		}
+		if u32(c.intField("pg_statistic", row, "starelid")) != tableOid {
+			continue
+		}
+		out = append(out, ColumnStat{
+			Attnum: i16(c.intField("pg_statistic", row, "staattnum")),
+			Inherit: c.boolField("pg_statistic", row, "stainherit"),
+			NullFrac: c.floatField("pg_statistic", row, "stanullfrac"),
+			Width: i32(c.intField("pg_statistic", row, "stawidth")),
+			Distinct: c.floatField("pg_statistic", row, "stadistinct"),
+			Kind: i16(c.intField("pg_statistic", row, "stakind1")),
+			Numbers: []f64{},
+			Values: []str{},
+		})
+	}
+	return out
+}
+
+// Statistic returns the stored null fraction for a column.
+fn (c Catalog) Statistic(t txn.Txn, tableOid Oid, attnum i16) ?f64 {
+	let snap = c.Manager.Snapshot(t)
+	for row in c.rows["pg_statistic"] {
+		if !c.visible(snap, "pg_statistic", row) {
+			continue
+		}
+		if u32(c.intField("pg_statistic", row, "starelid")) == tableOid && i16(c.intField("pg_statistic", row, "staattnum")) == attnum {
+			let f = mint.ParseFloat(c.textField("pg_statistic", row, "stanullfrac")) catch _ { 0.0 }
+			return f
+		}
+	}
+	return nil
+}
+
+// InformationSchemaView returns the SQL text of a built-in information_schema view.
+fn (c Catalog) InformationSchemaView(t txn.Txn, name str) ?str {
+	let snap = c.Manager.Snapshot(t)
+	for row in c.rows["pg_class"] {
+		if !c.visible(snap, "pg_class", row) {
+			continue
+		}
+		if c.textField("pg_class", row, "relname") != name || c.textField("pg_class", row, "relkind") != "v" {
+			continue
+		}
+		let ns = c.namespaceName(snap, u32(c.intField("pg_class", row, "relnamespace")))
+		if ns != "information_schema" {
+			continue
+		}
+		let oid = u32(c.intField("pg_class", row, "oid"))
+		for rule in c.rows["pg_rewrite"] {
+			if c.visible(snap, "pg_rewrite", rule) && u32(c.intField("pg_rewrite", rule, "ev_class")) == oid {
+				return c.textField("pg_rewrite", rule, "ev_action")
+			}
+		}
+	}
+	return nil
+}

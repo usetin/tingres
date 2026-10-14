@@ -90,7 +90,7 @@ fn lex(sql str) ![]Token {
 					at += 2
 				} else { at += 1 }
 			}
-			if depth > 0 { fail syntaxMessage(sql, start, "unterminated /* comment" ) }
+			if depth > 0 { fail syntaxMessage(sql, start, "unterminated /* comment at or near \"{sql[start:]}\"") }
 			continue
 		}
 		let start = at
@@ -185,11 +185,15 @@ fn lex(sql str) ![]Token {
 		at += 1
 		tokens = append(tokens, Token{Text: sql[start:at], Kind: "symbol", BytePos: start, EndBytePos: at})
 	}
+	// Pos is the 1-based CHARACTER offset (not byte offset) of the token start in the
+	// original query text; PostgreSQL counts characters, so multi-byte UTF-8 must not
+	// inflate a position. Walk byte spans once, counting characters before each token.
 	mut charPos = 1
 	mut previousByte = 0
 	for i in 0..len(tokens) {
 		charPos += countCharacters(sql, previousByte, tokens[i].BytePos)
 		tokens[i].Pos = charPos
+		charPos += countCharacters(sql, tokens[i].BytePos, tokens[i].EndBytePos)
 		previousByte = tokens[i].EndBytePos
 	}
 	return tokens
@@ -239,10 +243,14 @@ fn scanQuoted(sql str, start i64, quote u8, escapes bool) i64 {
 fn scanDollar(sql str, start i64) i64 {
 	let n = len(sql)
 	mut tagEnd = start + 1
-	if tagEnd >= n || !(isLetter(sql[tagEnd]) || sql[tagEnd] == 95) { return -1 }
-	tagEnd += 1
-	for tagEnd < n && (isLetter(sql[tagEnd]) || isDigit(sql[tagEnd]) || sql[tagEnd] == 95) { tagEnd += 1 }
-	if tagEnd >= n || sql[tagEnd] != 36 { return -1 }
+	if tagEnd < n && sql[tagEnd] == 36 {
+		// "$$" opens an empty-tag dollar-quoted string.
+	} else {
+		if tagEnd >= n || !(isLetter(sql[tagEnd]) || sql[tagEnd] == 95) { return -1 }
+		tagEnd += 1
+		for tagEnd < n && (isLetter(sql[tagEnd]) || isDigit(sql[tagEnd]) || sql[tagEnd] == 95) { tagEnd += 1 }
+		if tagEnd >= n || sql[tagEnd] != 36 { return -1 }
+	}
 	let marker = sql[start:tagEnd + 1]
 	let contentStart = tagEnd + 1
 	let close = findFrom(sql, marker, contentStart)

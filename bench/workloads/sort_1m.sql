@@ -1,0 +1,1 @@
+SELECT * FROM large_rows ORDER BY x LIMIT 10;

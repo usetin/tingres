@@ -1,7 +1,9 @@
 package catalog
 
-import "../txn"
 import "../store"
+import "../txn"
+import "../types"
+import "mint"
 
 // Oid is a PostgreSQL object identifier.
 type Oid = u32
@@ -13,6 +15,11 @@ type Column struct {
 	Typmod i32
 	Number i16
 	Nullable bool
+	HasDefault bool
+	DefaultText str
+	Identity str
+	Generated str
+	Collation Oid
 }
 
 // ColumnDef is one requested column in a CREATE TABLE.
@@ -21,6 +28,15 @@ type ColumnDef struct {
 	Type Oid
 	Typmod i32
 	Nullable bool
+	DefaultText str
+	NotNull bool
+}
+
+// IndexKey is one index key column with its ordering.
+type IndexKey struct {
+	Attnum i16
+	Desc bool
+	NullsFirst bool
 }
 
 // Index describes an index attached to a table.
@@ -29,6 +45,21 @@ type Index struct {
 	Name str
 	Rel u32
 	Unique bool
+	Primary bool
+	Cols []i16
+	Keys []IndexKey
+}
+
+// ColumnStat is a pg_statistic-shaped slot for one column.
+type ColumnStat struct {
+	Attnum i16
+	Inherit bool
+	NullFrac f64
+	Width i32
+	Distinct f64
+	Kind i16
+	Numbers []f64
+	Values []str
 }
 
 // Table is a catalog relation descriptor.
@@ -44,6 +75,11 @@ type Table struct {
 	DroppedBy u32
 	DroppedCommand u32
 	System bool
+	Owner u32
+	Kind str
+	RowType u32
+	RelTuples f64
+	RelPages i32
 }
 
 // TableDef describes a table to create.
@@ -51,6 +87,7 @@ type TableDef struct {
 	Schema str
 	Name str
 	Columns []ColumnDef
+	PrimaryKey []i16
 }
 
 // IndexDef describes an index to create.
@@ -58,41 +95,66 @@ type IndexDef struct {
 	Table Table
 	Name str
 	Unique bool
+	Cols []i16
+	Primary bool
+	Keys []IndexKey
 }
 
-// Catalog stores transactional relation metadata. M1 keeps catalog rows in memory until
-// the store heap tuple encoding and type Datum APIs are present in this worktree.
+// SequenceDef describes a CREATE SEQUENCE.
+type SequenceDef struct {
+	Schema str
+	Name str
+	Type Oid
+	Start i64
+	Increment i64
+	Min i64
+	Max i64
+	Cache i64
+	Cycle bool
+}
+
+// ViewDef describes a CREATE VIEW.
+type ViewDef struct {
+	Schema str
+	Name str
+	Columns []ColumnDef
+	Query str
+}
+
+// Catalog stores transactional relation metadata in the pg_catalog heaps and keeps
+// a decoded row cache rebuilt whenever the catalog version changes.
 type Catalog struct {
 	Store store.Store
 	Manager txn.Manager
-	tables map[Oid]Table
-	names map[str][]Oid
+	rows map[str][]RawRow
+	sysCols map[str][]ColDef
+	relIds map[str]u32
 	searchPaths map[u32][]str
 	nextOid u32
 	nextRel u32
 	version u64
 }
 
-// Open creates the catalog metadata and the M1 pg_catalog relation descriptors.
+// Open bootstraps pg_catalog on an empty data directory and loads the row cache.
 fn Open(s mut store.Store, m txn.Manager) !Catalog {
-	mut c = Catalog{Store: s, Manager: m, tables: make(map[Oid]Table), names: make(map[str][]Oid), searchPaths: make(map[u32][]str), nextOid: 16384, nextRel: 16384, version: 1}
-	c.addNamespace("pg_catalog", 11)
-	c.addNamespace("public", 2200)
-	c.addSystemTable(1259, "pg_class", 2615, "relname", 25, "relnamespace", 26, "relkind", 18)
-	c.addSystemTable(1249, "pg_attribute", 1249, "attrelid", 26, "attname", 25, "atttypid", 26)
-	c.addSystemTable(1247, "pg_type", 1247, "typname", 25, "typnamespace", 26, "typlen", 21)
-	c.addSystemTable(2615, "pg_namespace", 2615, "nspname", 25, "oid", 26, "nspowner", 26)
+	mut b = Bootstrapper{Store: s, sysCols: make(map[str][]ColDef), relIds: make(map[str]u32)}
+	try b.bootstrap()
+	let (rows, nextOid, nextRel) = loadRows(mut s, b.sysCols, b.relIds)
+	mut c = Catalog{Store: s, Manager: m, rows: rows, sysCols: b.sysCols, relIds: b.relIds, searchPaths: make(map[u32][]str), nextOid: nextOid, nextRel: nextRel, version: 1}
 	return c
 }
 
+const pgCatalogOid u32 = 11
+const publicOid u32 = 2200
+
 // LookupTable resolves a visible table by explicit schema or the transaction search path.
 fn (c Catalog) LookupTable(t txn.Txn, schema str, name str) ?Table {
-	let snapshot = c.Manager.Snapshot(t)
+	let snap = c.Manager.Snapshot(t)
 	if schema != "" {
-		return c.lookupInSchema(snapshot, schema, name)
+		return c.lookupInSchema(snap, schema, name)
 	}
 	for path in c.SearchPath(t) {
-		let found = c.lookupInSchema(snapshot, path, name)
+		let found = c.lookupInSchema(snap, path, name)
 		if found != nil {
 			return found
 		}
@@ -100,101 +162,54 @@ fn (c Catalog) LookupTable(t txn.Txn, schema str, name str) ?Table {
 	return nil
 }
 
-// CreateTable adds a table visible to its creating transaction and later transactions after commit.
-fn (c mut Catalog) CreateTable(t txn.Txn, def TableDef) !Table {
-	mut schema = def.Schema
-	if schema == "" {
-		schema = "public"
-	}
-	if !c.schemaExists(schema) {
-		fail "3F000 schema does not exist"
-	}
-	if def.Name == "" {
-		fail "42602 relation name must not be empty"
-	}
-	if c.lookupInSchema(c.Manager.Snapshot(t), schema, def.Name) != nil {
-		fail "42P07 relation already exists"
-	}
-	mut cols = []Column{}
-	for i, col in def.Columns {
-		if col.Name == "" {
-			fail "42602 column name must not be empty"
-		}
-		for prior in cols {
-			if prior.Name == col.Name {
-				fail "42701 column specified more than once"
-			}
-		}
-		cols = append(cols, Column{Name: col.Name, Type: col.Type, Typmod: col.Typmod, Number: i16(i + 1), Nullable: col.Nullable})
-	}
-	let oid = c.nextOid
-	c.nextOid += 1
-	let rel = c.nextRel
-	c.nextRel += 1
-	let table = Table{Oid: oid, Schema: schema, Name: def.Name, Cols: cols, Rel: rel, Indexes: []Index{}, CreatedBy: t.Xid(), CreatedCommand: t.CommandID(), DroppedBy: 0, DroppedCommand: 0, System: false}
-	c.tables[oid] = table
-	let key = nameKey(schema, def.Name)
-	mut ids = []u32{}
-	for existing in c.names[key] {
-		ids = append(ids, existing)
-	}
-	ids = append(ids, oid)
-	c.names[key] = ids
-	c.version += 1
-	return table
+// LookupTableOid rebuilds a table descriptor by oid.
+fn (c Catalog) LookupTableOid(t txn.Txn, oid Oid) ?Table {
+	let snap = c.Manager.Snapshot(t)
+	return c.lookupByOid(snap, oid)
 }
 
-// DropTable marks a relation dropped in the current transaction.
-fn (c mut Catalog) DropTable(t txn.Txn, tbl Table, cascade bool) ! {
-	if tbl.System {
-		fail "42501 permission denied: cannot drop a system relation"
-	}
-	let (current, ok) = c.tables[tbl.Oid]
-	if !ok || !c.visible(t, current) {
-		fail "42P01 relation does not exist"
-	}
-	if len(current.Indexes) > 0 && !cascade {
-		fail "2BP01 cannot drop relation because dependent objects exist"
-	}
-	current.DroppedBy = t.Xid()
-	current.DroppedCommand = t.CommandID()
-	c.tables[tbl.Oid] = current
-	c.version += 1
-	return
+// SystemTable returns one bootstrapped pg_catalog relation descriptor by name.
+fn (c Catalog) SystemTable(name str) ?Table {
+	let snap = c.bootSnapshot()
+	return c.lookupInSchema(snap, "pg_catalog", name)
 }
 
-// CreateIndex adds index metadata to its parent table.
-fn (c mut Catalog) CreateIndex(t txn.Txn, def IndexDef) !Index {
-	let (table, ok) = c.tables[def.Table.Oid]
-	if !ok || !c.visible(t, table) {
-		fail "42P01 relation does not exist"
+// SearchPath returns the configured schema order or PostgreSQL's default.
+fn (c Catalog) SearchPath(t txn.Txn) []str {
+	let (path, ok) = c.searchPaths[t.Xid()]
+	if ok {
+		return path
 	}
-	if def.Name == "" {
-		fail "42602 index name must not be empty"
-	}
-	let index = Index{Oid: c.nextOid, Name: def.Name, Rel: c.nextRel, Unique: def.Unique}
-	c.nextOid += 1
-	c.nextRel += 1
-	mut updated = table
-	updated.Indexes = append(updated.Indexes, index)
-	c.tables[table.Oid] = updated
-	c.version += 1
-	return index
+	return []str{"pg_catalog", "public"}
 }
 
-// LookupType returns the PostgreSQL OID for an M1 built-in type name.
+// SetSearchPath sets the transaction-local schema search order.
+fn (c mut Catalog) SetSearchPath(t txn.Txn, path []str) {
+	c.searchPaths[t.Xid()] = path
+	c.version += 1
+}
+
+// Version returns the catalog version used to invalidate cached plans.
+fn (c Catalog) Version() u64 {
+	return c.version
+}
+
+// LookupType returns the PostgreSQL OID for a built-in type name.
 fn (c Catalog) LookupType(name str) ?Oid {
 	return match name {
-		"bool" => 16
+		"bool", "boolean" => 16
 		"bytea" => 17
-		"int8" => 20
-		"int2" => 21
+		"char", "\"char\"" => 18
+		"name" => 19
+		"int8", "bigint" => 20
+		"int2", "smallint" => 21
 		"int4", "integer", "int" => 23
 		"text" => 25
 		"oid" => 26
 		"json" => 114
 		"float4", "real" => 700
 		"float8", "double precision" => 701
+		"bpchar", "character" => 1042
 		"varchar", "character varying" => 1043
 		"date" => 1082
 		"time" => 1083
@@ -208,101 +223,226 @@ fn (c Catalog) LookupType(name str) ?Oid {
 	}
 }
 
-// SystemTable returns one bootstrapped pg_catalog relation descriptor by name.
-fn (c Catalog) SystemTable(name str) ?Table {
-	let ids = c.names[nameKey("pg_catalog", name)]
-	mut found ?Table = nil
-	for oid in ids {
-		let table = c.tables[oid]
-		if table.System {
-			found = table
-		}
-	}
-	return found
-}
-
-// SetSearchPath sets the transaction-local schema search order.
-fn (c mut Catalog) SetSearchPath(t txn.Txn, path []str) {
-	c.searchPaths[t.Xid()] = path
-	c.version += 1
-}
-
-// SearchPath returns the configured schema order or PostgreSQL's M1 default.
-fn (c Catalog) SearchPath(t txn.Txn) []str {
-	let (path, ok) = c.searchPaths[t.Xid()]
-	if ok {
-		return path
-	}
-	return []str{"pg_catalog", "public"}
-}
-
-// Version returns the catalog version used to invalidate cached plans.
-fn (c Catalog) Version() u64 {
-	return c.version
+fn (c Catalog) bootSnapshot() txn.Snapshot {
+	return txn.Snapshot{Xmin: 3, Xmax: c.Manager.NextXid(), Xip: []u32{}, Xid: 0, Cid: 0}
 }
 
 fn (c Catalog) lookupInSchema(snap txn.Snapshot, schema str, name str) ?Table {
-	let ids = c.names[nameKey(schema, name)]
-	mut found ?Table = nil
-	for oid in ids {
-		let table = c.tables[oid]
-		if c.visibleSnapshot(snap, table) {
-			found = table
+	let ns = c.namespaceOid(snap, schema)
+	if ns == 0 {
+		return nil
+	}
+	for row in c.rows["pg_class"] {
+		if !c.visible(snap, "pg_class", row) {
+			continue
+		}
+		if c.textField("pg_class", row, "relname") != name {
+			continue
+		}
+		if u32(c.intField("pg_class", row, "relnamespace")) != ns {
+			continue
+		}
+		let kind = c.textField("pg_class", row, "relkind")
+		if !isRelationKind(kind) {
+			continue
+		}
+		return c.tableFromClass(snap, row)
+	}
+	return nil
+}
+
+fn (c Catalog) lookupByOid(snap txn.Snapshot, oid Oid) ?Table {
+	for row in c.rows["pg_class"] {
+		if !c.visible(snap, "pg_class", row) {
+			continue
+		}
+		if u32(c.intField("pg_class", row, "oid")) != oid {
+			continue
+		}
+		if !isRelationKind(c.textField("pg_class", row, "relkind")) {
+			continue
+		}
+		return c.tableFromClass(snap, row)
+	}
+	return nil
+}
+
+fn isRelationKind(kind str) bool {
+	return kind == "r" || kind == "p" || kind == "v" || kind == "m" || kind == "S" || kind == "f"
+}
+
+fn (c Catalog) namespaceOid(snap txn.Snapshot, schema str) u32 {
+	if schema == "pg_temp" {
+		return 0
+	}
+	for row in c.rows["pg_namespace"] {
+		if !c.visible(snap, "pg_namespace", row) {
+			continue
+		}
+		if c.textField("pg_namespace", row, "nspname") == schema {
+			return u32(c.intField("pg_namespace", row, "oid"))
+		}
+	}
+	return 0
+}
+
+fn (c Catalog) namespaceName(snap txn.Snapshot, oid u32) str {
+	for row in c.rows["pg_namespace"] {
+		if !c.visible(snap, "pg_namespace", row) {
+			continue
+		}
+		if u32(c.intField("pg_namespace", row, "oid")) == oid {
+			return c.textField("pg_namespace", row, "nspname")
+		}
+	}
+	return ""
+}
+
+// LookupNamespace returns the oid of a visible schema.
+fn (c Catalog) LookupNamespace(t txn.Txn, schema str) Oid {
+	return c.namespaceOid(c.Manager.Snapshot(t), schema)
+}
+
+fn (c Catalog) tableFromClass(snap txn.Snapshot, row RawRow) ?Table {
+	let oid = u32(c.intField("pg_class", row, "oid"))
+	let ns = u32(c.intField("pg_class", row, "relnamespace"))
+	return Table{
+		Oid: oid,
+		Schema: c.namespaceName(snap, ns),
+		Name: c.textField("pg_class", row, "relname"),
+		Cols: c.attributesFor(snap, oid),
+		Rel: u32(c.intField("pg_class", row, "relfilenode")),
+		Indexes: c.indexesFor(snap, oid),
+		CreatedBy: row.Xmin,
+		CreatedCommand: row.Cid,
+		DroppedBy: row.Xmax,
+		DroppedCommand: 0,
+		System: ns == pgCatalogOid,
+		Owner: u32(c.intField("pg_class", row, "relowner")),
+		Kind: c.textField("pg_class", row, "relkind"),
+		RowType: u32(c.intField("pg_class", row, "reltype")),
+		RelTuples: c.floatField("pg_class", row, "reltuples"),
+		RelPages: i32(c.intField("pg_class", row, "relpages")),
+	}
+}
+
+fn (c Catalog) attributesFor(snap txn.Snapshot, oid u32) []Column {
+	mut found = []Column{}
+	mut nums = []i16{}
+	for row in c.rows["pg_attribute"] {
+		if !c.visible(snap, "pg_attribute", row) {
+			continue
+		}
+		if u32(c.intField("pg_attribute", row, "attrelid")) != oid {
+			continue
+		}
+		let num = i16(c.intField("pg_attribute", row, "attnum"))
+		if num <= 0 || c.boolField("pg_attribute", row, "attisdropped") {
+			continue
+		}
+		mut col = Column{
+			Name: c.textField("pg_attribute", row, "attname"),
+			Type: u32(c.intField("pg_attribute", row, "atttypid")),
+			Typmod: i32(c.intField("pg_attribute", row, "atttypmod")),
+			Number: num,
+			Nullable: !c.boolField("pg_attribute", row, "attnotnull"),
+			HasDefault: c.boolField("pg_attribute", row, "atthasdef"),
+			Identity: c.textField("pg_attribute", row, "attidentity"),
+			Generated: c.textField("pg_attribute", row, "attgenerated"),
+			Collation: u32(c.intField("pg_attribute", row, "attcollation")),
+		}
+		if col.HasDefault {
+			col.DefaultText = c.defaultTextFor(snap, oid, num)
+		}
+		found = append(found, col)
+		nums = append(nums, num)
+	}
+	// Insertion sort by attnum keeps dropped and re-added columns stable.
+	for i in 1..len(found) {
+		mut j = i
+		for j > 0 && nums[j-1] > nums[j] {
+			let tmpC = found[j-1]
+			found[j-1] = found[j]
+			found[j] = tmpC
+			let tmpN = nums[j-1]
+			nums[j-1] = nums[j]
+			nums[j] = tmpN
+			j -= 1
 		}
 	}
 	return found
 }
 
-fn (c Catalog) visible(t txn.Txn, table Table) bool {
-	return c.visibleSnapshot(c.Manager.Snapshot(t), table)
-}
-
-fn (c Catalog) visibleSnapshot(snap txn.Snapshot, table Table) bool {
-	if table.CreatedBy == snap.Xid {
-		if table.CreatedCommand >= snap.Cid {
-			return false
+fn (c Catalog) defaultTextFor(snap txn.Snapshot, oid u32, attnum i16) str {
+	for row in c.rows["pg_attrdef"] {
+		if !c.visible(snap, "pg_attrdef", row) {
+			continue
 		}
-	} else if xidIn(table.CreatedBy, snap.Xip) || table.CreatedBy >= snap.Xmax || c.Manager.State(table.CreatedBy) != txn.XidState.Committed {
-		return false
+		if u32(c.intField("pg_attrdef", row, "adrelid")) != oid {
+			continue
+		}
+		if i16(c.intField("pg_attrdef", row, "adnum")) != attnum {
+			continue
+		}
+		return c.textField("pg_attrdef", row, "adbin")
 	}
-	if table.DroppedBy == 0 {
-		return true
+	return ""
+}
+
+fn (c Catalog) indexesFor(snap txn.Snapshot, oid u32) []Index {
+	mut out = []Index{}
+	for row in c.rows["pg_index"] {
+		if !c.visible(snap, "pg_index", row) {
+			continue
+		}
+		if u32(c.intField("pg_index", row, "indrelid")) != oid {
+			continue
+		}
+		let idxOid = u32(c.intField("pg_index", row, "indexrelid"))
+		out = append(out, Index{
+			Oid: idxOid,
+			Name: c.relationName(snap, idxOid),
+			Rel: c.relationFilenode(snap, idxOid),
+			Unique: c.boolField("pg_index", row, "indisunique"),
+			Primary: c.boolField("pg_index", row, "indisprimary"),
+		})
 	}
-	if table.DroppedBy == snap.Xid {
-		return table.DroppedCommand >= snap.Cid
-	}
-	if xidIn(table.DroppedBy, snap.Xip) || table.DroppedBy >= snap.Xmax {
-		return true
-	}
-	return c.Manager.State(table.DroppedBy) != txn.XidState.Committed
+	return out
 }
 
-fn (c Catalog) schemaExists(schema str) bool {
-	return schema == "pg_catalog" || schema == "public"
-}
-
-fn (c mut Catalog) addNamespace(name str, oid u32) {
-	let table = Table{Oid: oid, Schema: "pg_catalog", Name: name, Cols: []Column{}, Rel: oid, Indexes: []Index{}, CreatedBy: 2, CreatedCommand: 0, DroppedBy: 0, DroppedCommand: 0, System: true}
-	c.tables[oid] = table
-	c.names[nameKey("pg_catalog", name)] = []u32{oid}
-}
-
-fn (c mut Catalog) addSystemTable(oid u32, name str, rel u32, c1 str, t1 u32, c2 str, t2 u32, c3 str, t3 u32) {
-	let cols = []Column{Column{Name: c1, Type: t1, Typmod: -1, Number: 1, Nullable: false}, Column{Name: c2, Type: t2, Typmod: -1, Number: 2, Nullable: false}, Column{Name: c3, Type: t3, Typmod: -1, Number: 3, Nullable: false}}
-	let table = Table{Oid: oid, Schema: "pg_catalog", Name: name, Cols: cols, Rel: rel, Indexes: []Index{}, CreatedBy: 2, CreatedCommand: 0, DroppedBy: 0, DroppedCommand: 0, System: true}
-	c.tables[oid] = table
-	c.names[nameKey("pg_catalog", name)] = []u32{oid}
-}
-
-fn nameKey(schema str, name str) str {
-	return schema + "\x00" + name
-}
-
-fn xidIn(xid u32, xs []u32) bool {
-	for x in xs {
-		if x == xid {
-			return true
+fn (c Catalog) relationName(snap txn.Snapshot, oid u32) str {
+	for row in c.rows["pg_class"] {
+		if !c.visible(snap, "pg_class", row) {
+			continue
+		}
+		if u32(c.intField("pg_class", row, "oid")) == oid {
+			return c.textField("pg_class", row, "relname")
 		}
 	}
-	return false
+	return ""
+}
+
+fn (c Catalog) relationFilenode(snap txn.Snapshot, oid u32) u32 {
+	for row in c.rows["pg_class"] {
+		if !c.visible(snap, "pg_class", row) {
+			continue
+		}
+		if u32(c.intField("pg_class", row, "oid")) == oid {
+			return u32(c.intField("pg_class", row, "relfilenode"))
+		}
+	}
+	return 0
+}
+
+// findClassRow returns the visible pg_class row for an oid.
+fn (c Catalog) findClassRow(snap txn.Snapshot, oid u32) ?RawRow {
+	for row in c.rows["pg_class"] {
+		if !c.visible(snap, "pg_class", row) {
+			continue
+		}
+		if u32(c.intField("pg_class", row, "oid")) == oid && isRelationKind(c.textField("pg_class", row, "relkind")) {
+			return row
+		}
+	}
+	return nil
 }

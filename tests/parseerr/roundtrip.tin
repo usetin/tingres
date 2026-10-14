@@ -1,0 +1,39 @@
+package main
+
+import "say"
+import "quarry"
+import "../../parse"
+
+fn main() {
+	let args = quarry.Args()
+	let path = args[1]
+	let content = quarry.ReadFile(path) catch err {
+		say.Line("read: {err}")
+		return
+	}
+	let stmts = parse.Parse(content) catch err {
+		say.Line("parse: {err}")
+		return
+	}
+	say.Line("parsed {len(stmts)}")
+	mut bad = 0
+	for i in 0..len(stmts) {
+		let d = parse.Deparse(stmts[i])
+		let re = parse.Parse(d) catch err {
+			if bad < 10 { say.Line("REPARSE FAIL {i}: {d} err={err}") }
+			bad += 1
+			[]parse.Stmt{}
+		}
+		if len(re) != 1 {
+			if bad < 10 { say.Line("COUNT {i}: d={d} n={len(re)}") }
+			bad += 1
+			continue
+		}
+		let d2 = parse.Deparse(re[0])
+		if d2 != d {
+			if bad < 10 { say.Line("DIFF {i}:\n  d1={d}\n  d2={d2}") }
+			bad += 1
+		}
+	}
+	say.Line("bad {bad}")
+}
