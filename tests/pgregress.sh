@@ -51,9 +51,22 @@ PASSED=0
 for t in $TESTS; do
 	res=fail
 	if [ "$up" = 1 ] && [ -f "$REG/sql/$t.sql" ] && [ -f "$REG/expected/$t.out" ]; then
-		perl -e 'alarm shift; exec @ARGV' "$TEST_TIMEOUT" "$PSQL" -X -a -q -h 127.0.0.1 -p "$PORT" -U postgres -d regression \
+		# A watchdog, not perl's alarm: on macOS the alarm set before exec does not
+		# reliably kill a psql blocked on a server that never answers, and one hung
+		# test then wedges the whole suite.
+		"$PSQL" -X -a -q -h 127.0.0.1 -p "$PORT" -U postgres -d regression \
 			-v abs_srcdir="$REG" -v abs_builddir="$TMP" -v libdir="$TMP" -v dlsuffix=.so -v regresslib="$TMP/regress.so" \
-			-f "$REG/sql/$t.sql" >"$TMP/$t.out" 2>&1
+			-f "$REG/sql/$t.sql" >"$TMP/$t.out" 2>&1 &
+		psql_pid=$!
+		rm -f "$TMP/$t.timedout"
+		( sleep "$TEST_TIMEOUT"; kill -9 "$psql_pid" 2>/dev/null && touch "$TMP/$t.timedout" ) &
+		watchdog=$!
+		wait "$psql_pid" 2>/dev/null
+		kill "$watchdog" 2>/dev/null
+		wait "$watchdog" 2>/dev/null
+		# A statement that makes the server stop answering is a bug, not a difference:
+		# record it so it cannot hide behind an ordinary mismatch.
+		if [ -f "$TMP/$t.timedout" ]; then res=timeout; fi
 		if diff -w -q "$REG/expected/$t.out" "$TMP/$t.out" >/dev/null 2>&1; then res=pass; PASSED=$((PASSED + 1)); fi
 		if [ "$res" = fail ]; then
 			# Keep what the server answered and how it differs, so a failure can be triaged
