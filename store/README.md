@@ -12,8 +12,10 @@ must not be held across a wait, await, or another page load.
 - `Open(dir str, opts Options) !Store` creates or opens a data directory and replays valid WAL
   before returning.
 - `Options{BufferPages: n}` selects the buffer-pool frame count. Otherwise
-  `SharedBuffersBytes` selects a byte capacity; the default is 16 MiB. `WalRingBytes` is retained
-  for compatibility and is currently unused. `SyncOnWrite` requests syncing after each append.
+  `SharedBuffersBytes` selects a byte capacity; the default is 16 MiB.
+  `WalSegmentBytes` sets the WAL segment size (default 16 MiB, multiple of 512 bytes) and is
+  mainly for tests. `WalRingBytes` is retained for compatibility and is currently unused.
+  `SyncOnWrite` requests syncing after each append.
 - `(s mut Store) Close() !` flushes pages and writes a clean shutdown record/control file.
 - `(s mut Store) Checkpoint() !` flushes dirty buffers and writes a checkpoint/control file.
 - `(s Store) CurrentLsn() Lsn` returns the current end position of the WAL stream.
