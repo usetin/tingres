@@ -109,7 +109,14 @@ fn (m mut Manager) LockTuple(t Txn, rel u32, page u32, slot u16, mode TupleLock)
 and tuple locks, lock wait wakeup, deadlock victim selection, lock timeout/cancel, xid
 locks, isolation snapshots, hint bits, dirty/update results, snapshot registry and global
 xmin, durable commit/abort and xid reservation, two-bit clog, savepoints/subtransactions,
-crash recovery aborts in-flight tuples (17 tests).
+crash recovery aborts in-flight tuples, vacuum freezes/counts (18 tests).
+
+## Vacuum
+
+`Vacuum(rel, opts)` scans a heap against `GlobalXmin`, counts live/dead tuples, freezes
+tuples older than the horizon with the frozen hint (when `Freeze` is set), and drops
+commit-log pages entirely below the horizon. The M1 store has no prune hook, so dead tuple
+space is not reclaimed and clog truncation is in memory only.
 
 ## Known gaps
 
@@ -118,6 +125,6 @@ crash recovery aborts in-flight tuples (17 tests).
 - Savepoints/subtransactions are implemented for visibility, locks and recovery, but the
   store stamps the subxid as xmin (PostgreSQL instead keeps the parent xid and a combo
   cmin); observable rollback/commit behaviour matches.
-- `Vacuum(rel, opts)` and clog truncation are not implemented (the store has no prune
-  hook yet).
+- `Vacuum` cannot reclaim dead tuple space or truncate the on-disk clog until the store
+  exposes a prune hook.
 - Serializable behaves as repeatable read (no SSI).

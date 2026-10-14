@@ -90,6 +90,20 @@ type TupleCheck struct {
 	Ctid store.Tid
 }
 
+// VacuumOpts selects vacuum behaviour.
+type VacuumOpts struct {
+	Freeze bool
+	Full bool
+}
+
+// VacuumStats reports what a vacuum pass found.
+type VacuumStats struct {
+	Live i64
+	Dead i64
+	Frozen i64
+	Pages i64
+}
+
 // LockMode is one of PostgreSQL's eight relation lock modes.
 type LockMode enum {
 	AccessShare
@@ -301,6 +315,52 @@ fn (m Manager) GlobalXmin() u32 {
 	}
 	if xmin < 3 { return 3 }
 	return xmin
+}
+
+// Vacuum scans a heap against the oldest snapshot horizon, freezes tuples older than it,
+// and drops commit-log pages entirely below the horizon. The M1 store has no prune hook,
+// so dead tuples are counted but their space is not reclaimed yet.
+fn (m mut Manager) Vacuum(rel store.RelId, opts VacuumOpts) !VacuumStats {
+	let horizon = m.GlobalXmin()
+	mut stats = VacuumStats{Live: 0, Dead: 0, Frozen: 0, Pages: 0}
+	mut maxPage = u32(0)
+	mut scan = m.store.HeapScan(rel)
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		let page = u32(tuple.Tid.Page())
+		if page+1 > maxPage { maxPage = page + 1 }
+		let xmin = tuple.Header.Xmin()
+		let xmax = tuple.Header.Xmax()
+		let dead = xmax != 0 && xmax < horizon && m.State(xmax) == XidState.Committed
+		if dead {
+			stats.Dead += 1
+			continue
+		}
+		stats.Live += 1
+		if opts.Freeze && xmin != 0 && xmin < horizon && tuple.Header.Infomask()&infXminFrozen != infXminFrozen {
+			m.store.SetHint(rel, tuple.Tid, infXminFrozen) catch _ { }
+			stats.Frozen += 1
+		}
+	}
+	stats.Pages = i64(maxPage)
+	m.truncateClog(horizon)
+	return stats
+}
+
+fn (m mut Manager) truncateClog(horizon u32) {
+	let keepFrom = horizon / clogPageXids
+	mut stale = []u32{}
+	for pageNo, _ in m.clog {
+		if pageNo < keepFrom {
+			stale = append(stale, pageNo)
+		}
+	}
+	for pageNo in stale {
+		delete(m.clog, pageNo)
+	}
 }
 
 fn (m mut Manager) releaseTxnSnapshots(xid u32) {

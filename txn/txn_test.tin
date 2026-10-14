@@ -844,3 +844,38 @@ fn TestXidLockWaits(t mut crucible.T) {
 	crucible.NoFault("xid lock returns once committed", m.LockXid(waiter, blocker.Xid()))
 	abortForTest(mut t, mut m, mut waiter)
 }
+
+fn TestVacuumFreezesAndCounts(t mut crucible.T) {
+	let (_, db0, manager) = testManager("vacuum") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create heap", db.CreateHeap(99))
+	mut writer = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let keepTid = m.HeapInsert(writer, 99, []u8{1}) catch err {
+		t.Error("insert keep: {err}")
+		return
+	}
+	let deleteTid = m.HeapInsert(writer, 99, []u8{2}) catch err {
+		t.Error("insert delete: {err}")
+		return
+	}
+	crucible.NoFault("commit writer", m.Commit(mut writer))
+	mut deleter = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	crucible.NoFault("delete", m.HeapDelete(deleter, 99, deleteTid))
+	crucible.NoFault("commit deleter", m.Commit(mut deleter))
+	let stats = m.Vacuum(99, VacuumOpts{Freeze: true, Full: false}) catch err {
+		t.Error("vacuum: {err}")
+		return
+	}
+	crucible.Equal(mut t, "dead tuple counted", stats.Dead, i64(1))
+	crucible.Equal(mut t, "live tuple counted", stats.Live, i64(1))
+	crucible.True("frozen at least the live tuple", stats.Frozen >= 1)
+	let keepRow = db.HeapFetch(99, keepTid, []u8{}) catch err {
+		t.Error("fetch keep: {err}")
+		return
+	}
+	crucible.Equal(mut t, "live tuple frozen hint set", keepRow.Header.Infomask()&infXminFrozen, infXminFrozen)
+}
