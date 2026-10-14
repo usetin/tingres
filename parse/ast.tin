@@ -809,6 +809,7 @@ type CreateSchemaStmt struct {
 	IfNotExists bool
 	Name Identifier
 	Authorization ?Identifier
+	Elements []Stmt
 }
 
 // CompositeAttribute is one attribute of a composite type.

@@ -171,6 +171,7 @@ fn deparseCreateSchema(v CreateSchemaStmt) str {
 	if v.IfNotExists { out += "IF NOT EXISTS " }
 	out += identifierText(v.Name)
 	if let auth = v.Authorization { out += " AUTHORIZATION " + identifierText(auth) }
+	for element in v.Elements { out += " " + deparseStatement(element) }
 	return out
 }
 

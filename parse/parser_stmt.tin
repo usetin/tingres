@@ -139,6 +139,7 @@ fn (p mut Parser) parseWith(pos i64) !WithClause {
 		}
 		try p.expect("(")
 		let query = try p.parseSelect()
+		try p.expect(")")
 		if p.eat("search") {
 			if p.eat("breadth") { } else { let _ = p.eat("depth") }
 			try p.expect("first")
@@ -158,7 +159,6 @@ fn (p mut Parser) parseWith(pos i64) !WithClause {
 				let _ = try p.parseExpression(0)
 			}
 		}
-		try p.expect(")")
 		ctes = append(ctes, CommonTableExpr{Pos: name.Pos, Name: name, Columns: columns, Materialized: materialized, Query: query})
 		if !p.eat(",") { break }
 	}
@@ -288,6 +288,14 @@ fn (p mut Parser) parseSelectCore(pos i64) !SelectCore {
 		}
 	} else { p.eat("all") }
 	let targets = try p.parseTargetList()
+	if p.eat("into") {
+		p.eat("temp")
+		p.eat("temporary")
+		p.eat("unlogged")
+		p.eat("table")
+		let _ = try p.parseQualifiedName()
+		if p.eat("using") { let _ = try p.parseIdentifier() }
+	}
 	mut from = []FromItem{}
 	mut where ?Expr = nil
 	mut groupBy = []GroupingElement{}
@@ -457,7 +465,15 @@ fn (p mut Parser) parseAlias() !?AliasClause {
 fn (p mut Parser) parseOptionalAliasColumns() ![]Identifier {
 	mut columns = []Identifier{}
 	if p.eat("(") {
-		columns = try p.parseIdentifierList(")")
+		for p.text() != ")" {
+			let name = try p.parseIdentifier()
+			columns = append(columns, name)
+			// A record-returning function alias may give a type per column: x(a int, b text).
+			if p.text() != "," && p.text() != ")" {
+				let _ = try p.parseTypeName()
+			}
+			if !p.eat(",") { break }
+		}
 		try p.expect(")")
 	}
 	return columns
@@ -482,6 +498,17 @@ fn (p mut Parser) parseAliasOnFrom(item FromItem) !FromItem {
 		}
 		Table(v) => {
 			mut alias = v.Alias
+			if p.eat("tablesample") {
+				let _ = try p.parseIdentifier()
+				try p.expect("(")
+				let _ = try p.parseExpression(0)
+				try p.expect(")")
+				if p.eat("repeatable") {
+					try p.expect("(")
+					let _ = try p.parseExpression(0)
+					try p.expect(")")
+				}
+			}
 			if alias == nil { alias = try p.parseAlias() }
 			FromItem.Table(TableRef{Pos: v.Pos, Name: v.Name, Alias: alias})
 		}
@@ -771,6 +798,29 @@ fn (p mut Parser) parseColumnDef() !ColumnDef {
 				try p.expect(")")
 			}
 			mut cons = TableConstraint{Pos: name.Pos, Kind: "foreign key", Columns: []Identifier{name}, References: refTable, ReferenceColumns: refCols}
+			for !p.done() {
+				if p.eat("match") {
+					cons.MatchType = lowerAscii(p.take().Text)
+				} else if p.eat("on") {
+					let actionPos = p.pos()
+					mut event = ""
+					if p.eat("delete") { event = "delete" } else if p.eat("update") { event = "update" } else { break }
+					mut action = ""
+					if p.eat("no") { try p.expect("action")
+						action = "no action" } else if p.eat("restrict") { action = "restrict" } else if p.eat("cascade") { action = "cascade" } else if p.eat("set") {
+						if p.eat("null") { action = "set null" } else { try p.expect("default")
+							action = "set default" }
+					} else { break }
+					cons.ReferenceActions = append(cons.ReferenceActions, ReferenceAction{Pos: actionPos, Event: event, Action: action})
+				} else if p.eat("deferrable") {
+					cons.Deferrable = "deferrable"
+				} else if p.eat("not") {
+					if p.eat("deferrable") { cons.Deferrable = "not deferrable" } else if p.eat("valid") { } else { break }
+				} else if p.eat("initially") {
+					if p.eat("deferred") { cons.Initially = "deferred" } else { try p.expect("immediate")
+						cons.Initially = "immediate" }
+				} else { break }
+			}
 			if let pending = pendingName { cons.Name = pending }
 			pendingName = nil
 			constraints = append(constraints, cons)
@@ -801,6 +851,8 @@ fn (p mut Parser) parseColumnDef() !ColumnDef {
 			}
 		} else if p.eat("constraint") {
 			pendingName = try p.parseIdentifier()
+		} else if p.eat("compression") {
+			let _ = try p.parseIdentifier()
 		} else if p.eat("with") {
 			try p.expect("options")
 		} else {

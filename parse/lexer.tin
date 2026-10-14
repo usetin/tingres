@@ -202,6 +202,24 @@ fn lex(sql str) ![]Token {
 fn scanNumber(sql str, start i64) i64 {
 	let n = len(sql)
 	mut at = start
+	if at + 1 < n && sql[at] == 48 {
+		let c1 = sql[at + 1]
+		if c1 == 120 || c1 == 88 {
+			at += 2
+			for at < n && (isHexDigit(sql[at]) || sql[at] == 95) { at += 1 }
+			return at
+		}
+		if c1 == 111 || c1 == 79 {
+			at += 2
+			for at < n && ((sql[at] >= 48 && sql[at] <= 55) || sql[at] == 95) { at += 1 }
+			return at
+		}
+		if c1 == 98 || c1 == 66 {
+			at += 2
+			for at < n && (sql[at] == 48 || sql[at] == 49 || sql[at] == 95) { at += 1 }
+			return at
+		}
+	}
 	if sql[at] == 46 {
 		at += 1
 		for at < n && (isDigit(sql[at]) || sql[at] == 95) { at += 1 }

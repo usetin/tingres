@@ -53,6 +53,22 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 	mut isDefault = false
 	mut values = []Expr{}
 
+	if (scope == "session" && lowerAscii(p.text()) == "authorization") || (lowerAscii(p.text()) == "session" && p.At + 1 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "authorization") {
+		if lowerAscii(p.text()) == "session" { p.At += 1 }
+		try p.expect("authorization")
+		name = "session authorization"
+		if !p.eat("to") {
+			p.eat("=")
+		}
+		if p.eat("default") {
+			isDefault = true
+		} else {
+			let val = try p.parseExpression(0)
+			values = append(values, val)
+		}
+		return VariableSetStmt{Pos: pos, Kind: "set", Scope: scope, Name: name, Values: values, Default: isDefault, Local: local}
+	}
+
 	if p.eat("time") {
 		try p.expect("zone")
 		name = "time zone"

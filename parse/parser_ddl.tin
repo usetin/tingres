@@ -138,12 +138,17 @@ fn (p mut Parser) parseCreateTableBody(pos i64, temporary str) !CreateTableStmt 
 			let ts = try p.parseQualifiedName()
 			tablespace = nameText(ts)
 		} else if p.eat("as") {
+			if p.text() == "execute" {
+				p.At += 1
+				let _ = try p.parseIdentifier()
+			} else {
 			asQuery = try p.parseSelect()
 			if p.eat("with") {
 				if p.eat("no") {
 					try p.expect("data")
 					withData = false
 				} else { try p.expect("data") }
+			}
 			}
 		} else { break }
 	}
@@ -295,14 +300,19 @@ fn (p mut Parser) parseCreateSchemaBody(pos i64) !CreateSchemaStmt {
 	mut authorization ?Identifier = nil
 	mut name = Identifier{}
 	if p.eat("authorization") {
-		let role = try p.parseIdentifier()
+		let role = try p.parseLabelIdentifier()
 		authorization = role
 		name = role
 	} else {
 		name = try p.parseIdentifier()
-		if p.eat("authorization") { authorization = try p.parseIdentifier() }
+		if p.eat("authorization") { authorization = try p.parseLabelIdentifier() }
 	}
-	return CreateSchemaStmt{Pos: pos, IfNotExists: ifNotExists, Name: name, Authorization: authorization}
+	mut elements = []Stmt{}
+	for !p.done() {
+		let element = try p.parseStatementDispatch()
+		elements = append(elements, element)
+	}
+	return CreateSchemaStmt{Pos: pos, IfNotExists: ifNotExists, Name: name, Authorization: authorization, Elements: elements}
 }
 
 fn (p mut Parser) parseCreateTypeBody(pos i64) !CreateTypeStmt {
