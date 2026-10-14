@@ -65,7 +65,9 @@ fn FromBool(v bool) Datum {
 }
 
 fn FromStr(oid Oid, v str) Datum {
-	return Datum{oid: oid, null: false, i: 0, f: 0.0, b: false, s: v, bytes: []u8{}}
+	mut text = v
+	if oid == NameOid { text = truncate_name(v) }
+	return Datum{oid: oid, null: false, i: 0, f: 0.0, b: false, s: text, bytes: []u8{}}
 }
 
 fn FromBytes(oid Oid, v []u8) Datum {
@@ -358,6 +360,13 @@ fn trim_ascii_spaces(b []u8) []u8 {
 		end -= 1
 	}
 	return b[start:end]
+}
+
+fn truncate_name(text str) str {
+	if len(text) <= 63 { return text }
+	mut end = i64(63)
+	for end > 0 && (text[end] & 0xc0) == 0x80 { end -= 1 }
+	return text[:end]
 }
 
 // ParseIntBytes parses a decimal integer from b without allocations.
