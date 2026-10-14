@@ -99,7 +99,8 @@ Errors use PostgreSQL SQLSTATEs: `42P01`, `42P07`, `42701`, `42703`, `42P06`, `3
 hiding, cross-transaction visibility, abort restores); reopen persistence; SQLSTATEs;
 sequences; ALTER TABLE; indexes and schemas; the planner surface (index keys, reltuples,
 pg_statistic slots); the built-in information_schema views; CHECK/foreign-key/primary
-constraints (11 tests).
+constraints; default search_path (`pg_catalog`, `$user`, `public`) and `pg_temp`
+(12 tests).
 
 ## information_schema
 

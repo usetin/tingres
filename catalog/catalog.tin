@@ -209,7 +209,7 @@ fn (c Catalog) SearchPath(t txn.Txn) []str {
 	if ok {
 		return path
 	}
-	return []str{"pg_catalog", "public"}
+	return []str{"pg_catalog", "$user", "public"}
 }
 
 // SetSearchPath sets the transaction-local schema search order.
@@ -301,7 +301,7 @@ fn isRelationKind(kind str) bool {
 }
 
 fn (c Catalog) namespaceOid(snap txn.Snapshot, schema str) u32 {
-	if schema == "pg_temp" {
+	if schema == "" || schema == "$user" {
 		return 0
 	}
 	for row in c.rows["pg_namespace"] {
