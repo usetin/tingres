@@ -64,16 +64,28 @@ fn segmentOffset(lsn u64) i64 {
 fn crc32c(b []u8) u32 {
 	mut crc = u32(0xffffffff)
 	for x in b {
-		crc ^= u32(x)
-		for _i in 0..8 {
-			if crc&1 != 0 {
-				crc = (crc >> 1) ^ u32(0x82f63b78)
-			} else {
-				crc >>= 1
-			}
-		}
+		crc = (crc >> 8) ^ crc32cTable[(crc ^ u32(x)) & u32(0xff)]
 	}
 	return crc ^ u32(0xffffffff)
+}
+
+// crc32cTable is the Castagnoli reflected CRC lookup table, built once per process.
+let crc32cTable = buildCrc32cTable()
+
+fn buildCrc32cTable() []u32 {
+	mut t = make([]u32, 256)
+	for i in 0..256 {
+		mut c = u32(i)
+		for _k in 0..8 {
+			if c&1 != 0 {
+				c = (c >> 1) ^ u32(0x82f63b78)
+			} else {
+				c >>= 1
+			}
+		}
+		t[i] = c
+	}
+	return t
 }
 
 fn walEncode(kind u8, flags u8, rel u32, block u32, slot u16, body []u8) []u8 {

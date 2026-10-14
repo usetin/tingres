@@ -1,0 +1,21 @@
+package stats
+
+// EstimateReltuples applies PostgreSQL's density update rule.
+// oldReltuples/oldRelPages describe the previous estimate; newRelPages is
+// the current page count. If oldRelPages is zero, newRelPages is used as
+// the estimate base.
+fn EstimateReltuples(oldReltuples f64, oldRelPages i64, newRelPages i64) f64 {
+	if oldRelPages <= 0 {
+		if newRelPages <= 0 { return 0 }
+		return f64(newRelPages)
+	}
+	let density = oldReltuples / f64(oldRelPages)
+	let est = density * f64(newRelPages)
+	if est < 0 { return 0 }
+	return est
+}
+
+// UpdateRelPages is the convenience helper used after vacuum/analyze.
+fn UpdateRelPages(oldReltuples f64, oldRelPages i64, newRelPages i64) i64 {
+	return newRelPages
+}

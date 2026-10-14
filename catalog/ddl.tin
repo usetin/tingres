@@ -193,6 +193,49 @@ fn (c mut Catalog) writeDepend(t txn.Txn, classid u32, objid u32, objsubid i64, 
 	_ = try c.insertRow(t, "pg_depend", row)
 }
 
+// writeConstraint records a pg_constraint row for a primary/unique/check/foreign key.
+fn (c mut Catalog) writeConstraint(t txn.Txn, snap txn.Snapshot, tableOid u32, name str, contype str, indexOid u32, refTable u32, cols []i16, expr str) ! {
+	let ns = c.relationNamespace(snap, tableOid)
+	let oid = c.nextOid
+	c.nextOid += 1
+	mut vals = make(map[str]types.Datum)
+	vals["oid"] = types.FromI64(26, i64(oid))
+	vals["conname"] = types.FromStr(25, twine.Clone(name))
+	vals["connamespace"] = types.FromI64(26, i64(ns))
+	vals["contype"] = types.FromStr(25, twine.Clone(contype))
+	vals["condeferrable"] = types.FromBool(false)
+	vals["convalidated"] = types.FromBool(true)
+	vals["conrelid"] = types.FromI64(26, i64(tableOid))
+	vals["contypid"] = types.FromI64(26, 0)
+	vals["conindid"] = types.FromI64(26, i64(indexOid))
+	vals["conparentid"] = types.FromI64(26, 0)
+	vals["confrelid"] = types.FromI64(26, i64(refTable))
+	vals["confupdtype"] = types.FromStr(25, "a")
+	vals["confdeltype"] = types.FromStr(25, "a")
+	vals["confmatchtype"] = types.FromStr(25, "s")
+	vals["conislocal"] = types.FromBool(true)
+	vals["coninhcount"] = types.FromI64(21, 0)
+	vals["connoinherit"] = types.FromBool(false)
+	vals["conkey"] = types.FromStr(25, int16ArrayText(cols))
+	vals["confkey"] = types.FromStr(25, "")
+	vals["conbin"] = types.FromStr(25, twine.Clone(expr))
+	_ = try c.insertRow(t, "pg_constraint", c.buildRow("pg_constraint", vals))
+}
+
+fn int16ArrayText(cols []i16) str {
+	if len(cols) == 0 {
+		return ""
+	}
+	mut out = "{{"
+	for i, col in cols {
+		if i > 0 {
+			out = out + ","
+		}
+		out = out + mint.Itoa(i64(col))
+	}
+	return out + "}}"
+}
+
 // CreateTable allocates an oid and relfilenode, creates the heap, and writes
 // pg_class, pg_attribute, pg_type (rowtype) and pg_depend rows.
 fn (c mut Catalog) CreateTable(t txn.Txn, def TableDef) !Table {
@@ -242,15 +285,29 @@ fn (c mut Catalog) CreateTable(t txn.Txn, def TableDef) !Table {
 	try c.writeType(t, rowType, tableName, ns, oid, "c")
 	if len(def.PrimaryKey) > 0 {
 		let idxName = tableName + "_pkey"
-		let idx = try c.createIndex(t, snap, oid, idxName, true, true, def.PrimaryKey)
-		_ = idx
+		let idx = try c.createIndex(t, snap, oid, idxName, true, true, def.PrimaryKey, []IndexKey{})
+		try c.writeConstraint(t, snap, oid, idxName, "p", idx.Oid, 0, def.PrimaryKey, "")
+	}
+	for check in def.Checks {
+		mut cname = check.Name
+		if cname == "" {
+			cname = tableName + "_check"
+		}
+		try c.writeConstraint(t, snap, oid, cname, "c", 0, 0, []i16{}, check.Expr)
+	}
+	for fk in def.ForeignKeys {
+		mut fname = fk.Name
+		if fname == "" {
+			fname = tableName + "_fkey"
+		}
+		try c.writeConstraint(t, snap, oid, fname, "f", 0, fk.RefTable, fk.Columns, "")
 	}
 	c.version += 1
 	c.reload()
 	return Table{Oid: oid, Schema: schema, Name: tableName, Cols: cols, Rel: rel, Indexes: []Index{}, System: false, Owner: 10, Kind: "r", RowType: rowType}
 }
 
-fn (c mut Catalog) createIndex(t txn.Txn, snap txn.Snapshot, tableOid u32, name str, unique bool, primary bool, cols []i16) !Index {
+fn (c mut Catalog) createIndex(t txn.Txn, snap txn.Snapshot, tableOid u32, name str, unique bool, primary bool, cols []i16, keys []IndexKey) !Index {
 	let ns = c.relationNamespace(snap, tableOid)
 	let oid = c.nextOid
 	let rel = c.nextRel
@@ -292,7 +349,8 @@ fn (c mut Catalog) createIndex(t txn.Txn, snap txn.Snapshot, tableOid u32, name 
 		try c.deleteRow(t, "pg_class", classRow)
 		_ = try c.insertRow(t, "pg_class", c.buildRow("pg_class", vals))
 	}
-	return Index{Oid: oid, Name: name, Rel: rel, Unique: unique, Cols: cols}
+	let indexKeys = c.normalizeKeys(cols, keys)
+	return Index{Oid: oid, Name: name, Rel: rel, Unique: unique, Primary: primary, Cols: cols, Keys: indexKeys}
 }
 
 fn (c Catalog) relationNamespace(snap txn.Snapshot, oid u32) u32 {
@@ -320,10 +378,21 @@ fn (c mut Catalog) CreateIndex(t txn.Txn, def IndexDef) !Index {
 	if c.namespaceOid(snap, c.namespaceName(snap, ns)) != 0 && c.relationNamed(snap, ns, def.Name) != 0 {
 		fail "42P07 relation \"{def.Name}\" already exists"
 	}
-	let idx = try c.createIndex(t, snap, def.Table.Oid, def.Name, def.Unique, def.Primary, def.Cols)
+	let idx = try c.createIndex(t, snap, def.Table.Oid, def.Name, def.Unique, def.Primary, def.Cols, def.Keys)
 	c.version += 1
 	c.reload()
 	return idx
+}
+
+fn (c Catalog) normalizeKeys(cols []i16, keys []IndexKey) []IndexKey {
+	if len(keys) > 0 {
+		return keys
+	}
+	mut out = []IndexKey{}
+	for col in cols {
+		out = append(out, IndexKey{Attnum: col, Desc: false, NullsFirst: false})
+	}
+	return out
 }
 
 fn (c Catalog) relationNamed(snap txn.Snapshot, ns u32, name str) u32 {
@@ -872,14 +941,82 @@ fn (c mut Catalog) AnalyzeTable(t txn.Txn, tbl Table) ! {
 		mut vals = make(map[str]types.Datum)
 		vals["starelid"] = types.FromI64(26, i64(tbl.Oid))
 		vals["staattnum"] = types.FromI64(21, i64(col.Number))
+		vals["stainherit"] = types.FromBool(false)
 		vals["stanullfrac"] = types.FromF64(701, frac)
 		vals["stawidth"] = types.FromI64(23, 0)
 		vals["stadistinct"] = types.FromF64(701, -1.0)
-		vals["stavalues"] = types.FromStr(25, "")
+		vals["stakind1"] = types.FromI64(21, 0)
+		vals["stanumbers1"] = types.FromStr(25, "")
+		vals["stavalues1"] = types.FromStr(25, "")
 		_ = try c.insertRow(t, "pg_statistic", c.buildRow("pg_statistic", vals))
 	}
 	c.version += 1
 	c.reload()
+}
+
+// TableConstraints returns the recorded pg_constraint rows for a relation.
+fn (c Catalog) TableConstraints(t txn.Txn, tableOid Oid) []Constraint {
+	let snap = c.Manager.Snapshot(t)
+	mut out = []Constraint{}
+	for row in c.rows["pg_constraint"] {
+		if !c.visible(snap, "pg_constraint", row) {
+			continue
+		}
+		if u32(c.intField("pg_constraint", row, "conrelid")) != tableOid {
+			continue
+		}
+		out = append(out, Constraint{
+			Oid: u32(c.intField("pg_constraint", row, "oid")),
+			Name: c.textField("pg_constraint", row, "conname"),
+			Type: c.textField("pg_constraint", row, "contype"),
+			Key: parseInt16Array(c.textField("pg_constraint", row, "conkey")),
+			RefTable: u32(c.intField("pg_constraint", row, "confrelid")),
+			RefKey: parseInt16Array(c.textField("pg_constraint", row, "confkey")),
+			Expr: c.textField("pg_constraint", row, "conbin"),
+		})
+	}
+	return out
+}
+
+fn parseInt16Array(text str) []i16 {
+	if len(text) < 2 || text[0] != '{' {
+		return []i16{}
+	}
+	let body = text[1 : len(text)-1]
+	if body == "" {
+		return []i16{}
+	}
+	mut out = []i16{}
+	for part in twine.Split(body, ",") {
+		let n = mint.Atoi(part) catch _ { 0 }
+		out = append(out, i16(n))
+	}
+	return out
+}
+
+// ColumnStatistics returns pg_statistic-shaped slots for a relation's columns.
+fn (c Catalog) ColumnStatistics(t txn.Txn, tableOid Oid) []ColumnStat {
+	let snap = c.Manager.Snapshot(t)
+	mut out = []ColumnStat{}
+	for row in c.rows["pg_statistic"] {
+		if !c.visible(snap, "pg_statistic", row) {
+			continue
+		}
+		if u32(c.intField("pg_statistic", row, "starelid")) != tableOid {
+			continue
+		}
+		out = append(out, ColumnStat{
+			Attnum: i16(c.intField("pg_statistic", row, "staattnum")),
+			Inherit: c.boolField("pg_statistic", row, "stainherit"),
+			NullFrac: c.floatField("pg_statistic", row, "stanullfrac"),
+			Width: i32(c.intField("pg_statistic", row, "stawidth")),
+			Distinct: c.floatField("pg_statistic", row, "stadistinct"),
+			Kind: i16(c.intField("pg_statistic", row, "stakind1")),
+			Numbers: []f64{},
+			Values: []str{},
+		})
+	}
+	return out
 }
 
 // Statistic returns the stored null fraction for a column.

@@ -32,13 +32,45 @@ type ColumnDef struct {
 	NotNull bool
 }
 
+// IndexKey is one index key column with its ordering.
+type IndexKey struct {
+	Attnum i16
+	Desc bool
+	NullsFirst bool
+}
+
 // Index describes an index attached to a table.
 type Index struct {
 	Oid Oid
 	Name str
 	Rel u32
 	Unique bool
+	Primary bool
 	Cols []i16
+	Keys []IndexKey
+}
+
+// Constraint is one recorded pg_constraint row.
+type Constraint struct {
+	Oid Oid
+	Name str
+	Type str
+	Key []i16
+	RefTable Oid
+	RefKey []i16
+	Expr str
+}
+
+// ColumnStat is a pg_statistic-shaped slot for one column.
+type ColumnStat struct {
+	Attnum i16
+	Inherit bool
+	NullFrac f64
+	Width i32
+	Distinct f64
+	Kind i16
+	Numbers []f64
+	Values []str
 }
 
 // Table is a catalog relation descriptor.
@@ -57,6 +89,24 @@ type Table struct {
 	Owner u32
 	Kind str
 	RowType u32
+	RelTuples f64
+	RelPages i32
+}
+
+// CheckDef is one CHECK constraint expression.
+type CheckDef struct {
+	Name str
+	Expr str
+}
+
+// ForeignKeyDef is one foreign key constraint.
+type ForeignKeyDef struct {
+	Name str
+	Columns []i16
+	RefTable Oid
+	RefColumns []i16
+	OnDelete str
+	OnUpdate str
 }
 
 // TableDef describes a table to create.
@@ -65,6 +115,8 @@ type TableDef struct {
 	Name str
 	Columns []ColumnDef
 	PrimaryKey []i16
+	Checks []CheckDef
+	ForeignKeys []ForeignKeyDef
 }
 
 // IndexDef describes an index to create.
@@ -74,6 +126,7 @@ type IndexDef struct {
 	Unique bool
 	Cols []i16
 	Primary bool
+	Keys []IndexKey
 }
 
 // SequenceDef describes a CREATE SEQUENCE.
@@ -297,6 +350,8 @@ fn (c Catalog) tableFromClass(snap txn.Snapshot, row RawRow) ?Table {
 		Owner: u32(c.intField("pg_class", row, "relowner")),
 		Kind: c.textField("pg_class", row, "relkind"),
 		RowType: u32(c.intField("pg_class", row, "reltype")),
+		RelTuples: c.floatField("pg_class", row, "reltuples"),
+		RelPages: i32(c.intField("pg_class", row, "relpages")),
 	}
 }
 
@@ -378,6 +433,7 @@ fn (c Catalog) indexesFor(snap txn.Snapshot, oid u32) []Index {
 			Name: c.relationName(snap, idxOid),
 			Rel: c.relationFilenode(snap, idxOid),
 			Unique: c.boolField("pg_index", row, "indisunique"),
+			Primary: c.boolField("pg_index", row, "indisprimary"),
 		})
 	}
 	return out

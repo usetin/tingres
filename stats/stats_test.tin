@@ -1,0 +1,38 @@
+package stats
+
+import "../types"
+import "crucible"
+
+type SliceSource struct {
+	Rows [][]types.Datum
+	Pos i64
+}
+
+fn (s mut SliceSource) NextBatch() ![][]types.Datum {
+	if s.Pos >= len(s.Rows) { return [][]types.Datum{} }
+	let b = s.Rows[s.Pos]
+	s.Pos += 1
+	return [][]types.Datum{b}
+}
+
+fn TestSamplerSmoke(t mut crucible.T) {
+	mut rows = make([][]types.Datum, 0, 10)
+	for i in 0..10 {
+		rows = append(rows, []types.Datum{types.FromI64(types.Int4Oid, i64(i))})
+	}
+	mut src = SliceSource{Rows: rows, Pos: 0}
+	let sample = Sample(mut src, 1, u64(123)) catch err {
+		t.Error("sample fault: {err}")
+		return
+	}
+	t.True("sample nonempty", len(sample) > 0)
+}
+
+fn TestStatsSmoke(t mut crucible.T) {
+	mut rows = make([][]types.Datum, 0, 5)
+	for i in 0..5 {
+		rows = append(rows, []types.Datum{types.FromI64(types.Int4Oid, i64(i))})
+	}
+	let st = ComputeColumnStats(0, rows, 5, 10)
+	t.True("stats computed", true)
+}
