@@ -669,6 +669,7 @@ type TableConstraint struct {
 	MatchType str
 	Include []Identifier
 	Where ?Expr
+	Raw str
 }
 
 // LikeClause stores CREATE TABLE LIKE options.
@@ -825,6 +826,7 @@ type CreateTypeStmt struct {
 	Kind str
 	Labels []str
 	Attributes []CompositeAttribute
+	RangeOptions str
 }
 
 // FunctionParameter is one CREATE FUNCTION parameter.
@@ -980,6 +982,7 @@ type CommentStmt struct {
 	ObjectType str
 	Name QualifiedName
 	Text ?str
+	OnName ?QualifiedName
 }
 
 // GrantStmt stores GRANT privileges and recipients.

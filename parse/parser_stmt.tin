@@ -135,6 +135,25 @@ fn (p mut Parser) parseWith(pos i64) !WithClause {
 		}
 		try p.expect("(")
 		let query = try p.parseSelect()
+		if p.eat("search") {
+			if p.eat("breadth") { } else { let _ = p.eat("depth") }
+			try p.expect("first")
+			try p.expect("by")
+			let _ = try p.parseIdentifierList("set")
+			try p.expect("set")
+			let _ = try p.parseIdentifier()
+		}
+		if p.eat("cycle") {
+			let _ = try p.parseIdentifierList("set")
+			try p.expect("set")
+			let _ = try p.parseIdentifier()
+			if p.eat("using") { let _ = try p.parseIdentifier() }
+			if p.eat("to") {
+				let _ = try p.parseExpression(0)
+				try p.expect("default")
+				let _ = try p.parseExpression(0)
+			}
+		}
 		try p.expect(")")
 		ctes = append(ctes, CommonTableExpr{Pos: name.Pos, Name: name, Columns: columns, Materialized: materialized, Query: query})
 		if !p.eat(",") { break }
@@ -345,7 +364,7 @@ fn (p mut Parser) parseFromItem() !FromItem {
 			if natural || joinType != "inner" { try p.errorHere() }
 			break
 		}
-		let right = try p.parseFromAtom(false)
+		let right = try p.parseFromAtom(p.eat("lateral"))
 		mut condition ?JoinCondition = nil
 		if p.eat("on") {
 			let value = try p.parseExpression(0)
@@ -359,7 +378,7 @@ fn (p mut Parser) parseFromItem() !FromItem {
 		} else if joinType != "cross" && !natural { try p.errorHere() }
 		item = FromItem.Join(JoinExpr{Pos: joinPos, Left: item, Right: right, JoinType: joinType, Natural: natural, Condition: condition})
 	}
-	return item
+	return try p.parseAliasOnFrom(item)
 }
 
 fn ifPosition(p Parser) i64 {
@@ -386,6 +405,11 @@ fn (p mut Parser) parseFromAtom(lateral bool) !FromItem {
 	} else {
 		let name = try p.parseQualifiedName()
 		if p.text() == "(" {
+			if inWords(lowerAscii(name.Parts[len(name.Parts) - 1].Name), opaqueFunctionWords) {
+				let inner = p.captureParenInner()
+				let rawExpr = Expr.Literal(LiteralExpr{Pos: name.Pos, Kind: "raw", Value: nameText(name) + "(" + inner + ")"})
+				item = FromItem.Function(FunctionRef{Pos: name.Pos, Function: rawExpr, Alias: nil, Lateral: lateral})
+			} else {
 			let function = try p.parseFunction(name.Pos, name)
 			mut withOrdinality = false
 			if p.eat("with") {
@@ -393,6 +417,7 @@ fn (p mut Parser) parseFromAtom(lateral bool) !FromItem {
 				withOrdinality = true
 			}
 			item = FromItem.Function(FunctionRef{Pos: name.Pos, Function: function, Alias: nil, Lateral: lateral, WithOrdinality: withOrdinality})
+			}
 		} else {
 			item = FromItem.Table(TableRef{Pos: name.Pos, Name: name})
 		}
@@ -403,9 +428,20 @@ fn (p mut Parser) parseFromAtom(lateral bool) !FromItem {
 fn (p mut Parser) parseAlias() !?AliasClause {
 	mut alias ?AliasClause = nil
 	if p.eat("as") {
-		let name = try p.parseLabelIdentifier()
-		let columns = try p.parseOptionalAliasColumns()
-		alias = AliasClause{Pos: name.Pos, Name: name, Columns: columns}
+		if p.text() == "(" {
+			// A record-returning function's column definition list: func(...) AS (name type, ...).
+			p.At += 1
+			for p.text() != ")" {
+				let _ = try p.parseIdentifier()
+				let _ = try p.parseTypeName()
+				if !p.eat(",") { break }
+			}
+			try p.expect(")")
+		} else {
+			let name = try p.parseLabelIdentifier()
+			let columns = try p.parseOptionalAliasColumns()
+			alias = AliasClause{Pos: name.Pos, Name: name, Columns: columns}
+		}
 	} else if p.canBeIdentifier() && !isFromClause(p.text()) {
 		let name = try p.parseLabelIdentifier()
 		let columns = try p.parseOptionalAliasColumns()
@@ -444,6 +480,11 @@ fn (p mut Parser) parseAliasOnFrom(item FromItem) !FromItem {
 			mut alias = v.Alias
 			if alias == nil { alias = try p.parseAlias() }
 			FromItem.Table(TableRef{Pos: v.Pos, Name: v.Name, Alias: alias})
+		}
+		Join(v) => {
+			mut alias = v.Alias
+			if alias == nil { alias = try p.parseAlias() }
+			FromItem.Join(JoinExpr{Pos: v.Pos, Left: v.Left, Right: v.Right, JoinType: v.JoinType, Natural: v.Natural, Condition: v.Condition, Alias: alias})
 		}
 		_ => item
 	}
@@ -513,6 +554,16 @@ fn (p mut Parser) parseIdentifierList(end str) ![]Identifier {
 	for {
 		let value = try p.parseIdentifier()
 		values = append(values, value)
+		for p.eat("[") {
+			mut depth = 1
+			for depth > 0 && !p.done() {
+				let t = p.take().Text
+				if t == "[" { depth += 1 } else if t == "]" { depth -= 1 }
+			}
+		}
+		for p.eat(".") {
+			let _ = try p.parseIdentifier()
+		}
 		if !p.eat(",") { break }
 	}
 	return values
@@ -599,6 +650,17 @@ fn (p mut Parser) parseAssignments() ![]Assignment {
 			let column = try p.parseIdentifier()
 			columns = []Identifier{column}
 		}
+		for !p.done() {
+			if p.eat("[") {
+				mut depth = 1
+				for depth > 0 && !p.done() {
+					let t = p.take().Text
+					if t == "[" { depth += 1 } else if t == "]" { depth -= 1 }
+				}
+			} else if p.eat(".") {
+				let _ = try p.parseIdentifier()
+			} else { break }
+		}
 		try p.expect("=")
 		let value = try p.parseExpression(0)
 		assignments = append(assignments, Assignment{Pos: pos, Columns: columns, Value: value})
@@ -656,7 +718,8 @@ fn (p mut Parser) parseCreate() !Stmt {
 
 fn (p mut Parser) parseColumnDef() !ColumnDef {
 	let name = try p.parseIdentifier()
-	let typeName = try p.parseTypeName()
+	mut typeName = TypeName{Pos: name.Pos, Name: QualifiedName{Pos: name.Pos, Parts: []Identifier{}}, Modifiers: []TypeModifier{}, ArrayBounds: []ArrayBound{}, WithTimeZone: false, IntervalFields: ""}
+	if !columnOptionStart(p) { typeName = try p.parseTypeName() }
 	mut defaultExpr ?Expr = nil
 	mut nullability = "default"
 	mut collation ?QualifiedName = nil
@@ -743,7 +806,18 @@ fn (p mut Parser) parseColumnDef() !ColumnDef {
 	return ColumnDef{Pos: name.Pos, Name: name, TypeName: typeName, Default: defaultExpr, Nullability: nullability, Collation: collation, Constraints: constraints, Generated: generated, GeneratedExpr: generatedExpr, Identity: identity}
 }
 
+// columnOptionStart reports whether the token after a column name begins column options rather
+// than a type, so type-less column entries (CREATE TABLE ... AS (c), PARTITION OF (b WITH
+// OPTIONS ...)) parse.
+fn columnOptionStart(p Parser) bool {
+	if p.done() { return true }
+	let text = p.text()
+	if text == "," || text == ")" { return true }
+	return inWords(lowerAscii(text), "with not null default check constraint references primary unique generated collate")
+}
+
 fn (p mut Parser) parseTableConstraint(pos i64, name ?Identifier) !TableConstraint {
+	let startByte = p.bytePos()
 	mut kind = ""
 	mut columns = []Identifier{}
 	mut expressions = []Expr{}
@@ -759,11 +833,17 @@ fn (p mut Parser) parseTableConstraint(pos i64, name ?Identifier) !TableConstrai
 	} else if p.eat("foreign") {
 		try p.expect("key")
 		kind = "foreign key"
+	} else if p.eat("exclude") {
+		return try p.parseExcludeConstraint(pos, startByte, name)
 	} else { try p.errorHere() }
 	if kind != "check" {
-		try p.expect("(")
-		columns = try p.parseIdentifierList(")")
-		try p.expect(")")
+		if p.text() == "(" {
+			try p.expect("(")
+			columns = try p.parseIdentifierList(")")
+			try p.expect(")")
+		} else if kind == "foreign key" {
+			try p.errorHere()
+		}
 	}
 	mut references ?QualifiedName = nil
 	mut referenceColumns = []Identifier{}
@@ -818,13 +898,61 @@ fn (p mut Parser) parseTableConstraint(pos i64, name ?Identifier) !TableConstrai
 			if p.text() == "(" { let _ = p.captureParenInner() } else { break }
 		} else if p.eat("using") {
 			try p.expect("index")
-			try p.expect("tablespace")
-			let _ = try p.parseQualifiedName()
+			if p.eat("tablespace") {
+				let _ = try p.parseQualifiedName()
+			} else {
+				let _ = try p.parseQualifiedName()
+			}
 		} else if p.eat("no") {
 			try p.expect("inherit")
 		} else { break }
 	}
 	return TableConstraint{Pos: pos, Name: name, Kind: kind, Columns: columns, Expressions: expressions, References: references, ReferenceColumns: referenceColumns, MatchType: matchType, ReferenceActions: referenceActions, Deferrable: deferrable, Initially: initially, Include: include}
+}
+
+// parseExcludeConstraint parses an EXCLUDE constraint. Its element list (col WITH operator,
+// ...) and the trailing clauses are preserved verbatim in Raw so deparse is exact.
+fn (p mut Parser) parseExcludeConstraint(pos i64, startByte i64, name ?Identifier) !TableConstraint {
+	if p.eat("using") {
+		let _ = try p.parseQualifiedName()
+	}
+	try p.expect("(")
+	for p.text() != ")" {
+		if p.eat("(") {
+			let _ = try p.parseExpression(0)
+			try p.expect(")")
+		} else {
+			let _ = try p.parseIdentifier()
+		}
+		if p.eat("with") {
+			let _ = p.take()
+		}
+		if p.canBeIdentifier() && p.text() != "asc" && p.text() != "desc" && p.text() != "nulls" {
+			let _ = try p.parseQualifiedName()
+		}
+		if p.eat("asc") { } else if p.eat("desc") { }
+		if p.eat("nulls") {
+			if p.eat("first") { } else { try p.expect("last") }
+		}
+		if !p.eat(",") { break }
+	}
+	try p.expect(")")
+	for !p.done() {
+		if p.eat("where") {
+			let _ = p.captureParenInner()
+		} else if p.eat("with") {
+			if p.text() == "(" { let _ = p.captureParenInner() } else { break }
+		} else if p.eat("using") {
+			try p.expect("index")
+			if p.eat("tablespace") { let _ = try p.parseQualifiedName() } else { let _ = try p.parseQualifiedName() }
+		} else if p.eat("deferrable") { } else if p.eat("not") {
+			if !p.eat("deferrable") { let _ = p.eat("valid") }
+		} else if p.eat("initially") {
+			if !p.eat("deferred") { try p.expect("immediate") }
+		} else { break }
+	}
+	let raw = p.Source[startByte:p.Tokens[p.At - 1].EndBytePos]
+	return TableConstraint{Pos: pos, Name: name, Kind: "exclude", Raw: raw}
 }
 
 fn (p mut Parser) parseTransaction() !TransactionStmt {
@@ -837,6 +965,9 @@ fn (p mut Parser) parseTransaction() !TransactionStmt {
 	if command == "start" {
 		try p.expect("transaction")
 		kind = "begin"
+	} else if command == "set" {
+		try p.expect("transaction")
+		kind = "set transaction"
 	} else if command == "end" { kind = "commit" } else if command == "abort" { kind = "rollback" }
 	if kind == "commit" || kind == "rollback" {
 		p.eat("work")
@@ -854,10 +985,13 @@ fn (p mut Parser) parseTransaction() !TransactionStmt {
 	}
 	if kind == "begin" && p.eat("transaction") { }
 	if kind == "begin" && p.eat("work") { }
-	if kind == "begin" || kind == "start" {
+	if kind == "begin" || kind == "start" || kind == "set transaction" {
 		for {
 			let modePos = p.pos()
-			if p.eat("isolation") {
+			if p.eat("snapshot") {
+				let value = p.take().Text
+				modes = append(modes, TransactionMode{Pos: modePos, Kind: "snapshot", Value: value})
+			} else if p.eat("isolation") {
 				try p.expect("level")
 				mut level = ""
 				if p.eat("serializable") {

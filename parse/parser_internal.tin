@@ -5,7 +5,7 @@ package parse
 // by a dedicated AST node yet.
 const utilityStatementWords = "reindex cluster refresh declare fetch move close merge security load"
 const alterTableActionWords = "attach detach enable disable set reset validate cluster inherit no of not replica force"
-const opaqueFunctionWords = "json_value json_query json_exists json_scalar json_serialize json_table json_array json_arrayagg json_object json_objectagg jsonb_path_query jsonb_path_query_array jsonb_path_query_first jsonb_path_match jsonb_path_exists jsonb_path_agg xmlexists xmltable xpath xpath_exists"
+const opaqueFunctionWords = "json_value json_query json_exists json_scalar json_serialize json_table json_array json_arrayagg json_object json_objectagg jsonb_path_query jsonb_path_query_array jsonb_path_query_first jsonb_path_match jsonb_path_exists jsonb_path_agg xmlexists xmltable xpath xpath_exists xmlelement xmlforest xmlparse xmlserialize xmlpi xmlroot xmlconcat xmlagg xmlattributes"
 const createObjectWords = "aggregate cast collation conversion database domain event extension foreign language materialized operator policy publication rule server statistics subscription tablespace text transform trigger access procedure user recursive global local"
 const alterObjectWords = "aggregate cast collation conversion database domain event extension foreign language materialized operator policy publication rule server statistics subscription tablespace text transform trigger access procedure schema function index view sequence type default large"
 
@@ -201,6 +201,13 @@ fn (p mut Parser) parseTypeName() !TypeName {
 	if !p.done() { start = p.Tokens[p.At].Pos }
 	let first = try p.parseIdentifier()
 	mut parts = []Identifier{first}
+	for p.eat(".") {
+		let part = try p.parseIdentifier()
+		parts = append(parts, part)
+	}
+	if p.text() == "%" && p.At + 1 < len(p.Tokens) && (lowerAscii(p.Tokens[p.At + 1].Text) == "type" || lowerAscii(p.Tokens[p.At + 1].Text) == "rowtype") {
+		p.At += 2
+	}
 	mut withTimeZone = false
 	mut intervalFields = ""
 	let firstName = lowerAscii(first.Name)

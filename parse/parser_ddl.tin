@@ -81,7 +81,7 @@ fn (p mut Parser) parseCreateTableBody(pos i64, temporary str) !CreateTableStmt 
 				let name = try p.parseIdentifier()
 				let constraint = try p.parseTableConstraint(elementPos, name)
 				elements = append(elements, TableElement.Constraint(constraint))
-			} else if p.text() == "primary" || p.text() == "unique" || p.text() == "check" || p.text() == "foreign" {
+			} else if p.text() == "primary" || p.text() == "unique" || p.text() == "check" || p.text() == "foreign" || p.text() == "exclude" {
 				let constraint = try p.parseTableConstraint(elementPos, nil)
 				elements = append(elements, TableElement.Constraint(constraint))
 			} else {
@@ -172,9 +172,22 @@ fn (p mut Parser) parseCreateIndexBody(pos i64, unique bool) !CreateIndexStmt {
 		if p.eat("(") {
 			expression = try p.parseExpression(0)
 			try p.expect(")")
+		} else if p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "(" {
+			expression = try p.parseExpression(0)
 		} else { keyName = try p.parseIdentifier() }
 		mut opclass ?QualifiedName = nil
-		if p.canBeIdentifier() && p.text() != "asc" && p.text() != "desc" && p.text() != "nulls" { opclass = try p.parseQualifiedName() }
+		if p.canBeIdentifier() && p.text() != "asc" && p.text() != "desc" && p.text() != "nulls" {
+			opclass = try p.parseQualifiedName()
+			if p.eat("(") {
+				if p.text() != ")" {
+					for {
+						let _ = try p.parseExpression(0)
+						if !p.eat(",") { break }
+					}
+				}
+				try p.expect(")")
+			}
+		}
 		mut direction = ""
 		mut nulls = ""
 		if p.eat("asc") { direction = "asc" } else if p.eat("desc") { direction = "desc" }
@@ -296,6 +309,7 @@ fn (p mut Parser) parseCreateTypeBody(pos i64) !CreateTypeStmt {
 	mut kind = ""
 	mut labels = []str{}
 	mut attributes = []CompositeAttribute{}
+	mut rangeOptions = ""
 	if p.eat("enum") {
 		kind = "enum"
 		try p.expect("(")
@@ -305,9 +319,13 @@ fn (p mut Parser) parseCreateTypeBody(pos i64) !CreateTypeStmt {
 			if !p.eat(",") { break }
 		}
 		try p.expect(")")
+	} else if p.text() == "range" && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "(" {
+		p.At += 1
+		kind = "range"
+		rangeOptions = p.captureParenInner()
 	} else if p.eat("(") {
 		kind = "composite"
-		for {
+		for p.text() != ")" {
 			let attributeName = try p.parseIdentifier()
 			let typeName = try p.parseTypeName()
 			attributes = append(attributes, CompositeAttribute{Pos: attributeName.Pos, Name: attributeName, TypeName: typeName})
@@ -315,7 +333,7 @@ fn (p mut Parser) parseCreateTypeBody(pos i64) !CreateTypeStmt {
 		}
 		try p.expect(")")
 	} else { try p.errorHere() }
-	return CreateTypeStmt{Pos: pos, Name: name, Kind: kind, Labels: labels, Attributes: attributes}
+	return CreateTypeStmt{Pos: pos, Name: name, Kind: kind, Labels: labels, Attributes: attributes, RangeOptions: rangeOptions}
 }
 
 fn (p mut Parser) parseCreateFunctionBody(pos i64, orReplace bool) !CreateFunctionStmt {
@@ -329,6 +347,9 @@ fn (p mut Parser) parseCreateFunctionBody(pos i64, orReplace bool) !CreateFuncti
 			if p.eat("inout") { mode = "inout" } else if p.eat("out") { mode = "out" } else if p.eat("in") { mode = "in" } else if p.eat("variadic") { mode = "variadic" }
 			mut parameterName ?Identifier = nil
 			if p.canBeIdentifier() && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Kind == "word" { parameterName = try p.parseIdentifier() }
+			if mode == "in" {
+				if p.eat("inout") { mode = "inout" } else if p.eat("out") { mode = "out" } else if p.eat("in") { mode = "in" } else if p.eat("variadic") { mode = "variadic" }
+			}
 			let typeName = try p.parseTypeName()
 			mut defaultExpr ?Expr = nil
 			if p.eat("default") || p.eat("=") { defaultExpr = try p.parseExpression(0) }
@@ -337,9 +358,22 @@ fn (p mut Parser) parseCreateFunctionBody(pos i64, orReplace bool) !CreateFuncti
 		}
 	}
 	try p.expect(")")
-	try p.expect("returns")
-	let returnSet = p.eat("setof")
-	let returns = try p.parseTypeName()
+	mut returnSet = false
+	mut returns ?TypeName = nil
+	if p.eat("returns") {
+		if p.eat("table") {
+			try p.expect("(")
+			for p.text() != ")" {
+				let _ = try p.parseIdentifier()
+				let _ = try p.parseTypeName()
+				if !p.eat(",") { break }
+			}
+			try p.expect(")")
+		} else {
+			returnSet = p.eat("setof")
+			returns = try p.parseTypeName()
+		}
+	}
 	mut body = ""
 	mut language = ""
 	mut options = []FunctionOption{}
@@ -385,7 +419,7 @@ fn (p mut Parser) parseCreateRoleBody(pos i64) !CreateRoleStmt {
 			let option = lowerAscii(p.Tokens[p.At - 1].Text)
 			mut value ?Expr = nil
 			if option == "in" {
-				try p.expect("group")
+				if p.eat("group") { } else { try p.expect("role") }
 				value = Expr.Literal(LiteralExpr{Pos: optionPos, Kind: "word", Value: "group " + p.take().Text})
 			} else {
 				p.eat("limit")
@@ -496,7 +530,7 @@ fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 				let constraint = try p.parseTableConstraint(commandPos, name)
 				command.Kind = "add constraint"
 				command.Constraint = constraint
-			} else if p.text() == "primary" || p.text() == "unique" || p.text() == "check" || p.text() == "foreign" {
+			} else if p.text() == "primary" || p.text() == "unique" || p.text() == "check" || p.text() == "foreign" || p.text() == "exclude" {
 				let constraint = try p.parseTableConstraint(commandPos, nil)
 				command.Kind = "add constraint"
 				command.Constraint = constraint
@@ -531,6 +565,9 @@ fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 			if p.eat("type") {
 				command.Kind = "alter column type"
 				command.TypeName = try p.parseTypeName()
+				if p.eat("collate") {
+					let _ = try p.parseQualifiedName()
+				}
 				if p.eat("using") { command.Expression = try p.parseExpression(0) }
 			} else if p.eat("set") {
 				if p.eat("default") {
@@ -566,6 +603,9 @@ fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 		} else if p.eat("rename") {
 			if p.eat("column") {
 				command.Kind = "rename column"
+				command.Name = try p.parseIdentifier()
+			} else if p.eat("constraint") {
+				command.Kind = "rename constraint"
 				command.Name = try p.parseIdentifier()
 			} else { command.Kind = "rename table" }
 			try p.expect("to")
@@ -620,6 +660,10 @@ fn (p mut Parser) parseDrop() !Stmt {
 			if objectType == "function" && p.eat("(") {
 				if p.text() != ")" {
 					for {
+						if p.eat("inout") { } else if p.eat("out") { } else if p.eat("in") { } else if p.eat("variadic") { }
+						if p.canBeIdentifier() && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Kind == "word" {
+							let _ = try p.parseIdentifier()
+						}
 						let argType = try p.parseTypeName()
 						args = append(args, argType)
 						if !p.eat(",") { break }

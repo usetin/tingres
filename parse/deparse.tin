@@ -522,6 +522,7 @@ fn deparseColumn(v ColumnDef) str {
 // deparseColumnConstraint renders a column-level constraint, whose column is implicit and
 // must not be repeated in parentheses the way a table-level constraint prints it.
 fn deparseColumnConstraint(v TableConstraint) str {
+	if v.Raw != "" { return v.Raw }
 	mut out = ""
 	if let name = v.Name { out = "CONSTRAINT " + identifierText(name) + " " }
 	out += upperAscii(v.Kind)
@@ -538,6 +539,7 @@ fn deparseColumnConstraint(v TableConstraint) str {
 }
 
 fn deparseConstraint(v TableConstraint) str {
+	if v.Raw != "" { return v.Raw }
 	mut out = ""
 	if let name = v.Name { out = "CONSTRAINT " + identifierText(name) + " " }
 	out += upperAscii(v.Kind)
@@ -560,7 +562,7 @@ fn deparseTransaction(v TransactionStmt) str {
 	if let name = v.Name { out += " " + identifierText(name) }
 	for i, mode in v.Modes {
 		if i == 0 { out += " " } else { out += ", " }
-		if mode.Kind == "isolation level" { out += "ISOLATION LEVEL " + upperAscii(mode.Value) } else if mode.Kind == "read" { out += "READ " + upperAscii(mode.Value) } else { out += upperAscii(mode.Value + " " + mode.Kind) }
+		if mode.Kind == "isolation level" { out += "ISOLATION LEVEL " + upperAscii(mode.Value) } else if mode.Kind == "read" { out += "READ " + upperAscii(mode.Value) } else if mode.Kind == "snapshot" { out += "SNAPSHOT " + mode.Value } else { out += upperAscii(mode.Value + " " + mode.Kind) }
 	}
 	if v.Chain { out += " AND CHAIN" }
 	return out

@@ -294,6 +294,9 @@ fn stripInlineMeta(text str) str {
 			continue
 		}
 		if c == '\\' {
+			// A psql meta-command terminates the current query; represent it as a statement
+			// terminator so a query without a trailing semicolon (SELECT 1 \gset) still splits.
+			out = append(out, ';')
 			for i < n && text[i] != '\n' { i += 1 }
 			continue
 		}
@@ -311,12 +314,37 @@ fn substitutePsqlVars(text str) str {
 	let n = len(text)
 	for i < n {
 		let c = text[i]
+		if c == '$' {
+			mut j = i + 1
+			for j < n && isIdent(text[j]) { j += 1 }
+			if j < n && text[j] == '$' {
+				let tag = text[i:j + 1]
+				for k in i..j + 1 { out = append(out, text[k]) }
+				i = j + 1
+				mut found = false
+				mut k = j + 1
+				for k + len(tag) <= n {
+					if text[k:k + len(tag)] == tag {
+						for m in k..k + len(tag) { out = append(out, text[m]) }
+						i = k + len(tag)
+						found = true
+						break
+					}
+					k += 1
+				}
+				if !found { i = n }
+				continue
+			}
+		}
 		if c == '\'' || c == '"' {
 			let q = c
 			out = append(out, c)
 			i += 1
 			for i < n {
 				out = append(out, text[i])
+				if text[i] == '\\' && q == '\'' { if i + 1 < n { out = append(out, text[i + 1])
+						i += 2
+						continue } }
 				if text[i] == q {
 					if i + 1 < n && text[i + 1] == q { out = append(out, text[i + 1])
 						i += 2
@@ -324,6 +352,27 @@ fn substitutePsqlVars(text str) str {
 					i += 1
 					break
 				}
+				i += 1
+			}
+			continue
+		}
+		if c == '-' && i + 1 < n && text[i + 1] == '-' {
+			for i < n && text[i] != '\n' { out = append(out, text[i])
+				i += 1 }
+			continue
+		}
+		if c == '/' && i + 1 < n && text[i + 1] == '*' {
+			mut depth = 1
+			for i < n && depth > 0 {
+				out = append(out, text[i])
+				if text[i] == '/' && i + 1 < n && text[i + 1] == '*' { out = append(out, text[i + 1])
+					depth += 1
+					i += 2
+					continue }
+				if text[i] == '*' && i + 1 < n && text[i + 1] == '/' { out = append(out, text[i + 1])
+					depth -= 1
+					i += 2
+					continue }
 				i += 1
 			}
 			continue

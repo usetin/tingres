@@ -100,6 +100,14 @@ fn (p mut Parser) parseExpression(minPrecedence i64) !Expr {
 			} else if test == "null" || test == "true" || test == "false" || test == "unknown" {
 				p.At += 1
 				left = Expr.Is(IsExpr{Pos: operatorToken.Pos, Operand: left, Test: test, Negated: isNot, Right: nil})
+			} else if test == "json" || test == "document" || test == "normalized" {
+				p.At += 1
+				if p.eat("scalar") || p.eat("array") || p.eat("object") || p.eat("value") { }
+				if p.eat("with") || p.eat("without") {
+					try p.expect("unique")
+					try p.expect("keys")
+				}
+				left = Expr.Is(IsExpr{Pos: operatorToken.Pos, Operand: left, Test: test, Negated: isNot, Right: nil})
 			} else { try p.errorHere() }
 			continue
 		}
@@ -175,7 +183,7 @@ fn (p mut Parser) parseExpression(minPrecedence i64) !Expr {
 fn expressionPrecedence(word str, kind str) i64 {
 	if word == "or" { return 1 }
 	if word == "and" { return 2 }
-	if word == "isnull" || word == "notnull" || word == "is" || word == "in" || word == "between" || word == "like" || word == "ilike" || word == "similar" { return 4 }
+	if word == "isnull" || word == "notnull" || word == "is" || word == "in" || word == "between" || word == "like" || word == "ilike" || word == "similar" || word == "overlaps" { return 4 }
 	if word == "=" || word == "!=" || word == "<>" || word == "<" || word == ">" || word == "<=" || word == ">=" || word == "~" || word == "~*" || word == "!~" || word == "!~*" || word == "@>" || word == "<@" { return 4 }
 	if kind == "operator" {
 		if word == "->" || word == "->>" || word == "#>" || word == "#>>" { return 9 }
@@ -246,6 +254,11 @@ fn (p mut Parser) parsePrefix(minPrecedence i64) !Expr {
 		}
 		return Expr.Special(SpecialExpr{Pos: token.Pos, Name: word, Args: args})
 	}
+	if token.Kind == "word" && word == "collation" && lowerAscii(p.text()) == "for" {
+		p.At += 1
+		let inner = p.captureParenInner()
+		return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "raw", Value: "COLLATION FOR (" + inner + ")"})
+	}
 	if token.Kind == "word" && (word == "date" || word == "time" || word == "timestamp" || word == "interval") {
 		let save = p.At
 		mut deco = upperAscii(word)
@@ -305,6 +318,11 @@ fn (p mut Parser) parsePrefix(minPrecedence i64) !Expr {
 			return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Parts: parts, Star: true})
 		}
 		return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Parts: parts})
+	}
+	if token.Text == "[" {
+		let values = try p.parseExpressionList("]")
+		try p.expect("]")
+		return Expr.Array(ArrayExpr{Pos: token.Pos, Elements: values})
 	}
 	if token.Text == "*" && minPrecedence == 0 { return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Star: true}) }
 	if token.Text == "(" { return try p.parseParenExpression(token.Pos) }
@@ -394,6 +412,9 @@ fn (p mut Parser) parseCast(pos i64) !Expr {
 	let value = try p.parseExpression(0)
 	try p.expect("as")
 	let target = try p.parseTypeName()
+	if p.eat("collate") {
+		let _ = try p.parseQualifiedName()
+	}
 	try p.expect(")")
 	return Expr.Cast(CastExpr{Pos: pos, Value: value, TypeName: target, Syntax: "cast"})
 }
