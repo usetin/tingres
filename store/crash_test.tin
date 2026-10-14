@@ -163,14 +163,82 @@ fn TestCrashTruncatesAtEveryRecordBoundary(t mut crucible.T) {
 	let bounds = walRecordBoundaries(walBytes)
 	crucible.True("workload produced WAL records", len(bounds) > 10)
 	for i, upto in bounds {
-		if i%2 == 0 {
-			verifyCrashCopy(mut t, src, dst, upto, walBytes, "boundary {i}")
-		}
+		verifyCrashCopy(mut t, src, dst, upto, walBytes, "boundary {i}")
 	}
 	// Also the full, untruncated copy.
 	verifyCrashCopy(mut t, src, dst, i64(len(walBytes)), walBytes, "full")
 	quarry.RemoveAll(src) catch _ { }
 	quarry.RemoveAll(dst) catch _ { }
+}
+
+fn TestWalSegmentRolloverAndRecovery(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-wal-rollover"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 256, WalSegmentBytes: 16384})
+	if openErr != nil {
+		t.Error("open failed: {openErr}")
+		return
+	}
+	mut db = opened
+	db.CreateHeap(800) catch err {
+		t.Error("create heap failed: {err}")
+		return
+	}
+	let payload = []u8{1, 2, 3, 4, 5, 6, 7, 8}
+	let n = 6000
+	for i in 0..n {
+		writeU32(mut payload, 0, u32(i))
+		let (_, insErr) = db.HeapInsert(NewXidCtx(2, 0), 800, payload)
+		if insErr != nil {
+			t.Error("insert {i} failed: {insErr}")
+			return
+		}
+	}
+	let names = quarry.ReadDir(dir + "/wal") catch _ { []str{} }
+	mut segs = 0
+	for _, name in names {
+		let (_, ok) = parseSegmentName(name)
+		if ok {
+			segs += 1
+		}
+	}
+	let flushErr = db.Sync(db.CurrentLsn())
+	if flushErr != nil {
+		t.Error("sync failed: {flushErr}")
+		return
+	}
+	let names2 = quarry.ReadDir(dir + "/wal") catch _ { []str{} }
+	segs = 0
+	for _, name in names2 {
+		let (_, ok) = parseSegmentName(name)
+		if ok {
+			segs += 1
+		}
+	}
+	crucible.True("WAL rolled over several segments", segs >= 4)
+	// Reopen without a clean shutdown: recovery must replay records across every segment.
+	let (reopened, reopenErr) = Open(dir, Options{BufferPages: 256, WalSegmentBytes: 16384})
+	if reopenErr != nil {
+		t.Error("reopen failed: {reopenErr}")
+		return
+	}
+	mut db2 = reopened
+	mut scan = db2.HeapScan(800)
+	mut count = 0
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		if len(tuple.Payload) != 8 || i64(readU32(tuple.Payload, 0)) != count {
+			t.Error("recovered tuple {count} is out of order")
+			break
+		}
+		count += 1
+	}
+	crucible.Equal(mut t, "crossed segments recovered", count, n)
+	db2.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
 }
 
 fn TestCrashTruncatesAtRandomOffsets(t mut crucible.T) {

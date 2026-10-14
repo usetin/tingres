@@ -53,6 +53,7 @@ type Options struct {
 	BufferPages i64
 	SharedBuffersBytes i64
 	WalRingBytes i64
+	WalSegmentBytes i64
 	SyncOnWrite bool
 }
 
@@ -113,6 +114,7 @@ type Store struct {
 	kinds map[u8]str
 	redos []RecordRedo
 	walDir str
+	segSize i64
 	walActiveSeg u64
 	walBuf []u8
 	lastLsn u64
@@ -199,11 +201,12 @@ fn Open(dir str, opts Options) !Store {
 		try quarry.Sync(walDir)
 	}
 	let files = try NewRelationFiles(dir)
+	let segSize = try walSegmentCapacity(opts)
 	let capacity = try bufferCapacity(opts)
 	let buffers = try NewBufferPool(capacity)
 	mut walGate = lane.New[u8](1)
 	try walGate.Send(1)
-	mut s = Store{dir: dir, opts: opts, files: files, buffers: buffers, rels: map[u32]u8{}, freeHint: map[u32]u32{}, btreeHint: map[u32]u64{}, kinds: map[u8]str{}, redos: []RecordRedo{}, walDir: walDir, walActiveSeg: 1, walBuf: make([]u8, 0, walBufBytes), lastLsn: 0, writtenLsn: 0, syncedLsn: 0, walGate: walGate, walFailed: false, fpiPending: map[u64]bool{}, checkpointLsn: 0, redoLsn: 0, recovering: false, closed: false}
+	mut s = Store{dir: dir, opts: opts, files: files, buffers: buffers, rels: map[u32]u8{}, freeHint: map[u32]u32{}, btreeHint: map[u32]u64{}, kinds: map[u8]str{}, redos: []RecordRedo{}, walDir: walDir, segSize: segSize, walActiveSeg: 1, walBuf: make([]u8, 0, walBufBytes), lastLsn: 0, writtenLsn: 0, syncedLsn: 0, walGate: walGate, walFailed: false, fpiPending: map[u64]bool{}, checkpointLsn: 0, redoLsn: 0, recovering: false, closed: false}
 	let (redoLsn, _, hasControl) = try s.readControl()
 	if hasControl {
 		s.redoLsn = redoLsn
@@ -434,6 +437,17 @@ fn hasAnySegment(walDir str) bool {
 fn dirHasEntries(path str) bool {
 	let names = quarry.ReadDir(path) catch _ { return false }
 	return len(names) > 0
+}
+
+fn walSegmentCapacity(opts Options) !i64 {
+	mut bytes = opts.WalSegmentBytes
+	if bytes <= 0 {
+		bytes = WalSegmentSize
+	}
+	if bytes < 4096 || bytes%512 != 0 {
+		fail "store: wal segment must be a multiple of 512 bytes and at least 4 KiB"
+	}
+	return bytes
 }
 
 fn bufferCapacity(opts Options) !u32 {

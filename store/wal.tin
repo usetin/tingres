@@ -48,16 +48,16 @@ fn segmentName(seg u64) str {
 	return say.Fmt("%08d", seg) + ".wal"
 }
 
-fn segmentOf(lsn u64) u64 {
-	return lsn/u64(WalSegmentSize) + 1
+fn segmentOf(lsn u64, segSize i64) u64 {
+	return lsn/u64(segSize) + 1
 }
 
 fn segmentPath(dir str, seg u64) str {
 	return dir + "/" + segmentName(seg)
 }
 
-fn segmentOffset(lsn u64) i64 {
-	return i64(lsn%u64(WalSegmentSize))
+fn segmentOffset(lsn u64, segSize i64) i64 {
+	return i64(lsn%u64(segSize))
 }
 
 // crc32c is the Castagnoli polynomial used for WAL record framing.
@@ -120,15 +120,17 @@ fn (s mut Store) appendWal(kind u8, flags u8, rel u32, block u32, slot u16, body
 		fail "store: WAL writer failed; reopen after recovery"
 	}
 	let recLen = walHeaderSize + i64(len(body))
-	if recLen >= WalSegmentSize {
+	if recLen >= s.segSize {
 		fail "store: WAL record exceeds segment size"
 	}
-	let off = segmentOffset(s.lastLsn)
-	if WalSegmentSize-off < recLen {
-		let padLen = WalSegmentSize - off
+	let off = segmentOffset(s.lastLsn, s.segSize)
+	if s.segSize-off < recLen {
+		let padLen = s.segSize - off
 		mut pad = make([]u8, padLen)
-		writeU32(mut pad, 0, u32(padLen))
+		// A pad shorter than a record header is left as raw zeros; the reader treats a short tail
+		// at a segment end as padding and continues at the next segment.
 		if padLen >= walHeaderSize {
+			writeU32(mut pad, 0, u32(padLen))
 			writeU32(mut pad, 4, crc32c(pad[8:padLen]))
 		}
 		s.walBuf = append(s.walBuf, pad...)
@@ -138,7 +140,11 @@ fn (s mut Store) appendWal(kind u8, flags u8, rel u32, block u32, slot u16, body
 	s.walBuf = append(s.walBuf, rec...)
 	s.lastLsn += u64(len(rec))
 	let end = s.lastLsn
-	if i64(len(s.walBuf)) >= walBufBytes {
+	mut flushAt = walBufBytes
+	if s.segSize < flushAt {
+		flushAt = s.segSize
+	}
+	if i64(len(s.walBuf)) >= flushAt {
 		try s.flushWalBuffer()
 	}
 	return Lsn(end)
@@ -154,12 +160,12 @@ fn (s mut Store) flushWalBuffer() ! {
 	let base = s.writtenLsn
 	for pos < i64(len(s.walBuf)) {
 		let lsn = base+u64(pos)
-		let seg = segmentOf(lsn)
-		let off = segmentOffset(lsn)
-		let chunkLen = min(i64(len(s.walBuf))-pos, WalSegmentSize-off)
+		let seg = segmentOf(lsn, s.segSize)
+		let off = segmentOffset(lsn, s.segSize)
+		let chunkLen = min(i64(len(s.walBuf))-pos, s.segSize-off)
 		try s.writeSegmentChunk(seg, s.walBuf[pos:pos+chunkLen])
 		pos += chunkLen
-		if off+chunkLen >= WalSegmentSize {
+		if off+chunkLen >= s.segSize {
 			try quarry.Sync(segmentPath(s.walDir, seg))
 		}
 	}
@@ -183,8 +189,8 @@ fn (s mut Store) writeSegmentChunk(seg u64, data []u8) ! {
 // fsyncWal makes every segment between the synced and written positions durable.
 fn (s mut Store) fsyncWal() ! {
 	mut last = u64(1)
-	if s.writtenLsn != 0 { last = segmentOf(s.writtenLsn-1) }
-	mut seg = segmentOf(s.syncedLsn)
+	if s.writtenLsn != 0 { last = segmentOf(s.writtenLsn-1, s.segSize) }
+	mut seg = segmentOf(s.syncedLsn, s.segSize)
 	for seg <= last {
 		let path = segmentPath(s.walDir, seg)
 		if quarry.Exists(path) {
@@ -229,14 +235,14 @@ fn (s mut Store) openWalForWrite(lsn u64) {
 	s.lastLsn = lsn
 	s.writtenLsn = lsn
 	s.syncedLsn = lsn
-	s.walActiveSeg = segmentOf(lsn)
+	s.walActiveSeg = segmentOf(lsn, s.segSize)
 	s.walBuf = s.walBuf[0:0]
 }
 
 // truncateWal discards everything past endLsn and removes later segments.
 fn (s mut Store) truncateWal(endLsn u64) ! {
-	let lastSeg = segmentOf(endLsn)
-	let off = segmentOffset(endLsn)
+	let lastSeg = segmentOf(endLsn, s.segSize)
+	let off = segmentOffset(endLsn, s.segSize)
 	let names = quarry.ReadDir(s.walDir) catch _ { []str{} }
 	for _, name in names {
 		let (seg, ok) = parseSegmentName(name)
@@ -278,7 +284,7 @@ fn parseSegmentName(name str) (u64, bool) {
 // LSN of the last valid record.
 fn (s mut Store) walkWal(start u64) !u64 {
 	mut end = start
-	let startSeg = segmentOf(start)
+	let startSeg = segmentOf(start, s.segSize)
 	mut seg = startSeg
 	for _guard in 0..1000000 {
 		let path = segmentPath(s.walDir, seg)
@@ -289,7 +295,7 @@ fn (s mut Store) walkWal(start u64) !u64 {
 		let b = []u8(data)
 		mut off = i64(0)
 		if seg == startSeg {
-			off = segmentOffset(start)
+			off = segmentOffset(start, s.segSize)
 		}
 		mut torn = false
 		for off+walHeaderSize <= i64(len(b)) {
@@ -303,7 +309,7 @@ fn (s mut Store) walkWal(start u64) !u64 {
 				break
 			}
 			let kind = b[off+8]
-			let recStart = (seg-1)*u64(WalSegmentSize)+u64(off)
+			let recStart = (seg-1)*u64(s.segSize)+u64(off)
 			if kind != walPadKind {
 				try s.applyWalRecord(kind, b[off+9], readU32(b, off+12), readU32(b, off+16), readU16(b, off+20), copyBytes(b[off+walHeaderSize:off+total]), recStart, recStart+u64(total))
 			}
