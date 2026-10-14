@@ -482,5 +482,6 @@ fn stmtPos(s Stmt) i64 {
 		Do(v) => v.Pos
 		Checkpoint(v) => v.Pos
 		Call(v) => v.Pos
+		Utility(v) => v.Pos
 	}
 }

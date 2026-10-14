@@ -1,5 +1,14 @@
 package parse
 
+// Object kinds the parser accepts as opaque utility statements (validated leading keyword,
+// then verbatim text). These are PostgreSQL commands whose detailed grammar is not modelled
+// by a dedicated AST node yet.
+const utilityStatementWords = "reindex cluster refresh declare fetch move close merge security load"
+const alterTableActionWords = "attach detach enable disable set reset validate cluster inherit no of not replica force"
+const opaqueFunctionWords = "json_value json_query json_exists json_scalar json_serialize json_table json_array json_arrayagg json_object json_objectagg jsonb_path_query jsonb_path_query_array jsonb_path_query_first jsonb_path_match jsonb_path_exists jsonb_path_agg xmlexists xmltable xpath xpath_exists"
+const createObjectWords = "aggregate cast collation conversion database domain event extension foreign language materialized operator policy publication rule server statistics subscription tablespace text transform trigger access procedure user recursive global local"
+const alterObjectWords = "aggregate cast collation conversion database domain event extension foreign language materialized operator policy publication rule server statistics subscription tablespace text transform trigger access procedure schema function index view sequence type default large"
+
 type Parser struct {
 	Source str
 	Tokens []Token
@@ -33,6 +42,54 @@ fn (p Parser) pos() i64 {
 
 // rawAt returns the source spelling of the token at index at (as written, not lowercased),
 // which is what PostgreSQL quotes in "syntax error at or near ..." messages.
+// captureRest returns the verbatim source from the current token to the end of the statement
+// and consumes every remaining token. Used for opaque tails such as partition bounds.
+fn (p mut Parser) captureRest() str {
+	if p.done() { return "" }
+	let start = p.Tokens[p.At].BytePos
+	let end = p.Tokens[len(p.Tokens) - 1].EndBytePos
+	p.At = len(p.Tokens)
+	return p.Source[start:end]
+}
+
+// captureParenInner returns the verbatim text between the current "(" and its matching ")" and
+// consumes through the ")". Storage-parameter lists are preserved this way.
+fn (p mut Parser) captureParenInner() str {
+	if p.text() != "(" { return "" }
+	let open = p.At
+	mut depth = 0
+	mut close = -1
+	mut i = open
+	for i < len(p.Tokens) {
+		if p.Tokens[i].Text == "(" { depth += 1 } else if p.Tokens[i].Text == ")" {
+			depth -= 1
+			if depth == 0 { close = i
+				break }
+		}
+		i += 1
+	}
+	if close < 0 { return "" }
+	let inner = p.Source[p.Tokens[open].EndBytePos:p.Tokens[close].BytePos]
+	p.At = close + 1
+	return inner
+}
+
+// statementText reconstructs the current statement's source text from its token spans.
+fn (p Parser) statementText() str {
+	if len(p.Tokens) == 0 { return "" }
+	let first = p.Tokens[0]
+	let last = p.Tokens[len(p.Tokens) - 1]
+	return p.Source[first.BytePos:last.EndBytePos]
+}
+
+// utility consumes the rest of the statement and returns an opaque node that preserves it.
+// The leading keywords and object kind have already been validated by the caller.
+fn (p mut Parser) utility(kind str) Stmt {
+	let stmt = Stmt.Utility(UtilityStmt{Pos: p.Tokens[0].Pos, Kind: kind, Text: p.statementText()})
+	p.At = len(p.Tokens)
+	return stmt
+}
+
 fn (p Parser) rawAt(at i64) str {
 	if at >= len(p.Tokens) { return "" }
 	let token = p.Tokens[at]
@@ -179,6 +236,16 @@ fn (p mut Parser) parseTypeName() !TypeName {
 			if !p.eat(",") { break }
 		}
 		try p.expect(")")
+	}
+	if (firstName == "timestamp" || firstName == "time") && !withTimeZone {
+		if p.eat("with") {
+			try p.expect("time")
+			try p.expect("zone")
+			withTimeZone = true
+		} else if p.eat("without") {
+			try p.expect("time")
+			try p.expect("zone")
+		}
 	}
 	mut bounds = []ArrayBound{}
 	for p.eat("[") {

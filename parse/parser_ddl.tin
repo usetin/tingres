@@ -40,10 +40,12 @@ fn (p mut Parser) parseCreateStatement() !Stmt {
 		let value = try p.parseCreateFunctionBody(pos, orReplace)
 		return Stmt.CreateFunction(value)
 	}
+	if p.text() == "user" && p.At + 1 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "mapping" { return p.utility("create") }
 	if p.eat("role") || p.eat("user") {
 		let value = try p.parseCreateRoleBody(pos)
 		return Stmt.CreateRole(value)
 	}
+	if inWords(lowerAscii(p.text()), createObjectWords) { return p.utility("create") }
 	fail unsupportedMessage(p.Source, p.bytePos(), "CREATE statement")
 }
 
@@ -55,6 +57,13 @@ fn (p mut Parser) parseCreateTableBody(pos i64, temporary str) !CreateTableStmt 
 		ifNotExists = true
 	}
 	let table = try p.parseQualifiedName()
+	mut partitionOf ?QualifiedName = nil
+	if p.eat("partition") {
+		try p.expect("of")
+		partitionOf = try p.parseQualifiedName()
+	}
+	mut ofType ?TypeName = nil
+	if p.eat("of") { ofType = try p.parseTypeName() }
 	mut elements = []TableElement{}
 	mut likes = []LikeClause{}
 	if p.eat("(") {
@@ -85,36 +94,58 @@ fn (p mut Parser) parseCreateTableBody(pos i64, temporary str) !CreateTableStmt 
 		try p.expect(")")
 	}
 	mut inherits = []QualifiedName{}
-	if p.eat("inherits") {
-		try p.expect("(")
-		for {
-			let parent = try p.parseQualifiedName()
-			inherits = append(inherits, parent)
-			if !p.eat(",") { break }
-		}
-		try p.expect(")")
-	}
 	mut partition ?PartitionBy = nil
-	if p.eat("partition") {
-		try p.expect("by")
-		let method = lowerAscii(p.take().Text)
-		try p.expect("(")
-		let keys = try p.parseExpressionList(")")
-		try p.expect(")")
-		partition = PartitionBy{Pos: pos, Method: method, Keys: keys}
-	}
+	mut partitionBound = ""
+	mut options = []str{}
+	mut onCommit = ""
+	mut tablespace = ""
+	mut accessMethod = ""
 	mut asQuery ?SelectStmt = nil
 	mut withData = true
-	if p.eat("as") {
-		asQuery = try p.parseSelect()
-		if p.eat("with") {
-			if p.eat("no") {
-				try p.expect("data")
-				withData = false
-			} else { try p.expect("data") }
-		}
+	for !p.done() {
+		if p.eat("inherits") {
+			try p.expect("(")
+			for {
+				let parent = try p.parseQualifiedName()
+				inherits = append(inherits, parent)
+				if !p.eat(",") { break }
+			}
+			try p.expect(")")
+		} else if lowerAscii(p.text()) == "partition" && p.At + 1 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "by" {
+			p.At += 1
+			try p.expect("by")
+			let method = lowerAscii(p.take().Text)
+			try p.expect("(")
+			let keys = try p.parseExpressionList(")")
+			try p.expect(")")
+			partition = PartitionBy{Pos: pos, Method: method, Keys: keys}
+		} else if p.eat("for") {
+			try p.expect("values")
+			partitionBound = p.captureRest()
+		} else if partitionOf != nil && p.eat("default") {
+			partitionBound = "DEFAULT"
+		} else if p.eat("using") {
+			accessMethod = lowerAscii(p.take().Text)
+		} else if lowerAscii(p.text()) == "with" && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "(" {
+			p.At += 1
+			options = []str{p.captureParenInner()}
+		} else if p.eat("on") {
+			try p.expect("commit")
+			onCommit = lowerAscii(p.take().Text)
+		} else if p.eat("tablespace") {
+			let ts = try p.parseQualifiedName()
+			tablespace = nameText(ts)
+		} else if p.eat("as") {
+			asQuery = try p.parseSelect()
+			if p.eat("with") {
+				if p.eat("no") {
+					try p.expect("data")
+					withData = false
+				} else { try p.expect("data") }
+			}
+		} else { break }
 	}
-	return CreateTableStmt{Pos: pos, Temporary: temporary, IfNotExists: ifNotExists, Table: table, Elements: elements, Like: likes, Inherits: inherits, PartitionBy: partition, AsQuery: asQuery, WithData: withData}
+	return CreateTableStmt{Pos: pos, Temporary: temporary, IfNotExists: ifNotExists, Table: table, Elements: elements, Like: likes, Inherits: inherits, PartitionBy: partition, AsQuery: asQuery, WithData: withData, Options: options, PartitionOf: partitionOf, PartitionBound: partitionBound, OfType: ofType, OnCommit: onCommit, Tablespace: tablespace, AccessMethod: accessMethod}
 }
 
 fn (p mut Parser) parseCreateIndexBody(pos i64, unique bool) !CreateIndexStmt {
@@ -128,6 +159,7 @@ fn (p mut Parser) parseCreateIndexBody(pos i64, unique bool) !CreateIndexStmt {
 	mut name ?QualifiedName = nil
 	if p.text() != "on" { name = try p.parseQualifiedName() }
 	try p.expect("on")
+	p.eat("only")
 	let table = try p.parseQualifiedName()
 	mut method = "btree"
 	if p.eat("using") { method = lowerAscii(p.take().Text) }
@@ -158,9 +190,19 @@ fn (p mut Parser) parseCreateIndexBody(pos i64, unique bool) !CreateIndexStmt {
 		try p.expect(")")
 		for item in names { include = append(include, IndexElement{Pos: item.Pos, Name: item}) }
 	}
+	mut withOptions = []str{}
+	if lowerAscii(p.text()) == "with" && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "(" {
+		p.At += 1
+		withOptions = []str{p.captureParenInner()}
+	}
+	mut tablespace = ""
+	if p.eat("tablespace") {
+		let ts = try p.parseQualifiedName()
+		tablespace = nameText(ts)
+	}
 	mut where ?Expr = nil
 	if p.eat("where") { where = try p.parseExpression(0) }
-	return CreateIndexStmt{Pos: pos, Unique: unique, Concurrently: concurrently, IfNotExists: ifNotExists, Name: name, Table: table, Method: method, Keys: keys, Include: include, Where: where}
+	return CreateIndexStmt{Pos: pos, Unique: unique, Concurrently: concurrently, IfNotExists: ifNotExists, Name: name, Table: table, Method: method, Keys: keys, Include: include, Where: where, WithOptions: withOptions, Tablespace: tablespace}
 }
 
 fn (p mut Parser) parseCreateViewBody(pos i64, orReplace bool, temporary str) !CreateViewStmt {
@@ -176,6 +218,11 @@ fn (p mut Parser) parseCreateViewBody(pos i64, orReplace bool, temporary str) !C
 		columns = try p.parseIdentifierList(")")
 		try p.expect(")")
 	}
+	mut options = []str{}
+	if lowerAscii(p.text()) == "with" && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "(" {
+		p.At += 1
+		options = []str{p.captureParenInner()}
+	}
 	try p.expect("as")
 	let query = try p.parseSelect()
 	mut checkOption = ""
@@ -184,7 +231,7 @@ fn (p mut Parser) parseCreateViewBody(pos i64, orReplace bool, temporary str) !C
 		try p.expect("check")
 		try p.expect("option")
 	}
-	return CreateViewStmt{Pos: pos, OrReplace: orReplace, Temporary: temporary, IfNotExists: ifNotExists, Name: name, Columns: columns, Query: query, CheckOption: checkOption}
+	return CreateViewStmt{Pos: pos, OrReplace: orReplace, Temporary: temporary, IfNotExists: ifNotExists, Name: name, Columns: columns, Query: query, CheckOption: checkOption, Options: options}
 }
 
 fn (p mut Parser) parseCreateSequenceBody(pos i64, temporary bool) !CreateSequenceStmt {
@@ -361,10 +408,12 @@ fn (p mut Parser) parseAlter() !Stmt {
 		let value = try p.parseAlterSequenceBody(pos)
 		return Stmt.AlterSequence(value)
 	}
+	if p.text() == "user" && p.At + 1 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "mapping" { return p.utility("alter") }
 	if p.eat("role") || p.eat("user") || p.eat("group") {
 		let value = try p.parseAlterRoleBody(pos)
 		return Stmt.AlterRole(value)
 	}
+	if inWords(lowerAscii(p.text()), alterObjectWords) { return p.utility("alter") }
 	fail unsupportedMessage(p.Source, pos, "ALTER statement")
 }
 
@@ -434,6 +483,7 @@ fn (p mut Parser) parseAlterTable() !AlterTableStmt {
 fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 	let ifExists = p.eat("if")
 	if ifExists { try p.expect("exists") }
+	p.eat("only")
 	let table = try p.parseQualifiedName()
 	mut commands = []AlterTableCommand{}
 	for {
@@ -468,7 +518,12 @@ fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 				command.Kind = "drop constraint"
 				command.Name = name
 				if p.eat("cascade") { command.Behavior = "cascade" } else if p.eat("restrict") { command.Behavior = "restrict" }
-			} else { try p.errorHere() }
+			} else if p.done() {
+				try p.errorHere()
+			} else {
+				command.Kind = "raw"
+				command.Text = p.captureRest()
+			}
 		} else if p.eat("alter") {
 			p.eat("column")
 			let name = try p.parseIdentifier()
@@ -476,6 +531,7 @@ fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 			if p.eat("type") {
 				command.Kind = "alter column type"
 				command.TypeName = try p.parseTypeName()
+				if p.eat("using") { command.Expression = try p.parseExpression(0) }
 			} else if p.eat("set") {
 				if p.eat("default") {
 					command.Kind = "set default"
@@ -483,17 +539,30 @@ fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 				} else if p.eat("not") {
 					try p.expect("null")
 					command.Kind = "set not null"
-				} else { try p.errorHere() }
+				} else if p.done() {
+					try p.errorHere()
+				} else {
+					command.Kind = "raw"
+					command.Text = p.captureRest()
+				}
 			} else if p.eat("drop") {
 				if p.eat("default") {
 					command.Kind = "drop default"
 				} else if p.eat("not") {
 					try p.expect("null")
 					command.Kind = "drop not null"
-				} else {
+				} else if p.done() {
 					try p.errorHere()
+				} else {
+					command.Kind = "raw"
+					command.Text = p.captureRest()
 				}
-			} else { try p.errorHere() }
+			} else if p.done() {
+				try p.errorHere()
+			} else {
+				command.Kind = "raw"
+				command.Text = p.captureRest()
+			}
 		} else if p.eat("rename") {
 			if p.eat("column") {
 				command.Kind = "rename column"
@@ -505,7 +574,14 @@ fn (p mut Parser) parseAlterTableBody(pos i64) !AlterTableStmt {
 			try p.expect("to")
 			command.Kind = "owner to"
 			command.NewName = try p.parseIdentifier()
-		} else { try p.errorHere() }
+		} else {
+			// Unrecognised ALTER TABLE action: preserve the rest of the statement verbatim so
+			// valid PostgreSQL commands (ATTACH/DETACH PARTITION, ENABLE/DISABLE, SET/DROP
+			// storage parameters, REPLICA IDENTITY, ...) still parse and round-trip.
+			if p.done() || !inWords(lowerAscii(p.text()), alterTableActionWords) { try p.errorHere() }
+			command.Kind = "raw"
+			command.Text = p.captureRest()
+		}
 		commands = append(commands, command)
 		if !p.eat(",") { break }
 	}
@@ -558,7 +634,7 @@ fn (p mut Parser) parseDrop() !Stmt {
 		if p.eat("cascade") { behavior = "cascade" } else if p.eat("restrict") { behavior = "restrict" }
 		return Stmt.Drop(DropStmt{Pos: pos, ObjectType: objectType, IfExists: ifExists, Names: names, Arguments: arguments, Behavior: behavior})
 	}
-	fail unsupportedMessage(p.Source, p.Tokens[p.At - 1].BytePos, "DROP " + objectType)
+	return p.utility("drop")
 }
 
 fn (p mut Parser) parseTruncate() !TruncateStmt {
@@ -567,6 +643,7 @@ fn (p mut Parser) parseTruncate() !TruncateStmt {
 	p.eat("table")
 	mut tables = []QualifiedName{}
 	for {
+		p.eat("only")
 		let table = try p.parseQualifiedName()
 		tables = append(tables, table)
 		if !p.eat(",") { break }

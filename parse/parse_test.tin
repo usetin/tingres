@@ -212,6 +212,7 @@ fn stmtKind(statement Stmt) str {
 		Do(_) => "do"
 		Checkpoint(_) => "checkpoint"
 		Call(_) => "call"
+		Utility(_) => "utility"
 	}
 }
 

@@ -6,7 +6,9 @@ fn deparseAlterTable(v AlterTableStmt) str {
 	out += nameText(v.Table)
 	for i, cmd in v.Commands {
 		if i > 0 { out += ", " } else { out += " " }
-		if cmd.Kind == "add column" {
+		if cmd.Kind == "raw" {
+			out += cmd.Text
+		} else if cmd.Kind == "add column" {
 			if let col = cmd.Column { out += "ADD COLUMN " + deparseColumn(col) }
 		} else if cmd.Kind == "add constraint" {
 			if let c = cmd.Constraint { out += "ADD " + deparseConstraint(c) }
@@ -21,6 +23,7 @@ fn deparseAlterTable(v AlterTableStmt) str {
 			if let name = cmd.Name { out += identifierText(name) }
 			out += " TYPE "
 			if let tn = cmd.TypeName { out += deparseType(tn) }
+			if let expr = cmd.Expression { out += " USING " + deparseExpr(expr) }
 		} else if cmd.Kind == "set default" {
 			out += "ALTER COLUMN "
 			if let name = cmd.Name { out += identifierText(name) }
@@ -76,6 +79,15 @@ fn deparseAlterRole(v AlterRoleStmt) str {
 	return out
 }
 
+fn joinComma(items []str) str {
+	mut out = ""
+	for i, item in items {
+		if i > 0 { out += ", " }
+		out += item
+	}
+	return out
+}
+
 fn deparseCreateIndex(v CreateIndexStmt) str {
 	mut out = "CREATE "
 	if v.Unique { out += "UNIQUE " }
@@ -107,6 +119,8 @@ fn deparseCreateIndex(v CreateIndexStmt) str {
 		out += ")"
 	}
 	if let whereExpr = v.Where { out += " WHERE " + deparseExpr(whereExpr) }
+	if len(v.WithOptions) > 0 { out += " WITH (" + joinComma(v.WithOptions) + ")" }
+	if v.Tablespace != "" { out += " TABLESPACE " + v.Tablespace }
 	return out
 }
 
@@ -118,6 +132,7 @@ fn deparseCreateView(v CreateViewStmt) str {
 	if v.IfNotExists { out += "IF NOT EXISTS " }
 	out += nameText(v.Name)
 	if len(v.Columns) > 0 { out += " (" + deparseIdentifierList(v.Columns) + ")" }
+	if len(v.Options) > 0 { out += " WITH (" + v.Options[0] + ")" }
 	out += " AS " + deparseSelect(v.Query)
 	if v.CheckOption != "" {
 		if v.CheckOption == "local" || v.CheckOption == "cascaded" {
