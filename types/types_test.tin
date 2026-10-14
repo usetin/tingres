@@ -25,6 +25,41 @@ fn TestScalarInputOutput(t mut crucible.T) {
 	crucible.Equal(mut t, "numeric preserves scale", n.Text(), "12345678901234567890.00100")
 }
 
+fn TestIntegerBaseInputAndSeparators(t mut crucible.T) {
+	let hexMax = Parse(Int4Oid, "0x7FFFFFFF") catch err {
+		t.Error("hex int4 input failed: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "hex int4 max", hexMax.Text(), "2147483647")
+	let hexMin = Parse(Int4Oid, "-0x80000000") catch err {
+		t.Error("negative hex int4 input failed: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "hex int4 min", hexMin.Text(), "-2147483648")
+	let binary = Parse(Int4Oid, "0b_10_0101") catch err {
+		t.Error("binary int4 input failed: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "binary separators", binary.Text(), "37")
+	let octal = Parse(Int4Oid, "0o2_73") catch err {
+		t.Error("octal int4 input failed: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "octal separators", octal.Text(), "187")
+	let decimal = Parse(Int8Oid, "1_000_000") catch err {
+		t.Error("decimal separators input failed: {ErrorMessage(err)}")
+		return
+	}
+	crucible.Equal(mut t, "decimal separators", decimal.Text(), "1000000")
+	let invalid = Parse(Int4Oid, "0x") catch err {
+		crucible.Equal(mut t, "empty base digits SQLSTATE", ErrorCode(err), "22P02")
+		crucible.Equal(mut t, "empty base digits message", ErrorMessage(err), "invalid input syntax for type integer: \"0x\"")
+		return
+	}
+	_ = invalid
+	t.Error("empty hexadecimal input succeeded")
+}
+
 fn TestOrderingAndNull(t mut crucible.T) {
 	t.True("integer order", Compare(FromI64(Int4Oid, 2), FromI64(Int4Oid, 8)) < 0)
 	t.True("null sorts last", Compare(FromI64(Int4Oid, 8), Null()) < 0)
