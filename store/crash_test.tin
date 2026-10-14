@@ -241,6 +241,95 @@ fn TestWalSegmentRolloverAndRecovery(t mut crucible.T) {
 	quarry.RemoveAll(dir) catch _ { }
 }
 
+fn TestHeapRecoveryAfterCheckpoint(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-ckpt-crash"
+	let dst = "/tmp/tingres-store-ckpt-crash-copy"
+	quarry.RemoveAll(dir) catch _ { }
+	quarry.RemoveAll(dst) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 32})
+	if openErr != nil {
+		t.Error("open failed: {openErr}")
+		return
+	}
+	mut db = opened
+	db.CreateHeap(850) catch err {
+		t.Error("create failed: {err}")
+		return
+	}
+	let payload = []u8{0, 0, 0, 0}
+	for i in 0..100 {
+		writeU32(mut payload, 0, u32(i))
+		let (_, insErr) = db.HeapInsert(NewXidCtx(2, 0), 850, payload)
+		if insErr != nil {
+			t.Error("insert {i} failed: {insErr}")
+			return
+		}
+	}
+	db.Checkpoint() catch err {
+		t.Error("checkpoint failed: {err}")
+		return
+	}
+	let cpLsn = u64(db.CurrentLsn())
+	for i in 100..200 {
+		writeU32(mut payload, 0, u32(i))
+		let (_, insErr) = db.HeapInsert(NewXidCtx(3, 0), 850, payload)
+		if insErr != nil {
+			t.Error("insert {i} failed: {insErr}")
+			return
+		}
+	}
+	db.Sync(db.CurrentLsn()) catch err {
+		t.Error("sync failed: {err}")
+		return
+	}
+	let walData = quarry.ReadFile(dir + "/wal/00000001.wal") catch _ { "" }
+	let walBytes = []u8(walData)
+	// A copy taken as if the process crashed after the checkpoint recovers all 200 rows.
+	copyTree(dir, dst) catch err {
+		t.Error("copy failed: {err}")
+		return
+	}
+	checkCount(mut t, dst, 200, "after checkpoint")
+	// Cutting the WAL at the checkpoint end leaves exactly the flushed 100 rows; rebuild the copy
+	// because the previous check wrote the recovered pages back.
+	quarry.RemoveAll(dst) catch _ { }
+	copyTree(dir, dst) catch err {
+		t.Error("copy failed: {err}")
+		return
+	}
+	quarry.WriteFile(dst + "/wal/00000001.wal", str(walBytes[0:i64(cpLsn)])) catch err {
+		t.Error("truncate failed: {err}")
+		return
+	}
+	checkCount(mut t, dst, 100, "at checkpoint")
+	quarry.RemoveAll(dir) catch _ { }
+	quarry.RemoveAll(dst) catch _ { }
+}
+
+fn checkCount(t mut crucible.T, dir str, want i64, label str) {
+	let (opened, openErr) = Open(dir, Options{BufferPages: 32})
+	if openErr != nil {
+		t.Error("{label}: reopen failed: {openErr}")
+		return
+	}
+	mut db = opened
+	mut count = i64(0)
+	mut scan = db.HeapScan(850)
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		if len(tuple.Payload) != 4 || i64(readU32(tuple.Payload, 0)) != count {
+			t.Error("{label}: payload out of prefix at {count}")
+			break
+		}
+		count += 1
+	}
+	crucible.Equal(mut t, "{label}: row count", count, want)
+	db.Close() catch _ { }
+}
+
 fn TestCrashTruncatesAtRandomOffsets(t mut crucible.T) {
 	let src = "/tmp/tingres-store-crash-src2"
 	let dst = "/tmp/tingres-store-crash-dst2"
