@@ -36,10 +36,15 @@ retained by any active transaction or registered snapshot.
 
 ## Locks
 
-`LockRelation`, `TryLockRelation`, `LockTuple` implement PostgreSQL's eight relation lock
-modes and four tuple lock modes with the conflict matrices. `Commit`/`Abort` release all
-held locks. (Blocking waits, FIFO queues, deadlock detection and lock_timeout are not
-implemented yet.)
+`LockRelation`/`LockTuple` implement PostgreSQL's eight relation lock modes and four tuple
+lock modes with the conflict matrices. A conflicting request joins that relation's FIFO
+wait queue and waits (via `tide.Sleep`, so the core serves other tasks); earlier conflicting
+waiters go first, and a transaction may upgrade its own mode when no other holder conflicts.
+`LockXid` waits for another transaction to finish. `Commit`/`Abort` release all held locks.
+
+`SetLockTimeout(ns)` makes a wait fail with `55P03`, `SetDeadlockTimeout(ns)` runs a
+wait-for-graph check that fails the transaction closing a cycle with `40P01` and a
+PostgreSQL-style `DETAIL`, and `Cancel(xid)` wakes a waiter with `57014`.
 
 ## Savepoints and subtransactions
 
@@ -71,6 +76,13 @@ fn (m mut Manager) RollbackTo(t mut Txn, name str) !
 fn (m mut Manager) Release(t mut Txn, name str) !
 fn (t Txn) WriteXid() u32
 fn (t Txn) Subxids() []u32
+fn (m mut Manager) LockRelation(t Txn, rel u32, mode LockMode) !
+fn (m mut Manager) TryLockRelation(t Txn, rel u32, mode LockMode) bool
+fn (m mut Manager) LockTuple(t Txn, rel u32, page u32, slot u16, mode TupleLock) !
+fn (m mut Manager) LockXid(t Txn, xid u32) !
+fn (m mut Manager) SetLockTimeout(ns i64)
+fn (m mut Manager) SetDeadlockTimeout(ns i64)
+fn (m mut Manager) Cancel(xid u32)
 fn (m Manager) State(xid u32) XidState
 
 fn (m Manager) Visible(snap Snapshot, h store.TupleHeader) bool
@@ -94,14 +106,15 @@ fn (m mut Manager) LockTuple(t Txn, rel u32, page u32, slot u16, mode TupleLock)
 ## Tests
 
 `tin test txn` — snapshot/MVCC rule table, page visibility, delete visibility, relation
-and tuple locks, isolation snapshots, hint bits, dirty/update results, snapshot registry
-and global xmin, durable commit/abort and xid reservation, two-bit clog (12 tests).
+and tuple locks, lock wait wakeup, deadlock victim selection, lock timeout/cancel, xid
+locks, isolation snapshots, hint bits, dirty/update results, snapshot registry and global
+xmin, durable commit/abort and xid reservation, two-bit clog, savepoints/subtransactions,
+crash recovery aborts in-flight tuples (17 tests).
 
 ## Known gaps
 
-- Relation/tuple locks do not wait: a conflict fails immediately with `55P03`. Wait
-  queues, upgrade rules, `deadlock_timeout` detection (`40P01`), `lock_timeout`, cancel
-  wakeups and transaction-id locks are still to do.
+- Locks wait with polling (`tide.Sleep`), not a direct wakeup channel, and the deadlock
+  detector runs only after `deadlock_timeout` (no cross-core lock relay yet).
 - Savepoints/subtransactions are implemented for visibility, locks and recovery, but the
   store stamps the subxid as xmin (PostgreSQL instead keeps the parent xid and a combo
   cmin); observable rollback/commit behaviour matches.
