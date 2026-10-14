@@ -1,0 +1,1 @@
+SELECT l_returnflag, l_linestatus, sum(l_quantity), avg(l_extendedprice), count(*) FROM lineitem WHERE l_shipdate <= date '1998-12-01' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;
