@@ -71,7 +71,22 @@ file APIs for replacement-file positional writes; see `BUGS.md` for portability/
 ## Known limits
 
 The current scans materialize results in memory. The index's `unique` option is stored but uniqueness
-is enforced by the caller. There is no page free-space map, parallel cross-core buffer-pool access,
-or concurrent mutation guarantee for a single `Store`; lifecycle and checkpoint operations require
-quiescent mutations. The store tests are focused regression tests and do not yet implement the full
-randomized, multi-lane, crash-truncation, or Linux benchmark matrix from the storage checklist.
+is enforced by the caller. There is no page free-space map beyond a per-relation insert hint, no
+parallel cross-core buffer-pool access, and no concurrent mutation guarantee for a single `Store`;
+lifecycle and checkpoint operations require quiescent mutations. Page writes still go through a
+replacement-file rewrite because Tin has no positional write API (`BUGS.md`); a checkpoint writes
+each relation once, and a large buffer pool avoids the rewrite on reads. On a platform without
+`fdatasync`, every WAL sync is a full `fsync`, so the group-commit and durability numbers are
+fsync-bound.
+
+## Tests and benchmarks
+
+`tin test store` runs the page, buffer-pool, heap, B-tree, randomized-model, concurrency and
+crash-recovery suites. `TestBufferPoolEvictsAcrossThousandPages` forces clock-sweep eviction through
+a 16-frame pool and checks WAL-before-data; `TestRandomizedHeapVersusModel` and
+`TestBtreeVersusSortedModel` replay tens of thousands of seeded operations against in-memory models;
+`TestConcurrentHeapAndBtreeTasks` inserts from several tasks into one heap and one index;
+`TestCrashTruncatesAtEveryRecordBoundary` and `TestCrashTruncatesAtRandomOffsets` reopen copies of
+the data directory with the WAL cut at every record boundary and at random byte offsets, requiring
+the heap and B-tree to agree on a committed prefix. `tin test -bench store` prints heap insert,
+sequential scan, B-tree insert, point lookup and group-commit throughput.
