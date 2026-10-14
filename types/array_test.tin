@@ -1,0 +1,29 @@
+package types
+
+import "crucible"
+import "twine"
+
+fn brace() str { return str(u8(123)) }
+fn rbrace() str { return str(u8(125)) }
+
+fn TestArrayParseRoundTrip(t mut crucible.T) {
+	let cases = []str{brace()+"1,2,3"+rbrace(), brace()+rbrace(), brace()+"1,2"+rbrace()+brace()+"3,4"+rbrace()}
+	for c in cases {
+		let d = Parse(arrayOidFor(Int4Oid), c) catch _ { Null() }
+		crucible.Equal(mut t, "round trip {c}", d.Text(), c)
+	}
+}
+
+fn TestArrayIndexKey(t mut crucible.T) {
+	let a = Parse(arrayOidFor(Int4Oid), brace()+"1,2"+rbrace()) catch _ { Null() }
+	let b = Parse(arrayOidFor(Int4Oid), brace()+"1,3"+rbrace()) catch _ { Null() }
+	let ka = IndexKey(a)
+	let kb = IndexKey(b)
+	t.True("array index key orders", twine.Compare(str(ka), str(kb)) < 0)
+}
+
+fn TestArrayCastText(t mut crucible.T) {
+	let a = Parse(arrayOidFor(Int4Oid), brace()+"1,2"+rbrace()) catch _ { Null() }
+	let s = Cast(a, TextOid) catch _ { Null() }
+	crucible.Equal(mut t, "array cast to text", s.Text(), brace()+"1,2"+rbrace())
+}
