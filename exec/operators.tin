@@ -31,6 +31,10 @@ fn (c mut SeqScanCursor) Next() !([]types.Datum, bool) {
 		if !vis {
 			continue
 		}
+		if h.Xmax() == c.Snapshot.Xid {
+			// Deleted or replaced by this transaction's earlier command.
+			continue
+		}
 		let row = try types.DecodeRow(c.ColTypes, tuple.Payload)
 		mut evalCtx = c.Ctx
 		evalCtx.Row = row
@@ -232,14 +236,39 @@ fn (c mut SortCursor) Next() !([]types.Datum, bool) {
 	if !c.Loaded {
 		c.Loaded = true
 		mut rows = [][]types.Datum{}
+		mut keyVals = [][]types.Datum{}
 		for {
 			let (row, ok) = try c.Input.Next()
 			if !ok {
 				break
 			}
+			// Evaluate each key once per row, into its own context, before sorting.
+			// Re-evaluating expressions inside the comparator kept two ExprContext copies
+			// live in one frame, which a Tin stack-aliasing miscompile made both read the
+			// same row (see BUGS.md); precomputed keys avoid it and are faster.
+			mut kv = []types.Datum{}
+			for key in c.Keys {
+				mut k = key.Expr
+				mut kctx = NewExprContext(row, []types.Datum{})
+				let v = EvalExpr(mut k, mut kctx) catch _ { types.Null() }
+				kv = append(kv, v)
+			}
 			rows = append(rows, row)
+			keyVals = append(keyVals, kv)
 		}
-		c.sortRows(mut rows)
+		let n = len(rows)
+		for i in 1..n {
+			mut j = i
+			for j > 0 && c.compareKeys(keyVals[j], keyVals[j-1]) < 0 {
+				let tk = keyVals[j]
+				keyVals[j] = keyVals[j-1]
+				keyVals[j-1] = tk
+				let tr = rows[j]
+				rows[j] = rows[j-1]
+				rows[j-1] = tr
+				j -= 1
+			}
+		}
 		if c.Limit > 0 && len(rows) > c.Limit {
 			rows = rows[:c.Limit]
 		}
@@ -253,39 +282,33 @@ fn (c mut SortCursor) Next() !([]types.Datum, bool) {
 	return row, true
 }
 
-fn (c mut SortCursor) sortRows(rows mut [][]types.Datum) {
-	// Simple in-place insertion sort
-	let n = len(rows)
-	for i in 1..n {
-		mut j = i
-		for j > 0 && c.compare(mut rows[j], mut rows[j-1]) < 0 {
-			let tmp = rows[j]
-			rows[j] = rows[j-1]
-			rows[j-1] = tmp
-			j -= 1
+// compareKeys orders two rows by their precomputed key values.
+fn (c SortCursor) compareKeys(a []types.Datum, b []types.Datum) i64 {
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
 		}
+		return 1
 	}
-}
-
-fn (c mut SortCursor) compare(a mut []types.Datum, b mut []types.Datum) i64 {
-	mut ctxA = c.Ctx
-	ctxA.Row = a
-	mut ctxB = c.Ctx
-	ctxB.Row = b
-	for key in c.Keys {
-		mut kA = key.Expr
-		mut kB = key.Expr
-		let valA = EvalExpr(mut kA, mut ctxA) catch _ { types.Null() }
-		let valB = EvalExpr(mut kB, mut ctxB) catch _ { types.Null() }
+	for i, key in c.Keys {
+		if i >= len(a) {
+			continue
+		}
+		let valA = a[i]
+		let valB = b[i]
 		if types.IsNull(valA) && types.IsNull(valB) {
 			continue
 		}
 		if types.IsNull(valA) {
-			if key.NullsFirst { return -1 }
+			if key.NullsFirst {
+				return -1
+			}
 			return 1
 		}
 		if types.IsNull(valB) {
-			if key.NullsFirst { return 1 }
+			if key.NullsFirst {
+				return 1
+			}
 			return -1
 		}
 		let cmp = types.Compare(valA, valB)
@@ -414,6 +437,7 @@ type HashJoinCursor struct {
 	BucketIndex i64
 	Matched bool
 	RightWidth i64
+	PadLeft i64
 }
 
 fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
@@ -426,9 +450,24 @@ fn (c mut HashJoinCursor) Next() !([]types.Datum, bool) {
 				break
 			}
 			c.RightWidth = i64(len(rRow))
-			mut rCtx = c.Ctx
-			rCtx.Row = rRow
+			// The analyzer numbers slots globally, so a right key such as `u.id` carries
+			// its slot in the joined row (after the left columns). Pad the right row with
+			// the left width of NULLs so those slots resolve; exec's unit tests use
+			// relative right keys (PadLeft 0) and are used as they are.
 			mut rKeys = c.RightKeys
+			mut rCtx = c.Ctx
+			if c.PadLeft > 0 {
+				mut padded = []types.Datum{}
+				for _i in 0..c.PadLeft {
+					padded = append(padded, types.Null())
+				}
+				for d in rRow {
+					padded = append(padded, d)
+				}
+				rCtx.Row = padded
+			} else {
+				rCtx.Row = rRow
+			}
 			let key = try evalKey(mut rKeys, mut rCtx)
 			let (list, exists) = c.Buckets[key]
 			if exists {
@@ -796,6 +835,14 @@ fn BuildCursor(p mut plan.Plan, ctx mut ExprContext) !dyn Cursor {
 			}
 			return ValuesCursor{Rows: [][]types.Datum{}, Index: 0}
 		}
+		IndexScan(s) => {
+			mut base = try buildIndexFallback(s.Table, mut ctx)
+			return applyIndexQuals(base, s.Quals, s.Filter, ctx)
+		}
+		IndexOnlyScan(s) => {
+			mut base = try buildIndexFallback(s.Table, mut ctx)
+			return applyIndexQuals(base, s.Quals, s.Filter, ctx)
+		}
 		Filter(f) => {
 			let inCur = try BuildCursor(mut f.Input, mut ctx)
 			return PlanFilterCursor{
@@ -891,6 +938,7 @@ fn BuildCursor(p mut plan.Plan, ctx mut ExprContext) !dyn Cursor {
 				BucketIndex: 0,
 				Matched: false,
 				RightWidth: 0,
+				PadLeft: joinPadLeft(h.LeftKeys, h.RightKeys, i64(len(h.Left.Cols())), i64(len(h.Right.Cols()))),
 			}
 		}
 		MergeJoin(m) => {
@@ -914,6 +962,7 @@ fn BuildCursor(p mut plan.Plan, ctx mut ExprContext) !dyn Cursor {
 				BucketIndex: 0,
 				Matched: false,
 				RightWidth: 0,
+				PadLeft: joinPadLeft(m.LeftKeys, m.RightKeys, i64(len(m.Left.Cols())), i64(len(m.Right.Cols()))),
 			}
 		}
 		HashAgg(ha) => {
@@ -997,5 +1046,117 @@ fn BuildCursor(p mut plan.Plan, ctx mut ExprContext) !dyn Cursor {
 		_ => {
 			return ValuesCursor{Rows: [][]types.Datum{}, Index: 0}
 		}
+	}
+}
+
+// freshPlan returns its argument unchanged. It breaks the compiler's conservative
+// derived-value chain (E701 NOT_MUT) when a plan obtained from a statement-bound
+// prepared value must be passed to a `mut` parameter; see BUGS.md.
+fn freshPlan(p plan.Plan) plan.Plan {
+	return p
+}
+
+// freshModify is freshPlan for a ModifyTableNode.
+fn freshModify(node plan.ModifyTableNode) plan.ModifyTableNode {
+	return node
+}
+
+// buildIndexFallback runs a heap scan in place of an index scan. store.IndexSeek reports
+// 0A000 (no usable B-tree in this milestone), so the index bounds are ignored and the
+// index quals and residual filter are applied to every heap row instead.
+fn buildIndexFallback(table catalog.Table, ctx mut ExprContext) !dyn Cursor {
+	if let cat = ctx.Catalog {
+		mut snap = txn.Snapshot{}
+		if let t = ctx.Txn {
+			snap = cat.Manager.Snapshot(t)
+		}
+		mut colTypes = []u32{}
+		for col in table.Cols {
+			colTypes = append(colTypes, col.Type)
+		}
+		let scan = cat.Store.HeapScan(store.RelId(table.Rel))
+		return SeqScanCursor{Store: cat.Store, Manager: cat.Manager, Table: table, Snapshot: snap, Filter: nil, Projection: []plan.Expr{}, Scan: scan, ColTypes: colTypes, Ctx: ctx}
+	}
+	return ValuesCursor{Rows: [][]types.Datum{}, Index: 0}
+}
+
+// applyIndexQuals chains a filter per index qual and the residual filter onto a scan.
+fn applyIndexQuals(base dyn Cursor, quals []plan.Expr, filter ?plan.Expr, ctx ExprContext) dyn Cursor {
+	mut cur = base
+	for q in quals {
+		cur = PlanFilterCursor{Input: cur, Predicate: q, Ctx: ctx}
+	}
+	if let f = filter {
+		cur = PlanFilterCursor{Input: cur, Predicate: f, Ctx: ctx}
+	}
+	return cur
+}
+
+// joinPadLeft returns how many NULL columns to place in front of a right-join row when its
+// keys use the analyzer's global executor slots (slot >= the right row width). exec's own
+// unit tests build right keys relative to the right row (slot 0) and need no padding.
+fn joinPadLeft(leftKeys []plan.Expr, rightKeys []plan.Expr, leftWidth i64, rightWidth i64) i64 {
+	_ = leftKeys
+	mut m = i64(0)
+	for k in rightKeys {
+		let s = maxExprSlot(k)
+		if s > m {
+			m = s
+		}
+	}
+	if m >= rightWidth {
+		return leftWidth
+	}
+	return 0
+}
+
+// maxExprSlot returns the highest column slot referenced by an expression, or 0 when it
+// cannot tell.
+fn maxExprSlot(e plan.Expr) i64 {
+	match e {
+		ColRef(c) => { return c.Slot }
+		Cast(c) => { return maxExprSlot(c.Arg) }
+		NullTest(n) => { return maxExprSlot(n.Arg) }
+		OpCall(o) => {
+			mut m = i64(0)
+			for a in o.Args {
+				let s = maxExprSlot(a)
+				if s > m {
+					m = s
+				}
+			}
+			return m
+		}
+		FuncCall(f) => {
+			mut m = i64(0)
+			for a in f.Args {
+				let s = maxExprSlot(a)
+				if s > m {
+					m = s
+				}
+			}
+			return m
+		}
+		BoolExpr(b) => {
+			mut m = i64(0)
+			for a in b.Args {
+				let s = maxExprSlot(a)
+				if s > m {
+					m = s
+				}
+			}
+			return m
+		}
+		Coalesce(c) => {
+			mut m = i64(0)
+			for a in c.Args {
+				let s = maxExprSlot(a)
+				if s > m {
+					m = s
+				}
+			}
+			return m
+		}
+		_ => { return 0 }
 	}
 }

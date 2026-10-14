@@ -5,6 +5,7 @@ import "../txn"
 import "../types"
 import "../parse"
 import "../plan"
+import "../store"
 import "atomic"
 import "mint"
 import "twine"
@@ -43,6 +44,7 @@ type Session struct {
 	canceled atomic.Bool
 	preparedStatements map[str]PreparedStatement
 	portals map[str]Portal
+	mutatedRels map[u32]bool
 }
 
 // NewSession creates an execution session with default GUC parameters.
@@ -61,6 +63,7 @@ fn NewSession(c catalog.Catalog, m txn.Manager, user str, db str) Session {
 		canceled: atomic.NewBool(false),
 		preparedStatements: make(map[str]PreparedStatement),
 		portals: make(map[str]Portal),
+		mutatedRels: make(map[u32]bool),
 	}
 }
 
@@ -127,6 +130,9 @@ fn (s mut Session) Simple(sql str, out mut dyn Sink) ! {
 				errPayload = types.ErrorFromFault(err)
 				break
 			}
+			// PostgreSQL advances the command counter after each statement, so a row
+			// written by an earlier statement in this message is visible to a later one.
+			s.advanceCommandCounter()
 		}
 		if hasErr {
 			s.Manager.Abort(mut t) catch _ {}
@@ -156,6 +162,7 @@ fn (s mut Session) Simple(sql str, out mut dyn Sink) ! {
 			}
 			fail err
 		}
+		s.advanceCommandCounter()
 	}
 }
 
@@ -182,12 +189,13 @@ fn (s mut Session) executeSingle(sql str, out mut dyn Sink) ! {
 		return
 	}
 
-	for astStmt in parseResult {
-		try s.executeAst(astStmt, mut out)
+	for i in 0..len(parseResult) {
+		mut astStmt = parseResult[i]
+		try s.executeAst(mut astStmt, mut out)
 	}
 }
 
-fn (s mut Session) executeAst(stmt parse.Stmt, out mut dyn Sink) ! {
+fn (s mut Session) executeAst(stmt mut parse.Stmt, out mut dyn Sink) ! {
 	match stmt {
 		Transaction(t) => {
 			try s.executeTransaction(t, mut out)
@@ -205,8 +213,76 @@ fn (s mut Session) executeAst(stmt parse.Stmt, out mut dyn Sink) ! {
 			if s.state == TxnState.Aborted {
 				try s.abortedError()
 			}
-			// Plan and execute other statements once plan nodes land
-			out.CommandComplete("OK")
+			try s.executePlannedStatement(mut stmt, mut out)
+		}
+	}
+}
+
+// executePlannedStatement connects simple-query statements to the planner and executor.
+fn (s mut Session) executePlannedStatement(stmt mut parse.Stmt, out mut dyn Sink) ! {
+	// System-information functions are session-dependent and are not in the planner's
+	// function registry; exec answers FROM-less selects of them itself.
+	match stmt {
+		Select(sel) => {
+			let handled = try trySystemSelect(sel, mut s, mut out)
+			if handled {
+				return
+			}
+		}
+		_ => {}
+	}
+	let tx = try s.Txn()
+	let prepared = try plan.Prepare(s.Catalog, tx, stmt, []u32{})
+	match prepared.Plan {
+		Utility(_) => {
+			_ = try ExecuteUtility(mut stmt, mut s, mut out)
+		}
+		ModifyTable(node) => {
+			mut nodeMut = freshModify(node)
+			s.mutatedRels[node.Table.Rel] = true
+			mut ctx = ExprContext{
+				Row: []types.Datum{},
+				Params: []types.Datum{},
+				Txn: tx,
+				Catalog: s.Catalog,
+			}
+			_ = try ExecuteModifyTable(mut nodeMut, mut ctx, mut out)
+		}
+		_ => {
+			mut cols = []ColDesc{}
+			mut formats = []i16{}
+			for col in prepared.ResultCols {
+				cols = append(cols, ColDesc{
+					Name: col.Name,
+					Oid: col.Oid,
+					Typmod: col.Typmod,
+					TableOid: col.TableOid,
+					Attno: col.Attno,
+				})
+				formats = append(formats, 0)
+			}
+			if len(cols) > 0 {
+				out.RowDescription(cols, formats)
+			}
+			mut p = freshPlan(prepared.Plan)
+			mut ctx = ExprContext{
+				Row: []types.Datum{},
+				Params: []types.Datum{},
+				Txn: tx,
+				Catalog: s.Catalog,
+			}
+			mut cur = try BuildCursor(mut p, mut ctx)
+			mut count = i64(0)
+			for {
+				if s.canceled.Load() {
+					try types.ErrorFault(types.NewPgError("57014", "canceling statement due to user request", "", "", 0))
+				}
+				let (row, ok) = try cur.Next()
+				if !ok { break }
+				out.DataRow(row)
+				count += 1
+			}
+			out.CommandComplete("SELECT {count}")
 		}
 	}
 }
@@ -232,6 +308,7 @@ fn (s mut Session) executeTransaction(t parse.TransactionStmt, out mut dyn Sink)
 			s.currentTxn = txnObj
 			s.state = TxnState.InTxn
 			s.savepoints = []Savepoint{}
+			s.mutatedRels = make(map[u32]bool)
 			out.CommandComplete("BEGIN")
 		}
 		"commit" => {
@@ -248,6 +325,7 @@ fn (s mut Session) executeTransaction(t parse.TransactionStmt, out mut dyn Sink)
 				s.currentTxn = nil
 				s.state = TxnState.Idle
 				s.savepoints = []Savepoint{}
+				s.mutatedRels = make(map[u32]bool)
 				s.rollbackLocalGucs()
 				out.Notice(Notice{Message: "there is no transaction in progress", Code: "25P01", Detail: "", Hint: ""})
 				out.CommandComplete("ROLLBACK")
@@ -260,6 +338,7 @@ fn (s mut Session) executeTransaction(t parse.TransactionStmt, out mut dyn Sink)
 			s.currentTxn = nil
 			s.state = TxnState.Idle
 			s.savepoints = []Savepoint{}
+			s.mutatedRels = make(map[u32]bool)
 			s.rollbackLocalGucs()
 			out.CommandComplete("COMMIT")
 		}
@@ -276,6 +355,7 @@ fn (s mut Session) executeTransaction(t parse.TransactionStmt, out mut dyn Sink)
 			s.currentTxn = nil
 			s.state = TxnState.Idle
 			s.savepoints = []Savepoint{}
+			s.mutatedRels = make(map[u32]bool)
 			s.rollbackLocalGucs()
 			out.CommandComplete("ROLLBACK")
 		}
@@ -298,6 +378,9 @@ fn (s mut Session) executeTransaction(t parse.TransactionStmt, out mut dyn Sink)
 				cid = txnObj.CommandID()
 			}
 			s.savepoints = append(s.savepoints, Savepoint{Name: name, Cid: cid, LocalGucCount: len(s.localGucs)})
+			// Later statements in this transaction must carry a command id above the
+			// savepoint's so a ROLLBACK TO can undo exactly what came after it.
+			s.advanceCommandCounter()
 			out.CommandComplete("SAVEPOINT")
 		}
 		"rollback to" => {
@@ -314,6 +397,7 @@ fn (s mut Session) executeTransaction(t parse.TransactionStmt, out mut dyn Sink)
 			}
 			let sp = s.savepoints[idx]
 			s.rollbackLocalGucsTo(sp.LocalGucCount)
+			try s.rollbackSavepointData(sp)
 			s.savepoints = s.savepoints[:idx+1]
 			s.state = TxnState.InTxn
 			out.CommandComplete("ROLLBACK")
@@ -628,7 +712,7 @@ fn (s mut Session) Bind(portalName str, prepName str, params mut []types.Datum, 
 			Txn: s.currentTxn,
 			Catalog: s.Catalog,
 		}
-		mut prepPlan = prep.Plan
+		mut prepPlan = freshPlan(prep.Plan)
 		mut cur = try BuildCursor(mut prepPlan, mut ctx)
 		s.portals[portalName] = Portal{
 			Name: portalName,
@@ -695,7 +779,7 @@ fn (s mut Session) Execute(portalName str, maxRows i64, out mut dyn Sink) ! {
 				Txn: s.currentTxn,
 				Catalog: s.Catalog,
 			}
-			mut mtMut = mt
+			mut mtMut = freshModify(mt)
 			try ExecuteModifyTable(mut mtMut, mut ctx, mut out)
 			mut updated = portal
 			updated.Completed = true
@@ -841,6 +925,39 @@ fn (s Session) findSavepoint(name str) i64 {
 		}
 	}
 	return -1
+}
+
+// advanceCommandCounter bumps the active transaction's command id so rows written after
+// a savepoint are distinguishable from rows written before it.
+fn (s mut Session) advanceCommandCounter() {
+	if let t = s.currentTxn {
+		mut tm = t
+		tm.CommandCounterIncrement()
+		s.currentTxn = tm
+	}
+}
+
+// rollbackSavepointData undoes the row writes of the current transaction that happened
+// after sp, by marking their tuples deleted. txn.Manager has no subtransaction support,
+// so exec tracks the command id at each SAVEPOINT and re-scans the relations this
+// transaction touched. Tuples deleted (or updated) before sp cannot be restored this
+// way; store would need a tuple-undelete/undo API for that (see BUGS.md NEEDS-OTHER).
+fn (s mut Session) rollbackSavepointData(sp Savepoint) ! {
+	if let t = s.currentTxn {
+		let x = store.NewXidCtx(t.Xid(), t.CommandID())
+		for rel, _ in s.mutatedRels {
+			mut scan = s.Catalog.Store.HeapScan(store.RelId(rel))
+			for {
+				let (tuple, ok) = scan.Next()
+				if !ok {
+					break
+				}
+				if tuple.Header.Xmin() == t.Xid() && tuple.Header.Cid() > sp.Cid {
+					s.Catalog.Store.HeapDelete(x, store.RelId(rel), tuple.Tid) catch _ {}
+				}
+			}
+		}
+	}
 }
 
 fn (s Session) abortedError() ! {

@@ -8,7 +8,7 @@ import "../txn"
 import "../store"
 
 // ExecuteUtility processes DDL and utility statements.
-fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
+fn ExecuteUtility(stmt mut parse.Stmt, session mut Session, out mut dyn Sink) !str {
 	let tx = try session.Txn()
 	match stmt {
 		CreateTable(ct) => {
@@ -51,6 +51,11 @@ fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
 				}
 				try types.ErrorFault(types.NewPgError("42P07", "relation \"" + tblName + "\" already exists", "", "", 0))
 			}
+			// Materialize the backing heap relation for the new catalog entry.
+			let tblOpt = session.Catalog.LookupTable(tx, schemaName, tblName)
+			if let tbl = tblOpt {
+				try session.Catalog.Store.CreateHeap(store.RelId(tbl.Rel))
+			}
 			let tag = "CREATE TABLE"
 			out.CommandComplete(tag)
 			return tag
@@ -69,6 +74,7 @@ fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
 					let tblOpt = session.Catalog.LookupTable(tx, schemaName, name)
 					if let tbl = tblOpt {
 						session.Catalog.DropTable(tx, tbl, dr.Behavior == "cascade") catch _ {}
+						session.Catalog.Store.DropRel(store.RelId(tbl.Rel)) catch _ {}
 					} else if !dr.IfExists {
 						try types.ErrorFault(types.NewPgError("42P01", "table \"" + name + "\" does not exist", "", "", 0))
 					}
@@ -139,7 +145,7 @@ fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
 					Txn: tx,
 					Catalog: session.Catalog,
 				}
-				mut prepPlan = prep.Plan
+				mut prepPlan = freshPlan(prep.Plan)
 				mut cur = try BuildCursor(mut prepPlan, mut ctx)
 				if len(prep.Cols) > 0 {
 					mut sinkCols = []ColDesc{}

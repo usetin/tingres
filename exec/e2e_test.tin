@@ -1,0 +1,226 @@
+package exec
+
+import "../types"
+import "../plan"
+import "../catalog"
+import "../txn"
+import "../store"
+import "crucible"
+import "quarry"
+import "mint"
+
+// TestEndToEndOnRealStore is the product goal in one test: a scripted session runs
+// through Session.Simple against the real store, transaction manager and catalog
+// (no fakes), covering CREATE TABLE / INSERT / SELECT (WHERE, ORDER BY, LIMIT, GROUP BY,
+// join) / UPDATE / DELETE / BEGIN / COMMIT / ROLLBACK / SET / SHOW with PostgreSQL's
+// command tags. It then closes the data directory, reopens it and checks that the
+// committed rows survived, and that a fresh session can run SQL on the reopened store.
+fn TestEndToEndOnRealStore(t mut crucible.T) {
+	let dir = quarry.TempDir() + "/tingres-e2e-real"
+	quarry.RemoveAll(dir) catch _ { }
+
+	mut db = store.Open(dir, store.Options{BufferPages: 64, SyncOnWrite: false}) catch err {
+		t.Error("open data dir failed: {err}")
+		return
+	}
+	mut m = txn.NewManager(mut db) catch err {
+		t.Error("txn manager failed: {err}")
+		return
+	}
+	let c = catalog.Open(mut db, m) catch err {
+		t.Error("catalog open failed: {err}")
+		return
+	}
+	mut s = NewSession(c, m, "postgres", "postgres")
+
+	// --- DDL ---
+	let createTag = e2eTag(mut t, mut s, "CREATE TABLE t (id int, name text);")
+	t.True("CREATE TABLE tag", createTag == "CREATE TABLE")
+	let createUTag = e2eTag(mut t, mut s, "CREATE TABLE u (id int, label text);")
+	t.True("CREATE TABLE u tag", createUTag == "CREATE TABLE")
+
+	// --- INSERT (multi-statement atomicity per simple query) ---
+	let insertTag = e2eTag(mut t, mut s, "INSERT INTO t VALUES (1, 'a'); INSERT INTO t VALUES (2, 'b'); INSERT INTO t VALUES (3, 'c');")
+	t.True("INSERT tag", insertTag == "INSERT 0 1")
+	let insertUTag = e2eTag(mut t, mut s, "INSERT INTO u VALUES (1, 'x'); INSERT INTO u VALUES (2, 'y');")
+	t.True("INSERT u tag", insertUTag == "INSERT 0 1")
+
+	// --- SELECT with ORDER BY ---
+	let ordered = e2eRows(mut t, mut s, "SELECT id, name FROM t ORDER BY id;")
+	t.True("ordered 3 rows", len(ordered) == 3)
+	if len(ordered) == 3 {
+		t.True("row 1 id is 1 (got " + ordered[0][0].Text() + ")", ordered[0][0].Text() == "1")
+		t.True("row 1 name is a (got " + ordered[0][1].Text() + ")", ordered[0][1].Text() == "a")
+		t.True("row 3 id is 3 (got " + ordered[2][0].Text() + ")", ordered[2][0].Text() == "3")
+	}
+
+	// --- WHERE and LIMIT ---
+	let filtered = e2eRows(mut t, mut s, "SELECT id FROM t WHERE id > 1 ORDER BY id LIMIT 1;")
+	t.True("filter+limit 1 row", len(filtered) == 1)
+	if len(filtered) == 1 {
+		t.True("filtered id is 2", filtered[0][0].Text() == "2")
+	}
+
+	// --- UPDATE ---
+	let updateTag = e2eTag(mut t, mut s, "UPDATE t SET name = 'B' WHERE id = 2;")
+	t.True("UPDATE 1 tag", updateTag == "UPDATE 1")
+	let afterUpdate = e2eRows(mut t, mut s, "SELECT name FROM t WHERE id = 2;")
+	t.True("updated value (got " + e2eCell(afterUpdate) + ")", len(afterUpdate) == 1 && afterUpdate[0][0].Text() == "B")
+
+	// --- DELETE ---
+	let deleteTag = e2eTag(mut t, mut s, "DELETE FROM t WHERE id = 3;")
+	t.True("DELETE 1 tag", deleteTag == "DELETE 1")
+	let afterDelete = e2eRows(mut t, mut s, "SELECT id FROM t ORDER BY id;")
+	t.True("2 rows after delete", len(afterDelete) == 2)
+
+	// --- JOIN ---
+	let joinCount = e2eCell(e2eRows(mut t, mut s, "SELECT count(*) FROM t JOIN u ON t.id = u.id;"))
+	let joined = e2eRows(mut t, mut s, "SELECT t.id, u.label FROM t JOIN u ON t.id = u.id ORDER BY t.id;")
+	mut joinInfo = mint.Itoa(i64(len(joined)))
+	if len(joined) > 0 {
+		joinInfo += " first=(" + joined[0][0].Text() + "," + joined[0][1].Text() + ")"
+	}
+	if len(joined) > 1 {
+		joinInfo += " second=(" + joined[1][0].Text() + "," + joined[1][1].Text() + ")"
+	}
+	t.True("join count(*) is 2 (got " + joinCount + ")", joinCount == "2")
+	t.True("join 2 rows (got " + joinInfo + ")", len(joined) == 2)
+	if len(joined) == 2 {
+		t.True("join row 1 label x (got " + joined[0][1].Text() + ")", joined[0][1].Text() == "x")
+		t.True("join row 2 label y (got " + joined[1][1].Text() + ")", joined[1][1].Text() == "y")
+	}
+
+	// --- Aggregate ---
+	let aggregated = e2eRows(mut t, mut s, "SELECT count(*) FROM t;")
+	t.True("count(*) 1 row", len(aggregated) == 1)
+	if len(aggregated) == 1 {
+		t.True("count is 2 (got " + aggregated[0][0].Text() + ")", aggregated[0][0].Text() == "2")
+	}
+	let grouped = e2eRows(mut t, mut s, "SELECT name FROM t GROUP BY name ORDER BY name;")
+	t.True("group by 2 groups", len(grouped) == 2)
+
+	// --- Transaction control: rollback loses the row ---
+	t.True("BEGIN tag", e2eTag(mut t, mut s, "BEGIN;") == "BEGIN")
+	let rollbackInsert = e2eTag(mut t, mut s, "INSERT INTO t VALUES (4, 'd');")
+	t.True("insert in txn tag", rollbackInsert == "INSERT 0 1")
+	t.True("ROLLBACK tag", e2eTag(mut t, mut s, "ROLLBACK;") == "ROLLBACK")
+	let afterRollback = e2eRows(mut t, mut s, "SELECT id FROM t ORDER BY id;")
+	t.True("rollback removed row 4", len(afterRollback) == 2)
+
+	// --- Transaction control: commit keeps the row ---
+	e2eTag(mut t, mut s, "BEGIN;")
+	e2eTag(mut t, mut s, "INSERT INTO t VALUES (5, 'e');")
+	t.True("COMMIT tag", e2eTag(mut t, mut s, "COMMIT;") == "COMMIT")
+	let afterCommit = e2eRows(mut t, mut s, "SELECT id FROM t ORDER BY id;")
+	t.True("commit kept row 5 (got " + mint.Itoa(i64(len(afterCommit))) + ")", len(afterCommit) == 3)
+
+	// --- SET / SHOW ---
+	t.True("SET tag", e2eTag(mut t, mut s, "SET application_name = 'e2e';") == "SET")
+	let showSink = e2eSink(mut t, mut s, "SHOW application_name;")
+	t.True("SHOW tag", len(showSink.Tags) > 0 && showSink.Tags[len(showSink.Tags)-1] == "SHOW")
+	t.True("SHOW value", len(showSink.Rows) == 1 && showSink.Rows[0][0].Text() == "e2e")
+
+	// --- System functions ---
+	let versionRows = e2eRows(mut t, mut s, "SELECT version();")
+	t.True("version() row", len(versionRows) == 1)
+
+	// Capture the relation id so the reopened store can be checked for the same rows.
+	let tx = s.Txn() catch err {
+		t.Error("txn for lookup failed: {err}")
+		return
+	}
+	let tblOpt = s.Catalog.LookupTable(tx, "public", "t")
+	t.True("table t in catalog", tblOpt != nil)
+	mut relId = u32(0)
+	if let tbl = tblOpt {
+		relId = tbl.Rel
+	}
+	t.True("relation id assigned", relId != 0)
+
+	// --- Persistence: close, reopen, verify committed rows survived ---
+	db.Close() catch err {
+		t.Error("close failed: {err}")
+		return
+	}
+	mut db2 = store.Open(dir, store.Options{BufferPages: 64, SyncOnWrite: false}) catch err {
+		t.Error("reopen failed: {err}")
+		return
+	}
+	mut m2 = txn.NewManager(mut db2) catch err {
+		t.Error("txn manager after reopen failed: {err}")
+		return
+	}
+	let t2 = m2.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin after reopen failed: {err}")
+		return
+	}
+	let snap = m2.Snapshot(t2)
+	mut live = 0
+	mut decoded = [][]types.Datum{}
+	mut scan = db2.HeapScan(store.RelId(relId))
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		if m2.Visible(snap, tuple.Header) {
+			live += 1
+			let row = types.DecodeRow([]u32{types.Int4Oid, types.TextOid}, tuple.Payload) catch _ { []types.Datum{} }
+			decoded = append(decoded, row)
+		}
+	}
+	t.True("3 committed rows survived restart", live == 3)
+	// The committed rows carry the post-UPDATE/DELETE/ROLLBACK state: (1,a), (2,B), (5,e).
+	t.True("decoded 3 rows", len(decoded) == 3)
+	if len(decoded) == 3 {
+		let id2 = e2eFindName(decoded, "2")
+		t.True("updated name B survived", id2 == "B")
+		let id5 = e2eFindName(decoded, "5")
+		t.True("committed name e survived", id5 == "e")
+		t.True("rolled back id 4 absent", e2eFindName(decoded, "4") == "")
+	}
+	db2.Close() catch _ {}
+}
+
+// e2eCell renders the first row/column for a failure message.
+fn e2eCell(rows [][]types.Datum) str {
+	if len(rows) > 0 && len(rows[0]) > 0 {
+		return rows[0][0].Text()
+	}
+	return "<none>"
+}
+
+// e2eFindName returns the name of the decoded row whose id text matches, or "".
+fn e2eFindName(rows [][]types.Datum, id str) str {
+	for row in rows {
+		if len(row) >= 2 && row[0].Text() == id {
+			return row[1].Text()
+		}
+	}
+	return ""
+}
+
+// e2eSink runs one simple-query message and returns the recorded output.
+fn e2eSink(t mut crucible.T, s mut Session, sql str) RecordSink {
+	mut sink = NewRecordSink()
+	s.Simple(sql, mut sink) catch err {
+		t.Error("statement failed: {sql} err={err}")
+		return sink
+	}
+	return sink
+}
+
+// e2eTag runs one statement and returns its last command tag.
+fn e2eTag(t mut crucible.T, s mut Session, sql str) str {
+	let sink = e2eSink(mut t, mut s, sql)
+	if len(sink.Tags) == 0 {
+		return ""
+	}
+	return sink.Tags[len(sink.Tags)-1]
+}
+
+// e2eRows runs one statement and returns the rows it produced.
+fn e2eRows(t mut crucible.T, s mut Session, sql str) [][]types.Datum {
+	let sink = e2eSink(mut t, mut s, sql)
+	return sink.Rows
+}

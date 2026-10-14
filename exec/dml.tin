@@ -13,6 +13,9 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 			mut sourcePlan = node.Source
 			mut sourceCur = try BuildCursor(mut sourcePlan, mut ctx)
 			let rel = store.RelId(node.Table.Rel)
+			// Ensure the backing heap relation exists even when the caller built the
+			// catalog descriptor directly (unit tests, or a catalog that lost metadata).
+			cat.Store.CreateHeap(rel) catch _ { }
 			let x = store.NewXidCtx(t.Xid(), t.CommandID())
 
 			mut colTypes = []u32{}
@@ -85,7 +88,7 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 									}
 									let h = hTuple.Header
 									let snap = cat.Manager.Snapshot(t)
-									if cat.Manager.Visible(snap, h) {
+									if conflictVisible(cat.Manager, snap, t, h) {
 										let decoded = types.DecodeRow(colTypes, hTuple.Payload) catch _ { []types.Datum{} }
 										if len(decoded) > 0 && len(targetRow) > 0 && !types.IsNull(targetRow[0]) && !types.IsNull(decoded[0]) {
 											if types.Compare(targetRow[0], decoded[0]) == 0 {
@@ -151,6 +154,10 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 								break
 							}
 							let h = hTuple.Header
+							if h.Xmax() == t.Xid() {
+								// Already deleted by this transaction; skip it.
+								continue
+							}
 							if cat.Manager.Visible(snap, h) {
 								let decoded = types.DecodeRow(colTypes, hTuple.Payload) catch _ { []types.Datum{} }
 								if rowsMatch(decoded, sourceRow) {
@@ -181,8 +188,21 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 					return tag
 				}
 				Update => {
+					// The planner lowers UPDATE to Project(Input: target scan): the input
+					// yields the original row and the projection yields the replacement row.
+					// Walk the input to match the stored tuple, then write the projection.
+					mut oldPlan = freshPlan(node.Source)
+					mut newExprs = []plan.Expr{}
+					match node.Source {
+						Project(pr) => {
+							oldPlan = pr.Input
+							newExprs = pr.Exprs
+						}
+						_ => {}
+					}
+					mut oldCur = try BuildCursor(mut oldPlan, mut ctx)
 					for {
-						let (sourceRow, ok) = try sourceCur.Next()
+						let (oldRow, ok) = try oldCur.Next()
 						if !ok {
 							break
 						}
@@ -197,9 +217,13 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 								break
 							}
 							let h = hTuple.Header
+							if h.Xmax() == t.Xid() {
+								// Already modified by this transaction; not a target again.
+								continue
+							}
 							if cat.Manager.Visible(snap, h) {
 								let decoded = types.DecodeRow(colTypes, hTuple.Payload) catch _ { []types.Datum{} }
-								if rowsMatch(decoded, sourceRow) {
+								if rowsMatch(decoded, oldRow) {
 									targetTid = hTuple.Tid
 									found = true
 									break
@@ -209,10 +233,21 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 						if found {
 							try cat.Store.HeapDelete(x, rel, targetTid)
 							mut updatedRow = []types.Datum{}
+							if len(newExprs) > 0 {
+								mut updCtx = ctx
+								updCtx.Row = oldRow
+								for expr in newExprs {
+									mut eMut = expr
+									let val = try EvalExpr(mut eMut, mut updCtx)
+									updatedRow = append(updatedRow, val)
+								}
+							} else {
+								for d in oldRow {
+									updatedRow = append(updatedRow, d)
+								}
+							}
 							for i, col in node.Table.Cols {
-								if i < len(sourceRow) {
-									updatedRow = append(updatedRow, sourceRow[i])
-								} else {
+								if i >= len(updatedRow) {
 									updatedRow = append(updatedRow, types.Null())
 								}
 								if !col.Nullable && types.IsNull(updatedRow[i]) {
@@ -245,6 +280,16 @@ fn ExecuteModifyTable(node mut plan.ModifyTableNode, ctx mut ExprContext, out mu
 	}
 	try types.ErrorFault(types.NewPgError("XX000", "catalog and transaction required for DML", "", "", 0))
 	return ""
+}
+
+// conflictVisible reports whether a tuple is a uniqueness-conflict candidate: a row this
+// transaction inserted conflicts even before the command counter advances, and it is gone
+// once this transaction deleted it.
+fn conflictVisible(m txn.Manager, snap txn.Snapshot, t txn.Txn, h store.TupleHeader) bool {
+	if h.Xmin() == t.Xid() {
+		return h.Xmax() != t.Xid()
+	}
+	return m.Visible(snap, h)
 }
 
 fn rowsMatch(a []types.Datum, b []types.Datum) bool {

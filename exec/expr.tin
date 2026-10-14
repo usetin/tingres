@@ -27,7 +27,7 @@ fn NewExprContext(row []types.Datum, params []types.Datum) ExprContext {
 fn EvalExpr(e mut plan.Expr, ctx mut ExprContext) !types.Datum {
 	match e {
 		Const(c) => {
-			return c.Value
+			return normalizeConst(c.Value)
 		}
 		ColRef(c) => {
 			if c.Slot < 0 || c.Slot >= len(ctx.Row) {
@@ -230,6 +230,46 @@ fn EvalExpr(e mut plan.Expr, ctx mut ExprContext) !types.Datum {
 		}
 	}
 	return types.Null()
+}
+
+// normalizeConst decodes a string constant. plan's analyzer keeps a string literal's SQL
+// spelling, including the surrounding single quotes and doubled inner quotes, in the
+// constant datum; PostgreSQL's lexer hands the value without them. Normalizing here keeps
+// INSERT/SELECT/WHERE values correct until plan.analyzeLiteral decodes the token itself
+// (see BUGS.md NEEDS-OTHER).
+fn normalizeConst(d types.Datum) types.Datum {
+	if types.IsNull(d) {
+		return d
+	}
+	match d.Oid() {
+		types.TextOid, types.VarcharOid, types.BpcharOid, types.NameOid => {
+			let text = d.Text()
+			if len(text) >= 2 && text[0] == 39 && text[len(text)-1] == 39 {
+				return types.FromStr(d.Oid(), unquoteSqlLiteral(text))
+			}
+			return d
+		}
+		_ => {
+			return d
+		}
+	}
+}
+
+// unquoteSqlLiteral strips the outer quotes and collapses doubled quotes.
+fn unquoteSqlLiteral(text str) str {
+	mut out = ""
+	mut i = 1
+	let end = len(text) - 1
+	for i < end {
+		if text[i] == 39 && i + 1 < end && text[i+1] == 39 {
+			out += "'"
+			i += 2
+			continue
+		}
+		out += str(text[i])
+		i += 1
+	}
+	return out
 }
 
 fn evalSubLink(s mut plan.SubLinkExpr, ctx mut ExprContext) !types.Datum {
