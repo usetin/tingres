@@ -24,21 +24,19 @@ const defaultShutdownGrace = 5s
 const copyFlushBytes = 64 * 1024
 const livenessTick = 1s
 
-// gEngine is the process engine, set once by Serve before any session is created. A plain
-// program runs on one core, so this is not cross-core shared state; it is a global because
-// passing the engine through a task's function literal would hand long-lived memory to a
-// mut parameter (E312).
+// gEngine is where the process engine would be kept for the connection tasks. It is still
+// nil: handing the engine to a task is blocked by three compiler rules at once — through a
+// parameter it is E312 ("stores request memory into its mut parameter"), through a global it
+// is E310 (the engine is long-lived, and keep() would deep-copy the store and split it from
+// the one the WAL gate belongs to), and through a function literal it is E703 for a mut
+// parameter. See BUGS.md; until one of them is lifted, `--engine real` cannot serve a query
+// and `--engine auto` keeps using the conformance engine.
 mut gEngine ?Engine = nil
-
-// SetEngine installs the process engine.
-fn SetEngine(e Engine) {
-	gEngine = e
-}
 
 // EngineOrFail returns the process engine.
 fn EngineOrFail() !Engine {
 	if let e = gEngine { return e }
-	fail "tingres: the engine is not open"
+	fail "tingres: the query engine cannot be reached from a connection task yet (see BUGS.md)"
 }
 
 shared let activeConnections = atomic.NewInt(0)

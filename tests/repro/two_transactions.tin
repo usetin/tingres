@@ -1,0 +1,63 @@
+// Minimal repro for the real engine: two simple queries on one exec session.
+//
+//   tin run tests/repro/two_transactions.tin
+//
+// Two things it shows, both needed before `tingres --engine real` can serve:
+//  1. store -> txn -> catalog -> exec runs two simple queries on one session (they answer,
+//     each bounded by `within`, so the program never hangs), and
+//  2. what they answer today: the tag is `OK`, not `SELECT 1`, which is why the server's
+//     startup probe rejects the executor and `--engine auto` uses the conformance engine.
+// It is a program, not a test: the moment exec is end to end this is expected to print
+// `SELECT 1`, and the server's probe flips to the real engine by itself.
+package main
+
+import "../../catalog"
+import "../../exec"
+import "../../store"
+import "../../txn"
+import "quarry"
+import "say"
+
+fn main() {
+	let dir = quarry.TempDir() + "/tingres-repro-two-txns"
+	quarry.RemoveAll(dir) catch _ {
+	}
+	mut db = store.Open(dir, store.Options{BufferPages: 8, SharedBuffersBytes: 0, WalRingBytes: 0, SyncOnWrite: false}) catch err {
+		say.Line("store.Open failed: {err}")
+		return
+	}
+	let manager = txn.NewManager(mut db) catch err {
+		say.Line("txn.NewManager failed: {err}")
+		return
+	}
+	let cat = catalog.Open(mut db, manager) catch err {
+		say.Line("catalog.Open failed: {err}")
+		return
+	}
+	mut s = exec.NewSession(cat, manager, "postgres", "postgres")
+	mut first = exec.NewRecordSink()
+	within 5s {
+		s.Simple("SELECT 1", mut first) catch err {
+			say.Line("the first query failed: {err}")
+			return
+		}
+	} catch err {
+		say.Line("the first query did not finish within 5s: {err}")
+		say.Line("REPRO: even the first query does not finish")
+		return
+	}
+	say.Line("the first query finished, tags={first.Tags}")
+	mut second = exec.NewRecordSink()
+	within 5s {
+		s.Simple("SELECT 2", mut second) catch err {
+			say.Line("the second query failed: {err}")
+			return
+		}
+	} catch err {
+		say.Line("the second query did not finish within 5s: {err}")
+		say.Line("REPRO: the second query on one session never returns (store/txn/exec)")
+		return
+	}
+	say.Line("the second query finished, tags={second.Tags}")
+	say.Line("REPRO: both queries finished")
+}
