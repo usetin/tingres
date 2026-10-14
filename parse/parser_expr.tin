@@ -246,9 +246,31 @@ fn (p mut Parser) parsePrefix(minPrecedence i64) !Expr {
 		}
 		return Expr.Special(SpecialExpr{Pos: token.Pos, Name: word, Args: args})
 	}
-	if token.Kind == "word" && (word == "date" || word == "time" || word == "timestamp" || word == "interval") && p.kind() == "string" {
-		let literal = p.take()
-		return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "typed_" + word, Value: literal.Text})
+	if token.Kind == "word" && (word == "date" || word == "time" || word == "timestamp" || word == "interval") {
+		let save = p.At
+		mut deco = upperAscii(word)
+		if p.text() == "(" { deco += "(" + p.captureParenInner() + ")" }
+		if (word == "timestamp" || word == "time") && p.At + 1 < len(p.Tokens) && (lowerAscii(p.text()) == "with" || lowerAscii(p.text()) == "without") && lowerAscii(p.Tokens[p.At + 1].Text) == "time" {
+			let zoneWord = upperAscii(p.take().Text)
+			try p.expect("time")
+			try p.expect("zone")
+			deco += " " + zoneWord + " TIME ZONE"
+		}
+		if word == "interval" && (p.eat("year") || p.eat("month") || p.eat("day") || p.eat("hour") || p.eat("minute") || p.eat("second")) {
+			mut fields = upperAscii(p.Tokens[p.At - 1].Text)
+			if p.eat("to") { fields += " TO " + upperAscii(p.take().Text) }
+			deco += " " + fields
+		}
+		if p.kind() == "string" {
+			let literal = p.take()
+			mut text = deco + " " + literal.Text
+			if word == "interval" && (p.eat("year") || p.eat("month") || p.eat("day") || p.eat("hour") || p.eat("minute") || p.eat("second")) {
+				text += " " + upperAscii(p.Tokens[p.At - 1].Text)
+				if p.eat("to") { text += " TO " + upperAscii(p.take().Text) }
+			}
+			return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "typed", Value: text})
+		}
+		p.At = save
 	}
 	if token.Kind == "word" && token.KeywordClass == "reserved" { fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{p.Source[token.BytePos:token.EndBytePos]}\"") }
 	if token.Kind == "quoted" || token.Kind == "word" {
@@ -261,7 +283,22 @@ fn (p mut Parser) parsePrefix(minPrecedence i64) !Expr {
 			parts = append(parts, part)
 			if len(parts) == 3 { break }
 		}
-		if p.text() == "(" { return try p.parseFunction(token.Pos, QualifiedName{Pos: token.Pos, Parts: parts}) }
+		if p.kind() == "string" {
+			let lit = p.take()
+			return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "typed", Value: nameText(QualifiedName{Pos: token.Pos, Parts: parts}) + " " + lit.Text})
+		}
+		if p.text() == "(" {
+			if inWords(lowerAscii(parts[len(parts) - 1].Name), opaqueFunctionWords) {
+				let inner = p.captureParenInner()
+				return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "raw", Value: nameText(QualifiedName{Pos: token.Pos, Parts: parts}) + "(" + inner + ")"})
+			}
+			if typedStringAhead(p) {
+				let modifiers = p.captureParenInner()
+				let lit = p.take()
+				return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "typed", Value: nameText(QualifiedName{Pos: token.Pos, Parts: parts}) + "(" + modifiers + ") " + lit.Text})
+			}
+			return try p.parseFunction(token.Pos, QualifiedName{Pos: token.Pos, Parts: parts})
+		}
 		if len(parts) == 1 && p.text() == "(" { return try p.parseFunction(token.Pos, QualifiedName{Pos: token.Pos, Parts: parts}) }
 		if p.text() == "." && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Text == "*" {
 			p.At += 2
@@ -272,6 +309,22 @@ fn (p mut Parser) parsePrefix(minPrecedence i64) !Expr {
 	if token.Text == "*" && minPrecedence == 0 { return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Star: true}) }
 	if token.Text == "(" { return try p.parseParenExpression(token.Pos) }
 	fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{p.Source[token.BytePos:token.EndBytePos]}\"")
+}
+
+// typedStringAhead reports whether the "(" at the current position is a type modifier list
+// followed by a string literal (a typed constant such as numeric(10) '5'), rather than a
+// function call.
+fn typedStringAhead(p Parser) bool {
+	mut depth = 0
+	mut i = p.At
+	for i < len(p.Tokens) {
+		if p.Tokens[i].Text == "(" { depth += 1 } else if p.Tokens[i].Text == ")" {
+			depth -= 1
+			if depth == 0 { return i + 1 < len(p.Tokens) && p.Tokens[i + 1].Kind == "string" }
+		}
+		i += 1
+	}
+	return false
 }
 
 fn parseDigits(s str) i64 {

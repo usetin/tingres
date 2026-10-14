@@ -1,0 +1,207 @@
+package stats
+
+import "../types"
+import "mint"
+
+const DefaultEqSel f64 = 0.005
+const DefaultIneqSel f64 = 0.3333333333333333
+const DefaultMatchSel f64 = 0.005
+
+fn clampProb(x f64) f64 {
+	if x < 0 { return 0 }
+	if x > 1 { return 1 }
+	return x
+}
+
+fn nullFrac(s ColumnStats) f64 {
+	if s.NullFrac < 0 { return 0 }
+	if s.NullFrac > 1 { return 1 }
+	return s.NullFrac
+}
+
+fn ndistinctCount(s ColumnStats, totalRows f64) f64 {
+	mut n = s.NDistinct
+	if n < 0 {
+		if totalRows > 0 { n = -n * totalRows } else { n = -n }
+	}
+	if n <= 0 { return 0 }
+	return n
+}
+
+fn scalarOf(d types.Datum) f64 {
+	match d.Oid() {
+		types.Int2Oid, types.Int4Oid, types.Int8Oid, types.OidOid => {
+			let (n, perr) = mint.ParseInt(d.Text(), 10)
+			if perr != nil { return 0 }
+			return f64(n)
+		}
+		types.Float4Oid, types.Float8Oid => {
+			let (fv, ferr) = mint.ParseFloat(d.Text())
+			if ferr != nil { return 0 }
+			return fv
+		}
+		_ => { return f64(len(d.Text())) }
+	}
+	// cannot reach; parse ints
+	return 0
+}
+
+fn findMcv(s ColumnStats, v types.Datum) (i64, bool) {
+	for i in 0..len(s.MCVVals) {
+		if types.Compare(s.MCVVals[i], v) == 0 { return i64(i), true }
+	}
+	return -1, false
+}
+
+fn sumCommon(s ColumnStats) f64 {
+	mut x f64 = 0
+	for f in s.MCVFreqs { x += f }
+	return x
+}
+
+fn EqSelectivity(s ColumnStats, totalRows f64, constVal types.Datum) f64 {
+	if types.IsNull(constVal) { return 0 }
+	let nf = nullFrac(s)
+	let sc = sumCommon(s)
+	mut mcvHit f64 = 0
+	mut found bool = false
+	let (idx, ok) = findMcv(s, constVal)
+	if ok {
+		mcvHit = s.MCVFreqs[idx]
+		found = true
+	}
+	if found {
+		if mcvHit < 0 { mcvHit = 0 }
+		return clampProb(mcvHit)
+	}
+	// non-mcv
+	let nd = ndistinctCount(s, totalRows)
+	mut otherDistinct = nd - f64(len(s.MCVVals))
+	if otherDistinct < 1 { otherDistinct = 1 }
+	let nonMcvPop = 1.0 - nf - sc
+	if nonMcvPop < 0 { return clampProb(mcvHit) }
+	let est = nonMcvPop / otherDistinct
+	return clampProb(mcvHit + est)
+}
+
+fn leSelectivity(s ColumnStats, totalRows f64, constVal types.Datum) f64 {
+	// histogram binary search by types.Compare
+	let nb = len(s.HistBounds)
+	if nb < 2 { return DefaultIneqSel }
+	// MCV selec for <=
+	mut mcvSelec f64 = 0
+	for i in 0..len(s.MCVVals) {
+		if types.Compare(s.MCVVals[i], constVal) <= 0 { mcvSelec += s.MCVFreqs[i] }
+	}
+	mut lobound i64 = 0
+	mut hibound i64 = i64(nb)
+	for lobound < hibound {
+		let probe = (lobound + hibound) / 2
+		let ltcmp = types.Compare(s.HistBounds[probe], constVal) < 0 // bound < const
+		let c = ltcmp
+		if c {
+			lobound = probe + 1
+		} else {
+			hibound = probe
+		}
+	}
+	mut histfrac f64 = 0
+	if lobound <= 0 {
+		histfrac = 0
+	} else if lobound >= i64(nb) {
+		histfrac = 1
+	} else {
+		let i = lobound
+		// binfrac
+		mut binfrac f64 = 0.5
+		let low = scalarOf(s.HistBounds[i-1])
+		let high = scalarOf(s.HistBounds[i])
+		let val = scalarOf(constVal)
+		if high <= low {
+			binfrac = 0.5
+		} else if val <= low {
+			binfrac = 0
+		} else if val >= high {
+			binfrac = 1
+		} else {
+			binfrac = (val - low) / (high - low)
+			if binfrac < 0 || binfrac > 1 { binfrac = 0.5 }
+		}
+		histfrac = (f64(i-1) + binfrac) / f64(nb-1)
+		// first bin correction approx
+		if i == 1 { histfrac += (1.0 / f64(ndistinctCount(s,totalRows))) * (1.0 - binfrac) }
+	}
+	// merge
+	let nf = nullFrac(s)
+	let sc = sumCommon(s)
+	mut nonMcvProb f64 = 1.0 - nf - sc
+	if nonMcvProb < 0 { nonMcvProb = 0 }
+	let histPart = nonMcvProb * histfrac
+	let est = mcvSelec + histPart
+	return clampProb(est)
+}
+
+fn LessSelectivity(s ColumnStats, totalRows f64, constVal types.Datum) f64 {
+	let le = leSelectivity(s, totalRows, constVal)
+	// subtract approximate eq prob
+	let eqp = EqSelectivity(s, totalRows, constVal)
+	_ = eqp
+	return clampProb(le - EqSelectivity(s,totalRows,constVal)*0.5)
+}
+
+fn LessEqualSelectivity(s ColumnStats, totalRows f64, constVal types.Datum) f64 {
+	return leSelectivity(s, totalRows, constVal)
+}
+
+fn GreaterSelectivity(s ColumnStats, totalRows f64, constVal types.Datum) f64 {
+	return clampProb(1.0 - LessEqualSelectivity(s, totalRows, constVal))
+}
+
+fn GreaterEqualSelectivity(s ColumnStats, totalRows f64, constVal types.Datum) f64 {
+	return clampProb(1.0 - (leSelectivity(s,totalRows,constVal) - EqSelectivity(s,totalRows,constVal)*0.5))
+}
+
+fn IsNullSelectivity(s ColumnStats) f64 { return clampProb(nullFrac(s)) }
+fn IsNotNullSelectivity(s ColumnStats) f64 { return clampProb(1 - nullFrac(s)) }
+
+fn InListSelectivity(s ColumnStats, totalRows f64, vals []types.Datum) f64 {
+	mut total f64 = 0
+	for v in vals { total += EqSelectivity(s, totalRows, v) }
+	if total > 1 { total = 1 }
+	return clampProb(total)
+}
+
+fn PrefixLikeSelectivity(s ColumnStats, totalRows f64, prefix str) f64 {
+	// approximate via range not available; default
+	_ = s
+	_ = totalRows
+	_ = prefix
+	return DefaultMatchSel
+}
+
+fn CombineAnd(a f64, b f64) f64 { return clampProb(a*b) }
+fn CombineOr(a f64, b f64) f64 { return clampProb(a + b - a*b) }
+fn CombineNot(a f64) f64 { return clampProb(1 - a) }
+
+fn EqJoinSelectivity(left ColumnStats, right ColumnStats, leftRows f64, rightRows f64) f64 {
+	let ln = ndistinctCount(left, leftRows)
+	let rn = ndistinctCount(right, rightRows)
+	if ln <= 0 || rn <= 0 { return DefaultEqSel }
+	mut matched f64 = 0
+	for i in 0..len(left.MCVVals) {
+		for j in 0..len(right.MCVVals) {
+			if types.Compare(left.MCVVals[i], right.MCVVals[j]) == 0 {
+				let a = left.MCVFreqs[i]
+				let b = right.MCVFreqs[j]
+				if a < b { matched += a } else { matched += b }
+			}
+		}
+	}
+	mut common = ln
+	if rn < common { common = rn }
+	let est = (matched + (1.0 - matched) / (common+1)) / 1.0
+	// clamp sane
+	if est < DefaultEqSel { return DefaultEqSel }
+	if est > 1 { return 1 }
+	return est
+}

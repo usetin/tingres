@@ -36,6 +36,12 @@ fn (p mut Parser) parseStatementDispatch() !Stmt {
 			let value = try p.parseTransaction()
 			return Stmt.Transaction(value)
 		}
+		if first == "set" && (p.At + 1 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "constraints") {
+			return p.utility("set constraints")
+		}
+		if first == "set" && p.At + 2 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "session" && lowerAscii(p.Tokens[p.At + 2].Text) == "characteristics" {
+			return p.utility("set session characteristics")
+		}
 		let value = try p.parseVariableSet()
 		return Stmt.VariableSet(value)
 	} else if first == "explain" {
@@ -66,9 +72,11 @@ fn (p mut Parser) parseStatementDispatch() !Stmt {
 		let value = try p.parseComment()
 		return Stmt.Comment(value)
 	} else if first == "grant" {
+		if grantTargetsRole(p) { return p.utility("grant") }
 		let value = try p.parseGrant()
 		return Stmt.Grant(value)
 	} else if first == "revoke" {
+		if revokeTargetsRole(p) { return p.utility("revoke") }
 		let value = try p.parseRevoke()
 		return Stmt.Revoke(value)
 	} else if first == "listen" {
@@ -93,6 +101,7 @@ fn (p mut Parser) parseStatementDispatch() !Stmt {
 		let value = try p.parseCall()
 		return Stmt.Call(value)
 	}
+	if inWords(lowerAscii(p.text()), utilityStatementWords) { return p.utility("statement " + lowerAscii(p.text())) }
 	fail unsupportedMessage(p.Source, p.bytePos(), "statement " + first)
 }
 
@@ -359,6 +368,7 @@ fn ifPosition(p Parser) i64 {
 }
 
 fn (p mut Parser) parseFromAtom(lateral bool) !FromItem {
+	p.eat("only")
 	mut item = FromItem.Table(TableRef{Pos: 0, Name: QualifiedName{Pos: 0, Parts: []Identifier{Identifier{Pos: 0, Name: ""}}}})
 	if p.eat("(") {
 		if p.isQueryStart() {
@@ -513,6 +523,9 @@ fn (p mut Parser) parseInsert(withClause ?WithClause) !InsertStmt {
 	try p.expect("insert")
 	try p.expect("into")
 	let table = try p.parseQualifiedName()
+	if p.eat("as") {
+		let _ = try p.parseIdentifier()
+	}
 	mut columns = []Identifier{}
 	if p.eat("(") {
 		columns = try p.parseIdentifierList(")")
@@ -721,6 +734,8 @@ fn (p mut Parser) parseColumnDef() !ColumnDef {
 			}
 		} else if p.eat("constraint") {
 			pendingName = try p.parseIdentifier()
+		} else if p.eat("with") {
+			try p.expect("options")
 		} else {
 			break
 		}
@@ -759,7 +774,57 @@ fn (p mut Parser) parseTableConstraint(pos i64, name ?Identifier) !TableConstrai
 			try p.expect(")")
 		}
 	}
-	return TableConstraint{Pos: pos, Name: name, Kind: kind, Columns: columns, Expressions: expressions, References: references, ReferenceColumns: referenceColumns}
+	mut matchType = ""
+	mut referenceActions = []ReferenceAction{}
+	mut deferrable = ""
+	mut initially = ""
+	mut include = []Identifier{}
+	for !p.done() {
+		if p.eat("match") {
+			matchType = lowerAscii(p.take().Text)
+		} else if p.eat("on") {
+			let actionPos = p.pos()
+			mut event = ""
+			if p.eat("delete") { event = "delete" } else if p.eat("update") { event = "update" } else { try p.errorHere() }
+			mut action = ""
+			if p.eat("no") {
+				try p.expect("action")
+				action = "no action"
+			} else if p.eat("restrict") {
+				action = "restrict"
+			} else if p.eat("cascade") {
+				action = "cascade"
+			} else if p.eat("set") {
+				if p.eat("null") { action = "set null" } else {
+					try p.expect("default")
+					action = "set default"
+				}
+			} else { try p.errorHere() }
+			referenceActions = append(referenceActions, ReferenceAction{Pos: actionPos, Event: event, Action: action})
+		} else if p.eat("deferrable") {
+			deferrable = "deferrable"
+		} else if p.eat("not") {
+			if p.eat("deferrable") { deferrable = "not deferrable" } else if p.eat("valid") { } else { try p.errorHere() }
+		} else if p.eat("initially") {
+			if p.eat("deferred") { initially = "deferred" } else {
+				try p.expect("immediate")
+				initially = "immediate"
+			}
+		} else if p.eat("include") {
+			try p.expect("(")
+			include = try p.parseIdentifierList(")")
+			try p.expect(")")
+		} else if p.eat("with") {
+			if p.text() == "(" { let _ = p.captureParenInner() } else { break }
+		} else if p.eat("using") {
+			try p.expect("index")
+			try p.expect("tablespace")
+			let _ = try p.parseQualifiedName()
+		} else if p.eat("no") {
+			try p.expect("inherit")
+		} else { break }
+	}
+	return TableConstraint{Pos: pos, Name: name, Kind: kind, Columns: columns, Expressions: expressions, References: references, ReferenceColumns: referenceColumns, MatchType: matchType, ReferenceActions: referenceActions, Deferrable: deferrable, Initially: initially, Include: include}
 }
 
 fn (p mut Parser) parseTransaction() !TransactionStmt {
@@ -773,6 +838,10 @@ fn (p mut Parser) parseTransaction() !TransactionStmt {
 		try p.expect("transaction")
 		kind = "begin"
 	} else if command == "end" { kind = "commit" } else if command == "abort" { kind = "rollback" }
+	if kind == "commit" || kind == "rollback" {
+		p.eat("work")
+		p.eat("transaction")
+	}
 	if kind == "savepoint" { name = try p.parseIdentifier() }
 	if kind == "release" {
 		p.eat("savepoint")
@@ -784,6 +853,7 @@ fn (p mut Parser) parseTransaction() !TransactionStmt {
 		kind = "rollback to"
 	}
 	if kind == "begin" && p.eat("transaction") { }
+	if kind == "begin" && p.eat("work") { }
 	if kind == "begin" || kind == "start" {
 		for {
 			let modePos = p.pos()

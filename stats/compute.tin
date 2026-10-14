@@ -1,0 +1,253 @@
+package stats
+
+import "../types"
+import "sift"
+import "gauge"
+
+type TrackItem struct {
+	Val types.Datum
+	Count i64
+	First i64
+}
+
+fn datumWidth(d types.Datum) i64 {
+	match d.Oid() {
+		types.Int2Oid => { return 2 }
+		types.Int4Oid => { return 4 }
+		types.Int8Oid => { return 8 }
+		types.OidOid => { return 4 }
+		types.Float4Oid => { return 4 }
+		types.Float8Oid => { return 8 }
+		types.BoolOid => { return 1 }
+		_ => { return i64(len(d.Text())) }
+	}
+}
+
+fn ComputeColumnStats(colIndex i64, sample [][]types.Datum, totalRows f64, target i64) ColumnStats {
+	if target <= 0 { target = DefaultStatsTarget }
+	let samplerows = len(sample)
+	mut tr = totalRows
+	if tr <= 0 { tr = f64(samplerows) }
+	mut res = ColumnStats{ColIndex: colIndex, NullFrac: 0, AvgWidth: 0, NDistinct: 0, MCVVals: []types.Datum{}, MCVFreqs: []f64{}, HistBounds: []types.Datum{}, Correlation: 0}
+
+	mut nullCnt i64 = 0
+	mut nonnullCnt i64 = 0
+	mut totalWidth f64 = 0
+	mut toowide i64 = 0
+
+	mut nnVals = make([]types.Datum, 0, samplerows)
+	mut nnTup = make([]i64, 0, samplerows)
+	for i in 0..samplerows {
+		if i >= len(sample) { break }
+		let row = sample[i]
+		let d = row[colIndex]
+		if types.IsNull(d) {
+			nullCnt += 1
+			continue
+		}
+		nonnullCnt += 1
+		totalWidth += f64(datumWidth(d))
+		nnVals = append(nnVals, d)
+		nnTup = append(nnTup, i64(len(nnVals)-1))
+	}
+
+	if nonnullCnt == 0 {
+		if samplerows > 0 { res.NullFrac = 1.0 }
+		return res
+	}
+
+	// sort indices
+	let valuesCnt = len(nnVals)
+	mut order = make([]i64, valuesCnt)
+	for i in 0..valuesCnt { order[i] = i }
+	sift.SortBy(mut order, fn(a i64, b i64) bool { return types.Compare(nnVals[a], nnVals[b]) < 0 })
+
+	mut groupVals = make([]types.Datum, 0, valuesCnt)
+	mut groupCounts = make([]i64, 0, valuesCnt)
+	mut groupFirsts = make([]i64, 0, valuesCnt)
+
+	mut corrXysum f64 = 0
+	mut ndistinct i64 = 0
+	mut nmultiple i64 = 0
+	mut dupsCnt i64 = 0
+	mut prev i64 = -1
+	for k in 0..valuesCnt {
+		let idx = order[k]
+		let tupno = nnTup[idx]
+		corrXysum += f64(k) * f64(tupno)
+		if k == 0 || types.Compare(nnVals[order[k]], nnVals[order[k-1]]) != 0 {
+			if k > 0 {
+				ndistinct += 1
+				if dupsCnt > 1 {
+					nmultiple += 1
+					groupVals = append(groupVals, nnVals[order[prev]])
+					groupCounts = append(groupCounts, dupsCnt)
+					groupFirsts = append(groupFirsts, 0)
+				}
+			}
+			dupsCnt = 1
+			prev = k
+		} else {
+			dupsCnt += 1
+		}
+	}
+	// close last group
+	if valuesCnt > 0 {
+		ndistinct += 1
+		if dupsCnt > 1 {
+			nmultiple += 1
+			groupVals = append(groupVals, nnVals[order[prev]])
+			groupCounts = append(groupCounts, dupsCnt)
+			groupFirsts = append(groupFirsts, 0)
+		}
+	}
+
+	res.NullFrac = 0
+	if samplerows > 0 { res.NullFrac = f64(nullCnt) / f64(samplerows) }
+	res.AvgWidth = totalWidth / f64(nonnullCnt)
+
+	if nmultiple == 0 {
+		res.NDistinct = -1.0 * (1.0 - res.NullFrac)
+	} else if toowide == 0 && nmultiple == ndistinct {
+		res.NDistinct = f64(ndistinct)
+	} else {
+		let f1 = ndistinct - nmultiple + toowide
+		let d = f1 + nmultiple
+		let n = f64(samplerows - nullCnt)
+		let N = tr * (1.0 - res.NullFrac)
+		mut stad f64 = 0
+		if N > 0 { stad = (n * f64(d)) / ((n - f64(f1)) + f64(f1) * n / N) }
+		if stad < f64(d) { stad = f64(d) }
+		if N > 0 && stad > N { stad = N }
+		res.NDistinct = gauge.Floor(stad + 0.5)
+	}
+	if res.NDistinct > 0 && res.NDistinct > 0.1 * tr {
+		res.NDistinct = -(res.NDistinct / tr)
+	}
+
+	// build track
+	let numMcvTarget = target
+	mut trackMax = 2 * numMcvTarget
+	if trackMax < 10 { trackMax = 10 }
+	mut track = make([]TrackItem, 0, trackMax)
+	for g in 0..len(groupVals) {
+		let cand = TrackItem{Val: groupVals[g], Count: groupCounts[g], First: groupFirsts[g]}
+		if len(track) < trackMax {
+			track = append(track, cand)
+			mut k = len(track)-1
+			for k > 0 && track[k].Count > track[k-1].Count {
+				let tmp = track[k]
+				track[k] = track[k-1]
+				track[k-1] = tmp
+				k -= 1
+			}
+		} else if len(track)>0 && cand.Count > track[len(track)-1].Count {
+			track[len(track)-1] = cand
+			mut k = len(track)-1
+			for k > 0 && track[k].Count > track[k-1].Count {
+				let tmp = track[k]
+				track[k] = track[k-1]
+				track[k-1] = tmp
+				k -= 1
+			}
+		}
+	}
+
+	mut numMcv = numMcvTarget
+	if numMcv > len(track) { numMcv = len(track) }
+	if nmultiple == ndistinct && toowide == 0 && res.NDistinct > 0 && len(track) <= numMcvTarget && len(groupVals) == nmultiple {
+		numMcv = len(track)
+	} else if numMcv > 0 {
+		numMcv = analyzeMcvList(track, numMcv, res.NDistinct, res.NullFrac, samplerows, tr)
+	}
+	// remove invalid first expression usage by setting First unused.
+	mut mcvVals = make([]types.Datum, 0, numMcv)
+	mut mcvFreqs = make([]f64, 0, numMcv)
+	for i in 0..numMcv {
+		if i >= len(track) { break }
+		mcvVals = append(mcvVals, track[i].Val)
+		mcvFreqs = append(mcvFreqs, f64(track[i].Count) / f64(samplerows))
+	}
+
+	mut corr f64 = 0
+	if valuesCnt > 1 {
+		let corrXsum = f64(valuesCnt-1) * f64(valuesCnt) / 2.0
+		let corrX2sum = f64(valuesCnt-1) * f64(valuesCnt) * f64(2*valuesCnt-1) / 6.0
+		let denom = f64(valuesCnt)*corrX2sum - corrXsum*corrXsum
+		if denom != 0 { corr = (f64(valuesCnt)*corrXysum - corrXsum*corrXsum) / denom }
+	}
+
+	mut histBounds = make([]types.Datum, 0, target+1)
+	mut numHist = ndistinct - numMcv
+	if numHist > target+1 { numHist = target + 1 }
+	if numHist >= 2 {
+		mut nonMcv = make([]types.Datum, 0, valuesCnt)
+		for i in 0..valuesCnt {
+			let v = nnVals[order[i]]
+			mut isMcv bool = false
+			for j in 0..numMcv {
+				if j < len(track) && types.Compare(track[j].Val, v) == 0 { isMcv = true }
+			}
+			if !isMcv { nonMcv = append(nonMcv, v) }
+		}
+		let nvals = len(nonMcv)
+		if nvals >= numHist {
+			let delta = (nvals - 1) / (numHist - 1)
+			mut deltafrac = (nvals - 1) % (numHist - 1)
+			mut pos i64 = 0
+			mut posfrac i64 = 0
+			for i in 0..numHist {
+				histBounds = append(histBounds, nonMcv[pos])
+				pos += delta
+				posfrac += deltafrac
+				if posfrac >= (numHist - 1) {
+					pos += 1
+					posfrac -= (numHist - 1)
+				}
+			}
+		}
+	}
+
+	res.MCVVals = mcvVals
+	res.MCVFreqs = mcvFreqs
+	res.HistBounds = histBounds
+	res.Correlation = corr
+	return res
+}
+
+fn analyzeMcvList(track []TrackItem, numMcv i64, stadistinct f64, stanullfrac f64, samplerows i64, totalrows f64) i64 {
+	mut nm = numMcv
+	if f64(samplerows) == totalrows || totalrows <= 1.0 { return nm }
+	mut ndistinctTable = stadistinct
+	if ndistinctTable < 0 { ndistinctTable = -ndistinctTable * totalrows }
+	mut counts = make([]i64, 0, nm)
+	for i in 0..nm { if i < len(track) { counts = append(counts, track[i].Count) } }
+	mut sumcount f64 = 0
+	for i in 0..nm-1 { if i < len(counts) { sumcount += f64(counts[i]) } }
+	for nm > 0 {
+		let selec0 = 1.0 - sumcount / f64(samplerows) - stanullfrac
+		mut selec = selec0
+		if selec < 0 { selec = 0 }
+		if selec > 1 { selec = 1 }
+		let otherdistinct = ndistinctTable - f64(nm - 1)
+		if otherdistinct > 1 { selec = selec / otherdistinct }
+		let N = totalrows
+		let n = f64(samplerows)
+		let K = N * f64(counts[nm-1]) / n
+		let variance = n * K * (N - K) * (N - n) / (N * N * (N - 1))
+		mut stddev f64 = 0
+		if variance >= 0 { stddev = gauge.Sqrt(variance) }
+		let thr = selec * f64(samplerows) + 2*stddev + 0.5
+		if f64(counts[nm-1]) > thr { break }
+		nm -= 1
+		if nm == 0 { break }
+		if nm-1 < len(counts) { sumcount -= f64(counts[nm-1]) }
+	}
+	return nm
+}
+
+fn ComputeStats(sample [][]types.Datum, ncols i64, totalRows f64, target i64) []ColumnStats {
+	mut out = make([]ColumnStats, 0, ncols)
+	for c in 0..ncols { out = append(out, ComputeColumnStats(c, sample, totalRows, target)) }
+	return out
+}
