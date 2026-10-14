@@ -41,6 +41,9 @@ fn (e mut Engine) Close() ! {
 // session; a server that answers SELECT 1 with anything but a SELECT 1 tag (exec is still
 // a skeleton) must not be picked.
 fn ProbeRealEngine(e mut Engine) bool {
+	// The executor may be ready while the engine still cannot be handed to a connection task
+	// (see BUGS.md), and a server that cannot create a session serves nothing: require both.
+	if gEngine == nil { return false }
 	mut s = e.NewSession("postgres", "postgres")
 	mut sink = exec.NewRecordSink()
 	let ran = s.Simple("SELECT 1", mut sink)
