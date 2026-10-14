@@ -242,7 +242,7 @@ fn (c mut Catalog) CreateTable(t txn.Txn, def TableDef) !Table {
 	try c.writeType(t, rowType, tableName, ns, oid, "c")
 	if len(def.PrimaryKey) > 0 {
 		let idxName = tableName + "_pkey"
-		let idx = try c.createIndex(t, snap, oid, idxName, true, true, def.PrimaryKey)
+		let idx = try c.createIndex(t, snap, oid, idxName, true, true, def.PrimaryKey, []IndexKey{})
 		_ = idx
 	}
 	c.version += 1
@@ -250,7 +250,7 @@ fn (c mut Catalog) CreateTable(t txn.Txn, def TableDef) !Table {
 	return Table{Oid: oid, Schema: schema, Name: tableName, Cols: cols, Rel: rel, Indexes: []Index{}, System: false, Owner: 10, Kind: "r", RowType: rowType}
 }
 
-fn (c mut Catalog) createIndex(t txn.Txn, snap txn.Snapshot, tableOid u32, name str, unique bool, primary bool, cols []i16) !Index {
+fn (c mut Catalog) createIndex(t txn.Txn, snap txn.Snapshot, tableOid u32, name str, unique bool, primary bool, cols []i16, keys []IndexKey) !Index {
 	let ns = c.relationNamespace(snap, tableOid)
 	let oid = c.nextOid
 	let rel = c.nextRel
@@ -292,7 +292,8 @@ fn (c mut Catalog) createIndex(t txn.Txn, snap txn.Snapshot, tableOid u32, name 
 		try c.deleteRow(t, "pg_class", classRow)
 		_ = try c.insertRow(t, "pg_class", c.buildRow("pg_class", vals))
 	}
-	return Index{Oid: oid, Name: name, Rel: rel, Unique: unique, Cols: cols}
+	let indexKeys = c.normalizeKeys(cols, keys)
+	return Index{Oid: oid, Name: name, Rel: rel, Unique: unique, Primary: primary, Cols: cols, Keys: indexKeys}
 }
 
 fn (c Catalog) relationNamespace(snap txn.Snapshot, oid u32) u32 {
@@ -320,10 +321,21 @@ fn (c mut Catalog) CreateIndex(t txn.Txn, def IndexDef) !Index {
 	if c.namespaceOid(snap, c.namespaceName(snap, ns)) != 0 && c.relationNamed(snap, ns, def.Name) != 0 {
 		fail "42P07 relation \"{def.Name}\" already exists"
 	}
-	let idx = try c.createIndex(t, snap, def.Table.Oid, def.Name, def.Unique, def.Primary, def.Cols)
+	let idx = try c.createIndex(t, snap, def.Table.Oid, def.Name, def.Unique, def.Primary, def.Cols, def.Keys)
 	c.version += 1
 	c.reload()
 	return idx
+}
+
+fn (c Catalog) normalizeKeys(cols []i16, keys []IndexKey) []IndexKey {
+	if len(keys) > 0 {
+		return keys
+	}
+	mut out = []IndexKey{}
+	for col in cols {
+		out = append(out, IndexKey{Attnum: col, Desc: false, NullsFirst: false})
+	}
+	return out
 }
 
 fn (c Catalog) relationNamed(snap txn.Snapshot, ns u32, name str) u32 {
@@ -872,14 +884,42 @@ fn (c mut Catalog) AnalyzeTable(t txn.Txn, tbl Table) ! {
 		mut vals = make(map[str]types.Datum)
 		vals["starelid"] = types.FromI64(26, i64(tbl.Oid))
 		vals["staattnum"] = types.FromI64(21, i64(col.Number))
+		vals["stainherit"] = types.FromBool(false)
 		vals["stanullfrac"] = types.FromF64(701, frac)
 		vals["stawidth"] = types.FromI64(23, 0)
 		vals["stadistinct"] = types.FromF64(701, -1.0)
-		vals["stavalues"] = types.FromStr(25, "")
+		vals["stakind1"] = types.FromI64(21, 0)
+		vals["stanumbers1"] = types.FromStr(25, "")
+		vals["stavalues1"] = types.FromStr(25, "")
 		_ = try c.insertRow(t, "pg_statistic", c.buildRow("pg_statistic", vals))
 	}
 	c.version += 1
 	c.reload()
+}
+
+// ColumnStatistics returns pg_statistic-shaped slots for a relation's columns.
+fn (c Catalog) ColumnStatistics(t txn.Txn, tableOid Oid) []ColumnStat {
+	let snap = c.Manager.Snapshot(t)
+	mut out = []ColumnStat{}
+	for row in c.rows["pg_statistic"] {
+		if !c.visible(snap, "pg_statistic", row) {
+			continue
+		}
+		if u32(c.intField("pg_statistic", row, "starelid")) != tableOid {
+			continue
+		}
+		out = append(out, ColumnStat{
+			Attnum: i16(c.intField("pg_statistic", row, "staattnum")),
+			Inherit: c.boolField("pg_statistic", row, "stainherit"),
+			NullFrac: c.floatField("pg_statistic", row, "stanullfrac"),
+			Width: i32(c.intField("pg_statistic", row, "stawidth")),
+			Distinct: c.floatField("pg_statistic", row, "stadistinct"),
+			Kind: i16(c.intField("pg_statistic", row, "stakind1")),
+			Numbers: []f64{},
+			Values: []str{},
+		})
+	}
+	return out
 }
 
 // Statistic returns the stored null fraction for a column.

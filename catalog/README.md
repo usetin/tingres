@@ -59,6 +59,7 @@ fn (c mut Catalog) CreateEnum(t txn.Txn, schema str, name str, labels []str) !Oi
 fn (c Catalog)  EnumLabels(t txn.Txn, typeOid Oid) []str
 fn (c mut Catalog) Truncate(t txn.Txn, tbl Table) !
 fn (c mut Catalog) AnalyzeTable(t txn.Txn, tbl Table) !
+fn (c Catalog)  ColumnStatistics(t txn.Txn, tableOid Oid) []ColumnStat
 fn (c Catalog)  Statistic(t txn.Txn, tableOid Oid, attnum i16) ?f64
 fn (c Catalog)  InformationSchemaView(t txn.Txn, name str) ?str
 
@@ -71,8 +72,18 @@ fn (c mut Catalog) AlterTableSetDefault(t txn.Txn, tbl Table, name str, expr str
 ```
 
 `Table` carries `Oid`, `Schema`, `Name`, `Cols []Column`, `Rel` (relfilenode), `Indexes`,
-`System`, `Owner`, `Kind` and `RowType`. `Column` carries `Name`, `Type`, `Typmod`,
-`Number`, `Nullable`, `HasDefault`, `DefaultText`, `Identity`, `Generated`, `Collation`.
+`System`, `Owner`, `Kind`, `RowType`, `RelTuples f64` and `RelPages i32` (from
+`pg_class`). `Column` carries `Name`, `Type`, `Typmod`, `Number`, `Nullable`,
+`HasDefault`, `DefaultText`, `Identity`, `Generated`, `Collation`.
+
+For the planner, `Index` carries `Unique`, `Primary`, `Cols []i16` and
+`Keys []IndexKey` where `IndexKey{Attnum i16, Desc bool, NullsFirst bool}` is the ordered
+key list (`IndexDef` takes the same `Keys`; empty `Keys` means every `Cols` entry
+ascending, nulls last). Per-column statistics are `ColumnStat{Attnum, Inherit, NullFrac,
+Width, Distinct, Kind, Numbers []f64, Values []str}`, the shape of a `pg_statistic` slot,
+with the most-common values in `Values` and their frequencies in `Numbers`; `AnalyzeTable`
+computes `stanullfrac`/`stawidth`/`stadistinct` and `ColumnStatistics` reads the slots
+back.
 `Table.Rel`/`Column.Number` are the attnums/relfilenodes the executor and planner use.
 
 Errors use PostgreSQL SQLSTATEs: `42P01`, `42P07`, `42701`, `42703`, `42P06`, `3F000`,

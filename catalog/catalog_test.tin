@@ -402,3 +402,45 @@ fn TestCreateIndexAndSchema(t mut crucible.T) {
 	crucible.NoFault("drop index", c.DropIndex(tx, idx.Oid))
 	crucible.NoFault("abort", m.Abort(mut tx))
 }
+
+fn TestPlannerCatalogSurface(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("planner-surface") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let table = c.CreateTable(tx, TableDef{Schema: "public", Name: "items", Columns: []ColumnDef{ColumnDef{Name: "id", Type: 23, Typmod: -1}, ColumnDef{Name: "code", Type: 25, Typmod: -1}}}) catch err {
+		t.Error("create: {err}")
+		return
+	}
+	tx.CommandCounterIncrement()
+	let (idx, idxErr) = c.CreateIndex(tx, IndexDef{Table: table, Name: "items_code_key", Unique: true, Primary: false, Cols: []i16{2}, Keys: []IndexKey{IndexKey{Attnum: 2, Desc: true, NullsFirst: true}}})
+	if idxErr != nil {
+		t.Error("create index: {idxErr}")
+		return
+	}
+	crucible.Equal(mut t, "index unique flag", idx.Unique, true)
+	crucible.Equal(mut t, "index primary flag", idx.Primary, false)
+	crucible.Equal(mut t, "index key count", len(idx.Keys), 1)
+	crucible.Equal(mut t, "index key attnum", idx.Keys[0].Attnum, i16(2))
+	crucible.Equal(mut t, "index key descending", idx.Keys[0].Desc, true)
+	crucible.Equal(mut t, "index key nulls first", idx.Keys[0].NullsFirst, true)
+	crucible.NoFault("analyze", c.AnalyzeTable(tx, table))
+	tx.CommandCounterIncrement()
+	let stats = c.ColumnStatistics(tx, table.Oid)
+	crucible.Equal(mut t, "statistics per column", len(stats), 2)
+	crucible.Equal(mut t, "statistics first attnum", stats[0].Attnum, i16(1))
+	crucible.Equal(mut t, "statistics null fraction", stats[0].NullFrac, f64(0.0))
+	if let t2 = c.LookupTable(tx, "public", "items") {
+		crucible.Equal(mut t, "reltuples field", t2.RelTuples, f64(0.0))
+		crucible.Equal(mut t, "relpages field", t2.RelPages, i32(0))
+	} else {
+		t.Error("table missing")
+	}
+	crucible.NoFault("abort", m.Abort(mut tx))
+}

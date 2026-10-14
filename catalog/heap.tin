@@ -116,10 +116,13 @@ fn extraCols(name str) []ColDef {
 		_ => return []ColDef{
 			ColDef{Name: "starelid", Type: 26, Storage: 26, Number: 1, NotNull: true},
 			ColDef{Name: "staattnum", Type: 21, Storage: 21, Number: 2, NotNull: true},
-			ColDef{Name: "stanullfrac", Type: 700, Storage: 701, Number: 3, NotNull: true},
-			ColDef{Name: "stawidth", Type: 23, Storage: 23, Number: 4, NotNull: true},
-			ColDef{Name: "stadistinct", Type: 700, Storage: 701, Number: 5, NotNull: true},
-			ColDef{Name: "stavalues", Type: 25, Storage: 25, Number: 6},
+			ColDef{Name: "stainherit", Type: 16, Storage: 16, Number: 3, NotNull: true},
+			ColDef{Name: "stanullfrac", Type: 700, Storage: 701, Number: 4, NotNull: true},
+			ColDef{Name: "stawidth", Type: 23, Storage: 23, Number: 5, NotNull: true},
+			ColDef{Name: "stadistinct", Type: 700, Storage: 701, Number: 6, NotNull: true},
+			ColDef{Name: "stakind1", Type: 21, Storage: 21, Number: 7, NotNull: true},
+			ColDef{Name: "stanumbers1", Type: 1007, Storage: 25, Number: 8},
+			ColDef{Name: "stavalues1", Type: 1009, Storage: 25, Number: 9},
 		}
 	}
 }
@@ -323,6 +326,12 @@ fn (c Catalog) boolField(rel str, row RawRow, name str) bool {
 	if types.IsNull(d) { return false }
 	let text = d.Text()
 	return text == "true" || text == "t"
+}
+
+fn (c Catalog) floatField(rel str, row RawRow, name str) f64 {
+	let d = c.field(rel, row, name)
+	if types.IsNull(d) { return 0.0 }
+	return mint.ParseFloat(d.Text()) catch _ { 0.0 }
 }
 
 fn (c Catalog) relIdOf(name str) u32 {
