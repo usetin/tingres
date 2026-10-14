@@ -314,11 +314,23 @@ fn TestBtreeVersusSortedModel(t mut crucible.T) {
 	mut rng = dice.New(20261013)
 	mut model = []ModelEntry{}
 	// Large keys make few entries per page, so a few thousand leaves force thousands of splits.
+	// Every fourth key duplicates the previous one, and every 500th is close to 1 KiB, exercising
+	// duplicate runs that cross leaf boundaries and near-maximum key sizes.
 	let inserts = 50000
+	mut lastKey = []u8{}
 	for i in 0..inserts {
-		let keyLen = 250+rng.Intn(150)
-		mut key = make([]u8, keyLen)
-		rng.Fill(mut key)
+		mut key = []u8{}
+		if i%500 == 0 {
+			mut big = make([]u8, 1024)
+			rng.Fill(mut big)
+			key = big
+		} else if i%4 == 0 && len(lastKey) > 0 {
+			key = copyBytes(lastKey)
+		} else {
+			mut fresh = make([]u8, 250+rng.Intn(150))
+			rng.Fill(mut fresh)
+			key = fresh
+		}
 		let tid = Tid{page: u32(rng.Intn(1000000)), slot: u16(rng.Intn(65535))}
 		let insErr = db.IndexInsert(500, key, tid)
 		if insErr != nil {
@@ -326,6 +338,7 @@ fn TestBtreeVersusSortedModel(t mut crucible.T) {
 			return
 		}
 		model = append(model, ModelEntry{key: key, tid: tid})
+		lastKey = copyBytes(key)
 	}
 	modelSort(mut model)
 	let leaves = db.files.PageCount(500) catch _ { 0 }
