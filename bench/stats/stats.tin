@@ -1,0 +1,113 @@
+package stats
+
+import "quarry"
+import "say"
+import "tide"
+import "twine"
+
+
+import "mint"
+
+fn median(values []f64) f64 {
+	if len(values) == 0 { return 0.0 }
+	let sorted = clone_f64(values)
+	sort_f64(mut sorted)
+	if len(sorted)%2 == 1 {
+		return sorted[len(sorted)/2]
+	}
+	return (sorted[len(sorted)/2-1] + sorted[len(sorted)/2]) / 2.0
+}
+
+fn clone_f64(values []f64) []f64 {
+	mut out = make([]f64, 0, len(values))
+	for _, v in values { out = append(out, v) }
+	return out
+}
+
+fn sort_f64(values mut []f64) {
+	mut i i64 = 0
+	for i < len(values) {
+		mut j i64 = i + 1
+		for j < len(values) {
+			if values[j] < values[i] {
+				let tmp = values[i]
+				values[i] = values[j]
+				values[j] = tmp
+			}
+			j += 1
+		}
+		i += 1
+	}
+}
+
+fn reportRow(name str, tingres str, postgres str, ratio str, status str) str {
+	return "| {name} | {tingres} | {postgres} | {ratio} | {status} |"
+}
+
+fn machineName() str {
+	let v = quarry.Getenv("HOSTNAME")
+	if v == "" { return "unknown" }
+	return v
+}
+
+fn cpuModel() str {
+	let text = quarry.ReadFile("/proc/cpuinfo") catch _ { "" }
+	for line in twine.Split(text, "\n") {
+		if twine.HasPrefix(line, "model name") {
+			let parts = twine.Split(line, ":")
+			if len(parts) > 1 { return twine.TrimSpace(parts[1]) }
+		}
+	}
+	return "unknown"
+}
+
+fn coreCount() i64 {
+	let text = quarry.ReadFile("/proc/cpuinfo") catch _ { "" }
+	mut n i64 = 0
+	for line in twine.Split(text, "\n") {
+		if twine.HasPrefix(line, "processor") { n += 1 }
+	}
+	if n == 0 { return 1 }
+	return n
+}
+
+fn kernelVersion() str {
+	let text = quarry.ReadFile("/proc/version") catch _ { "" }
+	if text == "" { return "unknown" }
+	let parts = twine.Split(text, " ")
+	if len(parts) >= 3 { return parts[2] }
+	return twine.TrimSpace(text)
+}
+
+fn tingresCommit() str {
+	let v = quarry.Getenv("TINGRES_COMMIT")
+	if v == "" { return "unknown" }
+	return v
+}
+
+fn pgVersion() str { return "PostgreSQL 17" }
+
+fn WritePendingReport(path str) ! {
+	let cpu = cpuModel()
+	let cores = coreCount()
+	let kernel = kernelVersion()
+	let commit = tingresCommit()
+	let envDate = quarry.Getenv("RUN_DATE")
+	mut now = envDate
+	if now == "" { now = "unknown" }
+	let header = "Machine: {machineName()} | CPU: {cpu} | cores: {cores} | kernel: {kernel} | {pgVersion()} | tingres commit: {commit} | run date: {now}\nMedians of interleaved runs (>= 5 rounds), fsync on. Ratio > 1.0x means tingres is faster.\nMachine-reported values below are pending until the Linux workflow runs.\n"
+	let rows = reportRow("pgbench select-only, 1 client (tps)", "—", "—", "—", "pending") + "\n" +
+		reportRow("pgbench select-only, 16 clients (tps)", "—", "—", "—", "pending") + "\n" +
+		reportRow("pgbench select-only, 64 clients (tps)", "—", "—", "—", "pending") + "\n" +
+		reportRow("pgbench tpcb-like, 16 clients (tps)", "—", "—", "—", "pending") + "\n" +
+		reportRow("primary-key point lookup, p50 / p99 latency", "—", "—", "—", "pending") + "\n" +
+		reportRow("scan + aggregate over 10M rows (TPC-H Q1 shape)", "—", "—", "—", "pending") + "\n" +
+		reportRow("bulk insert via COPY (rows/s)", "—", "—", "—", "pending") + "\n" +
+		reportRow("single-row INSERT with fsync commit (commits/s, 16 clients)", "—", "—", "—", "pending") + "\n" +
+		reportRow("connection setup + first query (connections/s)", "—", "—", "—", "pending") + "\n" +
+		reportRow("SQL parse throughput, simple statements (statements/s)", "—", "—", "—", "pending") + "\n"
+	let table = "| benchmark | tingres | PostgreSQL 17 | ratio | status |\n|---|---:|---:|---:|---|\n" + rows
+	_ = mint.Itoa
+	try quarry.MkdirAll("bench/results")
+	try quarry.WriteFile(path, header + "\n" + table)
+}
