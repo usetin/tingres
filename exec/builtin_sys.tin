@@ -1,0 +1,330 @@
+package exec
+
+import "../types"
+import "../parse"
+import "twine"
+
+// builtin_sys provides the PostgreSQL system-information functions that clients call
+// before they can use a database: version(), current_database(), current_schema(),
+// current_user, pg_backend_pid(), current_setting() and friends. The planner resolves
+// functions through types.LookupFunc, whose registry is owned by the types package and
+// does not carry these session-dependent functions, so exec evaluates them itself for
+// FROM-less SELECTs (see trySystemSelect) before falling back to the planner.
+
+// serverVersion is the version string reported by version(). It follows PostgreSQL's
+// shape so drivers that parse it for the server major version keep working.
+const serverVersion = "PostgreSQL 17.0 (tingres) on aarch64-unknown-linux-gnu, compiled by tin, 64-bit"
+
+// someDatum lifts a datum into an optional result.
+fn someDatum(d types.Datum) ?types.Datum {
+	return d
+}
+
+// isSystemFunctionName reports whether exec owns a system-information function by name.
+fn isSystemFunctionName(name str) bool {
+	match twine.ToLower(name) {
+		"version", "current_database", "current_catalog", "current_schema", "current_user", "session_user", "user", "current_role", "pg_backend_pid", "pg_backend_pid_int", "current_setting", "set_config", "pg_get_userbyid", "pg_get_userbyid_name", "format_type", "pg_table_is_visible", "has_table_privilege", "obj_description", "current_query", "pg_current_query" => {
+			return true
+		}
+		_ => {
+			return false
+		}
+	}
+}
+
+// isSystemTarget reports whether a SELECT target is a call to a system function.
+fn isSystemTarget(expr parse.Expr) bool {
+	match expr {
+		Call(f) => {
+			if len(f.Name.Parts) == 0 {
+				return false
+			}
+			return isSystemFunctionName(f.Name.Parts[len(f.Name.Parts)-1].Name)
+		}
+		Special(sp) => {
+			return isSystemFunctionName(sp.Name)
+		}
+		_ => {
+			return false
+		}
+	}
+}
+
+// systemFunction evaluates one system-information function. It returns nil when the name
+// is not one of the functions exec owns; the caller then lets the planner handle it.
+fn systemFunction(name str, args []types.Datum, s mut Session) ?types.Datum {
+	let n = twine.ToLower(name)
+	if n == "version" && len(args) == 0 {
+		return someDatum(types.FromStr(types.TextOid, serverVersion))
+	}
+	if n == "current_database" || n == "current_catalog" {
+		return someDatum(types.FromStr(types.TextOid, s.Database))
+	}
+	if n == "current_schema" {
+		return someDatum(types.FromStr(types.TextOid, s.firstSearchSchema()))
+	}
+	if n == "current_user" || n == "session_user" || n == "user" || n == "current_role" {
+		return someDatum(types.FromStr(types.TextOid, s.User))
+	}
+	if n == "pg_backend_pid" || n == "pg_backend_pid_int" {
+		return someDatum(types.FromI64(types.Int4Oid, 1))
+	}
+	if n == "current_setting" && len(args) >= 1 {
+		mut missingOk = false
+		if len(args) >= 2 && !types.IsNull(args[1]) {
+			missingOk = args[1].Text() == "true" || args[1].Text() == "t" || args[1].Text() == "on"
+		}
+		let val = s.CurrentSetting(args[0].Text(), missingOk) catch _ { "" }
+		return someDatum(types.FromStr(types.TextOid, val))
+	}
+	if n == "set_config" && len(args) >= 3 {
+		mut local = false
+		if !types.IsNull(args[2]) {
+			local = args[2].Text() == "true" || args[2].Text() == "t" || args[2].Text() == "on"
+		}
+		let val = s.SetConfig(args[0].Text(), args[1].Text(), local) catch _ { args[1].Text() }
+		return someDatum(types.FromStr(types.TextOid, val))
+	}
+	if (n == "pg_get_userbyid" || n == "pg_get_userbyid_name") && len(args) >= 1 {
+		return someDatum(types.FromStr(types.TextOid, s.User))
+	}
+	if n == "format_type" && len(args) >= 1 {
+		return someDatum(types.FromStr(types.TextOid, systemTypeName(args[0].Text())))
+	}
+	if n == "pg_table_is_visible" && len(args) >= 1 {
+		return someDatum(types.FromBool(true))
+	}
+	if n == "has_table_privilege" {
+		return someDatum(types.FromBool(true))
+	}
+	if n == "obj_description" {
+		return someDatum(types.Null())
+	}
+	if n == "current_query" || n == "pg_current_query" {
+		return someDatum(types.FromStr(types.TextOid, ""))
+	}
+	return nil
+}
+
+// firstSearchSchema returns the first schema on the session search_path, defaulting to
+// public, which is what current_schema() reports.
+fn (s Session) firstSearchSchema() str {
+	let path = s.Guc("search_path")
+	if path == "" {
+		return "public"
+	}
+	for part in twine.Split(path, ",") {
+		let clean = twine.TrimSpace(part)
+		if clean == "" || clean == "\"$user\"" || clean == "$user" {
+			continue
+		}
+		mut name = clean
+		if len(name) >= 2 && name[0] == 34 && name[len(name)-1] == 34 {
+			name = name[1:len(name)-1]
+		}
+		return name
+	}
+	return "public"
+}
+
+// systemTypeName maps a type OID spelling to PostgreSQL's format_type output for the
+// core types. Unknown OIDs keep their number, as format_type does.
+fn systemTypeName(oidText str) str {
+	match oidText {
+		"16" => return "boolean"
+		"17" => return "bytea"
+		"19" => return "name"
+		"20" => return "bigint"
+		"21" => return "smallint"
+		"23" => return "integer"
+		"25" => return "text"
+		"26" => return "oid"
+		"700" => return "real"
+		"701" => return "double precision"
+		"1042" => return "character"
+		"1043" => return "character varying"
+		"1082" => return "date"
+		"1083" => return "time without time zone"
+		"1114" => return "timestamp without time zone"
+		"1184" => return "timestamp with time zone"
+		"1186" => return "interval"
+		"1700" => return "numeric"
+		"2950" => return "uuid"
+		"3802" => return "jsonb"
+		_ => return oidText
+	}
+}
+
+// evalSystemLiteral evaluates a literal target or argument in a system select.
+fn evalSystemLiteral(lit parse.LiteralExpr) !?types.Datum {
+	match lit.Kind {
+		"null", "unknown" => {
+			return someDatum(types.Null())
+		}
+		"true" => {
+			return someDatum(types.FromBool(true))
+		}
+		"false" => {
+			return someDatum(types.FromBool(false))
+		}
+		"number" => {
+			if containsFloatMarker(lit.Value) {
+				let v = try types.Parse(types.Float8Oid, lit.Value)
+				return someDatum(v)
+			}
+			let v = try types.Parse(types.Int4Oid, lit.Value)
+			return someDatum(v)
+		}
+		"string" => {
+			return someDatum(types.FromStr(types.TextOid, unquoteLiteral(lit.Value)))
+		}
+		_ => {
+			return nil
+		}
+	}
+}
+
+fn containsFloatMarker(text str) bool {
+	for c in text {
+		if c == '.' || c == 'e' || c == 'E' {
+			return true
+		}
+	}
+	return false
+}
+
+fn unquoteLiteral(text str) str {
+	if len(text) >= 2 && text[0] == 39 && text[len(text)-1] == 39 {
+		return text[1:len(text)-1]
+	}
+	return text
+}
+
+// evalSystemTarget evaluates one SELECT target that may be a system function call. It
+// returns nil when the expression is not a system function exec can evaluate alone.
+fn evalSystemTarget(expr parse.Expr, s mut Session) !?types.Datum {
+	match expr {
+		Call(f) => {
+			mut name = ""
+			if len(f.Name.Parts) > 0 {
+				name = f.Name.Parts[len(f.Name.Parts)-1].Name
+			}
+			if name == "" {
+				return nil
+			}
+			mut args = []types.Datum{}
+			for a in f.Args {
+				let vOpt = try evalSystemTarget(a.Value, mut s)
+				if let v = vOpt {
+					args = append(args, v)
+				} else {
+					return nil
+				}
+			}
+			return systemFunction(name, args, mut s)
+		}
+		Special(sp) => {
+			let n = twine.ToLower(sp.Name)
+			mut args = []types.Datum{}
+			for a in sp.Args {
+				let vOpt = try evalSystemTarget(a, mut s)
+				if let v = vOpt {
+					args = append(args, v)
+				} else {
+					return nil
+				}
+			}
+			return systemFunction(n, args, mut s)
+		}
+		Literal(lit) => {
+			return try evalSystemLiteral(lit)
+		}
+		ColumnRef(cr) => {
+			// current_user and friends sometimes parse as bare column references.
+			if len(cr.Parts) == 1 && !cr.Star {
+				let n = twine.ToLower(cr.Parts[0].Name)
+				if n == "current_user" || n == "session_user" || n == "user" || n == "current_role" || n == "current_catalog" || n == "current_schema" {
+					return systemFunction(n, []types.Datum{}, mut s)
+				}
+			}
+			return nil
+		}
+		_ => {
+			return nil
+		}
+	}
+}
+
+// trySystemSelect answers a FROM-less SELECT whose targets are all system-information
+// functions. It returns true when it handled the statement.
+fn trySystemSelect(sel parse.SelectStmt, s mut Session, out mut dyn Sink) !bool {
+	mut core = parse.SelectCore{}
+	match sel.Body {
+		Core(c) => {
+			core = c
+		}
+		_ => {
+			return false
+		}
+	}
+	if len(core.From) > 0 || core.Where != nil || len(core.GroupBy) > 0 || core.Having != nil || len(core.Windows) > 0 {
+		return false
+	}
+	if len(core.Targets) == 0 {
+		return false
+	}
+	mut values = []types.Datum{}
+	mut cols = []ColDesc{}
+	mut anySystem = false
+	for target in core.Targets {
+		if isSystemTarget(target.Value) {
+			anySystem = true
+		}
+		let vOpt = try evalSystemTarget(target.Value, mut s)
+		if let v = vOpt {
+			values = append(values, v)
+			mut name = defaultTargetName(target.Value)
+			if let id = target.Alias {
+				name = id.Name
+			}
+			cols = append(cols, ColDesc{Name: name, Oid: v.Oid(), Typmod: -1, TableOid: 0, Attno: i16(len(cols) + 1)})
+		} else {
+			return false
+		}
+	}
+	if !anySystem {
+		return false
+	}
+	mut formats = []i16{}
+	for _c in cols {
+		formats = append(formats, 0)
+	}
+	out.RowDescription(cols, formats)
+	out.DataRow(values)
+	out.CommandComplete("SELECT 1")
+	return true
+}
+
+// defaultTargetName is the column name PostgreSQL gives an unaliased target.
+fn defaultTargetName(expr parse.Expr) str {
+	match expr {
+		Call(f) => {
+			if len(f.Name.Parts) > 0 {
+				return f.Name.Parts[len(f.Name.Parts)-1].Name
+			}
+			return "?column?"
+		}
+		Special(sp) => {
+			return sp.Name
+		}
+		ColumnRef(cr) => {
+			if len(cr.Parts) > 0 {
+				return cr.Parts[len(cr.Parts)-1].Name
+			}
+			return "?column?"
+		}
+		_ => {
+			return "?column?"
+		}
+	}
+}

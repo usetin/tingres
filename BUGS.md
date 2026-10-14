@@ -33,6 +33,39 @@
   `index out of range [-1] with length 0` in `check_const_value` (repro `tests/compiler_bugs/const_slice_str.tin`,
   `const xs = []str{"a"}`). Use a function returning the value or a package-level `let` meanwhile; the catalog seed
   is a function. Blocked file: `catalog/seed.tin`.
+- NEEDS-TIN: value-struct stack aliasing. Two locals copied from the same struct (`mut ctxA = c.Ctx; ctxA.Row = a`
+  then `mut ctxB = c.Ctx; ctxB.Row = b`) and passed to a `mut`-receiver call can both read the second slice:
+  `exec.SortCursor.compare` returned 0 for rows 10 and 30, so ORDER BY never reordered. Observed only in the full
+  exec package (a stand-alone version of the same shape prints the correct `-20`), so there is no minimal repro
+  yet. Worked around in `exec/operators.tin` by precomputing sort keys per row. Blocked file:
+  `exec/operators.tin` (`SortCursor`).
+
+## Missing in other packages (NEEDS-OTHER), worked around inside `exec`
+
+- NEEDS-OTHER: catalog: persist and recover user-table/index metadata and relation OIDs across `catalog.Open`.
+  The `Catalog.tables`/`Catalog.names` maps (and the OID/relation counters) are rebuilt empty on reopen, so after
+  a restart `exec` cannot resolve a table by name, cannot rebuild a `catalog.Table` for an already-existing
+  relation, and a new `CREATE TABLE` can pick a relation id that collides with a recovered one. Blocked:
+  `exec.TestEndToEndOnRealStore` verifies durability by scanning the recovered heap relation directly; a real
+  restart-with-catalog path needs catalog persistence.
+- NEEDS-OTHER: txn: subtransaction / undo support for `ROLLBACK TO SAVEPOINT`. `txn.Manager` has no savepoint API
+  and no way to restore a tuple deleted before a savepoint, so `exec.Session` tracks the command id at each
+  SAVEPOINT and marks only the tuples written after it deleted. A row deleted before the savepoint stays deleted
+  across `ROLLBACK TO`. Blocked file: `exec/session.tin` (`rollbackSavepointData`).
+- NEEDS-OTHER: types/plan: a way to add session-dependent system functions (`version`, `current_database`,
+  `current_schema`, `current_setting`, `pg_backend_pid`, `pg_table_is_visible`, `format_type`, ...) to the shared
+  function registry, or planner support that defers them to exec. Other packages can only read the `let`
+  `types.builtinFuncRegistry` (immutable), so `exec/builtin_sys.tin` can only serve FROM-less SELECTs; psql's
+  `\d`/`\l`/`\dn` queries mix these functions with `pg_catalog` columns. Blocked files: `exec/builtin_sys.tin`,
+  `exec/session.tin` (`trySystemSelect`).
+- NEEDS-OTHER: plan: `analyzeLiteral` keeps a string literal's SQL spelling (including the surrounding and doubled
+  single quotes) in the constant datum, so a text constant holds `'a'` instead of `a`. `exec` decodes string
+  constants in `normalizeConst` until the analyzer decodes the lexer token itself. Blocked files:
+  `exec/expr.tin` (`normalizeConst`).
+- NEEDS-OTHER: plan: UPDATE/DELETE modify plans do not carry tuple identity (TID). `planUpdate` wraps the target
+  scan in a `Project` that replaces SET columns, so the original row no longer matches the stored tuple; exec walks
+  the `Project`'s input and re-matches the old row instead. A ctid output (or the scan's TID) would make
+  UPDATE/DELETE exact under concurrent writes and duplicates. Blocked file: `exec/dml.tin` (`ExecuteModifyTable`).
 
 ## Compiler diagnostics that shaped the code (not bugs, but worth knowing)
 

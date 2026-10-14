@@ -6,9 +6,10 @@ import "../catalog"
 import "../parse"
 import "../txn"
 import "../store"
+import "tide"
 
 // ExecuteUtility processes DDL and utility statements.
-fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
+fn ExecuteUtility(stmt mut parse.Stmt, session mut Session, out mut dyn Sink) !str {
 	let tx = try session.Txn()
 	match stmt {
 		CreateTable(ct) => {
@@ -51,6 +52,11 @@ fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
 				}
 				try types.ErrorFault(types.NewPgError("42P07", "relation \"" + tblName + "\" already exists", "", "", 0))
 			}
+			// Materialize the backing heap relation for the new catalog entry.
+			let tblOpt = session.Catalog.LookupTable(tx, schemaName, tblName)
+			if let tbl = tblOpt {
+				try session.Catalog.Store.CreateHeap(store.RelId(tbl.Rel))
+			}
 			let tag = "CREATE TABLE"
 			out.CommandComplete(tag)
 			return tag
@@ -69,6 +75,7 @@ fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
 					let tblOpt = session.Catalog.LookupTable(tx, schemaName, name)
 					if let tbl = tblOpt {
 						session.Catalog.DropTable(tx, tbl, dr.Behavior == "cascade") catch _ {}
+						session.Catalog.Store.DropRel(store.RelId(tbl.Rel)) catch _ {}
 					} else if !dr.IfExists {
 						try types.ErrorFault(types.NewPgError("42P01", "table \"" + name + "\" does not exist", "", "", 0))
 					}
@@ -114,7 +121,35 @@ fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
 				}
 			}
 			let prep = try plan.Prepare(session.Catalog, tx, ex.Statement, []u32{})
-			let lines = plan.ExplainPlan(prep.Plan, analyze)
+			mut lines = plan.ExplainPlan(prep.Plan, false)
+			if analyze {
+				// EXPLAIN ANALYZE runs the plan to measure it. exec records the actual rows
+				// and elapsed time for the root node as a plan.NodeStat; plan renders the
+				// annotation. Plans with side effects (DML/utility) are described without
+				// running, so EXPLAIN ANALYZE never changes data by accident.
+				mut stats = []plan.NodeStat{}
+				match prep.Plan {
+					Utility(_) => {}
+					ModifyTable(_) => {}
+					_ => {
+						mut p = freshPlan(prep.Plan)
+						mut ctx = ExprContext{Row: []types.Datum{}, Params: []types.Datum{}, Txn: tx, Catalog: session.Catalog}
+						let start = tide.Now()
+						mut cur = try BuildCursor(mut p, mut ctx)
+						mut count = i64(0)
+						for {
+							let (_, ok) = try cur.Next()
+							if !ok {
+								break
+							}
+							count += 1
+						}
+						let ms = f64(tide.Since(start)) / 1000000.0
+						stats = append(stats, plan.NodeStat{Path: []i64{}, ActualRows: f64(count), Loops: 1, ActualTimeMs: ms})
+						lines = plan.ExplainAnalyze(prep, stats)
+					}
+				}
+			}
 			out.RowDescription([]ColDesc{ColDesc{Name: "QUERY PLAN", Oid: types.TextOid, Typmod: -1, TableOid: 0, Attno: 1}}, []i16{0})
 			for line in lines {
 				out.DataRow([]types.Datum{types.FromStr(types.TextOid, line)})
@@ -139,7 +174,7 @@ fn ExecuteUtility(stmt parse.Stmt, session mut Session, out mut dyn Sink) !str {
 					Txn: tx,
 					Catalog: session.Catalog,
 				}
-				mut prepPlan = prep.Plan
+				mut prepPlan = freshPlan(prep.Plan)
 				mut cur = try BuildCursor(mut prepPlan, mut ctx)
 				if len(prep.Cols) > 0 {
 					mut sinkCols = []ColDesc{}
