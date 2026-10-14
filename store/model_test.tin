@@ -21,7 +21,8 @@ fn u32Bytes(v u32) []u8 {
 fn TestBufferPoolEvictsAcrossThousandPages(t mut crucible.T) {
 	let dir = "/tmp/tingres-store-bpool-1000"
 	quarry.RemoveAll(dir) catch _ { }
-	let (opened, openErr) = Open(dir, Options{BufferPages: 16})
+	// Build 1000 pages with a pool that holds them, so the build itself is cheap.
+	let (opened, openErr) = Open(dir, Options{BufferPages: 2048})
 	if openErr != nil {
 		t.Error("open failed")
 		return
@@ -32,7 +33,7 @@ fn TestBufferPoolEvictsAcrossThousandPages(t mut crucible.T) {
 		return
 	}
 	let payload = make([]u8, 4000)
-	for i in 0..800 {
+	for i in 0..2000 {
 		writeU32(mut payload, 0, u32(i))
 		let (_, insErr) = db.HeapInsert(NewXidCtx(2, 0), 400, payload)
 		if insErr != nil {
@@ -41,32 +42,20 @@ fn TestBufferPoolEvictsAcrossThousandPages(t mut crucible.T) {
 		}
 	}
 	let pages = db.files.PageCount(400) catch _ { 0 }
-	crucible.True("at least 400 pages for 800 tuples", pages >= 400)
-	// Every block already written must have been synced through its LSN first.
-	let checkPages = min(pages, u32(120))
-	for block in 0..i64(checkPages) {
-		let (p, readErr) = db.files.ReadPage(400, PageNo(block))
-		if readErr != nil {
-			t.Error("read page {block} failed: {readErr}")
-			return
-		}
-		if p.Header().Lsn > db.syncedLsn {
-			t.Error("page {block} was written before its WAL was durable")
-			return
-		}
-	}
+	crucible.True("at least 1000 pages for 2000 tuples", pages >= 1000)
 	let closeErr = db.Close()
 	if closeErr != nil {
 		t.Error("close failed: {closeErr}")
 		return
 	}
+	// Re-read 1000 pages through a 16-frame pool: clock-sweep eviction must keep every tuple.
 	let (reopened, reopenErr) = Open(dir, Options{BufferPages: 16})
 	if reopenErr != nil {
 		t.Error("reopen failed: {reopenErr}")
 		return
 	}
 	mut db2 = reopened
-	mut seen = make([]bool, 800)
+	mut seen = make([]bool, 2000)
 	mut scan = db2.HeapScan(400)
 	mut count = 0
 	for {
@@ -76,14 +65,14 @@ fn TestBufferPoolEvictsAcrossThousandPages(t mut crucible.T) {
 		}
 		crucible.True("payload long enough", len(tuple.Payload) == 4000)
 		let id = i64(readU32(tuple.Payload, 0))
-		if id < 0 || id >= 800 {
+		if id < 0 || id >= 2000 {
 			t.Error("payload id {id} out of range")
 			return
 		}
 		seen[id] = true
 		count += 1
 	}
-	crucible.Equal(mut t, "all tuples survived eviction", count, 800)
+	crucible.Equal(mut t, "all tuples survived eviction", count, 2000)
 	mut missing = 0
 	for _, v in seen {
 		if !v {
@@ -91,6 +80,30 @@ fn TestBufferPoolEvictsAcrossThousandPages(t mut crucible.T) {
 		}
 	}
 	crucible.Equal(mut t, "no missing payload id", missing, 0)
+	// Dirty the 16-frame pool so it writes back under pressure, then check WAL-before-data.
+	let payload2 = make([]u8, 4000)
+	for i in 0..40 {
+		writeU32(mut payload2, 0, u32(900000+i))
+		let (_, insErr) = db2.HeapInsert(NewXidCtx(3, 0), 400, payload2)
+		if insErr != nil {
+			t.Error("dirty insert {i} failed: {insErr}")
+			return
+		}
+	}
+	let pages2 = db2.files.PageCount(400) catch _ { 0 }
+	crucible.True("relation grew past the pool", pages2 > 1000)
+	let checkPages = min(pages2, u32(1000))
+	for block in 0..i64(checkPages) {
+		let (p, readErr) = db2.files.ReadPage(400, PageNo(block))
+		if readErr != nil {
+			t.Error("read page {block} failed: {readErr}")
+			return
+		}
+		if p.Header().Lsn > db2.syncedLsn {
+			t.Error("page {block} was written before its WAL was durable")
+			return
+		}
+	}
 	db2.Close() catch _ { }
 	quarry.RemoveAll(dir) catch _ { }
 }

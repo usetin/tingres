@@ -410,25 +410,25 @@ fn internalLeftmostChild(page Page) u32 {
 	return internalEntryChild(e)
 }
 
-// internalFindChild returns the last child whose separator is at or below key.
+// internalFindChild returns the last child whose separator is at or below key, by binary search
+// over the sorted separators (slot 1 is the leftmost child with an empty key).
 fn internalFindChild(page Page, key []u8) u32 {
 	let n = i64(page.Header().Slots)
-	mut best = u32(0)
-	mut found = false
-	for slot in 1..n+1 {
-		let e = page.ItemView(u16(slot)) catch _ { continue }
-		if len(e) < 2 {
-			continue
-		}
+	mut lo = i64(1)
+	mut hi = n
+	mut best = i64(1)
+	for lo <= hi {
+		let mid = (lo+hi)/2
+		let e = page.ItemView(u16(mid)) catch _ { break }
 		if keyCmp(entryKey(e), key) <= 0 {
-			best = internalEntryChild(e)
-			found = true
+			best = mid
+			lo = mid+1
+		} else {
+			hi = mid-1
 		}
 	}
-	if !found {
-		return internalLeftmostChild(page)
-	}
-	return best
+	let e = page.ItemView(u16(best)) catch _ { return internalLeftmostChild(page) }
+	return internalEntryChild(e)
 }
 
 // ---- page entry helpers ----
