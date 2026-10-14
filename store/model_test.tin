@@ -314,7 +314,7 @@ fn TestBtreeVersusSortedModel(t mut crucible.T) {
 	mut rng = dice.New(20261013)
 	mut model = []ModelEntry{}
 	// Large keys make few entries per page, so a few thousand leaves force thousands of splits.
-	let inserts = 20000
+	let inserts = 50000
 	for i in 0..inserts {
 		let keyLen = 250+rng.Intn(150)
 		mut key = make([]u8, keyLen)
