@@ -37,6 +37,8 @@ fn (s mut Store) DropRel(rel RelId) ! {
 	try s.buffers.InvalidateRel(rel)
 	try s.files.Drop(rel)
 	delete(s.rels, u32(rel))
+	delete(s.freeHint, u32(rel))
+	delete(s.btreeHint, u32(rel))
 }
 
 // HeapInsert appends a tuple version and returns its stable TID.
@@ -295,6 +297,7 @@ fn (s mut Store) prunePage(rel RelId, block PageNo, deadHorizon u32) ! {
 	}
 	page.PruneSlots(dead)
 	page.SetFlags(newFlags)
+	s.freeHint[u32(rel)] = u32(block)
 	let dirtyErr = s.buffers.MarkDirty(frame, lsn)
 	let unlockErr = s.buffers.UnlockContent(frame)
 	let unpinErr = s.buffers.Unpin(frame)
@@ -339,15 +342,29 @@ fn (s mut Store) PageAllVisible(rel RelId, block PageNo) !bool {
 }
 
 // findHeapFrame returns a latched, pinned page with room for recordBytes, extending the relation if
-// no existing page has room.
+// no existing page has room. A per-relation hint skips the pages already known to be full.
 fn (s mut Store) findHeapFrame(rel RelId, recordBytes i64) !(PageNo, u32) {
 	let diskCount = try s.files.PageCount(rel)
 	let count = max(diskCount, s.buffers.RelationPageCount(rel))
+	let hint = s.freeHint[u32(rel)]
+	if count > 0 && hint < count {
+		let (frame, page) = try s.pinPage(rel, PageNo(hint))
+		try s.buffers.LockContent(frame)
+		if page.FreeSpace() >= recordBytes+linePointerSize {
+			return PageNo(hint), frame
+		}
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+	}
 	for i in 0..i64(count) {
+		if u32(i) == hint {
+			continue
+		}
 		let block = PageNo(i)
 		let (frame, page) = try s.pinPage(rel, block)
 		try s.buffers.LockContent(frame)
 		if page.FreeSpace() >= recordBytes+linePointerSize {
+			s.freeHint[u32(rel)] = u32(block)
 			return block, frame
 		}
 		try s.buffers.UnlockContent(frame)
@@ -356,6 +373,7 @@ fn (s mut Store) findHeapFrame(rel RelId, recordBytes i64) !(PageNo, u32) {
 	let block = PageNo(count)
 	let (frame, _) = try s.pinPage(rel, block)
 	try s.buffers.LockContent(frame)
+	s.freeHint[u32(rel)] = u32(block)
 	return block, frame
 }
 
@@ -437,7 +455,7 @@ fn (s mut Store) redoHeapInsert(rel u32, block u32, slot u16, flags u8, body []u
 	if len(fpi) > 0 {
 		copy(page.Data, fpi)
 	}
-	let (_, insErr) = page.Insert(payload)
+	let (_, insErr) = page.InsertRaw(payload)
 	if insErr != nil {
 		try s.buffers.UnlockContent(frame)
 		try s.buffers.Unpin(frame)

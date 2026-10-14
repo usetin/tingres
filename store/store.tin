@@ -108,6 +108,8 @@ type Store struct {
 	files RelationFiles
 	buffers BufferPool
 	rels map[u32]u8
+	freeHint map[u32]u32
+	btreeHint map[u32]u64
 	kinds map[u8]str
 	redos []RecordRedo
 	walDir str
@@ -201,7 +203,7 @@ fn Open(dir str, opts Options) !Store {
 	let buffers = try NewBufferPool(capacity)
 	mut walGate = lane.New[u8](1)
 	try walGate.Send(1)
-	mut s = Store{dir: dir, opts: opts, files: files, buffers: buffers, rels: map[u32]u8{}, kinds: map[u8]str{}, redos: []RecordRedo{}, walDir: walDir, walActiveSeg: 1, walBuf: make([]u8, 0, walBufBytes), lastLsn: 0, writtenLsn: 0, syncedLsn: 0, walGate: walGate, walFailed: false, fpiPending: map[u64]bool{}, checkpointLsn: 0, redoLsn: 0, recovering: false, closed: false}
+	mut s = Store{dir: dir, opts: opts, files: files, buffers: buffers, rels: map[u32]u8{}, freeHint: map[u32]u32{}, btreeHint: map[u32]u64{}, kinds: map[u8]str{}, redos: []RecordRedo{}, walDir: walDir, walActiveSeg: 1, walBuf: make([]u8, 0, walBufBytes), lastLsn: 0, writtenLsn: 0, syncedLsn: 0, walGate: walGate, walFailed: false, fpiPending: map[u64]bool{}, checkpointLsn: 0, redoLsn: 0, recovering: false, closed: false}
 	let (redoLsn, _, hasControl) = try s.readControl()
 	if hasControl {
 		s.redoLsn = redoLsn
@@ -330,8 +332,8 @@ fn (s mut Store) applyWalRecord(kind u8, flags u8, rel u32, block u32, slot u16,
 		walKindHeapDelete, walKindHeapHint => { try s.redoHeapHeader(rel, block, slot, flags, body, recStart) }
 		walKindHeapPrune => { try s.redoHeapPrune(rel, block, flags, body, recStart) }
 		walKindPageImages => { try s.redoPageImages(rel, body, recStart) }
-		walKindBtreeInsert => { try s.redoBtreeInsert(rel, block, flags, body, recStart) }
-		walKindBtreeDelete => { try s.redoBtreeDelete(rel, block, flags, body, recStart) }
+		walKindBtreeInsert => { try s.redoBtreeInsert(rel, block, body, recStart) }
+		walKindBtreeDelete => { try s.redoBtreeDelete(rel, block, body, recStart) }
 		walKindCheckpoint => {
 			s.checkpointLsn = recEnd
 			s.redoLsn = recStart

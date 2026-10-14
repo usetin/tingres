@@ -1,8 +1,33 @@
 package store
 
+import "sift"
+
 // pager.tin routes every relation page read and write through the buffer pool. A page is loaded on
 // a miss, its frame latched only for the synchronous byte access, and written back to the relation
 // file only after the WAL through its page LSN is durable.
+
+// FlushItem orders dirty frames for a checkpoint.
+type FlushItem struct {
+	rel u32
+	block u32
+	frame u32
+}
+
+fn flushItemCmp(a FlushItem, b FlushItem) i64 {
+	if a.rel != b.rel {
+		if a.rel < b.rel {
+			return -1
+		}
+		return 1
+	}
+	if a.block != b.block {
+		if a.block < b.block {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
 
 // pinPage is the only path from Store operations to relation page bytes.
 fn (s mut Store) pinPage(rel RelId, block PageNo) !(u32, Page) {
@@ -14,7 +39,11 @@ fn (s mut Store) pinPage(rel RelId, block PageNo) !(u32, Page) {
 	}
 	let frame = try s.buffers.ChooseVictim()
 	if s.buffers.IsDirty(frame) {
-		try s.flushFrame(frame)
+		let key = try s.buffers.Key(frame)
+		try s.flushDirtyRel(key.rel)
+		if s.buffers.IsDirty(frame) {
+			fail "store: dirty frame must be flushed before eviction"
+		}
 	}
 	let size = try s.files.Size(rel)
 	let offset = i64(block)*PageSize
@@ -53,16 +82,82 @@ fn (s mut Store) flushFrame(frame u32) ! {
 	try s.buffers.ClearDirty(frame)
 }
 
-// flushBuffers writes every cleanly unpinned dirty frame.
+// flushBuffers writes every cleanly unpinned dirty frame, grouping pages by relation so each
+// relation is rewritten once instead of once per page.
 fn (s mut Store) flushBuffers() ! {
+	mut items = []FlushItem{}
 	for i in 0..i64(s.buffers.Capacity()) {
 		let frame = u32(i)
 		if s.buffers.IsDirty(frame) {
 			if s.buffers.framePinned(frame) {
 				fail "store: cannot checkpoint a pinned page"
 			}
-			try s.flushFrame(frame)
+			let key = try s.buffers.Key(frame)
+			items = append(items, FlushItem{rel: key.rel, block: key.page, frame: frame})
 		}
+	}
+	sift.SortFunc(mut items, flushItemCmp)
+	try s.flushItemGroups(items, true)
+}
+
+// flushDirtyRel writes the dirty, unpinned frames of one relation in a single rewrite.
+fn (s mut Store) flushDirtyRel(rel u32) ! {
+	mut items = []FlushItem{}
+	for i in 0..i64(s.buffers.Capacity()) {
+		let frame = u32(i)
+		if s.buffers.IsDirty(frame) && !s.buffers.framePinned(frame) {
+			let key = try s.buffers.Key(frame)
+			if key.rel == rel {
+				items = append(items, FlushItem{rel: key.rel, block: key.page, frame: frame})
+			}
+		}
+	}
+	sift.SortFunc(mut items, flushItemCmp)
+	try s.flushItemGroups(items, false)
+}
+
+fn (s mut Store) flushItemGroups(items []FlushItem, durable bool) ! {
+	mut i = 0
+	for i < len(items) {
+		let rel = items[i].rel
+		mut group = []FlushItem{}
+		for i < len(items) && items[i].rel == rel {
+			group = append(group, items[i])
+			i += 1
+		}
+		try s.flushPageGroup(rel, group, durable)
+	}
+}
+
+// flushPageGroup syncs the WAL through the highest page LSN, then applies every group page in one
+// relation rewrite.
+fn (s mut Store) flushPageGroup(rel u32, group []FlushItem, durable bool) ! {
+	if len(group) == 0 {
+		return
+	}
+	mut maxLsn = u64(0)
+	for _, it in group {
+		let page = try s.buffers.PageAt(it.frame)
+		let l = page.Header().Lsn
+		if l > maxLsn {
+			maxLsn = l
+		}
+	}
+	if !s.recovering {
+		try s.Sync(Lsn(maxLsn))
+	}
+	mut blocks = []u32{}
+	mut datas = [][]u8{}
+	for _, it in group {
+		let page = try s.buffers.PageAt(it.frame)
+		blocks = append(blocks, it.block)
+		mut d = copyBytes(page.Data)
+		sealBytes(mut d)
+		datas = append(datas, d)
+	}
+	try s.files.WritePages(RelId(rel), blocks, datas, durable)
+	for _, it in group {
+		try s.buffers.ClearDirty(it.frame)
 	}
 }
 
@@ -115,8 +210,7 @@ fn (s mut Store) readPageLocal(rel RelId, block PageNo) !Page {
 }
 
 // installPage copies a page into the buffer pool and marks it dirty through lsn.
-fn (s mut Store) installPage(rel RelId, block PageNo, page mut Page, lsn u64) ! {
-	page.SetLsn(lsn)
+fn (s mut Store) installPage(rel RelId, block PageNo, page Page, lsn u64) ! {
 	let (frame, cur) = try s.pinPage(rel, block)
 	try s.buffers.LockContent(frame)
 	copy(cur.Data, page.Data)
