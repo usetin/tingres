@@ -1,0 +1,29 @@
+package stats
+
+import "../types"
+
+// Sample draws at most 300*target rows from src using reservoir sampling.
+// If src has no more than that many rows, the entire result is returned.
+fn Sample[S RowSource](src mut S, target i64, seed u64) ![][]types.Datum {
+	if target <= 0 { target = DefaultStatsTarget }
+	let capacity = 300 * target
+	mut rng = NewRng(seed)
+	mut reservoir = make([][]types.Datum, 0, capacity)
+	mut seen i64 = 0
+	for {
+		let batch = try src.NextBatch()
+		if len(batch) == 0 { break }
+		for row in batch {
+			if seen < i64(capacity) {
+				reservoir = append(reservoir, row)
+			} else {
+				let j = rng.nextInt(seen + 1)
+				if j < i64(capacity) {
+					reservoir[j] = row
+				}
+			}
+			seen += 1
+		}
+	}
+	return reservoir
+}

@@ -466,3 +466,75 @@ fn TestInformationSchemaViews(t mut crucible.T) {
 	crucible.Equal(mut t, "unknown information_schema view", c.InformationSchemaView(tx, "made_up") == nil, true)
 	crucible.NoFault("abort", m.Abort(mut tx))
 }
+
+fn TestConstraints(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("constraints") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let parent = c.CreateTable(tx, TableDef{Schema: "public", Name: "parent", Columns: []ColumnDef{ColumnDef{Name: "id", Type: 23, Typmod: -1, NotNull: true}}, PrimaryKey: []i16{1}}) catch err {
+		t.Error("create parent: {err}")
+		return
+	}
+	tx.CommandCounterIncrement()
+	let child = c.CreateTable(tx, TableDef{Schema: "public", Name: "child", Columns: []ColumnDef{ColumnDef{Name: "id", Type: 23, Typmod: -1}, ColumnDef{Name: "parent_id", Type: 23, Typmod: -1}}, PrimaryKey: []i16{1}, Checks: []CheckDef{CheckDef{Name: "child_positive", Expr: "id > 0"}}, ForeignKeys: []ForeignKeyDef{ForeignKeyDef{Name: "child_parent_fk", Columns: []i16{2}, RefTable: parent.Oid, RefColumns: []i16{1}}}}) catch err {
+		t.Error("create child: {err}")
+		return
+	}
+	crucible.Equal(mut t, "child oid", child.Oid != 0, true)
+	tx.CommandCounterIncrement()
+	let cons = c.TableConstraints(tx, child.Oid)
+	crucible.Equal(mut t, "three constraints recorded", len(cons), 3)
+	mut sawPrimary = false
+	mut sawCheck = false
+	mut sawForeign = false
+	for con in cons {
+		if con.Type == "p" {
+			sawPrimary = true
+			crucible.Equal(mut t, "primary key column", con.Key[0], i16(1))
+		}
+		if con.Type == "c" {
+			sawCheck = true
+			crucible.Equal(mut t, "check expression", con.Expr, "id > 0")
+		}
+		if con.Type == "f" {
+			sawForeign = true
+			crucible.Equal(mut t, "foreign key references parent", con.RefTable, parent.Oid)
+			crucible.Equal(mut t, "foreign key column", con.Key[0], i16(2))
+		}
+	}
+	crucible.Equal(mut t, "primary constraint present", sawPrimary, true)
+	crucible.Equal(mut t, "check constraint present", sawCheck, true)
+	crucible.Equal(mut t, "foreign key present", sawForeign, true)
+	crucible.NoFault("abort", m.Abort(mut tx))
+}
+
+fn TestSearchPathResolution(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("search-path") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	let path = c.SearchPath(tx)
+	crucible.Equal(mut t, "default search path length", len(path), 3)
+	crucible.Equal(mut t, "pg_catalog implicit first", path[0], "pg_catalog")
+	crucible.Equal(mut t, "user schema second", path[1], "$user")
+	crucible.Equal(mut t, "public third", path[2], "public")
+	crucible.Equal(mut t, "public resolves", c.LookupNamespace(tx, "public"), u32(2200))
+	crucible.True("pg_temp resolves", c.LookupNamespace(tx, "pg_temp") != 0)
+	c.SetSearchPath(tx, []str{"app", "public"})
+	let custom = c.SearchPath(tx)
+	crucible.Equal(mut t, "custom search path first", custom[0], "app")
+	crucible.NoFault("abort", m.Abort(mut tx))
+}

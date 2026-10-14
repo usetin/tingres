@@ -244,6 +244,7 @@ fn deparseStatement(statement Stmt) str {
 		Do(v) => deparseDo(v)
 		Checkpoint(_) => "CHECKPOINT"
 		Call(v) => deparseCall(v)
+		Utility(v) => v.Text
 	}
 }
 
@@ -465,6 +466,8 @@ fn deparseCreateTable(v CreateTableStmt) str {
 	out += "TABLE "
 	if v.IfNotExists { out += "IF NOT EXISTS " }
 	out += nameText(v.Table)
+	if let parent = v.PartitionOf { out += " PARTITION OF " + nameText(parent) }
+	if let ofType = v.OfType { out += " OF " + deparseType(ofType) }
 	if len(v.Elements) > 0 {
 		out += " ("
 		for i, element in v.Elements {
@@ -476,6 +479,11 @@ fn deparseCreateTable(v CreateTableStmt) str {
 		}
 		out += ")"
 	}
+	if v.PartitionBound == "DEFAULT" {
+		out += " DEFAULT"
+	} else if v.PartitionBound != "" {
+		out += " FOR VALUES " + v.PartitionBound
+	}
 	if len(v.Inherits) > 0 {
 		out += " INHERITS ("
 		for i, parent in v.Inherits {
@@ -484,6 +492,18 @@ fn deparseCreateTable(v CreateTableStmt) str {
 		}
 		out += ")"
 	}
+	if let partition = v.PartitionBy {
+		out += " PARTITION BY " + upperAscii(partition.Method) + " ("
+		for i, key in partition.Keys {
+			if i > 0 { out += ", " }
+			out += deparseExpr(key)
+		}
+		out += ")"
+	}
+	if v.AccessMethod != "" && v.AccessMethod != "heap" { out += " USING " + upperAscii(v.AccessMethod) }
+	if len(v.Options) > 0 { out += " WITH (" + v.Options[0] + ")" }
+	if v.OnCommit != "" { out += " ON COMMIT " + upperAscii(v.OnCommit) }
+	if v.Tablespace != "" { out += " TABLESPACE " + v.Tablespace }
 	if let asQuery = v.AsQuery {
 		out += " AS " + deparseSelect(asQuery)
 		if !v.WithData { out += " WITH NO DATA" }
@@ -510,6 +530,10 @@ fn deparseColumnConstraint(v TableConstraint) str {
 		out += " REFERENCES " + nameText(references)
 		if len(v.ReferenceColumns) > 0 { out += " (" + deparseIdentifierList(v.ReferenceColumns) + ")" }
 	}
+	if v.MatchType != "" { out += " MATCH " + upperAscii(v.MatchType) }
+	for action in v.ReferenceActions { out += " ON " + upperAscii(action.Event) + " " + upperAscii(action.Action) }
+	if v.Deferrable != "" { out += " " + upperAscii(v.Deferrable) }
+	if v.Initially != "" { out += " INITIALLY " + upperAscii(v.Initially) }
 	return out
 }
 
@@ -523,6 +547,11 @@ fn deparseConstraint(v TableConstraint) str {
 		out += " REFERENCES " + nameText(references)
 		if len(v.ReferenceColumns) > 0 { out += " (" + deparseIdentifierList(v.ReferenceColumns) + ")" }
 	}
+	if v.MatchType != "" { out += " MATCH " + upperAscii(v.MatchType) }
+	for action in v.ReferenceActions { out += " ON " + upperAscii(action.Event) + " " + upperAscii(action.Action) }
+	if len(v.Include) > 0 { out += " INCLUDE (" + deparseIdentifierList(v.Include) + ")" }
+	if v.Deferrable != "" { out += " " + upperAscii(v.Deferrable) }
+	if v.Initially != "" { out += " INITIALLY " + upperAscii(v.Initially) }
 	return out
 }
 

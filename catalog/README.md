@@ -62,6 +62,7 @@ fn (c mut Catalog) AnalyzeTable(t txn.Txn, tbl Table) !
 fn (c Catalog)  ColumnStatistics(t txn.Txn, tableOid Oid) []ColumnStat
 fn (c Catalog)  Statistic(t txn.Txn, tableOid Oid, attnum i16) ?f64
 fn (c Catalog)  InformationSchemaView(t txn.Txn, name str) ?str
+fn (c Catalog)  TableConstraints(t txn.Txn, tableOid Oid) []Constraint
 fn (c mut Catalog) AlterTableAddColumn(t txn.Txn, tbl Table, def ColumnDef) !Column
 fn (c mut Catalog) AlterTableDropColumn(t txn.Txn, tbl Table, name str, cascade bool) !
 fn (c mut Catalog) AlterTableRenameColumn(t txn.Txn, tbl Table, oldName str, newName str) !
@@ -82,7 +83,10 @@ ascending, nulls last). Per-column statistics are `ColumnStat{Attnum, Inherit, N
 Width, Distinct, Kind, Numbers []f64, Values []str}`, the shape of a `pg_statistic` slot,
 with the most-common values in `Values` and their frequencies in `Numbers`; `AnalyzeTable`
 computes `stanullfrac`/`stawidth`/`stadistinct` and `ColumnStatistics` reads the slots
-back.
+back. Constraints are recorded in `pg_constraint` and read back as
+`Constraint{Oid, Name, Type, Key []i16, RefTable, RefKey []i16, Expr}` through
+`TableConstraints`; `TableDef.PrimaryKey`, `TableDef.Checks` and `TableDef.ForeignKeys`
+create the `p`, `c` and `f` rows (the primary key also creates a unique index).
 `Table.Rel`/`Column.Number` are the attnums/relfilenodes the executor and planner use.
 
 Errors use PostgreSQL SQLSTATEs: `42P01`, `42P07`, `42701`, `42703`, `42P06`, `3F000`,
@@ -94,7 +98,9 @@ Errors use PostgreSQL SQLSTATEs: `42P01`, `42P07`, `42701`, `42703`, `42P06`, `3
 `pg_type`/`pg_namespace` rows against PostgreSQL 17; transactional DDL (same-command
 hiding, cross-transaction visibility, abort restores); reopen persistence; SQLSTATEs;
 sequences; ALTER TABLE; indexes and schemas; the planner surface (index keys, reltuples,
-pg_statistic slots); the built-in information_schema views (10 tests).
+pg_statistic slots); the built-in information_schema views; CHECK/foreign-key/primary
+constraints; default search_path (`pg_catalog`, `$user`, `public`) and `pg_temp`
+(12 tests).
 
 ## information_schema
 

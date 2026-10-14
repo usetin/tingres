@@ -879,3 +879,78 @@ fn TestVacuumFreezesAndCounts(t mut crucible.T) {
 	}
 	crucible.Equal(mut t, "live tuple frozen hint set", keepRow.Header.Infomask()&infXminFrozen, infXminFrozen)
 }
+
+// lockDeadlock3 is a three-way wait-for ring; exactly one task must be the 40P01 victim.
+fn lockDeadlock3(t mut crucible.T, base Manager) ! {
+	scope s {
+		let a = s.spawn(fn() !str {
+			mut mgr = base
+			mut tx = mgr.Begin(Isolation.ReadCommitted) catch _ { return "" }
+			mgr.LockRelation(tx, 500, LockMode.AccessExclusive) catch _ { return "" }
+			tide.Sleep(10ms)
+			mgr.LockRelation(tx, 501, LockMode.AccessExclusive) catch err {
+				mgr.Abort(mut tx) catch _ { }
+				return codeOf(err)
+			}
+			mgr.Commit(mut tx) catch _ { }
+			return ""
+		})
+		let b = s.spawn(fn() !str {
+			mut mgr = base
+			mut tx = mgr.Begin(Isolation.ReadCommitted) catch _ { return "" }
+			mgr.LockRelation(tx, 501, LockMode.AccessExclusive) catch _ { return "" }
+			tide.Sleep(10ms)
+			mgr.LockRelation(tx, 502, LockMode.AccessExclusive) catch err {
+				mgr.Abort(mut tx) catch _ { }
+				return codeOf(err)
+			}
+			mgr.Commit(mut tx) catch _ { }
+			return ""
+		})
+		let cc = s.spawn(fn() !str {
+			mut mgr = base
+			mut tx = mgr.Begin(Isolation.ReadCommitted) catch _ { return "" }
+			mgr.LockRelation(tx, 502, LockMode.AccessExclusive) catch _ { return "" }
+			tide.Sleep(10ms)
+			mgr.LockRelation(tx, 500, LockMode.AccessExclusive) catch err {
+				mgr.Abort(mut tx) catch _ { }
+				return codeOf(err)
+			}
+			mgr.Commit(mut tx) catch _ { }
+			return ""
+		})
+		let ra = try a.wait()
+		let rb = try b.wait()
+		let rc = try cc.wait()
+		mut deadlocks = 0
+		if ra == "40P01" { deadlocks += 1 }
+		if rb == "40P01" { deadlocks += 1 }
+		if rc == "40P01" { deadlocks += 1 }
+		crucible.Equal(mut t, "three-way ring has one victim", deadlocks, 1)
+	}
+}
+
+fn TestThreeWayDeadlock(t mut crucible.T) {
+	let (_, _, manager) = testManager("deadlock3") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut m = manager
+	m.SetDeadlockTimeout(40ms)
+	lockDeadlock3(mut t, m) catch err {
+		t.Error("deadlock3: {err}")
+		return
+	}
+}
+
+fn BenchmarkLockAcquire(b mut crucible.B) {
+	let (_, _, manager) = testManager("bench-lock") catch _ { return }
+	mut m = manager
+	mut tx = m.Begin(Isolation.ReadCommitted) catch _ { return }
+	for i in 0..b.N {
+		let ok = arena { m.TryLockRelation(tx, 600, LockMode.RowExclusive) }
+		if !ok || i < 0 { continue }
+	}
+	m.Abort(mut tx) catch _ { }
+	hearth.Reset()
+}

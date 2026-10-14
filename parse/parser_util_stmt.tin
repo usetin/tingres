@@ -26,6 +26,9 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 		} else if p.eat("time") {
 			try p.expect("zone")
 			name = "time zone"
+		} else if p.eat("session") {
+			try p.expect("authorization")
+			name = "session authorization"
 		} else {
 			if p.done() { try p.errorHere() }
 			name = lowerAscii(p.take().Text)
@@ -61,7 +64,7 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 		} else if p.eat("local") {
 			values = append(values, Expr.Literal(LiteralExpr{Pos: p.pos(), Kind: "word", Value: "local"}))
 		} else {
-			let val = try p.parseExpression(0)
+			let val = try p.parseGucValue()
 			values = append(values, val)
 		}
 		return VariableSetStmt{Pos: pos, Kind: "set", Scope: scope, Name: name, Values: values, Default: isDefault, Local: local}
@@ -80,7 +83,7 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 		isDefault = true
 	} else {
 		for {
-			let val = try p.parseExpression(0)
+			let val = try p.parseGucValue()
 			values = append(values, val)
 			if !p.eat(",") {
 				break
@@ -88,6 +91,18 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 		}
 	}
 	return VariableSetStmt{Pos: pos, Kind: "set", Scope: scope, Name: name, Values: values, Default: isDefault, Local: local}
+}
+
+// parseGucValue parses a SET value, accepting bare ON/OFF words that the expression grammar
+// cannot (they are reserved keywords).
+fn (p mut Parser) parseGucValue() !Expr {
+	let w = lowerAscii(p.text())
+	if p.kind() == "word" && (w == "on" || w == "off") {
+		let valuePos = p.pos()
+		p.At += 1
+		return Expr.Literal(LiteralExpr{Pos: valuePos, Kind: "word", Value: w})
+	}
+	return try p.parseExpression(0)
 }
 
 fn (p mut Parser) parseExplain() !ExplainStmt {
@@ -417,6 +432,17 @@ fn (p mut Parser) parseGrant() !GrantStmt {
 	for {
 		let obj = try p.parseQualifiedName()
 		objects = append(objects, obj)
+		if objType == "function" || objType == "procedure" || objType == "routine" {
+			if p.eat("(") {
+				if p.text() != ")" {
+					for {
+						let _ = try p.parseTypeName()
+						if !p.eat(",") { break }
+					}
+				}
+				try p.expect(")")
+			}
+		}
 		if !p.eat(",") {
 			break
 		}
@@ -610,4 +636,25 @@ fn (p mut Parser) parseCall() !CallStmt {
 		try p.expect(")")
 	}
 	return CallStmt{Pos: pos, Name: name, Arguments: args}
+}
+
+// grantTargetsRole / revokeTargetsRole report whether the statement grants/revokes role
+// membership (GRANT role TO role) rather than object privileges. They look at whether the
+// first top-level ON/TO (ON/FROM for REVOKE) keyword is the role keyword.
+fn grantTargetsRole(p Parser) bool { return firstRoleKeyword(p, "to") }
+fn revokeTargetsRole(p Parser) bool { return firstRoleKeyword(p, "from") }
+
+fn firstRoleKeyword(p Parser, roleWord str) bool {
+	mut depth = 0
+	mut i = p.At
+	for i < len(p.Tokens) {
+		let text = p.Tokens[i].Text
+		if text == "(" { depth += 1 } else if text == ")" { depth -= 1 } else if depth == 0 {
+			let w = lowerAscii(text)
+			if w == "on" { return false }
+			if w == roleWord { return true }
+		}
+		i += 1
+	}
+	return false
 }

@@ -50,6 +50,17 @@ type Index struct {
 	Keys []IndexKey
 }
 
+// Constraint is one recorded pg_constraint row.
+type Constraint struct {
+	Oid Oid
+	Name str
+	Type str
+	Key []i16
+	RefTable Oid
+	RefKey []i16
+	Expr str
+}
+
 // ColumnStat is a pg_statistic-shaped slot for one column.
 type ColumnStat struct {
 	Attnum i16
@@ -82,12 +93,30 @@ type Table struct {
 	RelPages i32
 }
 
+// CheckDef is one CHECK constraint expression.
+type CheckDef struct {
+	Name str
+	Expr str
+}
+
+// ForeignKeyDef is one foreign key constraint.
+type ForeignKeyDef struct {
+	Name str
+	Columns []i16
+	RefTable Oid
+	RefColumns []i16
+	OnDelete str
+	OnUpdate str
+}
+
 // TableDef describes a table to create.
 type TableDef struct {
 	Schema str
 	Name str
 	Columns []ColumnDef
 	PrimaryKey []i16
+	Checks []CheckDef
+	ForeignKeys []ForeignKeyDef
 }
 
 // IndexDef describes an index to create.
@@ -180,7 +209,7 @@ fn (c Catalog) SearchPath(t txn.Txn) []str {
 	if ok {
 		return path
 	}
-	return []str{"pg_catalog", "public"}
+	return []str{"pg_catalog", "$user", "public"}
 }
 
 // SetSearchPath sets the transaction-local schema search order.
@@ -272,7 +301,7 @@ fn isRelationKind(kind str) bool {
 }
 
 fn (c Catalog) namespaceOid(snap txn.Snapshot, schema str) u32 {
-	if schema == "pg_temp" {
+	if schema == "" || schema == "$user" {
 		return 0
 	}
 	for row in c.rows["pg_namespace"] {
