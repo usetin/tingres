@@ -444,3 +444,25 @@ fn TestPlannerCatalogSurface(t mut crucible.T) {
 	}
 	crucible.NoFault("abort", m.Abort(mut tx))
 }
+
+fn TestInformationSchemaViews(t mut crucible.T) {
+	let (_, m0, c0) = testCatalog("info-schema") catch err {
+		t.Error("catalog: {err}")
+		return
+	}
+	mut m = m0
+	mut c = c0
+	mut tx = m.Begin(txn.Isolation.ReadCommitted) catch err {
+		t.Error("begin: {err}")
+		return
+	}
+	for name in []str{"tables", "columns", "schemata", "table_constraints", "key_column_usage"} {
+		if let sql = c.InformationSchemaView(tx, name) {
+			crucible.True("view {name} has a definition", len(sql) > 10)
+		} else {
+			t.Error("information_schema.{name} is not registered")
+		}
+	}
+	crucible.Equal(mut t, "unknown information_schema view", c.InformationSchemaView(tx, "made_up") == nil, true)
+	crucible.NoFault("abort", m.Abort(mut tx))
+}
