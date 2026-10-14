@@ -56,6 +56,7 @@ type Oid = u32                                  // pg_type oids are the real Pos
                                                 // int2 21, int4 23, text 25, oid 26, json 114, float4 700, float8 701,
                                                 // varchar 1043, date 1082, time 1083, timestamp 1114, timestamptz 1184,
                                                 // interval 1186, numeric 1700, uuid 2950, jsonb 3802, arrays per pg_type
+                                                // internal "char" 18 is exposed as CharOid and stores one PostgreSQL byte
 type Datum value struct { ... }                 // one SQL value; Null is a Datum; cheap to copy; owner picks layout
 fn Null() Datum
 fn IsNull(d Datum) bool
