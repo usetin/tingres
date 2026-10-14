@@ -1,0 +1,540 @@
+package store
+
+// Heap is slotted pages of versioned tuples. A tuple record is a 20-byte header
+// {xmin, xmax, cid, infomask, ctid} followed by a u32 payload length and the payload. Insert
+// appends a new line pointer and tuple; delete and hint rewrite the header in place. Store does no
+// MVCC: it returns every tuple version with its header and the caller decides visibility. A tuple
+// larger than a page is a clean error (no TOAST).
+
+const tupleHeaderSize i64 = 20
+
+// CreateHeap creates an empty heap relation.
+fn (s mut Store) CreateHeap(rel RelId) ! {
+	if s.closed {
+		fail "store: closed"
+	}
+	let (_, exists) = s.rels[u32(rel)]
+	if exists || s.files.Exists(rel) {
+		fail "store: relation already exists"
+	}
+	let lsn = try s.appendWal(walKindRelCreate, 0, u32(rel), 0, 0, []u8{relKindHeap})
+	try s.Sync(lsn)
+	try s.files.Ensure(rel)
+	s.rels[u32(rel)] = relKindHeap
+}
+
+// DropRel logs the drop before removing the relation file; replay removes it again.
+fn (s mut Store) DropRel(rel RelId) ! {
+	if s.closed {
+		fail "store: closed"
+	}
+	let (_, exists) = s.rels[u32(rel)]
+	if !exists {
+		fail "store: relation does not exist"
+	}
+	let lsn = try s.appendWal(walKindRelDrop, 0, u32(rel), 0, 0, []u8{})
+	try s.Sync(lsn)
+	try s.buffers.InvalidateRel(rel)
+	try s.files.Drop(rel)
+	delete(s.rels, u32(rel))
+	delete(s.freeHint, u32(rel))
+	delete(s.btreeHint, u32(rel))
+}
+
+// HeapInsert appends a tuple version and returns its stable TID.
+fn (s mut Store) HeapInsert(x XidCtx, rel RelId, payload []u8) !Tid {
+	if s.closed {
+		fail "store: closed"
+	}
+	let (kind, ok) = s.rels[u32(rel)]
+	if !ok || kind != relKindHeap {
+		fail "store: relation does not exist"
+	}
+	let recordBytes = tupleHeaderSize+4+i64(len(payload))
+	if recordBytes+linePointerSize > PageSize-pageHeaderSize {
+		fail "store: tuple too large for a page"
+	}
+	let (block, frame) = try s.findHeapFrame(rel, recordBytes)
+	let (slotValue, reserveErr) = s.buffers.ReserveItem(frame, recordBytes)
+	if reserveErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail reserveErr
+	}
+	let slot = slotValue
+	let tid = Tid{page: u32(block), slot: slot}
+	let h = TupleHeader{xmin: x.xid, xmax: 0, cid: x.cid, infomask: 0, ctid: tid}
+	let tupleBytes = encodeTupleRecord(h, payload)
+	let fpi = s.takeFpi(rel, block, frame)
+	mut flags = u8(0)
+	if len(fpi) > 0 { flags = walFlagFpi }
+	let (lsn, walErr) = s.appendWalWithFpi(walKindHeapInsert, flags, u32(rel), u32(block), slot, fpi, tupleBytes)
+	if walErr != nil {
+		s.buffers.CancelReservation(frame, slot, recordBytes) catch _ { }
+		s.releasePinnedPage(frame) catch _ { }
+		fail walErr
+	}
+	let insertErr = s.buffers.InsertReserved(frame, slot, tupleBytes)
+	if insertErr != nil {
+		s.buffers.CancelReservation(frame, slot, recordBytes) catch _ { }
+		s.releasePinnedPage(frame) catch _ { }
+		fail insertErr
+	}
+	let dirtyErr = s.buffers.MarkDirty(frame, lsn)
+	let unlockErr = s.buffers.UnlockContent(frame)
+	let unpinErr = s.buffers.Unpin(frame)
+	if dirtyErr != nil {
+		fail dirtyErr
+	}
+	if unlockErr != nil {
+		fail unlockErr
+	}
+	if unpinErr != nil {
+		fail unpinErr
+	}
+	return tid
+}
+
+// HeapDelete sets xmax on a tuple version. Visibility is decided by txn.
+fn (s mut Store) HeapDelete(x XidCtx, rel RelId, t Tid) ! {
+	let (r, ok) = s.rels[u32(rel)]
+	if !ok || r != relKindHeap {
+		fail "store: relation does not exist"
+	}
+	let (frame, page) = try s.pinPage(rel, PageNo(t.page))
+	try s.buffers.LockContent(frame)
+	let raw = page.Item(t.slot) catch err {
+		s.releasePinnedPage(frame) catch _ { }
+		fail err
+	}
+	let tuple = decodeTupleRecord(t, raw) catch err {
+		s.releasePinnedPage(frame) catch _ { }
+		fail err
+	}
+	let h = TupleHeader{xmin: tuple.Header.xmin, xmax: x.xid, cid: x.cid, infomask: tuple.Header.infomask, ctid: tuple.Header.ctid}
+	let fpi = s.takeFpi(rel, PageNo(t.page), frame)
+	mut flags = u8(0)
+	if len(fpi) > 0 { flags = walFlagFpi }
+	let (lsn, walErr) = s.appendWalWithFpi(walKindHeapDelete, flags, u32(rel), u32(t.page), t.slot, fpi, encodeHeader20(h))
+	if walErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail walErr
+	}
+	let setErr = page.SetItemPrefix(t.slot, encodeHeader20(h))
+	if setErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail setErr
+	}
+	let dirtyErr = s.buffers.MarkDirty(frame, lsn)
+	let unlockErr = s.buffers.UnlockContent(frame)
+	let unpinErr = s.buffers.Unpin(frame)
+	if dirtyErr != nil {
+		fail dirtyErr
+	}
+	if unlockErr != nil {
+		fail unlockErr
+	}
+	if unpinErr != nil {
+		fail unpinErr
+	}
+}
+
+// SetHint updates tuple hint bits through a WAL record.
+fn (s mut Store) SetHint(rel RelId, t Tid, bits u16) ! {
+	if bits == 0 {
+		return
+	}
+	let (r, ok) = s.rels[u32(rel)]
+	if !ok || r != relKindHeap {
+		fail "store: relation does not exist"
+	}
+	let (frame, page) = try s.pinPage(rel, PageNo(t.page))
+	try s.buffers.LockContent(frame)
+	let raw = page.Item(t.slot) catch err {
+		s.releasePinnedPage(frame) catch _ { }
+		fail err
+	}
+	let tuple = decodeTupleRecord(t, raw) catch err {
+		s.releasePinnedPage(frame) catch _ { }
+		fail err
+	}
+	let h = TupleHeader{xmin: tuple.Header.xmin, xmax: tuple.Header.xmax, cid: tuple.Header.cid, infomask: tuple.Header.infomask|bits, ctid: tuple.Header.ctid}
+	let fpi = s.takeFpi(rel, PageNo(t.page), frame)
+	mut flags = u8(0)
+	if len(fpi) > 0 { flags = walFlagFpi }
+	let (lsn, walErr) = s.appendWalWithFpi(walKindHeapHint, flags, u32(rel), u32(t.page), t.slot, fpi, encodeHeader20(h))
+	if walErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail walErr
+	}
+	let setErr = page.SetItemPrefix(t.slot, encodeHeader20(h))
+	if setErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail setErr
+	}
+	let dirtyErr = s.buffers.MarkDirty(frame, lsn)
+	let unlockErr = s.buffers.UnlockContent(frame)
+	let unpinErr = s.buffers.Unpin(frame)
+	if dirtyErr != nil {
+		fail dirtyErr
+	}
+	if unlockErr != nil {
+		fail unlockErr
+	}
+	if unpinErr != nil {
+		fail unpinErr
+	}
+}
+
+// HeapFetch returns the tuple version at TID. The caller may reuse out as scratch.
+fn (s mut Store) HeapFetch(rel RelId, t Tid, out []u8) !HeapTuple {
+	_ = out
+	let (_, ok) = s.rels[u32(rel)]
+	if !ok {
+		fail "store: relation does not exist"
+	}
+	let (frame, page) = try s.pinPage(rel, PageNo(t.page))
+	try s.buffers.LockContent(frame)
+	let raw = page.Item(t.slot) catch err {
+		s.releasePinnedPage(frame) catch _ { }
+		fail err
+	}
+	let tuple = decodeTupleRecord(t, raw) catch err {
+		s.releasePinnedPage(frame) catch _ { }
+		fail err
+	}
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+	return tuple
+}
+
+// HeapScan returns every tuple version in physical order through the buffer pool.
+fn (s mut Store) HeapScan(rel RelId) HeapScan {
+	mut tuples = []HeapTuple{}
+	let (kind, ok) = s.rels[u32(rel)]
+	if !ok || kind != relKindHeap {
+		return HeapScan{tuples: tuples}
+	}
+	let diskCount = s.files.PageCount(rel) catch _ { 0 }
+	let count = max(diskCount, s.buffers.RelationPageCount(rel))
+	for block in 0..i64(count) {
+		let (frame, page) = s.pinPage(rel, PageNo(block)) catch _ { continue }
+		let lockErr = s.buffers.LockContent(frame)
+		if lockErr != nil {
+			s.buffers.Unpin(frame) catch _ { }
+			continue
+		}
+		let slots = page.Header().Slots
+		for slot in 1..i64(slots)+1 {
+			let raw = page.Item(u16(slot)) catch _ { continue }
+			let tuple = decodeTupleRecord(Tid{page: u32(block), slot: u16(slot)}, raw) catch _ { continue }
+			tuples = append(tuples, tuple)
+		}
+		s.buffers.UnlockContent(frame) catch _ { }
+		s.buffers.Unpin(frame) catch _ { }
+	}
+	return HeapScan{tuples: tuples}
+}
+
+// Prune removes dead tuple versions at or below deadHorizon and compacts their pages, setting the
+// page-level all-visible bit when every surviving tuple predates the horizon. Vacuum owns the
+// horizon; Store trusts it.
+fn (s mut Store) Prune(rel RelId, deadHorizon u32) ! {
+	let (kind, ok) = s.rels[u32(rel)]
+	if !ok || kind != relKindHeap {
+		fail "store: relation does not exist"
+	}
+	let diskCount = try s.files.PageCount(rel)
+	let count = max(diskCount, s.buffers.RelationPageCount(rel))
+	for block in 0..i64(count) {
+		try s.prunePage(rel, PageNo(block), deadHorizon)
+	}
+}
+
+fn (s mut Store) prunePage(rel RelId, block PageNo, deadHorizon u32) ! {
+	let (frame, page) = try s.pinPage(rel, block)
+	try s.buffers.LockContent(frame)
+	mut dead = []u16{}
+	mut allVisible = true
+	let slots = page.Header().Slots
+	for slot in 1..i64(slots)+1 {
+		let s16 = u16(slot)
+		if page.SlotStatus(s16) != 1 {
+			continue
+		}
+		let raw = page.Item(s16) catch _ { continue }
+		let tuple = decodeTupleRecord(Tid{page: u32(block), slot: s16}, raw) catch _ { continue }
+		let xmax = tuple.Header.xmax
+		if xmax != 0 && xmax < deadHorizon {
+			dead = append(dead, s16)
+		} else if xmax != 0 || tuple.Header.xmin >= deadHorizon {
+			allVisible = false
+		}
+	}
+	if len(dead) == 0 {
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+		return
+	}
+	let flags = page.Flags()
+	mut newFlags = flags
+	if allVisible {
+		newFlags |= PageAllVisible
+	} else {
+		newFlags &= ~PageAllVisible
+	}
+	let fpi = s.takeFpi(rel, block, frame)
+	mut body = []u8{}
+	if len(fpi) > 0 {
+		body = append(body, fpi...)
+	}
+	body = append(body, encodePruneBody(dead, newFlags)...)
+	mut flagBits = u8(0)
+	if len(fpi) > 0 { flagBits = walFlagFpi }
+	let (lsn, walErr) = s.appendWal(walKindHeapPrune, flagBits, u32(rel), u32(block), 0, body)
+	if walErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail walErr
+	}
+	page.PruneSlots(dead)
+	page.SetFlags(newFlags)
+	s.freeHint[u32(rel)] = u32(block)
+	let dirtyErr = s.buffers.MarkDirty(frame, lsn)
+	let unlockErr = s.buffers.UnlockContent(frame)
+	let unpinErr = s.buffers.Unpin(frame)
+	if dirtyErr != nil {
+		fail dirtyErr
+	}
+	if unlockErr != nil {
+		fail unlockErr
+	}
+	if unpinErr != nil {
+		fail unpinErr
+	}
+}
+
+// SetPageAllVisible persists the page-level all-visible bit for a certified page.
+fn (s mut Store) SetPageAllVisible(rel RelId, block PageNo, v bool) ! {
+	let (frame, page) = try s.pinPage(rel, block)
+	try s.buffers.LockContent(frame)
+	let cur = page.AllVisible()
+	if cur == v {
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+		return
+	}
+	page.SetAllVisible(v)
+	let pageLsn = page.Header().Lsn
+	let lsn = try s.appendWalWithFpi(walKindHeapPrune, 0, u32(rel), u32(block), 0, []u8{}, encodePruneBody([]u16{}, page.Flags()))
+	try s.buffers.MarkDirty(frame, lsn)
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+	_ = pageLsn
+}
+
+// PageAllVisible reports the persisted page-level all-visible bit.
+fn (s mut Store) PageAllVisible(rel RelId, block PageNo) !bool {
+	let (frame, page) = try s.pinPage(rel, block)
+	try s.buffers.LockContent(frame)
+	let v = page.AllVisible()
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+	return v
+}
+
+// findHeapFrame returns a latched, pinned page with room for recordBytes, extending the relation if
+// no existing page has room. A per-relation hint skips the pages already known to be full.
+fn (s mut Store) findHeapFrame(rel RelId, recordBytes i64) !(PageNo, u32) {
+	let diskCount = try s.files.PageCount(rel)
+	let count = max(diskCount, s.buffers.RelationPageCount(rel))
+	let hint = s.freeHint[u32(rel)]
+	if count > 0 && hint < count {
+		let (frame, page) = try s.pinPage(rel, PageNo(hint))
+		try s.buffers.LockContent(frame)
+		if page.FreeSpace() >= recordBytes+linePointerSize {
+			return PageNo(hint), frame
+		}
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+	}
+	for i in 0..i64(count) {
+		if u32(i) == hint {
+			continue
+		}
+		let block = PageNo(i)
+		let (frame, page) = try s.pinPage(rel, block)
+		try s.buffers.LockContent(frame)
+		if page.FreeSpace() >= recordBytes+linePointerSize {
+			s.freeHint[u32(rel)] = u32(block)
+			return block, frame
+		}
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+	}
+	let block = PageNo(count)
+	let (frame, _) = try s.pinPage(rel, block)
+	try s.buffers.LockContent(frame)
+	s.freeHint[u32(rel)] = u32(block)
+	return block, frame
+}
+
+// ---- tuple encoding ----
+
+fn encodeHeader20(h TupleHeader) []u8 {
+	mut b = make([]u8, tupleHeaderSize)
+	writeU32(mut b, 0, h.xmin)
+	writeU32(mut b, 4, h.xmax)
+	writeU32(mut b, 8, h.cid)
+	writeU16(mut b, 12, h.infomask)
+	writeU32(mut b, 14, u32(h.ctid.page))
+	writeU16(mut b, 18, h.ctid.slot)
+	return b
+}
+
+fn encodeTupleRecord(h TupleHeader, payload []u8) []u8 {
+	mut data = make([]u8, tupleHeaderSize+4+i64(len(payload)))
+	writeU32(mut data, 0, h.xmin)
+	writeU32(mut data, 4, h.xmax)
+	writeU32(mut data, 8, h.cid)
+	writeU16(mut data, 12, h.infomask)
+	writeU32(mut data, 14, u32(h.ctid.page))
+	writeU16(mut data, 18, h.ctid.slot)
+	writeU32(mut data, 20, u32(len(payload)))
+	copy(data[24:], payload)
+	return data
+}
+
+fn decodeTupleRecord(t Tid, data []u8) !HeapTuple {
+	if len(data) < 24 {
+		fail "store: invalid tuple record"
+	}
+	let n = i64(readU32(data, 20))
+	if n != len(data)-24 {
+		fail "store: invalid tuple payload length"
+	}
+	let h = TupleHeader{xmin: readU32(data, 0), xmax: readU32(data, 4), cid: readU32(data, 8), infomask: readU16(data, 12), ctid: Tid{page: readU32(data, 14), slot: readU16(data, 18)}}
+	return HeapTuple{Header: h, Tid: t, Payload: copyBytes(data[24:])}
+}
+
+fn encodePruneBody(dead []u16, flags u16) []u8 {
+	mut b = make([]u8, 4+i64(len(dead))*2)
+	writeU16(mut b, 0, u16(len(dead)))
+	writeU16(mut b, 2, flags)
+	for i, slot in dead {
+		writeU16(mut b, 4+i*2, slot)
+	}
+	return b
+}
+
+fn decodePruneBody(body []u8) !([]u16, u16) {
+	if len(body) < 4 {
+		fail "store: bad prune record"
+	}
+	let count = i64(readU16(body, 0))
+	if len(body) != 4+count*2 {
+		fail "store: bad prune record length"
+	}
+	mut dead = []u16{}
+	for i in 0..count {
+		dead = append(dead, readU16(body, 4+i*2))
+	}
+	return dead, readU16(body, 2)
+}
+
+// ---- redo ----
+
+fn (s mut Store) redoHeapInsert(rel u32, block u32, slot u16, flags u8, body []u8, recStart u64) ! {
+	let (fpi, payload) = splitFpi(flags, body)
+	let (frame, page) = try s.pinPage(RelId(rel), PageNo(block))
+	try s.buffers.LockContent(frame)
+	let curLsn = page.Header().Lsn
+	if curLsn >= recStart {
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+		return
+	}
+	if len(fpi) > 0 {
+		copy(page.Data, fpi)
+	}
+	let (_, insErr) = page.InsertRaw(payload)
+	if insErr != nil {
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+		fail insErr
+	}
+	page.SetLsn(recStart)
+	try s.buffers.MarkDirty(frame, Lsn(recStart))
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+}
+
+fn (s mut Store) redoHeapHeader(rel u32, block u32, slot u16, flags u8, body []u8, recStart u64) ! {
+	let (fpi, payload) = splitFpi(flags, body)
+	if len(payload) < tupleHeaderSize {
+		fail "store: bad heap header record"
+	}
+	let (frame, page) = try s.pinPage(RelId(rel), PageNo(block))
+	try s.buffers.LockContent(frame)
+	let curLsn = page.Header().Lsn
+	if curLsn >= recStart {
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+		return
+	}
+	if len(fpi) > 0 {
+		copy(page.Data, fpi)
+	}
+	let setErr = page.SetItemPrefix(slot, payload[0:tupleHeaderSize])
+	if setErr != nil {
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+		fail setErr
+	}
+	page.SetLsn(recStart)
+	try s.buffers.MarkDirty(frame, Lsn(recStart))
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+}
+
+fn (s mut Store) redoHeapPrune(rel u32, block u32, flags u8, body []u8, recStart u64) ! {
+	let (fpi, payload) = splitFpi(flags, body)
+	let (dead, newFlags) = try decodePruneBody(payload)
+	let (frame, page) = try s.pinPage(RelId(rel), PageNo(block))
+	try s.buffers.LockContent(frame)
+	let curLsn = page.Header().Lsn
+	if curLsn >= recStart {
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+		return
+	}
+	if len(fpi) > 0 {
+		copy(page.Data, fpi)
+	}
+	if len(dead) > 0 {
+		page.PruneSlots(dead)
+	}
+	page.SetFlags(newFlags)
+	page.SetLsn(recStart)
+	try s.buffers.MarkDirty(frame, Lsn(recStart))
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+}
+
+fn (s mut Store) redoPageImages(rel u32, body []u8, recStart u64) ! {
+	let count = i64(readU32(body, 0))
+	mut pos = i64(4)
+	for _i in 0..count {
+		let block = readU32(body, pos)
+		pos += 4
+		let image = body[pos:pos+PageSize]
+		pos += PageSize
+		let (frame, page) = try s.pinPage(RelId(rel), PageNo(block))
+		try s.buffers.LockContent(frame)
+		if page.Header().Lsn < recStart {
+			copy(page.Data, image)
+			page.SetLsn(recStart)
+			try s.buffers.MarkDirty(frame, Lsn(recStart))
+		}
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+	}
+}

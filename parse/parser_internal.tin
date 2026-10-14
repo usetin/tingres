@@ -20,15 +20,29 @@ fn (p Parser) kind() str {
 	return p.Tokens[p.At].Kind
 }
 
-fn (p Parser) pos() i64 {
+fn (p Parser) bytePos() i64 {
 	if p.done() { return len(p.Source) }
 	return p.Tokens[p.At].BytePos
+}
+
+// pos is the 1-based character offset of the current token, suitable for AST Pos fields.
+fn (p Parser) pos() i64 {
+	if p.done() { return charPosition(p.Source, len(p.Source)) }
+	return p.Tokens[p.At].Pos
+}
+
+// rawAt returns the source spelling of the token at index at (as written, not lowercased),
+// which is what PostgreSQL quotes in "syntax error at or near ..." messages.
+fn (p Parser) rawAt(at i64) str {
+	if at >= len(p.Tokens) { return "" }
+	let token = p.Tokens[at]
+	return p.Source[token.BytePos:token.EndBytePos]
 }
 
 fn (p Parser) errorHere() ! {
 	if p.done() { fail syntaxMessage(p.Source, len(p.Source), "syntax error at end of input") }
 	let token = p.Tokens[p.At]
-	fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{token.Text}\"")
+	fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{p.rawAt(p.At)}\"")
 }
 
 fn (p mut Parser) take() Token {
@@ -53,7 +67,7 @@ fn (p mut Parser) expect(text str) !Token {
 
 fn (p mut Parser) enter() ! {
 	p.Depth += 1
-	if p.Depth > 256 { fail positionedMessage("54001", charPosition(p.Source, p.pos()), "stack depth limit exceeded") }
+	if p.Depth > 256 { fail positionedMessage("54001", charPosition(p.Source, p.bytePos()), "stack depth limit exceeded") }
 }
 
 fn (p mut Parser) leave() {

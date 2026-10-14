@@ -115,3 +115,159 @@ fn BenchmarkTimestampExtract(b mut crucible.B) {
 	}
 	if acc == 0 { }
 }
+
+// --- buffer writing and non-allocating parsing ---
+
+fn BenchmarkAppendTextInt4(b mut crucible.B) {
+	let d = FromI64(Int4Oid, 123456)
+	mut buf = make([]u8, 0, 64)
+	mut acc = i64(0)
+	for i in 0..b.N {
+		buf = buf[:0]
+		AppendText(d, mut buf)
+		acc += len(buf)
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkAppendTextDate(b mut crucible.B) {
+	let d = FromI64(DateOid, 19782)
+	mut buf = make([]u8, 0, 64)
+	mut acc = i64(0)
+	for i in 0..b.N {
+		buf = buf[:0]
+		AppendText(d, mut buf)
+		acc += len(buf)
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkAppendTextTimestamp(b mut crucible.B) {
+	let d = FromI64(TimestampOid, 1000000*microsPerDay+microsPerHour*12+microsPerMinute*34)
+	mut buf = make([]u8, 0, 64)
+	mut acc = i64(0)
+	for i in 0..b.N {
+		buf = buf[:0]
+		AppendText(d, mut buf)
+		acc += len(buf)
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkAppendTextNumeric(b mut crucible.B) {
+	let d = FromStr(NumericOid, "1234567890.12345")
+	mut buf = make([]u8, 0, 64)
+	mut acc = i64(0)
+	for i in 0..b.N {
+		buf = buf[:0]
+		AppendText(d, mut buf)
+		acc += len(buf)
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkParseBytesInt4(b mut crucible.B) {
+	let raw = []u8("123456")
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let d = ParseBytes(Int4Oid, raw) catch _ { continue }
+		acc += d.i
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkParseBytesBool(b mut crucible.B) {
+	let raw = []u8("true")
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let v = ParseBoolBytes(raw) catch _ { continue }
+		if v { acc += 1 }
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+// --- numeric fast path vs canonical text path ---
+
+fn BenchmarkNumericAddFast(b mut crucible.B) {
+	let x = ParseNumeric("123456789.12345") catch _ { return }
+	let y = ParseNumeric("-987654.54321") catch _ { return }
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let d = NumericAdd(x, y) catch _ { continue }
+		acc += d.offset
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkNumericAddSlow(b mut crucible.B) {
+	let x = FromStr(NumericOid, "123456789.12345")
+	let y = FromStr(NumericOid, "-987654.54321")
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let d = NumericAdd(x, y) catch _ { continue }
+		acc += len(d.Text())
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkNumericMulFast(b mut crucible.B) {
+	let x = ParseNumeric("1234567.8901") catch _ { return }
+	let y = ParseNumeric("9876.5432") catch _ { return }
+	mut acc = i64(0)
+	for i in 0..b.N {
+		let d = NumericMul(x, y) catch _ { continue }
+		acc += d.offset
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkNumericCompareFast(b mut crucible.B) {
+	let x = ParseNumeric("123456789.12345") catch _ { return }
+	let y = ParseNumeric("123456789.12344") catch _ { return }
+	mut acc = i64(0)
+	for i in 0..b.N {
+		acc += CompareNumeric(x, y)
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+fn BenchmarkNumericCompareSlow(b mut crucible.B) {
+	let x = FromStr(NumericOid, "123456789.12345")
+	let y = FromStr(NumericOid, "123456789.12344")
+	mut acc = i64(0)
+	for i in 0..b.N {
+		acc += CompareNumeric(x, y)
+		_ = i
+	}
+	if acc == 0 { }
+}
+
+// BenchmarkDatumCopyCompare copies a Datum and compares it with the original.
+// The slice holds 4 values, so the per-Datum cost is ns/op divided by 4.
+fn BenchmarkDatumCopyCompare(b mut crucible.B) {
+	let source = []Datum{
+		FromI64(Int8Oid, 42),
+		FromI64(DateOid, 19782),
+		FromI64(TimestampOid, 1000000*microsPerDay),
+		FromF64(Float8Oid, 1.5),
+	}
+	mut acc = i64(0)
+	for i in 0..b.N {
+		for v in source {
+			let copy = v
+			acc += Compare(copy, v)
+		}
+		_ = i
+	}
+	if acc == 0 { }
+}

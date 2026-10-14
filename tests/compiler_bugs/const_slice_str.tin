@@ -1,0 +1,12 @@
+package main
+
+import "say"
+
+// A package-level const whose value is a composite (slice) crashes the compiler
+// with "index out of range [-1] with length 0" in check_const_value. Use a
+// function or a package-level `let` instead.
+const xs = []str{"a"}
+
+fn main() {
+	say.Line(xs[0])
+}

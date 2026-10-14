@@ -78,6 +78,18 @@ fn (f mut RelationFiles) Create(rel RelId) ! {
 	f.sizes[u32(rel)] = 0
 }
 
+// Ensure creates the relation file only when it does not exist, keeping any content.
+fn (f mut RelationFiles) Ensure(rel RelId) ! {
+	if f.Exists(rel) {
+		return
+	}
+	let path = f.Path(rel)
+	try quarry.WriteFile(path, "")
+	try quarry.Sync(path)
+	try quarry.Sync(f.base)
+	f.sizes[u32(rel)] = 0
+}
+
 // ReadAt reads bytes at offset without changing a shared file cursor.
 fn (f RelationFiles) ReadAt(rel RelId, offset i64, out mut []u8) !i64 {
 	if offset < 0 {
@@ -267,12 +279,119 @@ fn (f RelationFiles) ReadPageInto(rel RelId, block PageNo, out mut []u8) ! {
 	}
 }
 
-// WritePage writes one complete block and extends the relation when needed.
+// WritePage writes one complete block and extends the relation when needed. A block written at the
+// current end of the file is appended instead of rewriting the whole relation. The page checksum is
+// recomputed here, so page mutators can leave it stale.
 fn (f mut RelationFiles) WritePage(rel RelId, block PageNo, p Page) ! {
-	if len(p.Data) != PageSize || !p.Valid() {
+	if len(p.Data) != PageSize {
 		fail "store: invalid page write"
 	}
-	try f.WriteAt(rel, i64(block)*PageSize, p.Data)
+	mut d = copyBytes(p.Data)
+	sealBytes(mut d)
+	let size = f.Size(rel) catch _ { 0 }
+	if i64(block)*PageSize == size {
+		try f.AppendBytes(rel, d)
+		return
+	}
+	try f.WriteAt(rel, i64(block)*PageSize, d)
+}
+
+// AppendBytes appends one sealed block at the end of a relation.
+fn (f mut RelationFiles) AppendBytes(rel RelId, d []u8) ! {
+	if len(d) != PageSize {
+		fail "store: invalid page append"
+	}
+	let size = f.Size(rel) catch _ { 0 }
+	try quarry.AppendFile(f.Path(rel), str(d))
+	f.sizes[u32(rel)] = size+PageSize
+}
+
+// WritePages applies several blocks in one rewrite of the relation, sorted by ascending block.
+fn (f mut RelationFiles) WritePages(rel RelId, blocks []u32, datas [][]u8, durable bool) ! {
+	if len(blocks) == 0 {
+		return
+	}
+	if len(blocks) != len(datas) {
+		fail "store: mismatched page batch"
+	}
+	for _, d in datas {
+		if len(d) != PageSize {
+			fail "store: invalid page batch entry"
+		}
+	}
+	let oldSize = f.Size(rel) catch _ { 0 }
+	let path = f.Path(rel)
+	let temp = path + ".tmp"
+	let (writer, createErr) = flume.Create(temp)
+	if createErr != nil {
+		fail createErr
+	}
+	mut w = writer
+	mut r = flume.Reader{}
+	mut haveOld = false
+	if oldSize > 0 && quarry.Exists(path) {
+		let (reader, openErr) = flume.Open(path)
+		if openErr != nil {
+			w.Close() catch _ { }
+			fail openErr
+		}
+		r = reader
+		haveOld = true
+	}
+	mut pos = i64(0)
+	mut writeErr fault = nil
+	for i, b in blocks {
+		let off = i64(b)*PageSize
+		if off > pos {
+			if pos < oldSize {
+				if haveOld {
+					writeErr = copyFileBytes(mut r, mut w, off-pos)
+				} else {
+					writeErr = say.Fault("store: missing relation file")
+				}
+			} else {
+				writeErr = writeFileZeros(mut w, off-pos)
+			}
+			if writeErr != nil {
+				break
+			}
+		}
+		let n = w.Write(datas[i]) catch err {
+			writeErr = err
+			0
+		}
+		if writeErr == nil && n != PageSize {
+			writeErr = say.Fault("store: short page batch write")
+		}
+		if writeErr != nil {
+			break
+		}
+		pos = off+PageSize
+	}
+	if writeErr == nil && pos < oldSize && haveOld {
+		writeErr = copyFileBytes(mut r, mut w, oldSize-pos)
+	}
+	if haveOld {
+		r.Close()
+	}
+	if writeErr == nil && durable {
+		writeErr = w.Sync()
+	}
+	let closeErr = w.Close()
+	if writeErr != nil {
+		if closeErr != nil {
+			fail "store: relation batch write and close failed"
+		}
+		fail writeErr
+	}
+	if closeErr != nil {
+		fail closeErr
+	}
+	try quarry.Rename(temp, path)
+	f.sizes[u32(rel)] = max(oldSize, pos)
+	if durable {
+		try quarry.Sync(f.base)
+	}
 }
 
 // PageCount is the cached number of complete blocks in a relation.

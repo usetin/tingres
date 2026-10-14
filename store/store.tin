@@ -1,27 +1,27 @@
 package store
 
-import "quarry"
 import "lane"
+import "quarry"
 
 // Package store owns durable relation pages and their WAL. A content latch protects only a short,
-// synchronous page access; callers must release it before any await or wait. Tin lanes stay on one
-// core, and cross-core access to this core-local mutable store must be sent through relay.
-
-type Lsn = u64
+// synchronous page access; no latch is held across an await, a wait or another page's load, and
+// Store is core-local (cross-core callers route through relay). The buffer pool is the only path
+// from Store operations to page bytes: every read and write goes through it, and a page is written
+// to its relation file only after the WAL record that produced its LSN is fsynced.
 
 type Tid struct {
-	page PageNo
+	page u32
 	slot u16
 }
 
 // NewTid constructs a tuple identifier.
 fn NewTid(page PageNo, slot u16) Tid {
-	return Tid{page: page, slot: slot}
+	return Tid{page: u32(page), slot: slot}
 }
 
 // Page returns the block number of the TID.
 fn (t Tid) Page() PageNo {
-	return t.page
+	return PageNo(t.page)
 }
 
 // Slot returns the one-based line-pointer number of the TID.
@@ -95,8 +95,11 @@ type HeapTuple struct {
 	Payload []u8
 }
 
-type HeapRelation struct {
-	Tuples []HeapTuple
+// RecordRedo is a registered WAL record kind and its redo callback.
+type RecordRedo struct {
+	kind u8
+	name str
+	redo fn(rel u32, block u32, slot u16, body []u8) !
 }
 
 type Store struct {
@@ -104,30 +107,29 @@ type Store struct {
 	opts Options
 	files RelationFiles
 	buffers BufferPool
-	walA []u8
-	walB []u8
-	walActive u8
-	walCapacityBytes i64
+	rels map[u32]u8
+	freeHint map[u32]u32
+	btreeHint map[u32]u64
+	kinds map[u8]str
+	redos []RecordRedo
+	walDir str
+	walActiveSeg u64
+	walBuf []u8
+	lastLsn u64
+	writtenLsn u64
+	syncedLsn u64
 	walGate lane.Lane[u8]
 	walFailed bool
-	walWrittenLsn u64
+	fpiPending map[u64]bool
+	checkpointLsn u64
+	redoLsn u64
+	recovering bool
 	closed bool
-	lastLsn u64
-	syncedLsn u64
-	relations map[u32]HeapRelation
-	recordKinds map[u8]str
 }
 
 type HeapScan struct {
 	tuples []HeapTuple
 	pos i64
-}
-
-type IndexScan struct {
-	items []IndexItem
-	pos i64
-	backward bool
-	err str
 }
 
 type IndexItem struct {
@@ -145,317 +147,11 @@ fn (item IndexItem) Tid() Tid {
 	return item.tid
 }
 
-// Open initializes the data directory and replays the currently supported WAL records.
-fn Open(dir str, opts Options) !Store {
-	try quarry.MkdirAll(dir)
-	let wal = dir + "/wal/00000001.wal"
-	try quarry.MkdirAll(dir + "/wal")
-	let hasWal = quarry.Exists(wal)
-	mut bytes = ""
-	if hasWal {
-		bytes = try quarry.ReadFile(wal)
-	} else {
-		if quarry.Exists(dir + "/base") {
-			fail "store: relation files exist without a WAL"
-		}
-		try quarry.WriteFile(wal, "")
-	}
-	try quarry.RemoveAll(dir + "/base")
-	mut files = try NewRelationFiles(dir)
-	let capacity = try bufferCapacity(opts)
-	let buffers = try NewBufferPool(capacity)
-	let ringBytes = try walBufferCapacity(opts)
-	mut walGate = lane.New[u8](1)
-	try walGate.Send(1)
-	mut s = Store{dir: dir, opts: opts, files: files, buffers: buffers, walA: make([]u8, 0, ringBytes), walB: make([]u8, 0, ringBytes), walActive: 0, walCapacityBytes: ringBytes, walGate: walGate, walFailed: false, walWrittenLsn: 0, relations: map[u32]HeapRelation{}, recordKinds: map[u8]str{}}
-	if !hasWal {
-		return s
-	}
-	return try recoverWal(mut s, bytes)
-}
-
-// Close flushes and closes the store.
-fn (s mut Store) Close() ! {
-	if s.closed {
-		return
-	}
-	try s.Checkpoint()
-	s.closed = true
-}
-
-// CreateHeap creates an empty heap relation.
-fn (s mut Store) CreateHeap(rel RelId) ! {
-	if s.closed {
-		fail "store: closed"
-	}
-	let (_, exists) = s.relations[u32(rel)]
-	if exists {
-		fail "store: relation already exists"
-	}
-	try s.appendWal(1, rel, Tid{page: 0, slot: 0}, TupleHeader{xmin: 0, xmax: 0, cid: 0, infomask: 0, ctid: Tid{page: 0, slot: 0}}, []u8{})
-	try s.Sync(s.CurrentLsn())
-	try s.files.Create(rel)
-	s.relations[u32(rel)] = HeapRelation{Tuples: []HeapTuple{}}
-}
-
-// DropRel records the drop before removing the relation file.
-fn (s mut Store) DropRel(rel RelId) ! {
-	try s.appendWal(2, rel, Tid{page: 0, slot: 0}, TupleHeader{xmin: 0, xmax: 0, cid: 0, infomask: 0, ctid: Tid{page: 0, slot: 0}}, []u8{})
-	try s.Sync(s.CurrentLsn())
-	try s.buffers.InvalidateRel(rel)
-	try s.files.Drop(rel)
-	delete(s.relations, u32(rel))
-}
-
-// HeapInsert appends a tuple version and returns its stable TID.
-fn (s mut Store) HeapInsert(x XidCtx, rel RelId, payload []u8) !Tid {
-	if len(payload) > PageSize-pageHeaderSize-linePointerSize-24 {
-		fail "store: tuple too large"
-	}
-	let (_, ok) = s.relations[u32(rel)]
-	if !ok {
-		fail "store: relation does not exist"
-	}
-	let recordBytes = 24+len(payload)
-	let (pageNo, frame, slot) = try s.reserveTupleBufferPage(rel, recordBytes)
-	let tid = Tid{page: pageNo, slot: slot}
-	let h = TupleHeader{xmin: x.xid, xmax: 0, cid: x.cid, infomask: 0, ctid: tid}
-	let tuple = HeapTuple{Header: h, Tid: tid, Payload: copyBytes(payload)}
-	let walErr = s.appendWal(3, rel, tid, h, payload)
-	if walErr != nil {
-		s.cancelTupleReservation(frame, slot, recordBytes) catch _ { }
-		fail walErr
-	}
-	let record = encodeTupleRecord(h, payload)
-	let lockErr = s.buffers.LockContent(frame)
-	if lockErr != nil {
-		s.buffers.Unpin(frame) catch _ { }
-		fail lockErr
-	}
-	let insertErr = s.buffers.InsertReserved(frame, slot, record)
-	if insertErr != nil {
-		s.buffers.CancelReservation(frame, slot, recordBytes) catch _ { }
-		s.releasePinnedPage(frame) catch _ { }
-		fail insertErr
-	}
-	let dirtyErr = s.buffers.MarkDirty(frame, Lsn(s.lastLsn))
-	let unlockErr = s.buffers.UnlockContent(frame)
-	let unpinErr = s.buffers.Unpin(frame)
-	if dirtyErr != nil { fail dirtyErr }
-	if unlockErr != nil { fail unlockErr }
-	if unpinErr != nil { fail unpinErr }
-	let (current, exists) = s.relations[u32(rel)]
-	if !exists {
-		fail "store: relation disappeared during insert"
-	}
-	current.Tuples = append(current.Tuples, tuple)
-	s.relations[u32(rel)] = current
-	return tid
-}
-
-// HeapDelete sets xmax on a tuple version. Visibility is decided by txn.
-fn (s mut Store) HeapDelete(x XidCtx, rel RelId, t Tid) ! {
-	let (r, ok) = s.relations[u32(rel)]
-	if !ok {
-		fail "store: invalid tuple id"
-	}
-	let i = tupleIndex(r.Tuples, t)
-	if i < 0 {
-		fail "store: invalid tuple id"
-	}
-	let old = r.Tuples[i]
-	let h = TupleHeader{xmin: old.Header.xmin, xmax: x.xid, cid: old.Header.cid, infomask: old.Header.infomask, ctid: old.Header.ctid}
-	let (frame, page) = try s.pinPage(rel, t.page)
-	try s.buffers.LockContent(frame)
-	let walErr = s.appendWal(4, rel, t, h, []u8{})
-	if walErr != nil {
-		s.releasePinnedPage(frame) catch _ { }
-		fail walErr
-	}
-	mut p = page
-	let raw = try p.Item(t.slot)
-	let tuple = try decodeTupleRecord(t, raw)
-	let replaceErr = p.SetItem(t.slot, encodeTupleRecord(h, tuple.Payload))
-	if replaceErr != nil {
-		s.releasePinnedPage(frame) catch _ { }
-		fail replaceErr
-	}
-	let dirtyErr = s.buffers.MarkDirty(frame, Lsn(s.lastLsn))
-	let unlockErr = s.buffers.UnlockContent(frame)
-	let unpinErr = s.buffers.Unpin(frame)
-	if dirtyErr != nil { fail dirtyErr }
-	if unlockErr != nil { fail unlockErr }
-	if unpinErr != nil { fail unpinErr }
-	r.Tuples[i].Header = h
-	s.relations[u32(rel)] = r
-}
-
-// HeapFetch returns the tuple version at TID. The caller may reuse out as scratch.
-fn (s mut Store) HeapFetch(rel RelId, t Tid, out []u8) !HeapTuple {
-	let (r, ok) = s.relations[u32(rel)]
-	if !ok {
-		fail "store: invalid tuple id"
-	}
-	let (frame, page) = try s.pinPage(rel, t.page)
-	try s.buffers.LockContent(frame)
-	mut p = page
-	let raw = try p.Item(t.slot)
-	let tuple = try decodeTupleRecord(t, raw)
-	_ = out
-	try s.buffers.UnlockContent(frame)
-	try s.buffers.Unpin(frame)
-	return tuple
-}
-
-// HeapScan returns every tuple version in physical order.
-fn (s mut Store) HeapScan(rel RelId) HeapScan {
-	let (_, ok) = s.relations[u32(rel)]
-	if !ok {
-		return HeapScan{tuples: []HeapTuple{}}
-	}
-	let diskCount = s.files.PageCount(rel) catch _ { 0 }
-	let count = max(diskCount, s.buffers.RelationPageCount(rel))
-	mut tuples = []HeapTuple{}
-	for block in 0..i64(count) {
-		let (frame, page) = s.pinPage(rel, PageNo(block)) catch _ { continue }
-		let lockErr = s.buffers.LockContent(frame)
-		if lockErr != nil {
-			s.buffers.Unpin(frame) catch _ { }
-			continue
-		}
-		let p = page
-		let slots = p.Header().Slots
-		for slot in 1..i64(slots)+1 {
-			let tid = Tid{page: PageNo(block), slot: u16(slot)}
-			let raw = p.Item(tid.slot) catch _ { continue }
-			let tuple = decodeTupleRecord(tid, raw) catch _ { continue }
-			tuples = append(tuples, tuple)
-		}
-		s.buffers.UnlockContent(frame) catch _ { }
-		s.buffers.Unpin(frame) catch _ { }
-	}
-	return HeapScan{tuples: tuples}
-}
-
-// Next yields the next tuple and whether one was present.
-fn (scan mut HeapScan) Next() (HeapTuple, bool) {
-	if scan.pos >= len(scan.tuples) {
-		return HeapTuple{Header: TupleHeader{xmin: 0, xmax: 0, cid: 0, infomask: 0, ctid: Tid{page: 0, slot: 0}}, Tid: Tid{page: 0, slot: 0}, Payload: []u8{}}, false
-	}
-	let tuple = scan.tuples[scan.pos]
-	scan.pos += 1
-	return tuple, true
-}
-
-// SetHint updates tuple hint bits through a WAL record.
-fn (s mut Store) SetHint(rel RelId, t Tid, bits u16) ! {
-	let (r, ok) = s.relations[u32(rel)]
-	if !ok {
-		fail "store: invalid tuple id"
-	}
-	let i = tupleIndex(r.Tuples, t)
-	if i < 0 {
-		fail "store: invalid tuple id"
-	}
-	let old = r.Tuples[i].Header
-	let h = TupleHeader{xmin: old.xmin, xmax: old.xmax, cid: old.cid, infomask: old.infomask | bits, ctid: old.ctid}
-	let (frame, page) = try s.pinPage(rel, t.page)
-	try s.buffers.LockContent(frame)
-	let walErr = s.appendWal(5, rel, t, h, []u8{})
-	if walErr != nil {
-		s.releasePinnedPage(frame) catch _ { }
-		fail walErr
-	}
-	mut p = page
-	let raw = try p.Item(t.slot)
-	let tuple = try decodeTupleRecord(t, raw)
-	let replaceErr = p.SetItem(t.slot, encodeTupleRecord(h, tuple.Payload))
-	if replaceErr != nil {
-		s.releasePinnedPage(frame) catch _ { }
-		fail replaceErr
-	}
-	let dirtyErr = s.buffers.MarkDirty(frame, Lsn(s.lastLsn))
-	let unlockErr = s.buffers.UnlockContent(frame)
-	let unpinErr = s.buffers.Unpin(frame)
-	if dirtyErr != nil { fail dirtyErr }
-	if unlockErr != nil { fail unlockErr }
-	if unpinErr != nil { fail unpinErr }
-	r.Tuples[i].Header = h
-	s.relations[u32(rel)] = r
-}
-
-// RegisterRecordKind reserves an extensible kind identifier for a neighbour package.
-fn (s mut Store) RegisterRecordKind(kind u8, name str) ! {
-	if kind < 16 || len(name) == 0 {
-		fail "store: WAL kinds below 16 are reserved"
-	}
-	let (_, exists) = s.recordKinds[kind]
-	if exists {
-		fail "store: WAL record kind is already registered"
-	}
-	s.recordKinds[kind] = name
-}
-
-// Sync flushes the WAL through the supplied LSN.
-fn (s mut Store) Sync(lsn Lsn) ! {
-	if lsn > s.lastLsn {
-		fail "store: LSN is beyond end of WAL"
-	}
-	let token = try s.walGate.Recv()
-	let syncErr = s.syncWalBatch(lsn)
-	let releaseErr = s.walGate.Send(token)
-	if syncErr != nil {
-		fail syncErr
-	}
-	if releaseErr != nil {
-		fail releaseErr
-	}
-}
-
-// CurrentLsn returns the byte position immediately after the last complete WAL frame.
-fn (s Store) CurrentLsn() Lsn {
-	return s.lastLsn
-}
-
-// LogRecord appends a package-defined WAL record and returns its ending LSN.
-fn (s mut Store) LogRecord(kind u8, payload []u8) !Lsn {
-	let (_, registered) = s.recordKinds[kind]
-	if !registered {
-		fail "store: WAL record kind is not registered"
-	}
-	let h = TupleHeader{xmin: 0, xmax: 0, cid: 0, infomask: 0, ctid: Tid{page: 0, slot: 0}}
-	try s.appendWal(kind, 0, Tid{page: 0, slot: 0}, h, payload)
-	return s.lastLsn
-}
-
-// Checkpoint flushes the WAL and persists the current heap image.
-fn (s mut Store) Checkpoint() ! {
-	try s.flushBuffers()
-	try s.Sync(s.CurrentLsn())
-}
-
-// CreateIndex creates an empty index. B-tree mutation is added in a later milestone.
-fn (s mut Store) CreateIndex(rel RelId, unique bool) ! {
-	_ = rel
-	_ = unique
-	fail "0A000: B-tree indexes are not available in milestone M1"
-}
-
-// IndexInsert reports the M1 unsupported-feature fault until B-tree pages are enabled.
-fn (s mut Store) IndexInsert(rel RelId, key []u8, t Tid) ! {
-	_ = rel
-	_ = key
-	_ = t
-	fail "0A000: B-tree indexes are not available yet"
-}
-
-// IndexSeek returns an empty ordered scan until B-tree pages are enabled.
-fn (s Store) IndexSeek(rel RelId, lo []u8, hi []u8, flags u32) IndexScan {
-	_ = rel
-	_ = lo
-	_ = hi
-	_ = flags
-	return IndexScan{items: []IndexItem{}, pos: 0, backward: false, err: "0A000: B-tree indexes are not available in milestone M1"}
+type IndexScan struct {
+	items []IndexItem
+	pos i64
+	backward bool
+	err str
 }
 
 // Error returns a deferred range-scan error because IndexSeek's fixed contract is not fallible.
@@ -473,106 +169,271 @@ fn (scan mut IndexScan) Next() (IndexItem, bool) {
 	return item, true
 }
 
-fn (s mut Store) appendWal(kind u8, rel RelId, tid Tid, h TupleHeader, payload []u8) ! {
-	if s.walFailed {
-		fail "store: WAL writer failed; reopen after recovery"
+// Next yields the next tuple and whether one was present.
+fn (scan mut HeapScan) Next() (HeapTuple, bool) {
+	if scan.pos >= len(scan.tuples) {
+		return HeapTuple{Header: TupleHeader{xmin: 0, xmax: 0, cid: 0, infomask: 0, ctid: Tid{page: 0, slot: 0}}, Tid: Tid{page: 0, slot: 0}, Payload: []u8{}}, false
 	}
-	let recordSize = 44+len(payload)
-	if recordSize > s.walCapacityBytes {
-		fail "store: WAL record exceeds configured ring size"
-	}
-	if s.activeWalLength()+recordSize > s.walCapacityBytes {
-		try s.Sync(s.CurrentLsn())
-		if s.activeWalLength()+recordSize > s.walCapacityBytes {
-			fail "store: WAL ring remains full after sync"
-		}
-	}
-	let nextLsn = s.lastLsn+u64(recordSize)
-	if s.walActive == 0 {
-		try appendWalFrame(mut s.walA, s.walCapacityBytes, kind, rel, tid, h, payload)
-	} else {
-		try appendWalFrame(mut s.walB, s.walCapacityBytes, kind, rel, tid, h, payload)
-	}
-	s.lastLsn = nextLsn
-	if s.opts.SyncOnWrite {
-		try s.Sync(Lsn(s.lastLsn))
-	}
+	let tuple = scan.tuples[scan.pos]
+	scan.pos += 1
+	return tuple, true
 }
 
-fn appendWalFrame(buf mut []u8, capacity i64, kind u8, rel RelId, tid Tid, h TupleHeader, payload []u8) ! {
-	let recordLen = 36+len(payload)
-	let frameLen = 8+recordLen
-	if len(buf)+frameLen > capacity {
-		fail "store: WAL ring is full"
+// Open initializes the data directory, reads the control file and runs crash recovery before
+// returning. Recovery restarts at the last checkpoint's redo LSN, skips pages whose LSN is newer
+// than a record's, runs the registered redo callbacks, and truncates the torn WAL tail.
+fn Open(dir str, opts Options) !Store {
+	try quarry.MkdirAll(dir)
+	let walDir = dir + "/wal"
+	try quarry.MkdirAll(walDir)
+	let baseDir = dir + "/base"
+	let hasBase = quarry.Exists(baseDir)
+	try quarry.MkdirAll(baseDir)
+	let segOne = segmentPath(walDir, 1)
+	let hasWal = quarry.Exists(segOne) || hasAnySegment(walDir)
+	if !hasWal && hasBase && dirHasEntries(baseDir) {
+		fail "store: relation files exist without a WAL"
 	}
-	let off = len(buf)
-	for _i in 0..frameLen {
-		buf = append(buf, u8(0))
+	if !hasWal {
+		try quarry.WriteFile(segOne, "")
+		try quarry.Sync(walDir)
 	}
-	writeU32(mut buf, off, u32(recordLen))
-	buf[off+8] = kind
-	writeU32(mut buf, off+12, u32(rel))
-	writeU32(mut buf, off+16, u32(tid.page))
-	writeU16(mut buf, off+20, tid.slot)
-	writeU32(mut buf, off+24, h.xmin)
-	writeU32(mut buf, off+28, h.xmax)
-	writeU32(mut buf, off+32, h.cid)
-	writeU16(mut buf, off+36, h.infomask)
-	writeU32(mut buf, off+38, u32(h.ctid.page))
-	writeU16(mut buf, off+42, h.ctid.slot)
-	if len(payload) > 0 {
-		copy(buf[off+44:off+44+len(payload)], payload)
+	let files = try NewRelationFiles(dir)
+	let capacity = try bufferCapacity(opts)
+	let buffers = try NewBufferPool(capacity)
+	mut walGate = lane.New[u8](1)
+	try walGate.Send(1)
+	mut s = Store{dir: dir, opts: opts, files: files, buffers: buffers, rels: map[u32]u8{}, freeHint: map[u32]u32{}, btreeHint: map[u32]u64{}, kinds: map[u8]str{}, redos: []RecordRedo{}, walDir: walDir, walActiveSeg: 1, walBuf: make([]u8, 0, walBufBytes), lastLsn: 0, writtenLsn: 0, syncedLsn: 0, walGate: walGate, walFailed: false, fpiPending: map[u64]bool{}, checkpointLsn: 0, redoLsn: 0, recovering: false, closed: false}
+	let (redoLsn, _, hasControl) = try s.readControl()
+	if hasControl {
+		s.redoLsn = redoLsn
 	}
-	let check = crc32(buf[off+8:off+8+recordLen])
-	writeU32(mut buf, off+4, check)
+	s.recovering = true
+	let end = try s.walkWal(s.redoLsn)
+	try s.flushBuffers()
+	s.recovering = false
+	try s.truncateWal(end)
+	s.openWalForWrite(end)
+	s.fpiPending = map[u64]bool{}
+	// Relation-create records before the checkpoint are not replayed, so recover kinds from disk.
+	for rel in s.files.List() {
+		s.rels[u32(rel)] = try s.detectRelKind(rel)
+	}
+	return s
 }
 
-fn (s mut Store) syncWalBatch(lsn Lsn) ! {
-	if s.walFailed {
-		fail "store: WAL writer failed; reopen after recovery"
+// detectRelKind reads a relation's first page type; an empty relation is a heap.
+fn (s mut Store) detectRelKind(rel RelId) !u8 {
+	let count = s.files.PageCount(rel) catch _ { 0 }
+	if count == 0 {
+		return relKindHeap
 	}
-	if u64(lsn) <= s.syncedLsn {
+	let (frame, page) = try s.pinPage(rel, PageNo(0))
+	try s.buffers.LockContent(frame)
+	let pt = page.PageType()
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+	if pt == PageTypeBtreeMeta {
+		return relKindBtree
+	}
+	return relKindHeap
+}
+
+// Close runs a shutdown checkpoint and marks the data directory clean.
+fn (s mut Store) Close() ! {
+	if s.closed {
 		return
 	}
-	let batchIndex = s.walActive
-	mut batch = []u8{}
-	if batchIndex == 0 {
-		batch = s.walA
-		s.walA = s.walA[0:0]
-		s.walActive = 1
-	} else {
-		batch = s.walB
-		s.walB = s.walB[0:0]
-		s.walActive = 0
+	try s.flushBuffers()
+	let lsn = try s.appendWal(walKindShutdown, 0, 0, 0, 0, []u8{})
+	try s.Sync(lsn)
+	s.checkpointLsn = u64(lsn)
+	s.redoLsn = u64(lsn) - u64(walHeaderSize)
+	s.fpiPending = map[u64]bool{}
+	try s.writeControl(true)
+	s.closed = true
+}
+
+// Checkpoint flushes dirty buffers, appends a checkpoint record and updates the control file.
+// It must not run concurrently with other Store mutations.
+fn (s mut Store) Checkpoint() ! {
+	if s.closed {
+		return
 	}
-	if len(batch) > 0 {
-		let batchEnd = s.walWrittenLsn+u64(len(batch))
-		let appendErr = quarry.AppendFile(s.dir + "/wal/00000001.wal", str(batch))
-		if appendErr != nil {
-			s.walFailed = true
-			if batchIndex == 0 { s.walA = batch } else { s.walB = batch }
-			fail appendErr
+	try s.flushBuffers()
+	try s.Sync(s.CurrentLsn())
+	let redo = u64(s.CurrentLsn())
+	let lsn = try s.appendWal(walKindCheckpoint, 0, 0, 0, 0, []u8{})
+	try s.Sync(lsn)
+	s.checkpointLsn = u64(lsn)
+	s.redoLsn = redo
+	s.fpiPending = map[u64]bool{}
+	try s.writeControl(false)
+}
+
+// CurrentLsn returns the byte position immediately after the last appended WAL record.
+fn (s Store) CurrentLsn() Lsn {
+	return Lsn(s.lastLsn)
+}
+
+// RedoLsn returns the LSN recovery will restart from.
+fn (s Store) RedoLsn() Lsn {
+	return Lsn(s.redoLsn)
+}
+
+// RegisterRecordKind reserves an extensible kind identifier for a neighbour package.
+fn (s mut Store) RegisterRecordKind(kind u8, name str) ! {
+	if kind < 16 || len(name) == 0 {
+		fail "store: WAL kinds below 16 are reserved"
+	}
+	let (_, exists) = s.kinds[kind]
+	if exists {
+		fail "store: WAL record kind is already registered"
+	}
+	s.kinds[kind] = name
+}
+
+// RegisterRecordKindRedo registers a neighbour record kind together with its redo callback; the
+// callback runs during a later replay for records of that kind.
+fn (s mut Store) RegisterRecordKindRedo(kind u8, name str, redo fn(rel u32, block u32, slot u16, body []u8) !) ! {
+	try s.RegisterRecordKind(kind, name)
+	s.redos = append(s.redos, RecordRedo{kind: kind, name: name, redo: redo})
+}
+
+// LogRecord appends a registered record kind with an opaque payload and returns its ending LSN.
+fn (s mut Store) LogRecord(kind u8, payload []u8) !Lsn {
+	let (_, registered) = s.kinds[kind]
+	if !registered {
+		fail "store: WAL record kind is not registered"
+	}
+	return try s.appendWal(kind, 0, 0, 0, 0, payload)
+}
+
+// ReplayRegistered re-runs every replayable record for kinds registered with RegisterRecordKindRedo,
+// which lets a neighbour rebuild its own state from the log.
+fn (s mut Store) ReplayRegistered() ! {
+	_ = try s.walkWal(0)
+}
+
+fn (s mut Store) runRegisteredRedo(kind u8, rel u32, block u32, slot u16, body []u8) ! {
+	for _, r in s.redos {
+		if r.kind == kind {
+			try r.redo(rel, block, slot, body)
+			return
 		}
-		s.walWrittenLsn = batchEnd
-	}
-	let syncErr = quarry.Sync(s.dir + "/wal/00000001.wal")
-	if syncErr != nil {
-		s.walFailed = true
-		fail syncErr
-	}
-	s.syncedLsn = s.walWrittenLsn
-	if u64(lsn) > s.syncedLsn {
-		fail "store: requested WAL LSN is not in the sync batch"
 	}
 }
 
-fn (s Store) walCapacity() i64 {
-	return s.walCapacityBytes
+fn (s mut Store) applyWalRecord(kind u8, flags u8, rel u32, block u32, slot u16, body []u8, recStart u64, recEnd u64) ! {
+	match kind {
+		walKindRelCreate => { try s.redoRelCreate(rel, body, recStart) }
+		walKindRelDrop => { try s.redoRelDrop(rel) }
+		walKindHeapInsert => { try s.redoHeapInsert(rel, block, slot, flags, body, recStart) }
+		walKindHeapDelete, walKindHeapHint => { try s.redoHeapHeader(rel, block, slot, flags, body, recStart) }
+		walKindHeapPrune => { try s.redoHeapPrune(rel, block, flags, body, recStart) }
+		walKindPageImages => { try s.redoPageImages(rel, body, recStart) }
+		walKindBtreeInsert => { try s.redoBtreeInsert(rel, block, body, recStart) }
+		walKindBtreeDelete => { try s.redoBtreeDelete(rel, block, body, recStart) }
+		walKindCheckpoint => {
+			s.checkpointLsn = recEnd
+			s.redoLsn = recStart
+			s.fpiPending = map[u64]bool{}
+		}
+		walKindShutdown => { s.checkpointLsn = recEnd }
+		_ => { try s.runRegisteredRedo(kind, rel, block, slot, body) }
+	}
 }
 
-fn (s Store) activeWalLength() i64 {
-	if s.walActive == 0 { return len(s.walA) }
-	return len(s.walB)
+fn (s mut Store) redoRelCreate(rel u32, body []u8, recStart u64) ! {
+	if len(body) < 1 {
+		fail "store: bad relation-create record"
+	}
+	let kind = body[0]
+	if !s.files.Exists(RelId(rel)) {
+		try s.files.Ensure(RelId(rel))
+	}
+	s.rels[rel] = kind
+	if kind == relKindBtree {
+		let count = s.files.PageCount(RelId(rel)) catch _ { 0 }
+		if count < 2 {
+			mut meta = NewPage()
+			meta.SetPageType(PageTypeBtreeMeta)
+			writeU32(mut meta.Data, 32, 1)
+			writeU32(mut meta.Data, 36, 0)
+			meta.SetLsn(recStart)
+			mut leaf = NewPage()
+			leaf.SetPageType(PageTypeBtreeLeaf)
+			leaf.SetLsn(recStart)
+			try s.files.WritePage(RelId(rel), 0, meta)
+			try s.files.WritePage(RelId(rel), 1, leaf)
+		}
+	}
+}
+
+fn (s mut Store) redoRelDrop(rel u32) ! {
+	try s.buffers.InvalidateRel(RelId(rel))
+	try s.files.Drop(RelId(rel))
+	delete(s.rels, rel)
+}
+
+// ---- control file ----
+
+const controlMagic u32 = 0x54474e53
+const controlBytes i64 = 32
+
+fn (s Store) controlPath() str {
+	return s.dir + "/global/control"
+}
+
+fn (s mut Store) writeControl(clean bool) ! {
+	let dir = s.dir + "/global"
+	try quarry.MkdirAll(dir)
+	let path = s.controlPath()
+	mut b = make([]u8, controlBytes)
+	writeU32(mut b, 0, controlMagic)
+	writeU32(mut b, 4, 1)
+	writeU64(mut b, 8, s.redoLsn)
+	writeU64(mut b, 16, s.checkpointLsn)
+	if clean {
+		writeU32(mut b, 24, 1)
+	}
+	let tmp = path + ".tmp"
+	try quarry.WriteFile(tmp, str(b))
+	try quarry.Sync(tmp)
+	try quarry.Rename(tmp, path)
+	try quarry.Sync(dir)
+}
+
+fn (s Store) readControl() !(u64, u64, bool) {
+	let path = s.controlPath()
+	if !quarry.Exists(path) {
+		return 0, 0, false
+	}
+	let data = try quarry.ReadFile(path)
+	if i64(len(data)) < controlBytes {
+		return 0, 0, false
+	}
+	let b = []u8(data)
+	if readU32(b, 0) != controlMagic {
+		fail "store: control file is not a tingres control file"
+	}
+	return readU64(b, 8), readU64(b, 16), true
+}
+
+fn hasAnySegment(walDir str) bool {
+	let names = quarry.ReadDir(walDir) catch _ { return false }
+	for _, name in names {
+		let (_, ok) = parseSegmentName(name)
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+fn dirHasEntries(path str) bool {
+	let names = quarry.ReadDir(path) catch _ { return false }
+	return len(names) > 0
 }
 
 fn bufferCapacity(opts Options) !u32 {
@@ -590,218 +451,6 @@ fn bufferCapacity(opts Options) !u32 {
 		fail "store: shared_buffers must be a positive multiple of 8 KiB"
 	}
 	return u32(bytes/PageSize)
-}
-
-fn walBufferCapacity(opts Options) !i64 {
-	mut bytes = opts.WalRingBytes
-	if bytes <= 0 {
-		bytes = 16*1024*1024
-	}
-	if bytes < 65536 {
-		fail "store: wal ring must be at least 64 KiB"
-	}
-	return bytes
-}
-
-// pinPage is the only path from Store operations to relation page bytes.
-fn (s mut Store) pinPage(rel RelId, block PageNo) !(u32, Page) {
-	let key = BufferKey{rel: u32(rel), page: u32(block)}
-	if s.buffers.Contains(key) {
-		let frame = try s.buffers.PinResident(key)
-		let page = try s.buffers.PageAt(frame)
-		return frame, page
-	}
-	let frame = try s.buffers.ChooseVictim()
-	if s.buffers.IsDirty(frame) {
-		try s.flushFrame(frame)
-	}
-	let size = try s.files.Size(rel)
-	let offset = i64(block)*PageSize
-	try s.buffers.Reserve(frame, key)
-	if offset < size {
-		let page = try s.buffers.PageAt(frame)
-		mut bytes = page.Data
-		let loadErr = s.files.ReadPageInto(rel, block, mut bytes)
-		if loadErr != nil {
-			s.buffers.Discard(frame) catch _ { }
-			fail loadErr
-		}
-	}
-	let page = try s.buffers.PageAt(frame)
-	return frame, page
-}
-
-fn (s mut Store) reserveTupleBufferPage(rel RelId, recordSize i64) !(PageNo, u32, u16) {
-	let diskCount = try s.files.PageCount(rel)
-	let count = max(diskCount, s.buffers.RelationPageCount(rel))
-	for i in 0..i64(count) {
-		let block = PageNo(i)
-		let (frame, _) = try s.pinPage(rel, block)
-		try s.buffers.LockContent(frame)
-		let (slot, reserveErr) = s.buffers.ReserveItem(frame, recordSize)
-		if reserveErr == nil {
-			try s.buffers.UnlockContent(frame)
-			return block, frame, slot
-		}
-		try s.buffers.UnlockContent(frame)
-		try s.buffers.Unpin(frame)
-	}
-	let block = PageNo(count)
-	let (frame, _) = try s.pinPage(rel, block)
-	try s.buffers.LockContent(frame)
-	let slot = try s.buffers.ReserveItem(frame, recordSize)
-	try s.buffers.UnlockContent(frame)
-	return block, frame, slot
-}
-
-fn (s mut Store) flushFrame(frame u32) ! {
-	if !s.buffers.IsDirty(frame) {
-		return
-	}
-	let key = try s.buffers.Key(frame)
-	let page = try s.buffers.PageAt(frame)
-	let lsn = Lsn(page.Header().Lsn)
-	try s.Sync(lsn)
-	if u64(lsn) > s.syncedLsn {
-		fail "store: refusing page write before WAL sync"
-	}
-	try s.files.WritePage(RelId(key.rel), PageNo(key.page), page)
-	try s.buffers.ClearDirty(frame)
-}
-
-fn (s mut Store) flushBuffers() ! {
-	for i in 0..i64(s.buffers.Capacity()) {
-		let frame = u32(i)
-		if s.buffers.IsDirty(frame) {
-			if s.buffers.framePinned(frame) {
-				fail "store: cannot checkpoint a pinned page"
-			}
-			try s.flushFrame(frame)
-		}
-	}
-}
-
-fn (s mut Store) releasePinnedPage(frame u32) ! {
-	try s.buffers.UnlockContent(frame)
-	try s.buffers.Unpin(frame)
-}
-
-fn (s mut Store) cancelTupleReservation(frame u32, slot u16, recordBytes i64) ! {
-	try s.buffers.LockContent(frame)
-	try s.buffers.CancelReservation(frame, slot, recordBytes)
-	try s.buffers.UnlockContent(frame)
-	try s.buffers.Unpin(frame)
-}
-
-fn findTuplePage(files RelationFiles, rel RelId, recordSize i64) !(PageNo, Page, u16) {
-	let count = try files.PageCount(rel)
-	for i in 0..i64(count) {
-		let block = PageNo(i)
-		mut p = try files.ReadPage(rel, block)
-		if p.FreeSpace() >= recordSize+linePointerSize {
-			return block, p, p.Header().Slots+1
-		}
-	}
-	return PageNo(count), NewPage(), u16(1)
-}
-
-fn encodeTupleRecord(h TupleHeader, payload []u8) []u8 {
-	mut data = make([]u8, 24+len(payload))
-	writeU32(mut data, 0, h.xmin)
-	writeU32(mut data, 4, h.xmax)
-	writeU32(mut data, 8, h.cid)
-	writeU16(mut data, 12, h.infomask)
-	writeU32(mut data, 14, u32(h.ctid.page))
-	writeU16(mut data, 18, h.ctid.slot)
-	writeU32(mut data, 20, u32(len(payload)))
-	copy(data[24:], payload)
-	return data
-}
-
-fn decodeTupleRecord(t Tid, data []u8) !HeapTuple {
-	if len(data) < 24 {
-		fail "store: invalid tuple record"
-	}
-	let n = i64(readU32(data, 20))
-	if n != len(data)-24 {
-		fail "store: invalid tuple payload length"
-	}
-	let h = TupleHeader{xmin: readU32(data, 0), xmax: readU32(data, 4), cid: readU32(data, 8), infomask: readU16(data, 12), ctid: Tid{page: PageNo(readU32(data, 14)), slot: readU16(data, 18)}}
-	return HeapTuple{Header: h, Tid: t, Payload: copyBytes(data[24:])}
-}
-
-fn replaceTupleFile(files mut RelationFiles, rel RelId, tid Tid, h TupleHeader, lsn u64) ! {
-	mut p = try files.ReadPage(rel, tid.page)
-	let raw = try p.Item(tid.slot)
-	let old = try decodeTupleRecord(tid, raw)
-	try p.SetItem(tid.slot, encodeTupleRecord(h, old.Payload))
-	p.SetLsn(lsn)
-	try files.WritePage(rel, tid.page, p)
-}
-
-fn tupleIndex(tuples []HeapTuple, tid Tid) i64 {
-	for i, tuple in tuples {
-		if tuple.Tid == tid {
-			return i64(i)
-		}
-	}
-	return -1
-}
-
-fn recoverWal(s mut Store, data str) !Store {
-	mut out = s
-	let b = []u8(data)
-	mut off = i64(0)
-	for off+8 <= len(b) {
-		let n = i64(readU32(b, off))
-		let expected = readU32(b, off+4)
-		if n < 36 || off+8+n > len(b) {
-			break
-		}
-		let body = b[off+8:off+8+n]
-		if crc32(body) != expected {
-			break
-		}
-		let kind = body[0]
-		let rel = readU32(body, 4)
-		let tid = Tid{page: PageNo(readU32(body, 8)), slot: readU16(body, 12)}
-		let h = TupleHeader{xmin: readU32(body, 16), xmax: readU32(body, 20), cid: readU32(body, 24), infomask: readU16(body, 28), ctid: Tid{page: PageNo(readU32(body, 30)), slot: readU16(body, 34)}}
-		if kind == 1 {
-			try out.files.Create(RelId(rel))
-			out.relations[rel] = HeapRelation{Tuples: []HeapTuple{}}
-		} else if kind == 2 {
-			try out.files.Drop(RelId(rel))
-			delete(out.relations, rel)
-		} else if kind == 3 {
-			let (r, ok) = out.relations[rel]
-			if ok {
-				let p = copyBytes(body[36:])
-				let (pageNo, page, slot) = try findTuplePage(out.files, RelId(rel), 24+len(p))
-				if pageNo != tid.page || slot != tid.slot {
-					fail "store: WAL tuple location does not match relation pages"
-				}
-				mut pageCopy = page
-				_ = try pageCopy.Insert(encodeTupleRecord(h, p))
-				pageCopy.SetLsn(u64(off+8+n))
-				try out.files.WritePage(RelId(rel), pageNo, pageCopy)
-				r.Tuples = append(r.Tuples, HeapTuple{Header: h, Tid: tid, Payload: p})
-				out.relations[rel] = r
-			}
-		} else if kind == 4 || kind == 5 {
-			let (r, ok) = out.relations[rel]
-			let i = tupleIndex(r.Tuples, tid)
-			if ok && i >= 0 {
-				try replaceTupleFile(mut out.files, RelId(rel), tid, h, u64(off+8+n))
-				r.Tuples[i].Header = h
-				out.relations[rel] = r
-			}
-		}
-		off += 8+n
-	}
-	out.lastLsn = u64(off)
-	out.syncedLsn = u64(off)
-	out.walWrittenLsn = u64(off)
-	return out
 }
 
 fn copyBytes(src []u8) []u8 {

@@ -3,7 +3,7 @@ package parse
 fn (p mut Parser) parseExpression(minPrecedence i64) !Expr {
 	try p.enter()
 	let initialDepth = p.Depth
-	mut left = try p.parsePrefix()
+	mut left = try p.parsePrefix(minPrecedence)
 	for !p.done() {
 		let word = lowerAscii(p.text())
 		if p.StopWord != "" && word == p.StopWord { break }
@@ -21,9 +21,10 @@ fn (p mut Parser) parseExpression(minPrecedence i64) !Expr {
 			left = Expr.Collate(CollateExpr{Pos: pos, Value: left, Collation: name})
 			continue
 		}
-		if word == "at" && p.At + 2 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "time" && lowerAscii(p.Tokens[p.At + 2].Text) == "zone" {
+		if word == "at" && p.At + 1 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "time" {
 			let pos = p.Tokens[p.At].Pos
-			p.At += 3
+			p.At += 2
+			try p.expect("zone")
 			let zone = try p.parseExpression(6)
 			left = Expr.AtTimeZone(AtTimeZoneExpr{Pos: pos, Value: left, Zone: zone})
 			continue
@@ -174,7 +175,7 @@ fn (p mut Parser) parseExpression(minPrecedence i64) !Expr {
 fn expressionPrecedence(word str, kind str) i64 {
 	if word == "or" { return 1 }
 	if word == "and" { return 2 }
-	if word == "isnull" || word == "notnull" || word == "is" || word == "in" || word == "not" || word == "between" || word == "like" || word == "ilike" || word == "similar" { return 4 }
+	if word == "isnull" || word == "notnull" || word == "is" || word == "in" || word == "between" || word == "like" || word == "ilike" || word == "similar" { return 4 }
 	if word == "=" || word == "!=" || word == "<>" || word == "<" || word == ">" || word == "<=" || word == ">=" || word == "~" || word == "~*" || word == "!~" || word == "!~*" || word == "@>" || word == "<@" { return 4 }
 	if kind == "operator" {
 		if word == "->" || word == "->>" || word == "#>" || word == "#>>" { return 9 }
@@ -206,7 +207,7 @@ fn (p Parser) isQueryStart() bool {
 	return word == "select" || word == "with" || word == "values" || word == "table"
 }
 
-fn (p mut Parser) parsePrefix() !Expr {
+fn (p mut Parser) parsePrefix(minPrecedence i64) !Expr {
 	if p.done() { try p.errorHere() }
 	let token = p.take()
 	let word = lowerAscii(token.Text)
@@ -249,7 +250,7 @@ fn (p mut Parser) parsePrefix() !Expr {
 		let literal = p.take()
 		return Expr.Literal(LiteralExpr{Pos: token.Pos, Kind: "typed_" + word, Value: literal.Text})
 	}
-	if token.Kind == "word" && token.KeywordClass == "reserved" { fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{token.Text}\"") }
+	if token.Kind == "word" && token.KeywordClass == "reserved" { fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{p.Source[token.BytePos:token.EndBytePos]}\"") }
 	if token.Kind == "quoted" || token.Kind == "word" {
 		let first = decodeIdentifier(token.Text)
 		mut parts = []Identifier{Identifier{Pos: token.Pos, Name: first.Name, Quoted: first.Quoted}}
@@ -268,9 +269,9 @@ fn (p mut Parser) parsePrefix() !Expr {
 		}
 		return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Parts: parts})
 	}
-	if token.Text == "*" { return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Star: true}) }
+	if token.Text == "*" && minPrecedence == 0 { return Expr.ColumnRef(ColumnRefExpr{Pos: token.Pos, Star: true}) }
 	if token.Text == "(" { return try p.parseParenExpression(token.Pos) }
-	fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{token.Text}\"")
+	fail syntaxMessage(p.Source, token.BytePos, "syntax error at or near \"{p.Source[token.BytePos:token.EndBytePos]}\"")
 }
 
 fn parseDigits(s str) i64 {
@@ -331,7 +332,7 @@ fn (p mut Parser) parseCase(pos i64) !Expr {
 	mut elseExpr ?Expr = nil
 	if p.eat("else") { elseExpr = try p.parseExpression(0) }
 	try p.expect("end")
-	if len(whens) == 0 { fail syntaxMessage(p.Source, p.pos(), "syntax error at or near \"case\"") }
+	if len(whens) == 0 { fail syntaxMessage(p.Source, p.bytePos(), "syntax error at or near \"case\"") }
 	return Expr.Case(CaseExpr{Pos: pos, Operand: operand, Whens: whens, ElseExpr: elseExpr})
 }
 
@@ -362,7 +363,7 @@ fn (p mut Parser) parseArray(pos i64) !Expr {
 		try p.expect(")")
 		return Expr.ArraySubquery(ArraySubqueryExpr{Pos: pos, Query: query})
 	}
-	fail syntaxMessage(p.Source, p.pos(), "syntax error at or near \"array\"")
+	fail syntaxMessage(p.Source, p.bytePos(), "syntax error at or near \"array\"")
 }
 
 fn (p mut Parser) parseRow(pos i64, explicit bool) !Expr {

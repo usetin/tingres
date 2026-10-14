@@ -1,0 +1,739 @@
+package catalog
+
+import "../store"
+import "../txn"
+import "../types"
+import "mint"
+import "twine"
+
+// This file owns the heap-backed part of the catalog: the fixed set of pg_catalog
+// relations, the generated seed data, decoding it into MVCC-visible rows, and
+// reloading the in-memory row cache after every catalog change.
+//
+// The generated seed (real PostgreSQL pg_class/pg_attribute/pg_type/pg_proc rows) is
+// packed into a small number of tuples in a private pg_seed heap instead of one store
+// tuple per catalog row. The M1 store scans page 0 on every insert and thrashes badly
+// under a small buffer pool, and a few large tuples keep pg_catalog bootstrap cheap.
+// User DDL still writes one real tuple per catalog row into the pg_catalog heaps.
+
+// ColDef is one catalog column, at storage and at PostgreSQL level.
+type ColDef struct {
+	Name str
+	Type Oid
+	Storage Oid
+	Number i16
+	NotNull bool
+	HasDefault bool
+	Identity str
+	Generated str
+	Collation Oid
+}
+
+// RawRow is one decoded catalog tuple with the header needed for visibility.
+type RawRow struct {
+	Rel str
+	Tid store.Tid
+	Xmin u32
+	Xmax u32
+	Cid u32
+	Infomask u16
+	Values []types.Datum
+}
+
+// SeedRow is one generated row before it is decoded into Datums.
+type SeedRow struct {
+	Rel str
+	Cells []str
+}
+
+// SysRel is a system relation with the relid of its heap.
+type SysRel struct {
+	Name str
+	Oid Oid
+	Rel u32
+	Kind str
+}
+
+// pgSeedRel is the private heap holding the packed generated seed.
+const pgSeedRel u32 = 2620
+const seedChunkBytes i64 = 5500
+
+// Bootstrapper owns only storage state so Open can seed heaps without mutating the
+// caller's transaction manager.
+type Bootstrapper struct {
+	Store store.Store
+	sysCols map[str][]ColDef
+	relIds map[str]u32
+}
+
+// sysRels lists the core pg_catalog relations. The relid is the relation oid; shared
+// catalogs have relfilenode 0 in PostgreSQL, so tingres uses a stable private relid.
+fn sysRels() []SysRel {
+	return []SysRel{
+		SysRel{Name: "pg_namespace", Oid: 2615, Rel: 2615, Kind: "r"},
+		SysRel{Name: "pg_class", Oid: 1259, Rel: 1259, Kind: "r"},
+		SysRel{Name: "pg_attribute", Oid: 1249, Rel: 1249, Kind: "r"},
+		SysRel{Name: "pg_type", Oid: 1247, Rel: 1247, Kind: "r"},
+		SysRel{Name: "pg_proc", Oid: 1255, Rel: 1255, Kind: "r"},
+		SysRel{Name: "pg_index", Oid: 2610, Rel: 2610, Kind: "r"},
+		SysRel{Name: "pg_constraint", Oid: 2606, Rel: 2606, Kind: "r"},
+		SysRel{Name: "pg_attrdef", Oid: 2604, Rel: 2604, Kind: "r"},
+		SysRel{Name: "pg_depend", Oid: 2608, Rel: 2608, Kind: "r"},
+		SysRel{Name: "pg_database", Oid: 1262, Rel: 1262, Kind: "r"},
+		SysRel{Name: "pg_authid", Oid: 1260, Rel: 1260, Kind: "r"},
+		SysRel{Name: "pg_roles", Oid: 12000, Rel: 12000, Kind: "v"},
+		SysRel{Name: "pg_sequence", Oid: 2224, Rel: 2224, Kind: "r"},
+	}
+}
+
+// extraRels are tingres-private system relations not present in the generated seed.
+fn extraRels() []SysRel {
+	return []SysRel{
+		SysRel{Name: "pg_rewrite", Oid: 2618, Rel: 2618, Kind: "r"},
+		SysRel{Name: "pg_enum", Oid: 3503, Rel: 3503, Kind: "r"},
+		SysRel{Name: "pg_statistic", Oid: 2619, Rel: 2619, Kind: "r"},
+	}
+}
+
+fn extraCols(name str) []ColDef {
+	match name {
+		"pg_rewrite" => return []ColDef{
+			ColDef{Name: "oid", Type: 26, Storage: 26, Number: 1, NotNull: true},
+			ColDef{Name: "rulename", Type: 19, Storage: 25, Number: 2, NotNull: true},
+			ColDef{Name: "ev_class", Type: 26, Storage: 26, Number: 3, NotNull: true},
+			ColDef{Name: "ev_type", Type: 18, Storage: 25, Number: 4, NotNull: true},
+			ColDef{Name: "ev_enabled", Type: 18, Storage: 25, Number: 5},
+			ColDef{Name: "is_instead", Type: 16, Storage: 16, Number: 6},
+			ColDef{Name: "ev_qual", Type: 194, Storage: 25, Number: 7},
+			ColDef{Name: "ev_action", Type: 194, Storage: 25, Number: 8},
+		}
+		"pg_enum" => return []ColDef{
+			ColDef{Name: "oid", Type: 26, Storage: 26, Number: 1, NotNull: true},
+			ColDef{Name: "enumtypid", Type: 26, Storage: 26, Number: 2, NotNull: true},
+			ColDef{Name: "enumsortorder", Type: 700, Storage: 701, Number: 3, NotNull: true},
+			ColDef{Name: "enumlabel", Type: 19, Storage: 25, Number: 4, NotNull: true},
+		}
+		_ => return []ColDef{
+			ColDef{Name: "starelid", Type: 26, Storage: 26, Number: 1, NotNull: true},
+			ColDef{Name: "staattnum", Type: 21, Storage: 21, Number: 2, NotNull: true},
+			ColDef{Name: "stainherit", Type: 16, Storage: 16, Number: 3, NotNull: true},
+			ColDef{Name: "stanullfrac", Type: 700, Storage: 701, Number: 4, NotNull: true},
+			ColDef{Name: "stawidth", Type: 23, Storage: 23, Number: 5, NotNull: true},
+			ColDef{Name: "stadistinct", Type: 700, Storage: 701, Number: 6, NotNull: true},
+			ColDef{Name: "stakind1", Type: 21, Storage: 21, Number: 7, NotNull: true},
+			ColDef{Name: "stanumbers1", Type: 1007, Storage: 25, Number: 8},
+			ColDef{Name: "stavalues1", Type: 1009, Storage: 25, Number: 9},
+		}
+	}
+}
+
+// storeOid maps a PostgreSQL type oid to the type used to encode a catalog row.
+fn storeOid(declared Oid) Oid {
+	match declared {
+		16 => return 16
+		20 => return 20
+		21 => return 21
+		23 => return 23
+		26, 24, 28 => return 26
+		700, 701 => return 701
+		19, 18, 194, 25, 30, 1009, 1034, 1028, 1002, 1005, 2277, 1043, 1042 => return 25
+	}
+	return 25
+}
+
+fn zeroDatum(oid Oid) types.Datum {
+	match oid {
+		16 => return types.FromBool(false)
+		20, 21, 23, 26 => return types.FromI64(oid, 0)
+		701 => return types.FromF64(701, 0.0)
+	}
+	return types.FromStr(25, "")
+}
+
+fn hexByte(cell str) []u8 {
+	mut out = []u8{}
+	mut hi = i64(-1)
+	for _, ch in cell {
+		let v = hexVal(ch)
+		if v < 0 { continue }
+		if hi < 0 {
+			hi = v
+		} else {
+			out = append(out, u8(hi*16+v))
+			hi = -1
+		}
+	}
+	return out
+}
+
+fn hexVal(ch i32) i64 {
+	if ch >= '0' && ch <= '9' { return i64(ch - '0') }
+	if ch >= 'a' && ch <= 'f' { return i64(ch - 'a' + 10) }
+	if ch >= 'A' && ch <= 'F' { return i64(ch - 'A' + 10) }
+	return -1
+}
+
+fn cellDatum(col ColDef, cell str) types.Datum {
+	if cell == "~" { return types.Null() }
+	let text = str(hexByte(cell))
+	match col.Storage {
+		16 => return types.FromBool(text == "t" || text == "true")
+		20, 21, 23, 26 => {
+			let n = mint.Atoi(text) catch _ { return types.FromI64(col.Storage, 0) }
+			return types.FromI64(col.Storage, n)
+		}
+		701 => {
+			let f = mint.ParseFloat(text) catch _ { return types.FromF64(701, 0.0) }
+			return types.FromF64(701, f)
+		}
+	}
+	return types.FromStr(col.Storage, text)
+}
+
+fn parseSeed() (map[str][]ColDef, []SeedRow) {
+	mut cols = make(map[str][]ColDef)
+	mut rows = []SeedRow{}
+	for line in seedLines() {
+		let parts = twine.Split(line, "\t")
+		if len(parts) == 0 { continue }
+		if parts[0] == "D" {
+			let typeNum = mint.Atoi(parts[4]) catch _ { 0 }
+			let declared = u32(typeNum)
+			let colNum = mint.Atoi(parts[2]) catch _ { 0 }
+			let col = ColDef{Name: parts[3], Type: declared, Storage: storeOid(declared), Number: i16(colNum), NotNull: parts[5] == "1", HasDefault: parts[6] == "1", Identity: parts[7], Generated: parts[8], Collation: 0}
+			let rel = parts[1]
+			let existing = cols[rel]
+			cols[rel] = append(existing, col)
+		} else if parts[0] == "R" {
+			rows = append(rows, SeedRow{Rel: parts[1], Cells: parts[2:]})
+		}
+	}
+	return cols, rows
+}
+
+// --- packed seed encoding ---
+
+fn appendU16(out mut []u8, v u16) {
+	out = append(out, u8(v >> 8), u8(v))
+}
+
+fn appendU32(out mut []u8, v u32) {
+	out = append(out, u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v))
+}
+
+fn appendBytes(out mut []u8, b []u8) {
+	appendU32(mut out, u32(len(b)))
+	out = append(out, b...)
+}
+
+fn readU16(b []u8, at i64) u16 {
+	return u16(b[at]) << 8 | u16(b[at+1])
+}
+
+fn readU32(b []u8, at i64) u32 {
+	return u32(b[at]) << 24 | u32(b[at+1]) << 16 | u32(b[at+2]) << 8 | u32(b[at+3])
+}
+
+fn seedRowSize(row SeedRow) i64 {
+	mut size = i64(2)
+	for cell in row.Cells {
+		size += 4 + len(cell)
+	}
+	return size
+}
+
+fn packSeedPayload(rel str, rows []SeedRow) []u8 {
+	mut out = []u8{}
+	appendBytes(mut out, []u8(rel))
+	appendU16(mut out, u16(len(rows)))
+	for row in rows {
+		appendU16(mut out, u16(len(row.Cells)))
+		for cell in row.Cells {
+			appendBytes(mut out, []u8(cell))
+		}
+	}
+	return out
+}
+
+fn unpackSeedPayload(payload []u8) []SeedRow {
+	if len(payload) < 6 { return []SeedRow{} }
+	let nameLen = i64(readU32(payload, 0))
+	mut at = 4 + nameLen
+	if at + 2 > len(payload) { return []SeedRow{} }
+	let rel = str(payload[4:at])
+	let n = i64(readU16(payload, at))
+	at += 2
+	mut out = []SeedRow{}
+	for _i in 0..n {
+		if at + 2 > len(payload) { break }
+		let nCells = i64(readU16(payload, at))
+		at += 2
+		mut cells = []str{}
+		for _j in 0..nCells {
+			if at + 4 > len(payload) { break }
+			let size = i64(readU32(payload, at))
+			at += 4
+			if at + size > len(payload) { break }
+			cells = append(cells, str(payload[at:at+size]))
+			at += size
+		}
+		out = append(out, SeedRow{Rel: rel, Cells: cells})
+	}
+	return out
+}
+
+fn loadSeed(s mut store.Store) map[str][]SeedRow {
+	mut out = make(map[str][]SeedRow)
+	let mutScan = s.HeapScan(store.RelId(pgSeedRel))
+	mut scan = mutScan
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok { break }
+		for row in unpackSeedPayload(tuple.Payload) {
+			let existing = out[row.Rel]
+			out[row.Rel] = append(existing, row)
+		}
+	}
+	return out
+}
+
+// --- row decode helpers ---
+
+// field returns a named column from a decoded row, or NULL when absent.
+fn (c Catalog) field(rel str, row RawRow, name str) types.Datum {
+	let cols = c.sysCols[rel]
+	for i, col in cols {
+		if col.Name == name {
+			if i < len(row.Values) { return row.Values[i] }
+			return types.Null()
+		}
+	}
+	return types.Null()
+}
+
+fn (c Catalog) textField(rel str, row RawRow, name str) str {
+	return c.field(rel, row, name).Text()
+}
+
+fn (c Catalog) intField(rel str, row RawRow, name str) i64 {
+	let d = c.field(rel, row, name)
+	if types.IsNull(d) { return 0 }
+	return mint.Atoi(d.Text()) catch _ { 0 }
+}
+
+fn (c Catalog) boolField(rel str, row RawRow, name str) bool {
+	let d = c.field(rel, row, name)
+	if types.IsNull(d) { return false }
+	let text = d.Text()
+	return text == "true" || text == "t"
+}
+
+fn (c Catalog) floatField(rel str, row RawRow, name str) f64 {
+	let d = c.field(rel, row, name)
+	if types.IsNull(d) { return 0.0 }
+	return mint.ParseFloat(d.Text()) catch _ { 0.0 }
+}
+
+fn (c Catalog) relIdOf(name str) u32 {
+	let (rel, ok) = c.relIds[name]
+	if ok { return rel }
+	return 0
+}
+
+// visible reports whether a decoded catalog row is visible to the snapshot.
+fn (c Catalog) visible(snap txn.Snapshot, name str, row RawRow) bool {
+	return c.Manager.TupleHeaderVisible(snap, store.RelId(c.relIdOf(name)), row.Xmin, row.Xmax, row.Cid, row.Infomask, row.Tid)
+}
+
+// buildRow turns a name->Datum map into a full row in the relation's column order.
+fn (c Catalog) buildRow(rel str, vals map[str]types.Datum) []types.Datum {
+	mut out = []types.Datum{}
+	for col in c.sysCols[rel] {
+		let (d, ok) = vals[col.Name]
+		if ok {
+			out = append(out, d)
+		} else {
+			out = append(out, zeroDatum(col.Storage))
+		}
+	}
+	return out
+}
+
+fn (c Catalog) storageTypes(rel str) []Oid {
+	mut out = []Oid{}
+	for col in c.sysCols[rel] {
+		out = append(out, col.Storage)
+	}
+	return out
+}
+
+fn (b Bootstrapper) relIdOf(name str) u32 {
+	let (rel, ok) = b.relIds[name]
+	if ok { return rel }
+	return 0
+}
+
+fn (b Bootstrapper) buildRow(rel str, vals map[str]types.Datum) []types.Datum {
+	return buildRowWith(b.sysCols, rel, vals)
+}
+
+// buildRowWith turns a name->Datum map into a full row in the relation's column order.
+fn buildRowWith(sysCols map[str][]ColDef, rel str, vals map[str]types.Datum) []types.Datum {
+	mut out = []types.Datum{}
+	for col in sysCols[rel] {
+		let (d, ok) = vals[col.Name]
+		if ok { out = append(out, d) } else { out = append(out, zeroDatum(col.Storage)) }
+	}
+	return out
+}
+
+fn (b Bootstrapper) storageTypes(rel str) []Oid {
+	mut out = []Oid{}
+	for col in b.sysCols[rel] { out = append(out, col.Storage) }
+	return out
+}
+
+fn (b mut Bootstrapper) insertSeedRow(rel str, row []types.Datum) ! {
+	mut payload = []u8{}
+	types.EncodeRow(b.storageTypes(rel), row, mut payload)
+	_ = try b.Store.HeapInsert(store.NewXidCtx(2, 0), store.RelId(b.relIdOf(rel)), payload)
+}
+
+fn (c mut Catalog) insertCatalogRow(t txn.Txn, rel str, vals map[str]types.Datum) !store.Tid {
+	let row = c.buildRow(rel, vals)
+	mut payload = []u8{}
+	types.EncodeRow(c.storageTypes(rel), row, mut payload)
+	return try c.Manager.HeapInsert(t, store.RelId(c.relIdOf(rel)), payload)
+}
+
+// bootstrap creates the system heaps and seeds them once, on an empty data directory.
+fn (b mut Bootstrapper) bootstrap() ! {
+	let (parsed, seedRows) = parseSeed()
+	b.sysCols = parsed
+	mut all = []SysRel{}
+	for rel in sysRels() { all = append(all, rel) }
+	for rel in extraRels() {
+		all = append(all, rel)
+		b.sysCols[rel.Name] = extraCols(rel.Name)
+	}
+	for rel in all {
+		b.relIds[rel.Name] = rel.Rel
+		b.Store.CreateHeap(store.RelId(rel.Rel)) catch _ { }
+	}
+	b.Store.CreateHeap(store.RelId(pgSeedRel)) catch _ { }
+	if b.catalogPopulated() {
+		return
+	}
+	mut byRel = make(map[str][]SeedRow)
+	for seed in seedRows {
+		let existing = byRel[seed.Rel]
+		byRel[seed.Rel] = append(existing, seed)
+	}
+	for rel in all {
+		let rows = byRel[rel.Name]
+		if len(rows) == 0 { continue }
+		try b.writeSeedChunks(rel.Name, rows)
+	}
+	try b.seedExtras()
+	let nsOid = informationSchemaOid(seedRows)
+	if nsOid != 0 {
+		try b.seedInformationSchema(nsOid)
+	}
+}
+
+// ViewSeed is one built-in information_schema view.
+type ViewSeed struct {
+	Name str
+	Cols []ColDef
+	Sql str
+}
+
+fn informationSchemaViews() []ViewSeed {
+	return []ViewSeed{
+		ViewSeed{Name: "tables", Cols: []ColDef{
+			ColDef{Name: "table_catalog", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "table_schema", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "table_name", Type: 19, Storage: 25, Number: 3},
+			ColDef{Name: "table_type", Type: 25, Storage: 25, Number: 4},
+		}, Sql: "SELECT current_database() AS table_catalog, n.nspname AS table_schema, c.relname AS table_name, CASE WHEN c.relkind = 'v' THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p', 'v') AND n.nspname NOT IN ('pg_catalog', 'pg_toast')"},
+		ViewSeed{Name: "columns", Cols: []ColDef{
+			ColDef{Name: "table_catalog", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "table_schema", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "table_name", Type: 19, Storage: 25, Number: 3},
+			ColDef{Name: "column_name", Type: 19, Storage: 25, Number: 4},
+			ColDef{Name: "ordinal_position", Type: 23, Storage: 23, Number: 5},
+			ColDef{Name: "column_default", Type: 25, Storage: 25, Number: 6},
+			ColDef{Name: "is_nullable", Type: 19, Storage: 25, Number: 7},
+			ColDef{Name: "data_type", Type: 25, Storage: 25, Number: 8},
+		}, Sql: "SELECT current_database() AS table_catalog, n.nspname AS table_schema, c.relname AS table_name, a.attname AS column_name, a.attnum AS ordinal_position, d.adbin AS column_default, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, t.typname AS data_type FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace JOIN pg_catalog.pg_type t ON t.oid = a.atttypid LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attnum > 0 AND NOT a.attisdropped"},
+		ViewSeed{Name: "schemata", Cols: []ColDef{
+			ColDef{Name: "catalog_name", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "schema_name", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "schema_owner", Type: 19, Storage: 25, Number: 3},
+		}, Sql: "SELECT current_database() AS catalog_name, nspname AS schema_name, pg_get_userbyid(nspowner) AS schema_owner FROM pg_catalog.pg_namespace"},
+		ViewSeed{Name: "table_constraints", Cols: []ColDef{
+			ColDef{Name: "constraint_catalog", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "constraint_schema", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "constraint_name", Type: 19, Storage: 25, Number: 3},
+			ColDef{Name: "table_name", Type: 19, Storage: 25, Number: 4},
+			ColDef{Name: "constraint_type", Type: 25, Storage: 25, Number: 5},
+		}, Sql: "SELECT current_database() AS constraint_catalog, n.nspname AS constraint_schema, con.conname AS constraint_name, c.relname AS table_name, con.contype AS constraint_type FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class c ON c.oid = con.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace"},
+		ViewSeed{Name: "key_column_usage", Cols: []ColDef{
+			ColDef{Name: "constraint_name", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "table_name", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "column_name", Type: 19, Storage: 25, Number: 3},
+			ColDef{Name: "ordinal_position", Type: 23, Storage: 23, Number: 4},
+		}, Sql: "SELECT con.conname AS constraint_name, c.relname AS table_name, a.attname AS column_name, u.ord AS ordinal_position FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class c ON c.oid = con.conrelid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY (con.conkey) CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS u(attnum, ord)"},
+	}
+}
+
+fn informationSchemaOid(seedRows []SeedRow) u32 {
+	for row in seedRows {
+		if row.Rel != "pg_namespace" || len(row.Cells) < 2 {
+			continue
+		}
+		if str(hexByte(row.Cells[1])) == "information_schema" {
+			let oidNum = mint.Atoi(str(hexByte(row.Cells[0]))) catch _ { 0 }
+			return u32(oidNum)
+		}
+	}
+	return 0
+}
+
+// seedInformationSchema writes pg_class/pg_attribute/pg_rewrite rows for the built-in
+// information_schema views.
+fn (b mut Bootstrapper) seedInformationSchema(nsOid u32) ! {
+	mut oid = u32(14000)
+	for view in informationSchemaViews() {
+		mut vals = make(map[str]types.Datum)
+		vals["oid"] = types.FromI64(26, i64(oid))
+		vals["relname"] = types.FromStr(25, view.Name)
+		vals["relnamespace"] = types.FromI64(26, i64(nsOid))
+		vals["reltype"] = types.FromI64(26, 0)
+		vals["relowner"] = types.FromI64(26, 10)
+		vals["relfilenode"] = types.FromI64(26, 0)
+		vals["relkind"] = types.FromStr(25, "v")
+		vals["relnatts"] = types.FromI64(21, i64(len(view.Cols)))
+		vals["relpersistence"] = types.FromStr(25, "p")
+		vals["relreplident"] = types.FromStr(25, "n")
+		try b.insertSeedRow("pg_class", b.buildRow("pg_class", vals))
+		for col in view.Cols {
+			try b.insertSeedRow("pg_attribute", b.attributeRow(oid, "", col))
+		}
+		mut rv = make(map[str]types.Datum)
+		rv["oid"] = types.FromI64(26, i64(oid+100))
+		rv["rulename"] = types.FromStr(25, "_RETURN")
+		rv["ev_class"] = types.FromI64(26, i64(oid))
+		rv["ev_type"] = types.FromStr(25, "1")
+		rv["ev_enabled"] = types.FromStr(25, "O")
+		rv["is_instead"] = types.FromBool(true)
+		rv["ev_qual"] = types.FromStr(25, "")
+		rv["ev_action"] = types.FromStr(25, view.Sql)
+		try b.insertSeedRow("pg_rewrite", b.buildRow("pg_rewrite", rv))
+		oid += 1
+	}
+}
+
+fn (b mut Bootstrapper) writeSeedChunks(rel str, rows []SeedRow) ! {
+	mut chunk = []SeedRow{}
+	mut size = i64(len(rel)) + 4
+	for row in rows {
+		let rowSize = seedRowSize(row)
+		if len(chunk) > 0 && size + rowSize > seedChunkBytes {
+			_ = try b.Store.HeapInsert(store.NewXidCtx(2, 0), store.RelId(pgSeedRel), packSeedPayload(rel, chunk))
+			chunk = []SeedRow{}
+			size = i64(len(rel)) + 4
+		}
+		chunk = append(chunk, row)
+		size += rowSize
+	}
+	if len(chunk) > 0 {
+		_ = try b.Store.HeapInsert(store.NewXidCtx(2, 0), store.RelId(pgSeedRel), packSeedPayload(rel, chunk))
+	}
+}
+
+// seedExtras writes pg_class/pg_attribute rows for the tingres-private relations.
+fn (b mut Bootstrapper) seedExtras() ! {
+	for rel in extraRels() {
+		let nsOid = u32(11)
+		mut vals = make(map[str]types.Datum)
+		vals["oid"] = types.FromI64(26, i64(rel.Oid))
+		vals["relname"] = types.FromStr(25, rel.Name)
+		vals["relnamespace"] = types.FromI64(26, i64(nsOid))
+		vals["reltype"] = types.FromI64(26, 0)
+		vals["relowner"] = types.FromI64(26, 10)
+		vals["relfilenode"] = types.FromI64(26, i64(rel.Rel))
+		vals["relkind"] = types.FromStr(25, rel.Kind)
+		vals["relnatts"] = types.FromI64(21, i64(len(b.sysCols[rel.Name])))
+		vals["relpersistence"] = types.FromStr(25, "p")
+		vals["relreplident"] = types.FromStr(25, "n")
+		try b.insertSeedRow("pg_class", b.buildRow("pg_class", vals))
+		for col in b.sysCols[rel.Name] {
+			try b.insertSeedRow("pg_attribute", b.attributeRow(rel.Oid, "", col))
+		}
+	}
+}
+
+// attributeRow builds a pg_attribute row for a column of a relation.
+fn (b Bootstrapper) attributeRow(attrelid Oid, attname str, col ColDef) []types.Datum {
+	return attributeRowWith(b.sysCols, attrelid, attname, col)
+}
+
+fn (c Catalog) attributeRow(attrelid Oid, attname str, col ColDef) []types.Datum {
+	return attributeRowWith(c.sysCols, attrelid, attname, col)
+}
+
+fn attributeRowWith(sysCols map[str][]ColDef, attrelid Oid, attname str, col ColDef) []types.Datum {
+	mut name = attname
+	if name == "" { name = col.Name }
+	mut vals = make(map[str]types.Datum)
+	vals["attrelid"] = types.FromI64(26, i64(attrelid))
+	vals["attname"] = types.FromStr(25, name)
+	vals["atttypid"] = types.FromI64(26, i64(col.Type))
+	vals["attlen"] = types.FromI64(21, typeLen(col.Type))
+	vals["attnum"] = types.FromI64(21, i64(col.Number))
+	vals["attcacheoff"] = types.FromI64(23, -1)
+	vals["atttypmod"] = types.FromI64(23, -1)
+	vals["attndims"] = types.FromI64(21, 0)
+	vals["attbyval"] = types.FromBool(typeByVal(col.Type))
+	vals["attalign"] = types.FromStr(25, typeAlign(col.Type))
+	vals["attstorage"] = types.FromStr(25, typeStorage(col.Type))
+	vals["attcompression"] = types.FromStr(25, "")
+	vals["attnotnull"] = types.FromBool(col.NotNull)
+	vals["atthasdef"] = types.FromBool(col.HasDefault)
+	vals["atthasmissing"] = types.FromBool(false)
+	vals["attidentity"] = types.FromStr(25, col.Identity)
+	vals["attgenerated"] = types.FromStr(25, col.Generated)
+	vals["attisdropped"] = types.FromBool(false)
+	vals["attislocal"] = types.FromBool(true)
+	vals["attinhcount"] = types.FromI64(21, 0)
+	vals["attcollation"] = types.FromI64(26, i64(col.Collation))
+	vals["attstattarget"] = types.FromI64(21, -1)
+	return buildRowWith(sysCols, "pg_attribute", vals)
+}
+
+fn typeLen(oid Oid) i64 {
+	match oid {
+		16 => return 1
+		18 => return 1
+		19 => return 64
+		21 => return 2
+		23 => return 4
+		26 => return 4
+		24, 28 => return 4
+		20 => return 8
+		700 => return 4
+		701 => return 8
+		25, 194 => return -1
+	}
+	return -1
+}
+
+fn typeByVal(oid Oid) bool {
+	match oid {
+		16, 18, 21, 23, 26, 20, 700, 701, 24, 28 => return true
+	}
+	return false
+}
+
+fn typeAlign(oid Oid) str {
+	match oid {
+		16, 18 => return "c"
+		21 => return "s"
+	}
+	return "i"
+}
+
+fn typeStorage(oid Oid) str {
+	match oid {
+		16, 18, 21, 23, 26, 20, 700, 701, 24, 28 => return "p"
+	}
+	return "x"
+}
+
+// catalogPopulated reports whether the packed seed was already written.
+fn (b mut Bootstrapper) catalogPopulated() bool {
+	mut scan = b.Store.HeapScan(store.RelId(pgSeedRel))
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok { break }
+		if tuple.Header.Xmin() == 2 { return true }
+	}
+	return false
+}
+
+// reload rebuilds the decoded row cache from the packed seed and the relation heaps.
+fn (c mut Catalog) reload() {
+	let (rows, maxOid, maxRel) = loadRows(mut c.Store, c.sysCols, c.relIds)
+	c.rows = rows
+	c.nextOid = maxOid
+	c.nextRel = maxRel
+}
+
+fn (c mut Catalog) scanRel(name str) []RawRow {
+	return scanCatalogRel(mut c.Store, c.storageTypes(name), store.RelId(c.relIdOf(name)), name)
+}
+
+fn loadRows(s mut store.Store, sysCols map[str][]ColDef, relIds map[str]u32) (map[str][]RawRow, u32, u32) {
+	let seed = loadSeed(mut s)
+	mut rows = make(map[str][]RawRow)
+	mut maxOid = u32(16384)
+	mut maxRel = u32(16384)
+	mut names = []str{}
+	for rel in sysRels() { names = append(names, rel.Name) }
+	for rel in extraRels() { names = append(names, rel.Name) }
+	for name in names {
+		mut list = []RawRow{}
+		for seedRow in seed[name] {
+			list = append(list, seedRawRow(sysCols, name, seedRow))
+		}
+		let heapRows = scanCatalogRel(mut s, storageTypesFor(sysCols, name), store.RelId(relIds[name]), name)
+		for row in heapRows {
+			list = append(list, row)
+		}
+		rows[name] = list
+	}
+	for row in rows["pg_class"] {
+		let oid = u32(rawIntField(sysCols, "pg_class", row, "oid"))
+		let filenode = u32(rawIntField(sysCols, "pg_class", row, "relfilenode"))
+		if oid > maxOid { maxOid = oid }
+		if filenode > maxRel { maxRel = filenode }
+	}
+	return rows, maxOid + 1, maxRel + 1
+}
+
+fn seedRawRow(sysCols map[str][]ColDef, name str, seed SeedRow) RawRow {
+	mut values = []types.Datum{}
+	let cols = sysCols[name]
+	for i, col in cols {
+		mut cell = "~"
+		if i < len(seed.Cells) { cell = seed.Cells[i] }
+		values = append(values, cellDatum(col, cell))
+	}
+	return RawRow{Rel: name, Tid: store.NewTid(0, 0), Xmin: 2, Xmax: 0, Cid: 0, Infomask: 0, Values: values}
+}
+
+fn storageTypesFor(sysCols map[str][]ColDef, name str) []Oid {
+	mut out = []Oid{}
+	for col in sysCols[name] { out = append(out, col.Storage) }
+	return out
+}
+
+fn rawIntField(sysCols map[str][]ColDef, rel str, row RawRow, name str) i64 {
+	for i, col in sysCols[rel] {
+		if col.Name == name && i < len(row.Values) { return mint.Atoi(row.Values[i].Text()) catch _ { 0 } }
+	}
+	return 0
+}
+
+fn scanCatalogRel(s mut store.Store, oidList []Oid, rel store.RelId, name str) []RawRow {
+	mut scan = s.HeapScan(rel)
+	mut out = []RawRow{}
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok { break }
+		let values = types.DecodeRow(oidList, tuple.Payload) catch _ { continue }
+		out = append(out, RawRow{Rel: name, Tid: tuple.Tid, Xmin: tuple.Header.Xmin(), Xmax: tuple.Header.Xmax(), Cid: tuple.Header.Cid(), Infomask: tuple.Header.Infomask(), Values: values})
+	}
+	return out
+}

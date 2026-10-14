@@ -44,7 +44,7 @@ fn (p mut Parser) parseCreateStatement() !Stmt {
 		let value = try p.parseCreateRoleBody(pos)
 		return Stmt.CreateRole(value)
 	}
-	fail unsupportedMessage(p.Source, p.pos(), "CREATE statement")
+	fail unsupportedMessage(p.Source, p.bytePos(), "CREATE statement")
 }
 
 fn (p mut Parser) parseCreateTableBody(pos i64, temporary str) !CreateTableStmt {
@@ -58,9 +58,10 @@ fn (p mut Parser) parseCreateTableBody(pos i64, temporary str) !CreateTableStmt 
 	mut elements = []TableElement{}
 	mut likes = []LikeClause{}
 	if p.eat("(") {
-		for {
-			let elementPos = p.pos()
-			if p.eat("like") {
+		if p.text() != ")" {
+			for {
+				let elementPos = p.pos()
+				if p.eat("like") {
 				let source = try p.parseQualifiedName()
 				mut options = []str{}
 				if p.eat("including") { options = append(options, "including " + lowerAscii(p.take().Text)) } else if p.eat("excluding") { options = append(options, "excluding " + lowerAscii(p.take().Text)) }
@@ -79,6 +80,7 @@ fn (p mut Parser) parseCreateTableBody(pos i64, temporary str) !CreateTableStmt 
 				elements = append(elements, TableElement.Column(column))
 			}
 			if !p.eat(",") { break }
+			}
 		}
 		try p.expect(")")
 	}
@@ -229,8 +231,15 @@ fn (p mut Parser) parseCreateSchemaBody(pos i64) !CreateSchemaStmt {
 		ifNotExists = true
 	}
 	mut authorization ?Identifier = nil
-	let name = try p.parseIdentifier()
-	if p.eat("authorization") { authorization = try p.parseIdentifier() }
+	mut name = Identifier{}
+	if p.eat("authorization") {
+		let role = try p.parseIdentifier()
+		authorization = role
+		name = role
+	} else {
+		name = try p.parseIdentifier()
+		if p.eat("authorization") { authorization = try p.parseIdentifier() }
+	}
 	return CreateSchemaStmt{Pos: pos, IfNotExists: ifNotExists, Name: name, Authorization: authorization}
 }
 
