@@ -212,6 +212,7 @@ fn stmtKind(statement Stmt) str {
 		Do(_) => "do"
 		Checkpoint(_) => "checkpoint"
 		Call(_) => "call"
+		Utility(_) => "utility"
 	}
 }
 
@@ -499,48 +500,65 @@ fn TestParseErrorWordingAndCodes(t mut crucible.T) {
 	// 1. Syntax error at end of input
 	let _ = Parse("SELECT 1 +") catch err {
 		let pe = ToParseError(err)
-		crucible.EqS("code at end of input", pe.Code, "42601")
-		crucible.EqS("msg at end of input", pe.Message, "syntax error at end of input")
-		crucible.EqI("pos at end of input", pe.Pos, 11)
+		crucible.Equal(mut t, "code at end of input", pe.Code, "42601")
+		crucible.Equal(mut t, "msg at end of input", pe.Message, "syntax error at end of input")
+		crucible.Equal(mut t, "pos at end of input", pe.Pos, 11)
 		[]Stmt{}
 	}
 
-	// 2. Syntax error at or near
+	// 2. Empty target list followed by a clause: PostgreSQL consumes the clause keyword and
+	//    reports the failure at the end of the input.
 	let _ = Parse("SELECT FROM") catch err {
 		let pe = ToParseError(err)
-		crucible.EqS("code at or near", pe.Code, "42601")
-		crucible.EqS("msg at or near", pe.Message, "syntax error at or near \"FROM\"")
-		crucible.EqI("pos at or near", pe.Pos, 8)
+		crucible.Equal(mut t, "code empty target", pe.Code, "42601")
+		crucible.Equal(mut t, "msg empty target", pe.Message, "syntax error at end of input")
+		crucible.Equal(mut t, "pos empty target", pe.Pos, 12)
 		[]Stmt{}
 	}
 
-	// 3. Unterminated quoted string
+	// 3. Syntax error at or near an upper-case keyword keeps the source spelling.
+	let _ = Parse("SELECT WHERE") catch err {
+		let pe = ToParseError(err)
+		crucible.Equal(mut t, "msg where", pe.Message, "syntax error at end of input")
+		crucible.Equal(mut t, "pos where", pe.Pos, 13)
+		[]Stmt{}
+	}
+
+	// 4. Unterminated quoted string
 	let _ = Parse("SELECT 'unterminated") catch err {
 		let pe = ToParseError(err)
-		crucible.EqS("code unterminated string", pe.Code, "42601")
-		crucible.True("msg unterminated string", hasText(pe.Message, "unterminated quoted string at or near"))
-		crucible.EqI("pos unterminated string", pe.Pos, 8)
+		crucible.Equal(mut t, "code unterminated string", pe.Code, "42601")
+		crucible.Equal(mut t, "msg unterminated string", pe.Message, "unterminated quoted string at or near \"'unterminated\"")
+		crucible.Equal(mut t, "pos unterminated string", pe.Pos, 8)
 		[]Stmt{}
 	}
 
-	// 4. Trailing junk after numeric literal
+	// 5. Trailing junk after numeric literal
 	let _ = Parse("SELECT 1a") catch err {
 		let pe = ToParseError(err)
-		crucible.EqS("code trailing junk", pe.Code, "42601")
-		crucible.True("msg trailing junk", hasText(pe.Message, "trailing junk after numeric literal at or near \"1a\""))
-		crucible.EqI("pos trailing junk", pe.Pos, 8)
+		crucible.Equal(mut t, "code trailing junk", pe.Code, "42601")
+		crucible.Equal(mut t, "msg trailing junk", pe.Message, "trailing junk after numeric literal at or near \"1a\"")
+		crucible.Equal(mut t, "pos trailing junk", pe.Pos, 8)
 		[]Stmt{}
 	}
 
-	// 5. Stack depth limit exceeded
+	// 6. Multi-byte input counts characters, not bytes: the '+' after 'é' is character 10.
+	let _ = Parse("SELECT 'é' +") catch err {
+		let pe = ToParseError(err)
+		crucible.Equal(mut t, "msg multi-byte", pe.Message, "syntax error at end of input")
+		crucible.Equal(mut t, "pos multi-byte", pe.Pos, 13)
+		[]Stmt{}
+	}
+
+	// 7. Stack depth limit exceeded
 	mut deepSql = "SELECT "
 	for i in 0..300 { deepSql += "(" }
 	deepSql += "1"
 	for i in 0..300 { deepSql += ")" }
 	let _ = Parse(deepSql) catch err {
 		let pe = ToParseError(err)
-		crucible.EqS("code stack depth", pe.Code, "54001")
-		crucible.EqS("msg stack depth", pe.Message, "stack depth limit exceeded")
+		crucible.Equal(mut t, "code stack depth", pe.Code, "54001")
+		crucible.Equal(mut t, "msg stack depth", pe.Message, "stack depth limit exceeded")
 		[]Stmt{}
 	}
 }
@@ -560,7 +578,7 @@ fn findTestdataFile(name str) str {
 
 fn TestValidCorpus(t mut crucible.T) {
 	let path = findTestdataFile("valid.sql")
-	crucible.True("found valid.sql", len(path) > 0)
+	t.True("found valid.sql", len(path) > 0)
 	let content = quarry.ReadFile(path) catch err {
 		t.Error("failed reading valid.sql: {err}")
 		""
@@ -569,7 +587,7 @@ fn TestValidCorpus(t mut crucible.T) {
 		t.Error("failed parsing valid.sql: {err}")
 		[]Stmt{}
 	}
-	crucible.True("valid corpus >= 1500 stmts", len(stmts) >= 1500)
+	t.True("valid corpus >= 1500 stmts", len(stmts) >= 1500)
 
 	mut roundtripFailures = 0
 	mut at = 0
@@ -578,45 +596,132 @@ fn TestValidCorpus(t mut crucible.T) {
 		roundtripFailures += checkRoundtripBatch(stmts, at, end)
 		at += 100
 	}
-	crucible.EqI("deparse roundtrip failures", roundtripFailures, 0)
+	crucible.Equal(mut t, "deparse roundtrip failures", roundtripFailures, 0)
 }
 
 fn TestInvalidCorpus(t mut crucible.T) {
 	let pathSql = findTestdataFile("invalid.sql")
-	crucible.True("found invalid.sql", len(pathSql) > 0)
+	t.True("found invalid.sql", len(pathSql) > 0)
 	let contentSql = quarry.ReadFile(pathSql) catch err {
 		t.Error("failed reading invalid.sql: {err}")
 		""
 	}
 	let pathExp = findTestdataFile("invalid_expected.txt")
-	crucible.True("found invalid_expected.txt", len(pathExp) > 0)
+	t.True("found invalid_expected.txt", len(pathExp) > 0)
 	let contentExp = quarry.ReadFile(pathExp) catch err {
 		t.Error("failed reading invalid_expected.txt: {err}")
 		""
 	}
 
-	let sqlLines = splitLines(contentSql)
+	let entries = splitCorpusEntries(contentSql)
 	let expLines = splitLines(contentExp)
-	crucible.True("invalid corpus >= 200 statements", len(sqlLines) >= 200)
-	crucible.EqI("sql and expected lines match", len(sqlLines), len(expLines))
+	t.True("invalid corpus >= 200 statements", len(entries) >= 200)
+	crucible.Equal(mut t, "sql and expected entries match", len(entries), len(expLines))
 
 	mut acceptedCount = 0
-	mut posMatches = 0
-	for i in 0..len(sqlLines) {
-		let line = sqlLines[i]
-		if len(line) == 0 { continue }
-		let parsed = Parse(line) catch err {
+	mut mismatches = 0
+	mut firstMismatch = ""
+	for i in 0..len(entries) {
+		let sql = entries[i]
+		if len(trimSpace(sql)) == 0 { continue }
+		let (expPos, expCode, expMessage) = parseExpectedLine(expLines[i])
+		let parsed = Parse(sql) catch err {
 			let pe = ToParseError(err)
-			crucible.EqS("error code is 42601", pe.Code, "42601")
-			if pe.Pos > 0 { posMatches += 1 }
+			if pe.Pos != expPos || pe.Code != expCode || pe.Message != expMessage {
+				mismatches += 1
+				if mismatches == 1 {
+					firstMismatch = "entry {i}: {singleLineText(sql)}\n    got pos={pe.Pos} code={pe.Code} msg={pe.Message}\n    exp pos={expPos} code={expCode} msg={expMessage}"
+				}
+			}
 			[]Stmt{}
 		}
 		if len(parsed) > 0 {
 			acceptedCount += 1
+			if acceptedCount == 1 { firstMismatch = "entry {i} unexpectedly accepted: {singleLineText(sql)}" }
 		}
 	}
-	crucible.EqI("invalid statements accepted", acceptedCount, 0)
-	crucible.True("all error positions valid", posMatches == len(sqlLines))
+	crucible.Equal(mut t, "invalid statements accepted", acceptedCount, 0)
+	crucible.Equal(mut t, "exact PostgreSQL error mismatches", mismatches, 0)
+	if mismatches > 0 || acceptedCount > 0 { t.Error("invalid corpus mismatch: {firstMismatch}") }
+}
+
+// splitCorpusEntries splits a corpus file whose entries are separated by lines containing only
+// @@, trimming the newline before each separator. Entries may span multiple lines.
+fn splitCorpusEntries(text str) []str {
+	mut out = []str{}
+	mut start = 0
+	mut i = 0
+	let n = len(text)
+	for i < n {
+		if i + 2 <= n && text[i:i + 2] == "@@" && (i + 2 == n || text[i + 2] == 10 || text[i + 2] == 13) {
+			out = append(out, trimTrailingNewline(text[start:i]))
+			i += 2
+			if i < n && text[i] == 13 { i += 1 }
+			if i < n && text[i] == 10 { i += 1 }
+			start = i
+			continue
+		}
+		i += 1
+	}
+	if start < n { out = append(out, trimTrailingNewline(text[start:])) }
+	return out
+}
+
+fn trimTrailingNewline(s str) str {
+	mut b = len(s)
+	if b > 0 && s[b - 1] == 10 { b -= 1 }
+	if b > 0 && s[b - 1] == 13 { b -= 1 }
+	return s[:b]
+}
+
+fn trimSpace(s str) str {
+	mut a = 0
+	mut b = len(s)
+	for a < b && isSpaceByte(s[a]) { a += 1 }
+	for b > a && isSpaceByte(s[b - 1]) { b -= 1 }
+	return s[a:b]
+}
+
+fn isSpaceByte(c u8) bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 }
+
+fn parseExpectedLine(line str) (i64, str, str) {
+	let first = findTab(line, 0)
+	if first < 0 { return -1, "", line }
+	let second = findTab(line, first + 1)
+	if second < 0 { return parsePosInt(line[:first]), line[first + 1:], "" }
+	return parsePosInt(line[:first]), line[first + 1:second], line[second + 1:]
+}
+
+fn findTab(s str, from i64) i64 {
+	for i in from..len(s) {
+		if s[i] == 9 { return i }
+	}
+	return -1
+}
+
+fn parsePosInt(text str) i64 {
+	mut negative = false
+	mut i = 0
+	if len(text) > 0 && text[0] == 45 { negative = true
+		i = 1 }
+	mut value = 0
+	for i < len(text) {
+		let c = text[i]
+		if c < '0' || c > '9' { return -1 }
+		value = value * 10 + i64(c - '0')
+		i += 1
+	}
+	if negative { return -value }
+	return value
+}
+
+fn singleLineText(s str) str {
+	mut out = ""
+	for i in 0..len(s) {
+		if s[i] == 10 { out += "\\n" } else { out += str(s[i]) }
+	}
+	if len(out) > 70 { return out[:70] + "..." }
+	return out
 }
 
 fn splitLines(s str) []str {

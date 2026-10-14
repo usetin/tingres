@@ -1,0 +1,348 @@
+package store
+
+import "crucible"
+import "dice"
+import "quarry"
+
+// Crash recovery tests: build a committed workload, then reopen copies of the data directory with
+// the WAL truncated at every record boundary and at random byte offsets. The heap and B-tree must
+// both come back as the same prefix of the workload, containing at least the committed records.
+
+const crashCommitKind u8 = 200
+const crashOps = 30
+
+fn copyTree(src str, dst str) ! {
+	try quarry.MkdirAll(dst)
+	let names = try quarry.ReadDir(src)
+	for _, name in names {
+		let sp = src + "/" + name
+		let dp = dst + "/" + name
+		if quarry.IsDir(sp) {
+			try copyTree(sp, dp)
+		} else {
+			let data = try quarry.ReadFile(sp)
+			try quarry.WriteFile(dp, data)
+		}
+	}
+}
+
+fn walRecordBoundaries(b []u8) []i64 {
+	mut out = []i64{}
+	mut off = i64(0)
+	for off+walHeaderSize <= i64(len(b)) {
+		let total = i64(readU32(b, off))
+		if total < walHeaderSize || off+total > i64(len(b)) {
+			break
+		}
+		if crc32c(b[off+8:off+total]) != readU32(b, off+4) {
+			break
+		}
+		off += total
+		out = append(out, off)
+	}
+	return out
+}
+
+// countCrashKinds returns the valid heap-insert, B-tree-insert and commit records in the first
+// upto bytes. This workload never splits, so every B-tree insert is one physiological record.
+fn countCrashKinds(b []u8, upto i64) (i64, i64, i64) {
+	let end = min(upto, i64(len(b)))
+	mut heapInserts = i64(0)
+	mut btreeInserts = i64(0)
+	mut commits = i64(0)
+	mut off = i64(0)
+	for off+walHeaderSize <= end {
+		let total = i64(readU32(b, off))
+		if total < walHeaderSize || off+total > end {
+			break
+		}
+		if crc32c(b[off+8:off+total]) != readU32(b, off+4) {
+			break
+		}
+		let kind = b[off+8]
+		if kind == walKindHeapInsert {
+			heapInserts += 1
+		}
+		if kind == walKindBtreeInsert {
+			btreeInserts += 1
+		}
+		if kind == crashCommitKind {
+			commits += 1
+		}
+		off += total
+	}
+	return heapInserts, btreeInserts, commits
+}
+
+fn makeCrashWorkload(src str) []u8 {
+	quarry.RemoveAll(src) catch _ { }
+	let (opened, openErr) = Open(src, Options{BufferPages: 64})
+	if openErr != nil {
+		return []u8{}
+	}
+	mut db = opened
+	db.CreateHeap(600) catch _ { return []u8{} }
+	db.CreateIndex(601, false) catch _ { return []u8{} }
+	db.RegisterRecordKind(crashCommitKind, "crash test commit") catch _ { return []u8{} }
+	for i in 0..crashOps {
+		let bytes = []u8{u8(i)}
+		let (tid, insErr) = db.HeapInsert(NewXidCtx(2, 0), 600, bytes)
+		if insErr != nil {
+			return []u8{}
+		}
+		db.IndexInsert(601, bytes, tid) catch _ { return []u8{} }
+		db.LogRecord(crashCommitKind, bytes) catch _ { return []u8{} }
+		db.Sync(db.CurrentLsn()) catch _ { return []u8{} }
+	}
+	let data = quarry.ReadFile(src + "/wal/00000001.wal") catch _ { "" }
+	return []u8(data)
+}
+
+fn verifyCrashCopy(t mut crucible.T, src str, dst str, upto i64, walBytes []u8, label str) {
+	quarry.RemoveAll(dst) catch _ { }
+	copyTree(src, dst) catch err {
+		t.Error("{label}: copy failed: {err}")
+		return
+	}
+	let seg1 = dst + "/wal/00000001.wal"
+	if upto < i64(len(walBytes)) {
+		quarry.WriteFile(seg1, str(walBytes[0:upto])) catch err {
+			t.Error("{label}: truncate failed: {err}")
+			return
+		}
+	}
+	let (expHeap, expBtree, expCommit) = countCrashKinds(walBytes, upto)
+	let (opened, openErr) = Open(dst, Options{BufferPages: 64})
+	if openErr != nil {
+		t.Error("{label}: reopen failed: {openErr}")
+		return
+	}
+	mut db = opened
+	mut heapCount = i64(0)
+	mut scan = db.HeapScan(600)
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		if len(tuple.Payload) != 1 || i64(tuple.Payload[0]) != heapCount {
+			t.Error("{label}: heap payload out of prefix at {heapCount}")
+			break
+		}
+		heapCount += 1
+	}
+	crucible.Equal(mut t, "{label}: heap prefix", heapCount, expHeap)
+	mut btreeCount = i64(0)
+	mut iscan = db.IndexSeek(601, []u8{}, []u8{}, IndexLoUnbounded|IndexHiUnbounded)
+	crucible.Equal(mut t, "{label}: btree scan error", iscan.Error(), "")
+	for {
+		let (item, ok) = iscan.Next()
+		if !ok {
+			break
+		}
+		if len(item.Key()) != 1 || i64(item.Key()[0]) != btreeCount {
+			t.Error("{label}: btree key out of prefix at {btreeCount}")
+			break
+		}
+		btreeCount += 1
+	}
+	crucible.Equal(mut t, "{label}: btree prefix", btreeCount, expBtree)
+	crucible.True("{label}: committed prefix recovered", heapCount >= expCommit)
+	crucible.True("{label}: btree committed prefix recovered", btreeCount >= expCommit)
+	db.Close() catch _ { }
+}
+
+fn TestCrashTruncatesAtEveryRecordBoundary(t mut crucible.T) {
+	let src = "/tmp/tingres-store-crash-src"
+	let dst = "/tmp/tingres-store-crash-dst"
+	let walBytes = makeCrashWorkload(src)
+	if len(walBytes) == 0 {
+		t.Error("crash workload setup failed")
+		return
+	}
+	let bounds = walRecordBoundaries(walBytes)
+	crucible.True("workload produced WAL records", len(bounds) > 10)
+	for i, upto in bounds {
+		verifyCrashCopy(mut t, src, dst, upto, walBytes, "boundary {i}")
+	}
+	// Also the full, untruncated copy.
+	verifyCrashCopy(mut t, src, dst, i64(len(walBytes)), walBytes, "full")
+	quarry.RemoveAll(src) catch _ { }
+	quarry.RemoveAll(dst) catch _ { }
+}
+
+fn TestWalSegmentRolloverAndRecovery(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-wal-rollover"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 256, WalSegmentBytes: 16384})
+	if openErr != nil {
+		t.Error("open failed: {openErr}")
+		return
+	}
+	mut db = opened
+	db.CreateHeap(800) catch err {
+		t.Error("create heap failed: {err}")
+		return
+	}
+	let payload = []u8{1, 2, 3, 4, 5, 6, 7, 8}
+	let n = 6000
+	for i in 0..n {
+		writeU32(mut payload, 0, u32(i))
+		let (_, insErr) = db.HeapInsert(NewXidCtx(2, 0), 800, payload)
+		if insErr != nil {
+			t.Error("insert {i} failed: {insErr}")
+			return
+		}
+	}
+	let names = quarry.ReadDir(dir + "/wal") catch _ { []str{} }
+	mut segs = 0
+	for _, name in names {
+		let (_, ok) = parseSegmentName(name)
+		if ok {
+			segs += 1
+		}
+	}
+	let flushErr = db.Sync(db.CurrentLsn())
+	if flushErr != nil {
+		t.Error("sync failed: {flushErr}")
+		return
+	}
+	let names2 = quarry.ReadDir(dir + "/wal") catch _ { []str{} }
+	segs = 0
+	for _, name in names2 {
+		let (_, ok) = parseSegmentName(name)
+		if ok {
+			segs += 1
+		}
+	}
+	crucible.True("WAL rolled over several segments", segs >= 4)
+	// Reopen without a clean shutdown: recovery must replay records across every segment.
+	let (reopened, reopenErr) = Open(dir, Options{BufferPages: 256, WalSegmentBytes: 16384})
+	if reopenErr != nil {
+		t.Error("reopen failed: {reopenErr}")
+		return
+	}
+	mut db2 = reopened
+	mut scan = db2.HeapScan(800)
+	mut count = 0
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		if len(tuple.Payload) != 8 || i64(readU32(tuple.Payload, 0)) != count {
+			t.Error("recovered tuple {count} is out of order")
+			break
+		}
+		count += 1
+	}
+	crucible.Equal(mut t, "crossed segments recovered", count, n)
+	db2.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+}
+
+fn TestHeapRecoveryAfterCheckpoint(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-ckpt-crash"
+	let dst = "/tmp/tingres-store-ckpt-crash-copy"
+	quarry.RemoveAll(dir) catch _ { }
+	quarry.RemoveAll(dst) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 32})
+	if openErr != nil {
+		t.Error("open failed: {openErr}")
+		return
+	}
+	mut db = opened
+	db.CreateHeap(850) catch err {
+		t.Error("create failed: {err}")
+		return
+	}
+	let payload = []u8{0, 0, 0, 0}
+	for i in 0..100 {
+		writeU32(mut payload, 0, u32(i))
+		let (_, insErr) = db.HeapInsert(NewXidCtx(2, 0), 850, payload)
+		if insErr != nil {
+			t.Error("insert {i} failed: {insErr}")
+			return
+		}
+	}
+	db.Checkpoint() catch err {
+		t.Error("checkpoint failed: {err}")
+		return
+	}
+	let cpLsn = u64(db.CurrentLsn())
+	for i in 100..200 {
+		writeU32(mut payload, 0, u32(i))
+		let (_, insErr) = db.HeapInsert(NewXidCtx(3, 0), 850, payload)
+		if insErr != nil {
+			t.Error("insert {i} failed: {insErr}")
+			return
+		}
+	}
+	db.Sync(db.CurrentLsn()) catch err {
+		t.Error("sync failed: {err}")
+		return
+	}
+	let walData = quarry.ReadFile(dir + "/wal/00000001.wal") catch _ { "" }
+	let walBytes = []u8(walData)
+	// A copy taken as if the process crashed after the checkpoint recovers all 200 rows.
+	copyTree(dir, dst) catch err {
+		t.Error("copy failed: {err}")
+		return
+	}
+	checkCount(mut t, dst, 200, "after checkpoint")
+	// Cutting the WAL at the checkpoint end leaves exactly the flushed 100 rows; rebuild the copy
+	// because the previous check wrote the recovered pages back.
+	quarry.RemoveAll(dst) catch _ { }
+	copyTree(dir, dst) catch err {
+		t.Error("copy failed: {err}")
+		return
+	}
+	quarry.WriteFile(dst + "/wal/00000001.wal", str(walBytes[0:i64(cpLsn)])) catch err {
+		t.Error("truncate failed: {err}")
+		return
+	}
+	checkCount(mut t, dst, 100, "at checkpoint")
+	quarry.RemoveAll(dir) catch _ { }
+	quarry.RemoveAll(dst) catch _ { }
+}
+
+fn checkCount(t mut crucible.T, dir str, want i64, label str) {
+	let (opened, openErr) = Open(dir, Options{BufferPages: 32})
+	if openErr != nil {
+		t.Error("{label}: reopen failed: {openErr}")
+		return
+	}
+	mut db = opened
+	mut count = i64(0)
+	mut scan = db.HeapScan(850)
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		if len(tuple.Payload) != 4 || i64(readU32(tuple.Payload, 0)) != count {
+			t.Error("{label}: payload out of prefix at {count}")
+			break
+		}
+		count += 1
+	}
+	crucible.Equal(mut t, "{label}: row count", count, want)
+	db.Close() catch _ { }
+}
+
+fn TestCrashTruncatesAtRandomOffsets(t mut crucible.T) {
+	let src = "/tmp/tingres-store-crash-src2"
+	let dst = "/tmp/tingres-store-crash-dst2"
+	let walBytes = makeCrashWorkload(src)
+	if len(walBytes) == 0 {
+		t.Error("crash workload setup failed")
+		return
+	}
+	mut rng = dice.New(424242)
+	for q in 0..20 {
+		let upto = rng.Intn(i64(len(walBytes))+1)
+		verifyCrashCopy(mut t, src, dst, upto, walBytes, "random {q}")
+	}
+	quarry.RemoveAll(src) catch _ { }
+	quarry.RemoveAll(dst) catch _ { }
+}

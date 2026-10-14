@@ -1,0 +1,197 @@
+package store
+
+import "crucible"
+import "quarry"
+
+fn TestHeapHeadersHintsAndPrunePersist(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-heap-deep-test"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 4})
+	if openErr != nil {
+		t.Error("open failed")
+		return
+	}
+	mut db = opened
+	db.CreateHeap(201) catch err {
+		t.Error("create heap failed: {err}")
+		return
+	}
+	let (a, aErr) = db.HeapInsert(NewXidCtx(2, 1), 201, []u8{1, 2})
+	if aErr != nil {
+		t.Error("first insert failed")
+		return
+	}
+	let (b, bErr) = db.HeapInsert(NewXidCtx(3, 2), 201, []u8{3})
+	if bErr != nil {
+		t.Error("second insert failed")
+		return
+	}
+	let hintErr = db.SetHint(201, a, 4)
+	if hintErr != nil {
+		t.Error("hint update failed")
+		return
+	}
+	let (tuple, fetchErr) = db.HeapFetch(201, a, []u8{})
+	if fetchErr != nil {
+		t.Error("fetch failed")
+		return
+	}
+	crucible.Equal(mut t, "xmin retained", tuple.Header.Xmin(), u32(2))
+	crucible.Equal(mut t, "hint bits applied", tuple.Header.Infomask(), u16(4))
+	db.HeapDelete(NewXidCtx(8, 3), 201, b) catch err {
+		t.Error("delete failed: {err}")
+		return
+	}
+	db.Prune(201, 9) catch err {
+		t.Error("prune failed: {err}")
+		return
+	}
+	let visible = db.PageAllVisible(201, PageNo(0)) catch _ { false }
+	crucible.True("page marked all visible", visible)
+	mut scan = db.HeapScan(201)
+	let (_, first) = scan.Next()
+	let (_, second) = scan.Next()
+	let (_, third) = scan.Next()
+	crucible.True("prune leaves only live version", first && !second && !third)
+	db.Close() catch err {
+		t.Error("close failed: {err}")
+		return
+	}
+	let (reopened, reopenErr) = Open(dir, Options{BufferPages: 4})
+	if reopenErr != nil {
+		t.Error("reopen failed")
+		return
+	}
+	let (after, afterErr) = reopened.HeapFetch(201, a, []u8{})
+	if afterErr != nil {
+		t.Error("fetch after reopen failed")
+		return
+	}
+	crucible.Equal(mut t, "hint survives checkpoint", after.Header.Infomask(), u16(4))
+	reopened.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+}
+
+fn TestBtreeSplitsRangesDuplicatesAndRecovery(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-btree-deep-test"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 8})
+	if openErr != nil {
+		t.Error("open failed")
+		return
+	}
+	mut db = opened
+	db.CreateIndex(202, false) catch err {
+		t.Error("create index failed: {err}")
+		return
+	}
+	for i in 0..1400 {
+		let key = testIndexKey(u32(i))
+		let indexErr = db.IndexInsert(202, key, NewTid(u32(i/100), u16(i%100+1)))
+		if indexErr != nil {
+			t.Error("index insert failed at {i}: {indexErr}")
+			return
+		}
+	}
+	let duplicateKey = testIndexKey(777)
+	db.IndexInsert(202, duplicateKey, NewTid(99, 7)) catch err {
+		t.Error("duplicate insert failed: {err}")
+		return
+	}
+	let (matches, lookupErr) = db.IndexLookupExact(202, duplicateKey)
+	if lookupErr != nil {
+		t.Error("exact lookup failed")
+		return
+	}
+	crucible.Equal(mut t, "exact lookup includes both duplicates", len(matches), 2)
+	mut forward = db.IndexSeek(202, testIndexKey(100), testIndexKey(150), 0)
+	crucible.Equal(mut t, "forward scan has inclusive endpoints", countIndexScan(mut forward), 51)
+	mut backward = db.IndexSeek(202, testIndexKey(100), testIndexKey(150), IndexBackward)
+	crucible.Equal(mut t, "backward scan has same range", countIndexScan(mut backward), 51)
+	db.IndexDelete(202, duplicateKey, NewTid(99, 7)) catch err {
+		t.Error("index delete failed: {err}")
+		return
+	}
+	let (afterDelete, deleteLookupErr) = db.IndexLookupExact(202, duplicateKey)
+	if deleteLookupErr != nil {
+		t.Error("lookup after delete failed")
+		return
+	}
+	crucible.Equal(mut t, "delete removes one duplicate", len(afterDelete), 1)
+	let pageCount = db.files.PageCount(202) catch _ { 0 }
+	crucible.True("tree grew beyond the meta and first leaf", pageCount > 2)
+	db.Checkpoint() catch err {
+		t.Error("checkpoint failed: {err}")
+		return
+	}
+	db.Close() catch err {
+		t.Error("close failed: {err}")
+		return
+	}
+	let (reopened, reopenErr) = Open(dir, Options{BufferPages: 8})
+	if reopenErr != nil {
+		t.Error("reopen failed: {reopenErr}")
+		return
+	}
+	let (persisted, persistedErr) = reopened.IndexLookupExact(202, testIndexKey(777))
+	if persistedErr != nil {
+		t.Error("exact lookup after recovery failed")
+		return
+	}
+	crucible.Equal(mut t, "B-tree entry survives recovery", len(persisted), 1)
+	reopened.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+}
+
+fn TestBtreeRecoveryBeforeCheckpoint(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-btree-redo-test"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 4})
+	if openErr != nil {
+		t.Error("open failed")
+		return
+	}
+	mut db = opened
+	db.CreateIndex(203, false) catch err {
+		t.Error("create index failed: {err}")
+		return
+	}
+	for i in 0..700 {
+		db.IndexInsert(203, testIndexKey(u32(i)), NewTid(u32(i/50), u16(i%50+1))) catch err {
+			t.Error("index insert failed at {i}: {err}")
+			return
+		}
+	}
+	db.Sync(db.CurrentLsn()) catch err {
+		t.Error("WAL sync failed: {err}")
+		return
+	}
+	// Reopening without Close simulates recovery before any checkpoint flushed the dirty pages.
+	let (recovered, recoveryErr) = Open(dir, Options{BufferPages: 4})
+	if recoveryErr != nil {
+		t.Error("recovery failed: {recoveryErr}")
+		return
+	}
+	let (items, lookupErr) = recovered.IndexLookupExact(203, testIndexKey(699))
+	if lookupErr != nil {
+		t.Error("lookup after redo failed")
+		return
+	}
+	crucible.Equal(mut t, "uncheckpointed index insert is redone", len(items), 1)
+	recovered.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+}
+
+fn testIndexKey(v u32) []u8 {
+	return []u8{u8(v >> 24), u8(v >> 16), u8(v >> 8), u8(v)}
+}
+
+fn countIndexScan(scan mut IndexScan) i64 {
+	mut n = i64(0)
+	for {
+		let (_, ok) = scan.Next()
+		if !ok { break }
+		n += 1
+	}
+	return n
+}

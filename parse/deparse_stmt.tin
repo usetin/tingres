@@ -6,7 +6,9 @@ fn deparseAlterTable(v AlterTableStmt) str {
 	out += nameText(v.Table)
 	for i, cmd in v.Commands {
 		if i > 0 { out += ", " } else { out += " " }
-		if cmd.Kind == "add column" {
+		if cmd.Kind == "raw" {
+			out += cmd.Text
+		} else if cmd.Kind == "add column" {
 			if let col = cmd.Column { out += "ADD COLUMN " + deparseColumn(col) }
 		} else if cmd.Kind == "add constraint" {
 			if let c = cmd.Constraint { out += "ADD " + deparseConstraint(c) }
@@ -21,6 +23,7 @@ fn deparseAlterTable(v AlterTableStmt) str {
 			if let name = cmd.Name { out += identifierText(name) }
 			out += " TYPE "
 			if let tn = cmd.TypeName { out += deparseType(tn) }
+			if let expr = cmd.Expression { out += " USING " + deparseExpr(expr) }
 		} else if cmd.Kind == "set default" {
 			out += "ALTER COLUMN "
 			if let name = cmd.Name { out += identifierText(name) }
@@ -46,6 +49,15 @@ fn deparseAlterTable(v AlterTableStmt) str {
 		} else if cmd.Kind == "rename table" {
 			out += "RENAME TO "
 			if let newName = cmd.NewName { out += identifierText(newName) }
+		} else if cmd.Kind == "rename constraint" {
+			out += "RENAME CONSTRAINT "
+			if let name = cmd.Name { out += identifierText(name) }
+			out += " TO "
+			if let newName = cmd.NewName { out += identifierText(newName) }
+		} else if cmd.Kind == "alter constraint" {
+			out += "ALTER CONSTRAINT "
+			if let name = cmd.Name { out += identifierText(name) }
+			out += " " + cmd.Text
 		} else if cmd.Kind == "owner to" {
 			out += "OWNER TO "
 			if let newName = cmd.NewName { out += identifierText(newName) }
@@ -72,6 +84,15 @@ fn deparseAlterRole(v AlterRoleStmt) str {
 	for opt in v.Options {
 		out += " " + upperAscii(opt.Name)
 		if let val = opt.Value { out += " " + deparseExpr(val) }
+	}
+	return out
+}
+
+fn joinComma(items []str) str {
+	mut out = ""
+	for i, item in items {
+		if i > 0 { out += ", " }
+		out += item
 	}
 	return out
 }
@@ -107,6 +128,8 @@ fn deparseCreateIndex(v CreateIndexStmt) str {
 		out += ")"
 	}
 	if let whereExpr = v.Where { out += " WHERE " + deparseExpr(whereExpr) }
+	if len(v.WithOptions) > 0 { out += " WITH (" + joinComma(v.WithOptions) + ")" }
+	if v.Tablespace != "" { out += " TABLESPACE " + v.Tablespace }
 	return out
 }
 
@@ -118,6 +141,7 @@ fn deparseCreateView(v CreateViewStmt) str {
 	if v.IfNotExists { out += "IF NOT EXISTS " }
 	out += nameText(v.Name)
 	if len(v.Columns) > 0 { out += " (" + deparseIdentifierList(v.Columns) + ")" }
+	if len(v.Options) > 0 { out += " WITH (" + v.Options[0] + ")" }
 	out += " AS " + deparseSelect(v.Query)
 	if v.CheckOption != "" {
 		if v.CheckOption == "local" || v.CheckOption == "cascaded" {
@@ -147,10 +171,12 @@ fn deparseCreateSchema(v CreateSchemaStmt) str {
 	if v.IfNotExists { out += "IF NOT EXISTS " }
 	out += identifierText(v.Name)
 	if let auth = v.Authorization { out += " AUTHORIZATION " + identifierText(auth) }
+	for element in v.Elements { out += " " + deparseStatement(element) }
 	return out
 }
 
 fn deparseCreateType(v CreateTypeStmt) str {
+	if v.Kind == "base" { return "CREATE TYPE " + nameText(v.Name) + " (" + v.RangeOptions + ")" }
 	mut out = "CREATE TYPE " + nameText(v.Name) + " AS "
 	if v.Kind == "enum" {
 		out += "ENUM ("
@@ -166,6 +192,8 @@ fn deparseCreateType(v CreateTypeStmt) str {
 			out += identifierText(attr.Name) + " " + deparseType(attr.TypeName)
 		}
 		out += ")"
+	} else if v.Kind == "range" {
+		out += "RANGE (" + v.RangeOptions + ")"
 	}
 	return out
 }
@@ -181,9 +209,9 @@ fn deparseCreateFunction(v CreateFunctionStmt) str {
 		out += deparseType(param.TypeName)
 		if let def = param.Default { out += " DEFAULT " + deparseExpr(def) }
 	}
-	out += ") RETURNS "
-	if v.ReturnSet { out += "SETOF " }
-	if let ret = v.Returns { out += deparseType(ret) }
+	out += ")"
+	if v.ReturnSet { out += " RETURNS SETOF" }
+	if let ret = v.Returns { out += " RETURNS " + deparseType(ret) }
 	if v.Language != "" { out += " LANGUAGE " + upperAscii(v.Language) }
 	if v.Body != "" { out += " AS " + v.Body }
 	for opt in v.Options {
@@ -370,7 +398,9 @@ fn deparseDiscard(v DiscardStmt) str {
 }
 
 fn deparseComment(v CommentStmt) str {
-	mut out = "COMMENT ON " + upperAscii(v.ObjectType) + " " + nameText(v.Name) + " IS "
+	mut out = "COMMENT ON " + upperAscii(v.ObjectType) + " " + nameText(v.Name)
+	if let on = v.OnName { out += " ON " + nameText(on) }
+	out += " IS "
 	if let text = v.Text {
 		out += text
 	} else {

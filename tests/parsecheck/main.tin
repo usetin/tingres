@@ -2,13 +2,17 @@ package main
 
 import "say"
 import "quarry"
+import "fault"
 import "../../parse"
 
 // parsecheck FILE.sql...: how much of PostgreSQL's own regression SQL tingres's parser accepts.
 // Each file is split into statements (psql meta-commands and COPY data blocks removed) and every
-// statement goes through parse.Parse. Prints one line per file and a TOTAL line:
+// statement goes through parse.Parse. Output:
 //   FILE <name> <statements> <parsed>
+//   F <category>              one line per failing statement (category groups failures)
+//   FIRST <name> <fail> <parsed> <category> :: <statement snippet>
 //   TOTAL <files> <filesFullyParsed> <statements> <parsed>
+// Pipe the F lines through `sort | uniq -c | sort -rn` to rank missing constructs.
 
 fn main() {
 	let args = quarry.Args()
@@ -18,19 +22,65 @@ fn main() {
 	mut ok i64 = 0
 	for a in args[1:] {
 		let text = quarry.ReadFile(a) catch _ { "" }
-		let stmts = splitStatements(stripMeta(text))
+		let vars = collectPsqlVars(text)
+		let stmts = splitStatements(substitutePsqlVars(stripInlineMeta(stripMeta(text)), vars))
 		mut good i64 = 0
+		mut bad i64 = 0
+		mut firstBad = ""
 		for s in stmts {
-			let r = parse.Parse(s) catch _ { []parse.Stmt{} }
+			let r = parse.Parse(s) catch err {
+				bad += 1
+				let cat = normMsg(err)
+				say.Line("F {cat} :: {snippet(s)}")
+				if firstBad == "" { firstBad = cat + " :: " + snippet(s) }
+				[]parse.Stmt{}
+			}
 			if len(r) > 0 { good += 1 }
 		}
 		say.Line("FILE {baseName(a)} {len(stmts)} {good}")
+		if bad > 0 { say.Line("FIRST {baseName(a)} {bad} {good} {firstBad}") }
 		files += 1
 		if good == len(stmts) { full += 1 }
 		total += len(stmts)
 		ok += good
 	}
 	say.Line("TOTAL {files} {full} {total} {ok}")
+}
+
+// normMsg reduces a parse fault to a stable category: drop the position suffix and the part of
+// the message after the first quoted token.
+fn normMsg(err fault) str {
+	let message = fault.Message(err)
+	mut cut = len(message)
+	let marker = " (position "
+	let at = indexOf(message, marker)
+	if at >= 0 { cut = at }
+	let q1 = indexOf(message, "\"")
+	if q1 >= 0 && q1 < cut {
+		let rest = message[q1 + 1:]
+		let q2 = indexOf(rest, "\"")
+		if q2 >= 0 && q1 + 1 + q2 + 1 <= cut { cut = q1 + 1 + q2 + 1 } else { cut = q1 + 1 }
+	}
+	return message[:cut]
+}
+
+fn indexOf(s str, needle str) i64 {
+	if len(needle) == 0 { return 0 }
+	if len(s) < len(needle) { return -1 }
+	for i in 0..len(s) - len(needle) + 1 {
+		if s[i:i + len(needle)] == needle { return i }
+	}
+	return -1
+}
+
+fn snippet(s str) str {
+	mut out = ""
+	for i in 0..len(s) {
+		let c = s[i]
+		if c == 10 || c == 13 || c == 9 { out += " " } else { out += str(c) }
+		if len(out) >= 90 { return out + "..." }
+	}
+	return out
 }
 
 fn baseName(p str) str {
@@ -93,6 +143,7 @@ fn splitStatements(sql str) []str {
 	mut start = 0
 	mut i = 0
 	mut meaningful = false
+	mut parens = 0
 	let n = len(sql)
 	for i < n {
 		let c = sql[i]
@@ -158,18 +209,291 @@ fn splitStatements(sql str) []str {
 				continue
 			}
 		}
-		if c == ';' {
+		if c == ';' && parens == 0 {
 			if meaningful { out = append(out, sql[start:i + 1]) }
 			start = i + 1
 			meaningful = false
 			i += 1
 			continue
 		}
+		if c == '(' { parens += 1 } else if c == ')' { if parens > 0 { parens -= 1 } }
 		if c != ' ' && c != '\n' && c != '\t' && c != '\r' { meaningful = true }
 		i += 1
 	}
 	if meaningful { out = append(out, sql[start:n]) }
 	return out
+}
+
+// stripInlineMeta removes psql meta-commands (a backslash to end of line) that appear in the
+// middle of a line, e.g. "SELECT 1 \gset". Backslashes inside strings, dollar-quoted strings
+// and comments are left alone.
+fn stripInlineMeta(text str) str {
+	mut out = []u8{}
+	mut i = 0
+	let n = len(text)
+	for i < n {
+		let c = text[i]
+		if c == '\'' || c == '"' {
+			let q = c
+			out = append(out, c)
+			i += 1
+			for i < n {
+				out = append(out, text[i])
+				if text[i] == '\\' && q == '\'' { if i + 1 < n { out = append(out, text[i + 1])
+						i += 2
+						continue } }
+				if text[i] == q {
+					if i + 1 < n && text[i + 1] == q { out = append(out, text[i + 1])
+						i += 2
+						continue }
+					i += 1
+					break
+				}
+				i += 1
+			}
+			continue
+		}
+		if c == '$' {
+			mut j = i + 1
+			for j < n && isIdent(text[j]) { j += 1 }
+			if j < n && text[j] == '$' {
+				let tag = text[i:j + 1]
+				for k in i..j + 1 { out = append(out, text[k]) }
+				i = j + 1
+				mut found = false
+				mut k = j + 1
+				for k + len(tag) <= n {
+					if text[k:k + len(tag)] == tag {
+						for m in k..k + len(tag) { out = append(out, text[m]) }
+						i = k + len(tag)
+						found = true
+						break
+					}
+					k += 1
+				}
+				if !found { i = n }
+				continue
+			}
+		}
+		if c == '-' && i + 1 < n && text[i + 1] == '-' {
+			for i < n && text[i] != '\n' { out = append(out, text[i])
+				i += 1 }
+			continue
+		}
+		if c == '/' && i + 1 < n && text[i + 1] == '*' {
+			mut depth = 1
+			for i < n && depth > 0 {
+				out = append(out, text[i])
+				if text[i] == '/' && i + 1 < n && text[i + 1] == '*' { out = append(out, text[i + 1])
+					depth += 1
+					i += 2
+					continue }
+				if text[i] == '*' && i + 1 < n && text[i + 1] == '/' { out = append(out, text[i + 1])
+					depth -= 1
+					i += 2
+					continue }
+				i += 1
+			}
+			continue
+		}
+		if c == '\\' {
+			// A psql meta-command terminates the current query; represent it as a statement
+			// terminator so a query without a trailing semicolon (SELECT 1 \gset) still splits.
+			out = append(out, ';')
+			for i < n && text[i] != '\n' { i += 1 }
+			continue
+		}
+		out = append(out, c)
+		i += 1
+	}
+	return str(out)
+}
+
+// collectPsqlVars scans psql \set lines and returns the variable values so :name references to
+// SQL-valued variables (e.g. \set x 'truncate t; insert ...') can be expanded.
+fn collectPsqlVars(text str) map[str]str {
+	mut vars = make(map[str]str)
+	mut start = 0
+	for i in 0..len(text) + 1 {
+		if i == len(text) || text[i] == '\n' {
+			let line = trimLeftSpace(text[start:i])
+			start = i + 1
+			if hasPrefixText(line, "\\set") {
+				let rest = trimLeftSpace(line[4:])
+				let boundary = firstSpace(rest)
+				let name = rest[:boundary]
+				mut value = trimSpaces(rest[boundary:])
+				if len(value) >= 2 && value[0] == '\'' && value[len(value) - 1] == '\'' {
+					value = replaceDoubledQuote(value[1:len(value) - 1])
+				}
+				if len(name) > 0 { vars[name] = value }
+			}
+		}
+	}
+	return vars
+}
+
+fn trimLeftSpace(s str) str {
+	mut a = 0
+	for a < len(s) && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r') { a += 1 }
+	return s[a:]
+}
+
+fn trimSpaces(s str) str {
+	mut a = 0
+	mut b = len(s)
+	for a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n') { a += 1 }
+	for b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r' || s[b - 1] == '\n') { b -= 1 }
+	return s[a:b]
+}
+
+fn firstSpace(s str) i64 {
+	for i in 0..len(s) {
+		if s[i] == ' ' || s[i] == '\t' { return i }
+	}
+	return len(s)
+}
+
+fn replaceDoubledQuote(s str) str {
+	mut out = []u8{}
+	mut i = 0
+	for i < len(s) {
+		if s[i] == '\'' && i + 1 < len(s) && s[i + 1] == '\'' {
+			out = append(out, '\'')
+			i += 2
+			continue
+		}
+		out = append(out, s[i])
+		i += 1
+	}
+	return str(out)
+}
+
+fn hasPrefixText(s str, prefix str) bool {
+	if len(s) < len(prefix) { return false }
+	for i in 0..len(prefix) {
+		if s[i] != prefix[i] { return false }
+	}
+	return true
+}
+
+fn containsChar(s str, c u8) bool {
+	for i in 0..len(s) {
+		if s[i] == c { return true }
+	}
+	return false
+}
+
+// hasVarRef reports whether s contains a psql variable reference (:name, not ::cast).
+fn hasVarRef(s str) bool {
+	for i in 0..len(s) {
+		if s[i] != ':' { continue }
+		if i > 0 && s[i - 1] == ':' { continue }
+		if i + 1 < len(s) && s[i + 1] == ':' { continue }
+		if i + 1 < len(s) && isIdent(s[i + 1]) { return true }
+	}
+	return false
+}
+
+// substitutePsqlVars replaces psql variable references (:'name' and :name) with a parseable
+// placeholder, so regression scripts that psql substitutes before sending still tokenize.
+// A :name whose \set value is SQL text (no nested variables) is expanded to that text.
+fn substitutePsqlVars(text str, vars map[str]str) str {
+	mut out = []u8{}
+	mut i = 0
+	let n = len(text)
+	for i < n {
+		let c = text[i]
+		if c == '$' {
+			mut j = i + 1
+			for j < n && isIdent(text[j]) { j += 1 }
+			if j < n && text[j] == '$' {
+				let tag = text[i:j + 1]
+				for k in i..j + 1 { out = append(out, text[k]) }
+				i = j + 1
+				mut found = false
+				mut k = j + 1
+				for k + len(tag) <= n {
+					if text[k:k + len(tag)] == tag {
+						for m in k..k + len(tag) { out = append(out, text[m]) }
+						i = k + len(tag)
+						found = true
+						break
+					}
+					k += 1
+				}
+				if !found { i = n }
+				continue
+			}
+		}
+		if c == '\'' || c == '"' {
+			let q = c
+			out = append(out, c)
+			i += 1
+			for i < n {
+				out = append(out, text[i])
+				if text[i] == '\\' && q == '\'' { if i + 1 < n { out = append(out, text[i + 1])
+						i += 2
+						continue } }
+				if text[i] == q {
+					if i + 1 < n && text[i + 1] == q { out = append(out, text[i + 1])
+						i += 2
+						continue }
+					i += 1
+					break
+				}
+				i += 1
+			}
+			continue
+		}
+		if c == '-' && i + 1 < n && text[i + 1] == '-' {
+			for i < n && text[i] != '\n' { out = append(out, text[i])
+				i += 1 }
+			continue
+		}
+		if c == '/' && i + 1 < n && text[i + 1] == '*' {
+			mut depth = 1
+			for i < n && depth > 0 {
+				out = append(out, text[i])
+				if text[i] == '/' && i + 1 < n && text[i + 1] == '*' { out = append(out, text[i + 1])
+					depth += 1
+					i += 2
+					continue }
+				if text[i] == '*' && i + 1 < n && text[i + 1] == '/' { out = append(out, text[i + 1])
+					depth -= 1
+					i += 2
+					continue }
+				i += 1
+			}
+			continue
+		}
+		if c == ':' && i + 1 < n {
+			mut prev u8 = ' '
+			if i > 0 { prev = text[i - 1] }
+			let prevOk = prev == ' ' || prev == '\n' || prev == '\t' || prev == ',' || prev == '(' || prev == '=' || prev == '\r'
+			let next = text[i + 1]
+			if isIdent(next) && next != ':' && prevOk {
+				mut j = i + 1
+				for j < n && isIdent(text[j]) { j += 1 }
+				let name = text[i + 1:j]
+				let (value, ok) = vars[name]
+				if ok && !hasVarRef(value) && len(value) > 0 {
+					for k in 0..len(value) { out = append(out, value[k]) }
+					i = j
+					continue
+				}
+				i += 1
+				continue
+			}
+			if next == '\'' && next != ':' && prevOk {
+				i += 1
+				continue
+			}
+		}
+		out = append(out, c)
+		i += 1
+	}
+	return str(out)
 }
 
 fn isIdent(c u8) bool {

@@ -1,0 +1,756 @@
+package store
+
+// B-tree through the buffer pool. Keys are opaque byte strings ordered by memcmp; equal keys are
+// ordered by heap TID so duplicates are allowed and stable. A leaf page holds sorted live entries
+// [u16 keyLen][key][u32 tidPage][u16 tidSlot]; an internal page holds [u16 keyLen][key][u32 child]
+// with slot 1 as the leftmost child (empty key). A leaf insert or delete that does not split is
+// applied in place through the page latch and logged physiologically; a split or root move is
+// logged as full page images of every page it touches, so a crash in the middle of a split
+// recovers by replaying the images.
+
+// IndexSeek flags. Bounds are inclusive unless the matching exclusive flag is set; an unbounded
+// side has no key to compare.
+const IndexLoExclusive u32 = 1
+const IndexHiExclusive u32 = 2
+const IndexBackward u32 = 4
+const IndexLoUnbounded u32 = 8
+const IndexHiUnbounded u32 = 16
+
+const btreeMetaRootOffset i64 = 32
+const btreeMetaHeightOffset i64 = 36
+const btreeMetaUniqueOffset i64 = 40
+
+const maxKeyBytes i64 = 2048
+
+// CreateIndex creates an empty B-tree relation with a meta page and one empty leaf.
+fn (s mut Store) CreateIndex(rel RelId, unique bool) ! {
+	if s.closed {
+		fail "store: closed"
+	}
+	let (_, exists) = s.rels[u32(rel)]
+	if exists || s.files.Exists(rel) {
+		fail "store: relation already exists"
+	}
+	let lsn = try s.appendWal(walKindRelCreate, 0, u32(rel), 0, 0, []u8{relKindBtree})
+	try s.Sync(lsn)
+	try s.files.Ensure(rel)
+	mut meta = NewPage()
+	meta.SetPageType(PageTypeBtreeMeta)
+	writeU32(mut meta.Data, btreeMetaRootOffset, 1)
+	writeU32(mut meta.Data, btreeMetaHeightOffset, 0)
+	if unique {
+		writeU32(mut meta.Data, btreeMetaUniqueOffset, 1)
+	}
+	meta.SetLsn(u64(lsn))
+	mut leaf = NewPage()
+	leaf.SetPageType(PageTypeBtreeLeaf)
+	leaf.SetLsn(u64(lsn))
+	try s.files.WritePage(rel, 0, meta)
+	try s.files.WritePage(rel, 1, leaf)
+	s.rels[u32(rel)] = relKindBtree
+	s.btreeHint[u32(rel)] = (u64(1) << 32) | u64(1)
+}
+
+// IndexInsert inserts one key/TID pair, splitting pages as needed. The common no-split case is
+// applied in place from the pinned latch without copying the page.
+fn (s mut Store) IndexInsert(rel RelId, key []u8, t Tid) ! {
+	let (kind, ok) = s.rels[u32(rel)]
+	if !ok || kind != relKindBtree {
+		fail "store: relation does not exist"
+	}
+	if len(key) > maxKeyBytes {
+		fail "store: index key is too large"
+	}
+	let (root, height) = try s.btreeRoot(rel)
+	mut path = []u32{}
+	mut block = root
+	mut level = height
+	for level > 0 {
+		path = append(path, block)
+		block = try s.btreeChildAt(rel, block, key)
+		level -= 1
+	}
+	let entry = leafEntry(key, t)
+	let inserted = try s.leafInsertInPlace(rel, block, entry)
+	if inserted {
+		return
+	}
+	try s.btreeSplitInsert(rel, block, root, height, path, entry)
+}
+
+// IndexDelete removes one key/TID pair; it is for vacuum and does not merge underfull pages.
+fn (s mut Store) IndexDelete(rel RelId, key []u8, t Tid) ! {
+	let (kind, ok) = s.rels[u32(rel)]
+	if !ok || kind != relKindBtree {
+		fail "store: relation does not exist"
+	}
+	let block = try s.btreeLeaf(rel, key)
+	let page = try s.readPageLocal(rel, block)
+	let entry = leafEntry(key, t)
+	mut p = page
+	if !leafDeleteEntry(mut p, entry) {
+		return
+	}
+	let lsn = try s.appendWal(walKindBtreeDelete, 0, u32(rel), u32(block), 0, entry)
+	let recStart = u64(lsn)-u64(walHeaderSize+len(entry))
+	try s.installPage(rel, block, p, recStart)
+}
+
+// leafLowerBoundSlot is the first 1-based slot whose key is at or above key; leaves have no dead
+// slots, so this is a binary search.
+fn leafLowerBoundSlot(page Page, key []u8) i64 {
+	let n = i64(page.Header().Slots)
+	mut lo = i64(1)
+	mut hi = n
+	mut res = n+1
+	for lo <= hi {
+		let mid = (lo+hi)/2
+		let e = page.ItemView(u16(mid)) catch _ { break }
+		if keyCmp(entryKey(e), key) < 0 {
+			lo = mid+1
+		} else {
+			res = mid
+			hi = mid-1
+		}
+	}
+	return res
+}
+
+// IndexLookupExact returns every TID stored for key, including dead ones; the caller checks
+// uniqueness.
+fn (s mut Store) IndexLookupExact(rel RelId, key []u8) ![]Tid {
+	let (kind, ok) = s.rels[u32(rel)]
+	if !ok || kind != relKindBtree {
+		fail "store: relation does not exist"
+	}
+	mut tids = []Tid{}
+	mut block = try s.btreeLeaf(rel, key)
+	mut first = true
+	for _guard in 0..1000000 {
+		let page = try s.readPageLocal(rel, block)
+		let n = i64(page.Header().Slots)
+		mut start = i64(1)
+		if first {
+			start = leafLowerBoundSlot(page, key)
+			first = false
+		}
+		mut stop = false
+		mut i = start
+		for i <= n {
+			let e = page.Item(u16(i)) catch _ {
+				i += 1
+				continue
+			}
+			let c = keyCmp(entryKey(e), key)
+			if c == 0 {
+				tids = append(tids, leafEntryTid(e))
+			} else if c > 0 {
+				stop = true
+			}
+			i += 1
+		}
+		let next = page.NextBlock()
+		if stop || next == 0 {
+			break
+		}
+		block = PageNo(next)
+	}
+	return tids
+}
+
+// IndexSeek returns an ordered range scan; flags select bound inclusivity, unbounded sides and
+// direction. A fault is reported through IndexScan.Error because the contract is not fallible.
+fn (s mut Store) IndexSeek(rel RelId, lo []u8, hi []u8, flags u32) IndexScan {
+	mut scan = IndexScan{items: []IndexItem{}, pos: 0, backward: flags&IndexBackward != 0, err: ""}
+	let (kind, ok) = s.rels[u32(rel)]
+	if !ok || kind != relKindBtree {
+		scan.err = "store: relation does not exist"
+		return scan
+	}
+	mut items = s.indexCollect(rel, lo, hi, flags) catch err {
+		scan.err = "{err}"
+		return scan
+	}
+	if flags&IndexBackward != 0 {
+		mut rev = []IndexItem{}
+		mut i = len(items)-1
+		for i >= 0 {
+			rev = append(rev, items[i])
+			i -= 1
+		}
+		items = rev
+	}
+	scan.items = items
+	return scan
+}
+
+fn (s mut Store) indexCollect(rel RelId, lo []u8, hi []u8, flags u32) ![]IndexItem {
+	mut items = []IndexItem{}
+	let loUnbounded = flags&IndexLoUnbounded != 0
+	let hiUnbounded = flags&IndexHiUnbounded != 0
+	let loExcl = flags&IndexLoExclusive != 0
+	let hiExcl = flags&IndexHiExclusive != 0
+	mut block = try s.btreeLeaf(rel, lo)
+	if loUnbounded {
+		block = try s.btreeLeftmostLeaf(rel)
+	}
+	mut first = true
+	for _guard in 0..1000000 {
+		let page = try s.readPageLocal(rel, block)
+		let n = i64(page.Header().Slots)
+		mut start = i64(1)
+		if first {
+			if !loUnbounded {
+				start = leafLowerBoundSlot(page, lo)
+			}
+			first = false
+		}
+		mut pastHi = false
+		mut i = start
+		for i <= n {
+			let e = page.Item(u16(i)) catch _ {
+				i += 1
+				continue
+			}
+			let k = entryKey(e)
+			if !loUnbounded {
+				let cl = keyCmp(k, lo)
+				if cl < 0 || (cl == 0 && loExcl) {
+					i += 1
+					continue
+				}
+			}
+			if !hiUnbounded {
+				let ch = keyCmp(k, hi)
+				if ch > 0 || (ch == 0 && hiExcl) {
+					if ch > 0 {
+						pastHi = true
+					}
+					i += 1
+					continue
+				}
+			}
+			items = append(items, IndexItem{key: copyBytes(k), tid: leafEntryTid(e)})
+			i += 1
+		}
+		let next = page.NextBlock()
+		if pastHi || next == 0 {
+			break
+		}
+		block = PageNo(next)
+	}
+	return items
+}
+
+// ---- in-place leaf mutation ----
+
+fn (s mut Store) leafInsertInPlace(rel RelId, block PageNo, entry []u8) !bool {
+	let (frame, page) = try s.pinPage(rel, block)
+	try s.buffers.LockContent(frame)
+	if page.FreeSpace() < i64(len(entry))+linePointerSize {
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+		return false
+	}
+	let pos = leafInsertPos(page, entry)
+	let lsn = s.appendWal(walKindBtreeInsert, 0, u32(rel), u32(block), 0, entry) catch err {
+		s.releasePinnedPage(frame) catch _ { }
+		fail err
+	}
+	let (_, insErr) = page.InsertAt(pos, entry)
+	if insErr != nil {
+		s.releasePinnedPage(frame) catch _ { }
+		fail insErr
+	}
+	let dirtyErr = s.buffers.MarkDirty(frame, lsn)
+	let unlockErr = s.buffers.UnlockContent(frame)
+	let unpinErr = s.buffers.Unpin(frame)
+	if dirtyErr != nil {
+		fail dirtyErr
+	}
+	if unlockErr != nil {
+		fail unlockErr
+	}
+	if unpinErr != nil {
+		fail unpinErr
+	}
+	return true
+}
+
+// leafInsertPos is the 1-based slot before which entry sorts; pages have no dead slots.
+fn leafInsertPos(page Page, entry []u8) u16 {
+	let n = i64(page.Header().Slots)
+	mut lo = i64(1)
+	mut hi = n
+	mut pos = n+1
+	for lo <= hi {
+		let mid = (lo+hi)/2
+		let e = page.ItemView(u16(mid)) catch _ { break }
+		if leafEntryLess(e, entry) {
+			lo = mid+1
+		} else {
+			pos = mid
+			hi = mid-1
+		}
+	}
+	return u16(pos)
+}
+
+// ---- split path ----
+
+type BtreeCtx struct {
+	nextBlock u32
+	blocks []u32
+	pages []Page
+}
+
+fn newBtreeCtx(s Store, rel RelId) BtreeCtx {
+	let disk = s.files.PageCount(rel) catch _ { 0 }
+	let resident = s.buffers.RelationPageCount(rel)
+	return BtreeCtx{nextBlock: max(disk, resident), blocks: []u32{}, pages: []Page{}}
+}
+
+fn (c mut BtreeCtx) put(block u32, page Page) {
+	for i, b in c.blocks {
+		if b == block {
+			c.pages[i] = page
+			return
+		}
+	}
+	c.blocks = append(c.blocks, block)
+	c.pages = append(c.pages, page)
+}
+
+fn (s mut Store) flushBtreeImages(rel RelId, ctx BtreeCtx) ! {
+	mut body = make([]u8, 0, 4+i64(len(ctx.blocks))*(4+PageSize))
+	mut count = make([]u8, 4)
+	writeU32(mut count, 0, u32(len(ctx.blocks)))
+	body = append(body, count...)
+	for i, b in ctx.blocks {
+		mut hdr = make([]u8, 4)
+		writeU32(mut hdr, 0, b)
+		body = append(body, hdr...)
+		body = append(body, ctx.pages[i].Data...)
+	}
+	let lsn = try s.appendWal(walKindPageImages, 0, u32(rel), 0, 0, body)
+	let recStart = u64(lsn)-u64(walHeaderSize+i64(len(body)))
+	for i, b in ctx.blocks {
+		try s.installPage(rel, PageNo(b), ctx.pages[i], recStart)
+	}
+}
+
+// btreeSplitInsert splits the full leaf and propagates the separator up the recorded path.
+fn (s mut Store) btreeSplitInsert(rel RelId, leafBlock PageNo, root u32, height u32, path []u32, entry []u8) ! {
+	mut ctx = newBtreeCtx(s, rel)
+	let leaf = try s.readPageLocal(rel, leafBlock)
+	let newBlock = ctx.nextBlock
+	ctx.nextBlock += 1
+	let oldNext = leaf.NextBlock()
+	let (left, right, sep) = splitLeaf(leaf, u32(leafBlock), newBlock, entry)
+	ctx.put(u32(leafBlock), left)
+	ctx.put(newBlock, right)
+	if oldNext != 0 {
+		mut nx = try s.readPageLocal(rel, PageNo(oldNext))
+		nx.SetPrevBlock(newBlock)
+		ctx.put(oldNext, nx)
+	}
+	mut childBlock = newBlock
+	mut sepKey = sep
+	mut done = false
+	mut i = len(path)-1
+	for i >= 0 && !done {
+		let parentBlock = path[i]
+		let parent = try s.readPageLocal(rel, PageNo(parentBlock))
+		mut p = parent
+		if internalInsertEntry(mut p, internalEntry(sepKey, childBlock)) {
+			ctx.put(parentBlock, p)
+			done = true
+		} else {
+			let nb = ctx.nextBlock
+			ctx.nextBlock += 1
+			let pOldNext = parent.NextBlock()
+			let (pl, pr, upSep) = splitInternal(parent, u32(parentBlock), nb, sepKey, childBlock)
+			ctx.put(parentBlock, pl)
+			ctx.put(nb, pr)
+			if pOldNext != 0 {
+				mut nx = try s.readPageLocal(rel, PageNo(pOldNext))
+				nx.SetPrevBlock(nb)
+				ctx.put(pOldNext, nx)
+			}
+			sepKey = upSep
+			childBlock = nb
+		}
+		i -= 1
+	}
+	if !done {
+		let nb = ctx.nextBlock
+		ctx.nextBlock += 1
+		mut newRoot = newBtreePage(PageTypeBtreeInternal)
+		newRoot.InsertRaw(internalEntry([]u8{}, root)) catch _ { }
+		newRoot.InsertRaw(internalEntry(sepKey, childBlock)) catch _ { }
+		ctx.put(nb, newRoot)
+		mut meta = try s.readPageLocal(rel, PageNo(0))
+		writeU32(mut meta.Data, btreeMetaRootOffset, nb)
+		writeU32(mut meta.Data, btreeMetaHeightOffset, height+1)
+		ctx.put(0, meta)
+		s.btreeHint[u32(rel)] = (u64(nb) << 32) | u64(height+2)
+	}
+	try s.flushBtreeImages(rel, ctx)
+}
+
+// ---- tree navigation ----
+
+fn (s mut Store) btreeRoot(rel RelId) !(u32, u32) {
+	let packed = s.btreeHint[u32(rel)]
+	if packed != 0 {
+		return u32(packed >> 32), u32(packed&u64(0xffffffff))-1
+	}
+	let meta = try s.readPageLocal(rel, PageNo(0))
+	let root = readU32(meta.Data, btreeMetaRootOffset)
+	let height = readU32(meta.Data, btreeMetaHeightOffset)
+	s.btreeHint[u32(rel)] = (u64(root) << 32) | u64(height+1)
+	return root, height
+}
+
+// btreeChildAt finds a key's child internal block without copying the page.
+fn (s mut Store) btreeChildAt(rel RelId, block u32, key []u8) !u32 {
+	let (frame, page) = try s.pinPage(rel, PageNo(block))
+	try s.buffers.LockContent(frame)
+	let child = internalFindChild(page, key)
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+	return child
+}
+
+fn (s mut Store) btreeLeaf(rel RelId, key []u8) !PageNo {
+	let (root, height) = try s.btreeRoot(rel)
+	mut block = root
+	mut level = height
+	for level > 0 {
+		block = try s.btreeChildAt(rel, block, key)
+		level -= 1
+	}
+	return PageNo(block)
+}
+
+fn (s mut Store) btreeLeftmostLeaf(rel RelId) !PageNo {
+	let (root, height) = try s.btreeRoot(rel)
+	mut block = root
+	mut level = height
+	for level > 0 {
+		let (frame, page) = try s.pinPage(rel, PageNo(block))
+		try s.buffers.LockContent(frame)
+		block = internalLeftmostChild(page)
+		try s.buffers.UnlockContent(frame)
+		try s.buffers.Unpin(frame)
+		level -= 1
+	}
+	return PageNo(block)
+}
+
+fn internalLeftmostChild(page Page) u32 {
+	let e = page.Item(1) catch _ { return 0 }
+	if len(e) < 2 {
+		return 0
+	}
+	return internalEntryChild(e)
+}
+
+// internalFindChild returns the last child whose separator is at or below key, by binary search
+// over the sorted separators (slot 1 is the leftmost child with an empty key).
+fn internalFindChild(page Page, key []u8) u32 {
+	let n = i64(page.Header().Slots)
+	mut lo = i64(1)
+	mut hi = n
+	mut best = i64(1)
+	for lo <= hi {
+		let mid = (lo+hi)/2
+		let e = page.ItemView(u16(mid)) catch _ { break }
+		if keyCmp(entryKey(e), key) <= 0 {
+			best = mid
+			lo = mid+1
+		} else {
+			hi = mid-1
+		}
+	}
+	let e = page.ItemView(u16(best)) catch _ { return internalLeftmostChild(page) }
+	return internalEntryChild(e)
+}
+
+// ---- page entry helpers ----
+
+fn newBtreePage(pt u16) Page {
+	mut p = NewPage()
+	p.SetPageType(pt)
+	return p
+}
+
+fn leafLiveSlots(page Page) []u16 {
+	mut slots = []u16{}
+	let n = page.Header().Slots
+	for slot in 1..i64(n)+1 {
+		if page.SlotStatus(u16(slot)) == 1 {
+			slots = append(slots, u16(slot))
+		}
+	}
+	return slots
+}
+
+fn leafEntry(key []u8, t Tid) []u8 {
+	mut b = make([]u8, 2+len(key)+6)
+	writeU16(mut b, 0, u16(len(key)))
+	copy(b[2:], key)
+	writeU32(mut b, 2+len(key), t.page)
+	writeU16(mut b, 2+len(key)+4, t.slot)
+	return b
+}
+
+fn internalEntry(key []u8, child u32) []u8 {
+	mut b = make([]u8, 2+len(key)+4)
+	writeU16(mut b, 0, u16(len(key)))
+	copy(b[2:], key)
+	writeU32(mut b, 2+len(key), child)
+	return b
+}
+
+fn entryKey(e []u8) []u8 {
+	let n = i64(readU16(e, 0))
+	return e[2:2+n]
+}
+
+fn leafEntryTid(e []u8) Tid {
+	let n = i64(readU16(e, 0))
+	return Tid{page: readU32(e, 2+n), slot: readU16(e, 2+n+4)}
+}
+
+fn internalEntryChild(e []u8) u32 {
+	let n = i64(readU16(e, 0))
+	return readU32(e, 2+n)
+}
+
+fn keyCmp(a []u8, b []u8) i64 {
+	let n = min(len(a), len(b))
+	for i in 0..n {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return 0
+}
+
+fn leafEntryLess(a []u8, b []u8) bool {
+	let c = keyCmp(entryKey(a), entryKey(b))
+	if c != 0 {
+		return c < 0
+	}
+	let ta = leafEntryTid(a)
+	let tb = leafEntryTid(b)
+	if ta.page != tb.page {
+		return ta.page < tb.page
+	}
+	return ta.slot < tb.slot
+}
+
+fn leafEntryEqualTid(e []u8, key []u8, t Tid) bool {
+	if keyCmp(entryKey(e), key) != 0 {
+		return false
+	}
+	let tid = leafEntryTid(e)
+	return tid.page == t.page && tid.slot == t.slot
+}
+
+fn sortLeafEntries(entries mut [][]u8) {
+	for i in 1..len(entries) {
+		let key = entries[i]
+		mut j = i-1
+		for j >= 0 && leafEntryLess(key, entries[j]) {
+			entries[j+1] = entries[j]
+			j -= 1
+		}
+		entries[j+1] = key
+	}
+}
+
+fn sortInternalEntries(entries mut [][]u8) {
+	for i in 1..len(entries) {
+		let key = entries[i]
+		mut j = i-1
+		for j >= 0 && keyCmp(entryKey(key), entryKey(entries[j])) < 0 {
+			entries[j+1] = entries[j]
+			j -= 1
+		}
+		entries[j+1] = key
+	}
+}
+
+fn leafDeleteEntry(p mut Page, entry []u8) bool {
+	let slots = leafLiveSlots(p)
+	mut entries = [][]u8{}
+	mut removed = false
+	let key = entryKey(entry)
+	let t = leafEntryTid(entry)
+	for _, sl in slots {
+		let e = p.Item(sl) catch _ { continue }
+		if !removed && leafEntryEqualTid(e, key, t) {
+			removed = true
+			continue
+		}
+		entries = append(entries, copyBytes(e))
+	}
+	if !removed {
+		return false
+	}
+	mut fresh = newBtreePage(PageTypeBtreeLeaf)
+	fresh.SetPrevBlock(p.PrevBlock())
+	fresh.SetNextBlock(p.NextBlock())
+	fresh.SetLsn(p.Header().Lsn)
+	fresh.SetAllVisible(p.AllVisible())
+	for e in entries {
+		fresh.InsertRaw(e) catch _ { }
+	}
+	copy(p.Data, fresh.Data)
+	return true
+}
+
+fn internalInsertEntry(p mut Page, entry []u8) bool {
+	let slots = leafLiveSlots(p)
+	if len(slots) == 0 {
+		return false
+	}
+	let leftmost = p.Item(slots[0]) catch _ { return false }
+	mut seps = [][]u8{}
+	for i in 1..len(slots) {
+		let e = p.Item(slots[i]) catch _ { continue }
+		seps = append(seps, copyBytes(e))
+	}
+	seps = append(seps, copyBytes(entry))
+	sortInternalEntries(mut seps)
+	mut fresh = newBtreePage(PageTypeBtreeInternal)
+	fresh.SetPrevBlock(p.PrevBlock())
+	fresh.SetNextBlock(p.NextBlock())
+	fresh.SetLsn(p.Header().Lsn)
+	fresh.InsertRaw(copyBytes(leftmost)) catch _ { }
+	for e in seps {
+		let (_, err) = fresh.InsertRaw(e)
+		if err != nil {
+			return false
+		}
+	}
+	copy(p.Data, fresh.Data)
+	return true
+}
+
+fn splitLeaf(page Page, block u32, newBlock u32, entry []u8) (Page, Page, []u8) {
+	let slots = leafLiveSlots(page)
+	mut entries = [][]u8{}
+	for _, sl in slots {
+		let e = page.Item(sl) catch _ { continue }
+		entries = append(entries, copyBytes(e))
+	}
+	entries = append(entries, copyBytes(entry))
+	sortLeafEntries(mut entries)
+	mut mid = len(entries)/2
+	if mid < 1 {
+		mid = 1
+	}
+	for mid < len(entries)-1 && keyCmp(entryKey(entries[mid-1]), entryKey(entries[mid])) == 0 {
+		mid += 1
+	}
+	mut left = newBtreePage(PageTypeBtreeLeaf)
+	mut right = newBtreePage(PageTypeBtreeLeaf)
+	for i in 0..mid {
+		left.InsertRaw(entries[i]) catch _ { }
+	}
+	for i in mid..len(entries) {
+		right.InsertRaw(entries[i]) catch _ { }
+	}
+	left.SetPrevBlock(page.PrevBlock())
+	left.SetNextBlock(newBlock)
+	right.SetPrevBlock(block)
+	right.SetNextBlock(page.NextBlock())
+	left.SetLsn(page.Header().Lsn)
+	right.SetLsn(page.Header().Lsn)
+	return left, right, copyBytes(entryKey(entries[mid]))
+}
+
+fn splitInternal(page Page, block u32, newBlock u32, sepKey []u8, childBlock u32) (Page, Page, []u8) {
+	let slots = leafLiveSlots(page)
+	let leftmost = page.Item(slots[0]) catch _ { []u8{} }
+	mut seps = [][]u8{}
+	for i in 1..len(slots) {
+		let e = page.Item(slots[i]) catch _ { continue }
+		seps = append(seps, copyBytes(e))
+	}
+	seps = append(seps, internalEntry(sepKey, childBlock))
+	sortInternalEntries(mut seps)
+	mut mid = len(seps)/2
+	if mid < 1 {
+		mid = 1
+	}
+	if mid > len(seps)-1 {
+		mid = len(seps)-1
+	}
+	let promoted = copyBytes(entryKey(seps[mid]))
+	let midChild = internalEntryChild(seps[mid])
+	mut left = newBtreePage(PageTypeBtreeInternal)
+	mut right = newBtreePage(PageTypeBtreeInternal)
+	left.InsertRaw(copyBytes(leftmost)) catch _ { }
+	for i in 0..mid {
+		left.InsertRaw(seps[i]) catch _ { }
+	}
+	right.InsertRaw(internalEntry([]u8{}, midChild)) catch _ { }
+	for i in mid+1..len(seps) {
+		right.InsertRaw(seps[i]) catch _ { }
+	}
+	left.SetPrevBlock(page.PrevBlock())
+	left.SetNextBlock(newBlock)
+	right.SetPrevBlock(block)
+	right.SetNextBlock(page.NextBlock())
+	left.SetLsn(page.Header().Lsn)
+	right.SetLsn(page.Header().Lsn)
+	return left, right, promoted
+}
+
+// ---- btree redo ----
+
+fn (s mut Store) redoBtreeInsert(rel u32, block u32, body []u8, recStart u64) ! {
+	let (frame, page) = try s.pinPage(RelId(rel), PageNo(block))
+	try s.buffers.LockContent(frame)
+	if page.Header().Lsn < recStart {
+		let pos = leafInsertPos(page, body)
+		let (_, insErr) = page.InsertAt(pos, body)
+		if insErr != nil {
+			try s.buffers.UnlockContent(frame)
+			try s.buffers.Unpin(frame)
+			fail insErr
+		}
+		page.SetLsn(recStart)
+		try s.buffers.MarkDirty(frame, Lsn(recStart))
+	}
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+}
+
+fn (s mut Store) redoBtreeDelete(rel u32, block u32, body []u8, recStart u64) ! {
+	let (frame, page) = try s.pinPage(RelId(rel), PageNo(block))
+	try s.buffers.LockContent(frame)
+	if page.Header().Lsn < recStart {
+		mut p = page
+		if leafDeleteEntry(mut p, body) {
+			copy(page.Data, p.Data)
+			page.SetLsn(recStart)
+			try s.buffers.MarkDirty(frame, Lsn(recStart))
+		}
+	}
+	try s.buffers.UnlockContent(frame)
+	try s.buffers.Unpin(frame)
+}

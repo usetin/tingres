@@ -1,0 +1,50 @@
+package stats
+
+import "../types"
+import "gauge"
+
+const DefaultStatsTarget i64 = 100
+const DefaultSampleRows i64 = 30000
+
+// RowSource supplies rows in batches. NextBatch returns an empty slice
+// when there are no more rows.
+shape RowSource {
+	mut NextBatch() ![][]types.Datum
+}
+
+type ColumnStats struct {
+	ColIndex i64
+	NullFrac f64
+	AvgWidth f64
+	NDistinct f64
+	MCVVals []types.Datum
+	MCVFreqs []f64
+	HistBounds []types.Datum
+	Correlation f64
+}
+
+type Rng struct {
+	State u64
+}
+
+fn NewRng(seed u64) Rng {
+	mut s = seed
+	if s == 0 { s = 1 }
+	s = s *% 6364136223846793005 +% 1442695040888963407
+	return Rng{State: s}
+}
+
+fn (r mut Rng) nextU64() u64 {
+	r.State = r.State *% 2862933555777941757 +% 3037000493
+	mut x = r.State
+	x = x ^ (x >> 12)
+	x = x *% 0x5deece66d
+	x = x ^ (x >> 18)
+	return x
+}
+
+fn (r mut Rng) nextInt(n i64) i64 {
+	if n <= 0 { return 0 }
+	let v = r.nextU64()
+	return i64(v % u64(n))
+}

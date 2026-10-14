@@ -20,16 +20,32 @@
   `E020 UNEXPECTED: expected a name, found 'mut'` on the *next* member. Minimal repro:
   `shape s { mut A() !\nmut B() !i64 }`. Worked around in `proto/proto.tin` by giving the write methods an `!i64`
   result. Blocked file: `proto/proto.tin`.
+- NEEDS-TIN: positional file writes (`quarry.WriteAt(path, off, data)` backed by `pwrite`) and a durable
+  data-only sync (`quarry.DataSync(path)` backed by `fdatasync`) for `store/file.tin`. Tin exposes `quarry.Sync`
+  and positional `quarry.ReadAt` only through `tin2/sysprim`, with no `WriteAt`/`fdatasync` API. Until then
+  `store` rewrites a relation through a synced replacement file, which copies the whole relation on every page
+  write and is far too costly for a database buffer pool. Blocked file: `store/file.tin`.
 - NEEDS-TIN: fix the inline value-struct-in-enum-literal miscompile (repro
   `tests/compiler_bugs/inline_value_struct_enum_const.tin`, expected `a 23 1` / `b 23 2`). Blocked:
-  `plan/analyze.tin` and `plan/planner.tin` constant construction (worked around by always materialising the datum
-  into a local first, via `mkConstExpr`/`mkInt4Const`/`mkBoolConst`/`mkStrConst`/`mkNullConst`).
+  `plan/analyze.tin` and `plan/planner.tin` constant construction (worked around by always materialising the
+  datum into a local first).
+- NEEDS-TIN: a package-level `const` with a composite value crashes the compiler with
+  `index out of range [-1] with length 0` in `check_const_value` (repro `tests/compiler_bugs/const_slice_str.tin`,
+  `const xs = []str{"a"}`). Use a function returning the value or a package-level `let` meanwhile; the catalog seed
+  is a function. Blocked file: `catalog/seed.tin`.
+- NEEDS-TIN: value-struct stack aliasing. Two locals copied from the same struct (`mut ctxA = c.Ctx; ctxA.Row = a`
+  then `mut ctxB = c.Ctx; ctxB.Row = b`) and passed to a `mut`-receiver call can both read the second slice:
+  `exec.SortCursor.compare` returned 0 for rows 10 and 30, so ORDER BY never reordered. Observed only in the full
+  exec package (a stand-alone version of the same shape prints the correct `-20`), so there is no minimal repro
+  yet. Worked around in `exec/operators.tin` by precomputing sort keys per row. Blocked file:
+  `exec/operators.tin` (`SortCursor`).
 
 ## Missing in other packages (NEEDS-OTHER), worked around inside `exec`
 
 - NEEDS-OTHER: catalog: persist and recover user-table/index metadata and relation OIDs across `catalog.Open`.
-  The `Catalog.tables`/`Catalog.names` maps are rebuilt empty on reopen, so after a restart `exec` cannot resolve a
-  table by name and cannot rebuild a `catalog.Table` for an already-existing relation. Blocked:
+  The `Catalog.tables`/`Catalog.names` maps (and the OID/relation counters) are rebuilt empty on reopen, so after
+  a restart `exec` cannot resolve a table by name, cannot rebuild a `catalog.Table` for an already-existing
+  relation, and a new `CREATE TABLE` can pick a relation id that collides with a recovered one. Blocked:
   `exec.TestEndToEndOnRealStore` verifies durability by scanning the recovered heap relation directly; a real
   restart-with-catalog path needs catalog persistence.
 - NEEDS-OTHER: txn: subtransaction / undo support for `ROLLBACK TO SAVEPOINT`. `txn.Manager` has no savepoint API
@@ -38,17 +54,18 @@
   across `ROLLBACK TO`. Blocked file: `exec/session.tin` (`rollbackSavepointData`).
 - NEEDS-OTHER: types/plan: a way to add session-dependent system functions (`version`, `current_database`,
   `current_schema`, `current_setting`, `pg_backend_pid`, `pg_table_is_visible`, `format_type`, ...) to the shared
-  function registry, or planner support that defers them to exec. Other packages can only append to a `let`
+  function registry, or planner support that defers them to exec. Other packages can only read the `let`
   `types.builtinFuncRegistry` (immutable), so `exec/builtin_sys.tin` can only serve FROM-less SELECTs; psql's
   `\d`/`\l`/`\dn` queries mix these functions with `pg_catalog` columns. Blocked files: `exec/builtin_sys.tin`,
   `exec/session.tin` (`trySystemSelect`).
-- NEEDS-OTHER: plan: `analyzeLiteral` keeps a string literal's SQL spelling (including the surrounding and doubled single quotes) in the constant datum, so a text constant holds `'a'` instead of `a`. exec decodes string constants in `normalizeConst` until the analyzer decodes the lexer token itself. Blocked files: `exec/expr.tin` (`normalizeConst`).
+- NEEDS-OTHER: plan: `analyzeLiteral` keeps a string literal's SQL spelling (including the surrounding and doubled
+  single quotes) in the constant datum, so a text constant holds `'a'` instead of `a`. `exec` decodes string
+  constants in `normalizeConst` until the analyzer decodes the lexer token itself. Blocked files:
+  `exec/expr.tin` (`normalizeConst`).
 - NEEDS-OTHER: plan: UPDATE/DELETE modify plans do not carry tuple identity (TID). `planUpdate` wraps the target
   scan in a `Project` that replaces SET columns, so the original row no longer matches the stored tuple; exec walks
   the `Project`'s input and re-matches the old row instead. A ctid output (or the scan's TID) would make
   UPDATE/DELETE exact under concurrent writes and duplicates. Blocked file: `exec/dml.tin` (`ExecuteModifyTable`).
-
-- NEEDS-TIN: value-struct stack aliasing. Two locals copied from the same struct (`mut ctxA = c.Ctx; ctxA.Row = a` then `mut ctxB = c.Ctx; ctxB.Row = b`) and passed to a `mut`-receiver call can both read the second slice: `exec.SortCursor.compare` returned 0 for rows 10 and 30, so ORDER BY never reordered. Observed only in the full exec package (a stand-alone 20-line version prints the correct `-20`), so there is no minimal repro yet. Worked around in `exec/operators.tin` by precomputing sort keys per row (and in `exec/expr.tin`/`plan/` by materialising values through helpers). Blocked file: `exec/operators.tin` (`SortCursor`).
 
 ## Compiler diagnostics that shaped the code (not bugs, but worth knowing)
 
@@ -67,7 +84,21 @@
 - `tests/compiler_bugs/forward_map_struct_key.tin`: Tin segfaults when a struct declares a map whose struct key and
   struct value types are declared later in the package. The transaction manager avoids the compiler bug by
   declaring `LockMode`, `LockKey` and `LockHolder` before `Manager`.
-- `tests/compiler_bugs/inline_value_struct_enum_const.tin`: Tin miscompiles an inline value-struct constructor used
-  as an enum-variant struct field once two such locals are live (`plan.Expr.Const(plan.ConstExpr{Value:
-  types.FromI64(types.Int4Oid, 1), ...})` reads back with `oid == 1` instead of 23). It is stack-layout dependent:
-  construction through a helper that binds the datum to a local first is correct.
+- `tests/compiler_bugs/inline_value_struct_enum_const.tin`: Tin miscompiles an inline value-struct constructor
+  used as an enum-variant struct field once two such locals are live
+  (`plan.Expr.Const(plan.ConstExpr{Value: types.FromI64(types.Int4Oid, 1), ...})` reads back with `oid == 1`
+  instead of 23). It is stack-layout dependent: construction through a helper that binds the datum to a local
+  first is correct. All constant construction in `plan/` goes through `mkConstExpr`/`mkInt4Const`/`mkBoolConst`/
+  `mkStrConst`/`mkNullConst` to avoid it.
+- `tests/compiler_bugs/const_slice_str.tin`: a package-level `const` whose value is a composite (for example
+  `const xs = []str{"a"}`) crashes the compiler with `index out of range [-1] with length 0` in
+  `check_const_value`. `catalog/seed.tin` therefore returns its generated seed from a function.
+
+## Reproduced bugs in other tingres packages
+
+- `parse`: the lexer's `Token.Pos` is not a character offset. `parse/lexer.tin` initialises `charPos = 1` and then
+  adds only `countCharacters(sql, previousByte, BytePos)` (the whitespace gap) per token, never the token length,
+  so `Pos` is a token-gap ordinal (for `SELECT foo FROM users` the `foo` token reports `Pos == 2`). `plan/`
+  therefore cannot produce PostgreSQL-compatible error positions (`PgError.Position`) and emits analyzer errors
+  with position 0. Fix: `charPos = 1 + countCharacters(sql, 0, tokens[i].BytePos)`. Blocked: PostgreSQL-exact
+  error positions from `plan/analyze.tin`.

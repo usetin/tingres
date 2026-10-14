@@ -1,0 +1,148 @@
+package store
+
+import "crucible"
+import "quarry"
+
+// Benchmarks for the store hot paths. They are Linux numbers that matter; on macOS they only check
+// that the paths run.
+
+const benchGroupCommitKind u8 = 201
+
+fn BenchmarkHeapInsert(b mut crucible.B) {
+	let dir = "/tmp/tingres-store-bench-heap-insert"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 512})
+	if openErr != nil {
+		return
+	}
+	mut db = opened
+	db.CreateHeap(900) catch _ { return }
+	let payload = []u8{1, 2, 3, 4, 5, 6, 7, 8}
+	for i in 0..b.N {
+		if i%20000 == 0 && i > 0 {
+			db.DropRel(900) catch _ { return }
+			db.CreateHeap(900) catch _ { return }
+		}
+		db.HeapInsert(NewXidCtx(2, 0), 900, payload) catch _ { return }
+	}
+	db.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+}
+
+fn BenchmarkHeapSeqScan(b mut crucible.B) {
+	let dir = "/tmp/tingres-store-bench-heap-scan"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 512})
+	if openErr != nil {
+		return
+	}
+	mut db = opened
+	db.CreateHeap(901) catch _ { return }
+	let payload = []u8{1, 2, 3, 4}
+	for i in 0..5000 {
+		db.HeapInsert(NewXidCtx(2, 0), 901, payload) catch _ { return }
+	}
+	for _i in 0..b.N {
+		mut scan = db.HeapScan(901)
+		mut rows = i64(0)
+		for {
+			let (_, ok) = scan.Next()
+			if !ok {
+				break
+			}
+			rows += 1
+		}
+		if rows != 5000 {
+			return
+		}
+	}
+	db.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+}
+
+fn BenchmarkBtreeInsert(b mut crucible.B) {
+	let dir = "/tmp/tingres-store-bench-btree-insert"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 2048})
+	if openErr != nil {
+		return
+	}
+	mut db = opened
+	db.CreateIndex(902, false) catch _ { return }
+	mut key = make([]u8, 8)
+	for i in 0..b.N {
+		if i%20000 == 0 && i > 0 {
+			db.DropRel(902) catch _ { return }
+			db.CreateIndex(902, false) catch _ { return }
+		}
+		writeU32(mut key, 0, u32(i))
+		writeU32(mut key, 4, u32(i>>32))
+		let tid = Tid{page: u32(i), slot: u16(i&0xffff)}
+		db.IndexInsert(902, key, tid) catch _ { return }
+	}
+	db.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+}
+
+fn BenchmarkBtreePointLookup(b mut crucible.B) {
+	let dir = "/tmp/tingres-store-bench-btree-lookup"
+	let first = !quarry.Exists(dir + "/base/903")
+	let (opened, openErr) = Open(dir, Options{BufferPages: 2048})
+	if openErr != nil {
+		return
+	}
+	mut db = opened
+	let createErr = db.CreateIndex(903, false)
+	if createErr != nil && first {
+		return
+	}
+	let n = 20000
+	mut key = make([]u8, 8)
+	if first {
+		for i in 0..n {
+			writeU32(mut key, 0, u32(i))
+			writeU32(mut key, 4, u32(i>>32))
+			let tid = Tid{page: u32(i), slot: u16(i&0xffff)}
+			db.IndexInsert(903, key, tid) catch _ { return }
+		}
+	}
+	for i in 0..b.N {
+		let k = i%i64(n)
+		writeU32(mut key, 0, u32(k))
+		writeU32(mut key, 4, u32(k>>32))
+		let tids = db.IndexLookupExact(903, key) catch _ { return }
+		if len(tids) != 1 {
+			return
+		}
+	}
+	db.Close() catch _ { }
+}
+
+fn groupCommitWorkload(dir str, committers i64, per i64) ! {
+	mut db = try Open(dir, Options{BufferPages: 64})
+	try db.RegisterRecordKind(benchGroupCommitKind, "bench commit")
+	let payload = []u8{7}
+	scope sc {
+		for _t in 0..committers {
+			sc.spawn(fn() ! {
+				for _j in 0..per {
+					let lsn = try db.LogRecord(benchGroupCommitKind, payload)
+					try db.Sync(lsn)
+				}
+			})
+		}
+	}
+	db.Close() catch _ { }
+}
+
+fn BenchmarkGroupCommit(b mut crucible.B) {
+	let dir = "/tmp/tingres-store-bench-group-commit"
+	quarry.RemoveAll(dir) catch _ { }
+	let committers = i64(8)
+	mut per = b.N/committers
+	if per < 1 {
+		per = 1
+	}
+	groupCommitWorkload(dir, committers, per) catch _ { return }
+	quarry.RemoveAll(dir) catch _ { }
+}

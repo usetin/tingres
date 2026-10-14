@@ -11,6 +11,7 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 			try p.expect("zone")
 			name = "time zone"
 		} else {
+			if p.done() { try p.errorHere() }
 			name = lowerAscii(p.take().Text)
 			for p.eat(".") {
 				name += "." + lowerAscii(p.take().Text)
@@ -25,7 +26,11 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 		} else if p.eat("time") {
 			try p.expect("zone")
 			name = "time zone"
+		} else if p.eat("session") {
+			try p.expect("authorization")
+			name = "session authorization"
 		} else {
+			if p.done() { try p.errorHere() }
 			name = lowerAscii(p.take().Text)
 			for p.eat(".") {
 				name += "." + lowerAscii(p.take().Text)
@@ -48,6 +53,22 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 	mut isDefault = false
 	mut values = []Expr{}
 
+	if (scope == "session" && lowerAscii(p.text()) == "authorization") || (lowerAscii(p.text()) == "session" && p.At + 1 < len(p.Tokens) && lowerAscii(p.Tokens[p.At + 1].Text) == "authorization") {
+		if lowerAscii(p.text()) == "session" { p.At += 1 }
+		try p.expect("authorization")
+		name = "session authorization"
+		if !p.eat("to") {
+			p.eat("=")
+		}
+		if p.eat("default") {
+			isDefault = true
+		} else {
+			let val = try p.parseExpression(0)
+			values = append(values, val)
+		}
+		return VariableSetStmt{Pos: pos, Kind: "set", Scope: scope, Name: name, Values: values, Default: isDefault, Local: local}
+	}
+
 	if p.eat("time") {
 		try p.expect("zone")
 		name = "time zone"
@@ -59,12 +80,13 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 		} else if p.eat("local") {
 			values = append(values, Expr.Literal(LiteralExpr{Pos: p.pos(), Kind: "word", Value: "local"}))
 		} else {
-			let val = try p.parseExpression(0)
+			let val = try p.parseGucValue()
 			values = append(values, val)
 		}
 		return VariableSetStmt{Pos: pos, Kind: "set", Scope: scope, Name: name, Values: values, Default: isDefault, Local: local}
 	}
 
+	if p.done() || (p.kind() != "word" && p.kind() != "quoted") { try p.errorHere() }
 	name = lowerAscii(p.take().Text)
 	for p.eat(".") {
 		name += "." + lowerAscii(p.take().Text)
@@ -77,7 +99,7 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 		isDefault = true
 	} else {
 		for {
-			let val = try p.parseExpression(0)
+			let val = try p.parseGucValue()
 			values = append(values, val)
 			if !p.eat(",") {
 				break
@@ -85,6 +107,18 @@ fn (p mut Parser) parseVariableSet() !VariableSetStmt {
 		}
 	}
 	return VariableSetStmt{Pos: pos, Kind: "set", Scope: scope, Name: name, Values: values, Default: isDefault, Local: local}
+}
+
+// parseGucValue parses a SET value, accepting bare ON/OFF words that the expression grammar
+// cannot (they are reserved keywords).
+fn (p mut Parser) parseGucValue() !Expr {
+	let w = lowerAscii(p.text())
+	if p.kind() == "word" && (w == "on" || w == "off") {
+		let valuePos = p.pos()
+		p.At += 1
+		return Expr.Literal(LiteralExpr{Pos: valuePos, Kind: "word", Value: w})
+	}
+	return try p.parseExpression(0)
 }
 
 fn (p mut Parser) parseExplain() !ExplainStmt {
@@ -132,6 +166,10 @@ fn (p mut Parser) parseCopy() !CopyStmt {
 		let sel = try p.parseSelect()
 		try p.expect(")")
 		query = sel
+		if p.eat("(") {
+			cols = try p.parseIdentifierList(")")
+			try p.expect(")")
+		}
 	} else {
 		let t = try p.parseQualifiedName()
 		table = t
@@ -296,7 +334,10 @@ fn (p mut Parser) parseVacuum() !VacuumStmt {
 				let expr = try p.parseExpression(0)
 				parallelExpr = expr
 			} else {
-				try p.errorHere()
+				// Other options (SKIP_LOCKED, INDEX_CLEANUP, BUFFER_USAGE_LIMIT, ...) plus an
+				// optional value; consume the option and its value verbatim.
+				let _ = p.take()
+				for !p.done() && p.text() != "," && p.text() != ")" { p.At += 1 }
 			}
 			if !p.eat(",") {
 				break
@@ -359,6 +400,7 @@ fn (p mut Parser) parseAnalyze() !AnalyzeStmt {
 fn (p mut Parser) parseDiscard() !DiscardStmt {
 	let pos = p.pos()
 	try p.expect("discard")
+	if p.done() { try p.errorHere() }
 	let target = lowerAscii(p.take().Text)
 	return DiscardStmt{Pos: pos, Target: target}
 }
@@ -369,13 +411,36 @@ fn (p mut Parser) parseComment() !CommentStmt {
 	try p.expect("on")
 	let objType = lowerAscii(p.take().Text)
 	let name = try p.parseQualifiedName()
+	mut onName ?QualifiedName = nil
+	if objType == "function" || objType == "procedure" || objType == "aggregate" || objType == "routine" {
+		if p.eat("(") {
+			if p.eat("*") { } else if p.text() != ")" {
+				for {
+					if p.eat("inout") { } else if p.eat("out") { } else if p.eat("in") { } else if p.eat("variadic") { }
+					if p.canBeIdentifier() && p.At + 1 < len(p.Tokens) && p.Tokens[p.At + 1].Kind == "word" {
+						let _ = try p.parseIdentifier()
+					}
+					let _ = try p.parseTypeName()
+					if !p.eat(",") { break }
+				}
+			}
+			try p.expect(")")
+		}
+	} else if objType == "constraint" || objType == "trigger" || objType == "policy" || objType == "rule" {
+		try p.expect("on")
+		onName = try p.parseQualifiedName()
+	} else if objType == "operator" || objType == "cast" || objType == "transform" {
+		if p.text() == "(" {
+			let _ = p.captureParenInner()
+		}
+	}
 	try p.expect("is")
 	mut text ?str = nil
 	if !p.eat("null") {
 		let tok = p.take()
 		text = tok.Text
 	}
-	return CommentStmt{Pos: pos, ObjectType: objType, Name: name, Text: text}
+	return CommentStmt{Pos: pos, ObjectType: objType, Name: name, Text: text, OnName: onName}
 }
 
 fn (p mut Parser) parseGrant() !GrantStmt {
@@ -383,11 +448,18 @@ fn (p mut Parser) parseGrant() !GrantStmt {
 	try p.expect("grant")
 	mut privs = []str{}
 	for {
+		if p.done() || lowerAscii(p.text()) == "on" { try p.errorHere() }
 		if p.eat("all") {
 			p.eat("privileges")
 			privs = append(privs, "all")
 		} else {
-			privs = append(privs, lowerAscii(p.take().Text))
+			mut priv = lowerAscii(p.take().Text)
+			if p.eat("(") {
+				let cols = try p.parseIdentifierList(")")
+				try p.expect(")")
+				priv += " (" + deparseIdentifierList(cols) + ")"
+			}
+			privs = append(privs, priv)
 		}
 		if !p.eat(",") {
 			break
@@ -405,13 +477,48 @@ fn (p mut Parser) parseGrant() !GrantStmt {
 		objType = "database"
 	} else if p.eat("function") {
 		objType = "function"
+	} else if p.eat("procedure") {
+		objType = "procedure"
+	} else if p.eat("routine") {
+		objType = "routine"
 	} else if p.eat("type") {
 		objType = "type"
+	} else if p.eat("language") {
+		objType = "language"
+	} else if p.eat("tablespace") {
+		objType = "tablespace"
+	} else if p.eat("foreign") {
+		if p.eat("data") {
+			try p.expect("wrapper")
+			objType = "foreign data wrapper"
+		} else {
+			try p.expect("server")
+			objType = "foreign server"
+		}
+	} else if p.eat("large") {
+		try p.expect("object")
+		objType = "large object"
+	} else if p.eat("all") {
+		let kind = lowerAscii(p.take().Text)
+		try p.expect("in")
+		try p.expect("schema")
+		objType = "all " + kind + " in schema"
 	}
 	mut objects = []QualifiedName{}
 	for {
 		let obj = try p.parseQualifiedName()
 		objects = append(objects, obj)
+		if objType == "function" || objType == "procedure" || objType == "routine" {
+			if p.eat("(") {
+				if p.text() != ")" {
+					for {
+						let _ = try p.parseTypeName()
+						if !p.eat(",") { break }
+					}
+				}
+				try p.expect(")")
+			}
+		}
 		if !p.eat(",") {
 			break
 		}
@@ -446,11 +553,18 @@ fn (p mut Parser) parseRevoke() !RevokeStmt {
 	}
 	mut privs = []str{}
 	for {
+		if p.done() || lowerAscii(p.text()) == "on" { try p.errorHere() }
 		if p.eat("all") {
 			p.eat("privileges")
 			privs = append(privs, "all")
 		} else {
-			privs = append(privs, lowerAscii(p.take().Text))
+			mut priv = lowerAscii(p.take().Text)
+			if p.eat("(") {
+				let cols = try p.parseIdentifierList(")")
+				try p.expect(")")
+				priv += " (" + deparseIdentifierList(cols) + ")"
+			}
+			privs = append(privs, priv)
 		}
 		if !p.eat(",") {
 			break
@@ -468,13 +582,48 @@ fn (p mut Parser) parseRevoke() !RevokeStmt {
 		objType = "database"
 	} else if p.eat("function") {
 		objType = "function"
+	} else if p.eat("procedure") {
+		objType = "procedure"
+	} else if p.eat("routine") {
+		objType = "routine"
 	} else if p.eat("type") {
 		objType = "type"
+	} else if p.eat("language") {
+		objType = "language"
+	} else if p.eat("tablespace") {
+		objType = "tablespace"
+	} else if p.eat("foreign") {
+		if p.eat("data") {
+			try p.expect("wrapper")
+			objType = "foreign data wrapper"
+		} else {
+			try p.expect("server")
+			objType = "foreign server"
+		}
+	} else if p.eat("large") {
+		try p.expect("object")
+		objType = "large object"
+	} else if p.eat("all") {
+		let kind = lowerAscii(p.take().Text)
+		try p.expect("in")
+		try p.expect("schema")
+		objType = "all " + kind + " in schema"
 	}
 	mut objects = []QualifiedName{}
 	for {
 		let obj = try p.parseQualifiedName()
 		objects = append(objects, obj)
+		if objType == "function" || objType == "procedure" || objType == "routine" {
+			if p.eat("(") {
+				if p.text() != ")" {
+					for {
+						let _ = try p.parseTypeName()
+						if !p.eat(",") { break }
+					}
+				}
+				try p.expect(")")
+			}
+		}
 		if !p.eat(",") {
 			break
 		}
@@ -576,6 +725,9 @@ fn (p mut Parser) parseDo() !DoStmt {
 		lang = lowerAscii(p.take().Text)
 	}
 	let body = p.take().Text
+	if p.eat("language") {
+		lang = lowerAscii(p.take().Text)
+	}
 	return DoStmt{Pos: pos, Body: body, Language: lang}
 }
 
@@ -604,4 +756,25 @@ fn (p mut Parser) parseCall() !CallStmt {
 		try p.expect(")")
 	}
 	return CallStmt{Pos: pos, Name: name, Arguments: args}
+}
+
+// grantTargetsRole / revokeTargetsRole report whether the statement grants/revokes role
+// membership (GRANT role TO role) rather than object privileges. They look at whether the
+// first top-level ON/TO (ON/FROM for REVOKE) keyword is the role keyword.
+fn grantTargetsRole(p Parser) bool { return firstRoleKeyword(p, "to") }
+fn revokeTargetsRole(p Parser) bool { return firstRoleKeyword(p, "from") }
+
+fn firstRoleKeyword(p Parser, roleWord str) bool {
+	mut depth = 0
+	mut i = p.At
+	for i < len(p.Tokens) {
+		let text = p.Tokens[i].Text
+		if text == "(" { depth += 1 } else if text == ")" { depth -= 1 } else if depth == 0 {
+			let w = lowerAscii(text)
+			if w == "on" { return false }
+			if w == roleWord { return true }
+		}
+		i += 1
+	}
+	return false
 }

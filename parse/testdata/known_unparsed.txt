@@ -1,0 +1,664 @@
+known_unparsed.txt - PostgreSQL 17 regression statements that parse.Parse still rejects.
+
+Generated with tests/parsecheck:
+  tin build tests/parsecheck/main.tin -o bin/parsecheck
+  bin/parsecheck /path/to/tingres-pgsrc/pg/src/test/regress/sql/*.sql
+
+As of the last run: TOTAL 227 files, 118 fully parsed, 45460 of 46240 statements
+parsed (98.31%). The 780 remaining statements fall into the categories below; count is
+the number of failing statements in that category. Many are intentionally invalid
+statements the regression suite uses to test PostgreSQL's own error reporting (for
+example 'SELECT * FROM a_star*' in inheritance.sql or the syntax-error section of
+constraints.sql), and psql/encoding artefacts (euc_kr.sql). The rest are grammar not
+modelled yet, listed with a one-line reason and a representative statement.
+
+count  category :: example
+--------------------------------------------------------------------------------
+  43  syntax error at or near "("
+      reason: unsupported parenthesised tails: EXCLUDE/opclass arguments, COPY column lists, base-type option lists, record column-def lists and similar
+      e.g.   -- check display of assorted RTE_FUNCTION expressions  cre
+  38  syntax error at or near ","
+      reason: ALTER of exotic object kinds (ALTER TEXT SEARCH/OPERATOR/AGGREGATE/CONVERSION ...) whose multi-part action grammar is not modelled
+      e.g. -- -- Test for ALTER some_object {RENAME TO, OWNER TO, SET S
+  38  syntax error at end of input
+      reason: statement forms with a trailing clause the parser does not consume (e.g. CREATE RULE action lists, CREATE CAST, partitioned-index options)
+      e.g. -- -- CREATE_CAST --  -- Create some types to test with CREA
+  28  syntax error at or near "*"
+      reason: intentionally invalid regression statements (SELECT * FROM a_star* in inheritance.sql) and COMMENT ON AGGREGATE edge cases
+      e.g.   -- -- inheritance stress test -- SELECT * FROM a_star*;
+  25  syntax error at or near "INSERT"
+      reason: data-modifying CTEs (WITH x AS (INSERT ...) SELECT ...) whose CTE body is not a SELECT
+      e.g.   -- create an extra wide table to test for issues related t
+  22  syntax error at or near "WITH"
+      reason: CREATE TABLE ... WITH OIDS (removed feature) and other intentionally-failing forms
+      e.g.   -- check that tables with oids cannot be created anymore C
+  17  feature not supported: CREATE statement
+      reason: CREATE object kinds whose grammar is not modelled (TEXT SEARCH, OPERATOR CLASS/FAMILY, CAST, TRANSFORM, ...)
+      e.g.  -- -- create default conversion with qualified name -- CREA
+  14  syntax error at or near "SELECT"
+      reason: encoding-specific files (euc_kr.sql) and statements psql rewrites before sending
+      e.g.      SELECT lo_from_bytea(0, lo_get(newloid_1)) AS newloid_2
+  13  syntax error at or near "BEGIN"
+      reason: psql \gset / embedded-statement separation edge cases (advisory_lock.sql etc.)
+      e.g.  CREATE FUNCTION functest_S_3a() RETURNS boolean     BEGIN A
+  12  syntax error at or near "["
+      reason: array/JSON subscript forms outside the ones handled
+      e.g.   -- not supported  insert into inserttest (f3.if2[1], f3.if
+  12  syntax error at or near "FROM"
+      reason: SELECT INTO / MERGE and other FROM-position variants
+      e.g.  SELECT * FROM ROWS FROM( getrngfunc6(1) AS (rngfuncid int, 
+  12  syntax error at or near ")"
+      reason: intentionally invalid regression statements (constraints.sql syntax-error section)
+      e.g.   -- syntax errors --  test for extraneous comma CREATE TABL
+  11  syntax error at or near "left"
+      reason: join chains where a clause follows a parenthesised join alias
+      e.g.   -- -- test a corner case in which we shouldn't apply the s
+  10  syntax error at or near "RETURN"
+      reason: CREATE FUNCTION option ordering variants
+      e.g.    -- -- SQL-standard body -- CREATE FUNCTION functest_S_1(a
+  10  feature not supported: statement using
+      reason: CREATE ACCESS METHOD ... USING handler and ALTER ... USING forms
+      e.g.   with recursive search_graph(f, t, label) as (  select * fr
+   9  syntax error at or near "with"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Multiply-referenced CTEs can't be inlined if they conta
+   9  syntax error at or near "from"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- multiple functions select * from rows from(rngfunct(1),
+   9  syntax error at or near "SET"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.                       -- ERROR ALTER SEQUENCE foreign_schema
+   9  syntax error at or near "FOR"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- DROP USER MAPPING DROP USER MAPPING FOR regress_test_mi
+   9  syntax error at or near "EXISTS"
+      reason: IF NOT EXISTS in object kinds handled opaquely
+      e.g.  -- fail because c2 already exists ALTER TABLE test_add_colu
+   8  syntax error at or near "set"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   create function report_guc(text) returns text as $$$$ lang
+   8  syntax error at or near "\"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g. /*  * This test is for ICU collations.  */  /* skip test if 
+   8  syntax error at or near "PREPARED"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Test ROLLBACK PREPARED ROLLBACK PREPARED 'regress_foo1'
+   8  syntax error at or near "NUL"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- with a tab CREATE TABLE foo   (id INT4 UNIQUE NOT NULL,
+   8  syntax error at or near "DELETE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- and this WITH RECURSIVE x(n) AS (   WITH sub_cte AS (SE
+   8  syntax error at or near ""
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  alter table atacc1 rename "........pg.dropped.1........" to
+   7  syntax error at or near "select"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- create page w/ free space in range [nearlyEmptyFreeSpac
+   7  syntax error at or near "insert"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  with ins (a, b, c) as   (insert into mlparted (b, a) select
+   6  syntax error at or near "text_pattern_ops"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- Neither collation nor operator class specifications are 
+   6  syntax error at or near "part_test_int4_ops"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- check validation when attaching hash partitions  -- Use
+   6  syntax error at or near "WITHOUT"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- but explicitly not adding oids is still supported CREAT
+   6  syntax error at or near "UPDATE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Exercise code in ExecGetTriggerResultRel() as there's b
+   6  syntax error at or near "TRUE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  VACUUM (PARALLEL 2, FULL TRUE) pvactst;
+   6  syntax error at or near "ORDER"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  (SELECT 1,2,3 UNION SELECT 4,5,6 ORDER BY 1,2) INTERSECT SE
+   6  syntax error at or near "FORMAT"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT JSON('{ "a" : 1 } ' FORMAT JSON);
+   5  syntax error at or near "union"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- likewise, where the subquery is a UNION ALL whose arms 
+   5  syntax error at or near "constraint_comments_dom"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  COMMENT ON CONSTRAINT the_constraint ON DOMAIN constraint_c
+   5  syntax error at or near "all"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- f select 'foo' like all (array['f%', '%o']);
+   5  syntax error at or near "USING"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- CREATE VIEW doesn't support USING CREATE VIEW tableam_v
+   5  syntax error at or near "RENAME"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  ALTER ROLE regress_hasprivs RENAME TO regress_tenant;
+   5  syntax error at or near "IF"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.     -- works DROP INDEX CONCURRENTLY IF EXISTS "concur_index
+   5  syntax error at or near "CURRENT_USER"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Intentionally include some non-initial privs for pg_dum
+   5  syntax error at or near "ADD"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- fail ALTER GROUP regress_priv_user1 ADD USER regress_pri
+   5  syntax error at or near "@@"
+      reason: full-text-search operator usage the expression grammar rejects
+      e.g.   -- center of box, left unary operator SELECT @@(b1.f1) AS 
+   5  syntax error at or near "/"
+      reason: operator spacing in rare expressions (jsonpath, pattern ops)
+      e.g.   -- Full aggregation as GROUP BY clause matches with PARTIT
+   5  syntax error at or near "'regresslib'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE FUNCTION test_text_to_bytea(text) RETURNS bytea     
+   5  syntax error at or near "'a#"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- T581 regular expression substring (with SQL's bizarre r
+   4  syntax error at or near "on"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- remove redundant conversions. explain (verbose on, costs
+   4  syntax error at or near "any"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.    -- test [not] (like|ilike) (any|all) (...) select 'foo' l
+   4  syntax error at or near "UNION"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- exercise rescan code path via a repeatedly-evaluated su
+   4  syntax error at or near "AT"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  VALUES (CAST('1978-07-07 19:38 America/New_York' AS TIMESTA
+   4  syntax error at or near "'twophase_tab'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  prepare transaction 'twophase_tab';
+   4  syntax error at or near "'!'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT U&'d!0061t\+000061' UESCAPE '!' AS U&"d*0061t\+00006
+   4  feature not supported: statement qry
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- test mark/restore with in-memory sorts EXPLAIN (COSTS O
+   4  feature not supported: statement import
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- IMPORT FOREIGN SCHEMA IMPORT FOREIGN SCHEMA s1 FROM SER
+   4  feature not supported: ALTER statement
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.    -- ROUTINE syntax  ALTER ROUTINE cp_testfunc1(int) RENAME
+   3  syntax error at or near "as"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  create view view_of_joins_2d as select * from (tbl1 join tb
+   3  syntax error at or near "WINDOW"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE OR REPLACE FUNCTION functest1(a int) RETURNS int LAN
+   3  syntax error at or near "TABLE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  COMMENT ON FOREIGN TABLE ft1 IS 'ft1';
+   3  syntax error at or near "MERGE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- used in a CTE without RETURNING WITH foo AS (   MERGE IN
+   3  syntax error at or near "GRANTED"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  GRANT INSERT ON atest2 TO regress_priv_user4 GRANTED BY CUR
+   3  syntax error at or near "DROP"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- fail ALTER GROUP regress_priv_group2 DROP USER regress_p
+   3  syntax error at or near "DEFERRABLE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- -- Deferrable unique constraints --  CREATE TABLE uniqu
+   3  syntax error at or near "COST"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- setup of malicious function CREATE OR REPLACE FUNCTION 
+   3  syntax error at or near "COLLATE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE TYPE collate_dep_test2 AS (x int, y text COLLATE tes
+   3  syntax error at or near "AS"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- error SELECT * FROM (J1_TBL JOIN J2_TBL USING (i) AS x)
+   3  syntax error at or near ":"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  COMMENT ON DATABASE :"datname" IS 'This is a test comment';
+   3  syntax error at or near "314159"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- bad index name drop index 314159;
+   3  syntax error at or near "1005"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  GRANT ALL ON LARGE OBJECT 1005 TO regress_priv_user2;
+   3  syntax error at or near "1001"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   GRANT ALL ON LARGE OBJECT 1001 TO PUBLIC;
+   3  syntax error at or near "######"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Test comments COMMENT ON OPERATOR ###### (NONE, int4) I
+   2  trailing junk after numeric literal at or near "0.0e"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 0.0e;
+   2  syntax error at or near "||/"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- cube root SELECT ||/ float8 '27' AS three;
+   2  syntax error at or near "|/"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   SELECT |/ float8 '64' AS eight;
+   2  syntax error at or near "storage"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- fails  -- SET STORAGE may need to add a TOAST table crea
+   2  syntax error at or near "return"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- -- These functions are used in tests that used to use m
+   2  syntax error at or near "priv_testdomain1"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  REVOKE USAGE on DOMAIN priv_testdomain1 FROM PUBLIC;
+   2  syntax error at or near "point_ops"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE TABLE partitioned (  a point ) PARTITION BY LIST (a 
+   2  syntax error at or near "join"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- -- check a case in which a PlaceHolderVar forces join o
+   2  syntax error at or near "concur_temp_ind"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  DROP INDEX CONCURRENTLY concur_temp_ind;
+   2  syntax error at or near "b"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  ALTER TABLE inht1 RENAME b TO bb;
+   2  syntax error at or near "aa"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.                 -- to be failed ALTER TABLE inhts RENAME aa 
+   2  syntax error at or near "a"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  alter table atacc1 rename a to x;
+   2  syntax error at or near "UESCAPE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 'tricky' AS U&"\" UESCAPE '!';
+   2  syntax error at or near "SKIP_LOCKED"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  ANALYZE (SKIP_LOCKED, VERBOSE) does_not_exist;
+   2  syntax error at or near "ROLE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- ok, can grant other users into a role CREATE ROLE regre
+   2  syntax error at or near "PRIMARY"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.    CREATE TABLE persons3 OF person_type (     PRIMARY KEY (i
+   2  syntax error at or near "NO"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- -- Check NO INHERIT type of constraints and inheritance
+   2  syntax error at or near "NFC"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT U&'\00E4\24D1c' IS NFC NORMALIZED AS test_nfc;
+   2  syntax error at or near "LOCAL"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE VIEW timestamp_local_view AS   SELECT CAST('1978-07-
+   2  syntax error at or near "INCLUDE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   CREATE TABLE tbl (c1 int,c2 int, c3 int, c4 box,     EXCLU
+   2  syntax error at or near "DEFAULT"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- check that we notice insertion of a volatile default ar
+   2  syntax error at or near "CYCLE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- cycled  ALTER SEQUENCE sequence_test2 RESTART WITH 24  
+   2  syntax error at or near "BUFFER_USAGE_LIMIT"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  ANALYZE (BUFFER_USAGE_LIMIT '512 kB') vac_option_tab;
+   2  syntax error at or near "ALL"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   ALTER TABLE ALL IN TABLESPACE regress_tblspace_renamed SET
+   2  syntax error at or near "ADMIN"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- ok, can grant other users into a role with admin option
+   2  syntax error at or near "@-@"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Length SELECT s, @-@ s FROM LSEG_TBL;
+   2  syntax error at or near "?|"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- -- Lines --  -- Vertical SELECT s FROM LINE_TBL WHERE ?
+   2  syntax error at or near "?"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Horizontal SELECT s FROM LINE_TBL WHERE ?- s;
+   2  syntax error at or near "42"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   GRANT SELECT ON LARGE OBJECT 42 TO public;
+   2  syntax error at or near "2001"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- to be denied REVOKE ALL ON LARGE OBJECT 2001, 2002 FROM 
+   2  syntax error at or near "123"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   INSERT INTO 123 VALUES(123);
+   2  syntax error at or near "100000"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE SEQUENCE sequence_test8 AS integer MAXVALUE 100000;
+   2  syntax error at or near "'twophase_func'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  prepare transaction 'twophase_func';
+   2  syntax error at or near "'regress_foo3'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_foo3';
+   2  syntax error at or near "'a*#"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT SUBSTRING('abcdefg' SIMILAR 'a*#"%#"g*' ESCAPE '#') 
+   2  syntax error at or near "'+'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT U&'wrong: +0061' UESCAPE '+';
+   2  syntax error at or near "'%'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Null inputs should return NULL SELECT SUBSTRING('abcdef
+   2  syntax error at or near "' - next line'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g. -- -- STRINGS -- Test various data entry syntaxes. --  -- SQ
+   2  syntax error at or near "#"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   SELECT circle(f1)    FROM POLYGON_TBL    WHERE (# f1) >= 3
+   2  syntax error at or near "!!"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT plainto_tsquery('english', 'foo bar') || !!plainto_t
+   1  unterminated quoted identifier at or near ""
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- test troff-ms output format    prepare q as   select 's
+   1  trailing junk after numeric literal at or near "1x"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 1x;
+   1  trailing junk after numeric literal at or near "1o"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 1o;
+   1  trailing junk after numeric literal at or near "1b"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 1b;
+   1  trailing junk after numeric literal at or near "123a"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- error cases SELECT 123abc;
+   1  trailing junk after numeric literal at or near "0x0y"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 0x0y;
+   1  trailing junk after numeric literal at or near "0x0o"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 0x0o;
+   1  trailing junk after numeric literal at or near "0o0x"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 0o0x;
+   1  trailing junk after numeric literal at or near "0b0x"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 0b0x;
+   1  trailing junk after numeric literal at or near "00004C"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   select '"\b\f\r\n\t\v\"\''; select '"\x50\u0067\u{53}\u{05
+   1  trailing junk after numeric literal at or near "0.a"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 0.a;
+   1  trailing junk after numeric literal at or near "0.0e1a"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 0.0e1a;
+   1  trailing junk after numeric literal at or near "0.0a"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT 0.0a;
+   1  trailing junk after numeric literal at or near ".0a"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT .0a;
+   1  syntax error at or near "|@|"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT |@|ARRAY[1,2,3];
+   1  syntax error at or near "x"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   SELECT sum(unique1) over (rows between unbounded.x precedi
+   1  syntax error at or near "variadic"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.    drop function dfunc(a variadic int[]);
+   1  syntax error at or near "varchar_ops"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   create table rlp3 (b varchar, a int) partition by list (b 
+   1  syntax error at or near "using"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   create temp view v_cycle2 as with recursive search_graph(f
+   1  syntax error at or near "update"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   with upd as (   update parted2_stmt_trig set a = a ) updat
+   1  syntax error at or near "test_int4_ops"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE TABLE partkey_t (a int4) PARTITION BY RANGE (a test_
+   1  syntax error at or near "test2"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- fail due to missing column alter table atacc3 rename tes
+   1  syntax error at or near "stud_emp_copy"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   COPY BINARY stud_emp_copy FROM 'filename';
+   1  syntax error at or near "stud_emp"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   COPY BINARY stud_emp TO 'filename';
+   1  syntax error at or near "returns"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- -- alter function -- create function test_strict(text) 
+   1  syntax error at or near "regress_event_trigger"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- OK comment on event trigger regress_event_trigger is 't
+   1  syntax error at or near "priv_testtype1"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- fail GRANT USAGE ON DOMAIN priv_testtype1 TO regress_pri
+   1  syntax error at or near "part_test_int4_ops2"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   create table hp_contradict_test (a int, b int) partition b
+   1  syntax error at or near "oid_ops"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   CREATE TABLE partitioned (  a int,  b int,  c text,  d tex
+   1  syntax error at or near "nonexistentarg"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  ANALYZE (nonexistentarg) does_not_exit;
+   1  syntax error at or near "nonexistent"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  ANALYZE (nonexistent-arg) does_not_exist;
+   1  syntax error at or near "non_existing"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  --fail alter table dropColumnExists drop column if exists n
+   1  syntax error at or near "no_comments_dom"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  COMMENT ON CONSTRAINT the_constraint ON DOMAIN no_comments_
+   1  syntax error at or near "nfkc"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- reverse-listing of various special function syntaxes re
+   1  syntax error at or near "idxpart_temp_a_idx"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- error -- non-concurrent drop is enforced here, so it is 
+   1  syntax error at or near "idxpart_a_idx"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- no way drop index concurrently idxpart_a_idx;
+   1  syntax error at or near "full"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   explain (costs off) select * from int8_tbl t1 left join   
+   1  syntax error at or near "distinct"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- "group by distinct" behavior... select a, b, c from (va
+   1  syntax error at or near "deferrable"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE TABLE test_replica_identity_t3 (id serial constraint
+   1  syntax error at or near "dcomptype"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  comment on constraint c1 on domain dcomptype is 'random com
+   1  syntax error at or near "d"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.       -- to be failed ALTER TABLE inhts RENAME d TO dd;
+   1  syntax error at or near "custom_opclass"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   create table hash_parted (  a int,  b int ) partition by h
+   1  syntax error at or near "cost"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Test proper handling of parameterized appendrel paths w
+   1  syntax error at or near "c"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   alter table tt3 rename c to d;
+   1  syntax error at or near "at_test_sql_partop"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  create table at_test_sql_partop (a int) partition by range 
+   1  syntax error at or near "anothertab_chk"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- fails alter table anothertab drop constraint IF EXISTS a
+   1  syntax error at or near "aaa"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  ALTER TABLE inht1 RENAME aaa TO aaaa;
+   1  syntax error at or near "WRAPPER"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  COMMENT ON FOREIGN DATA WRAPPER dummy IS 'useless';
+   1  syntax error at or near "U&'\00AC'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.    -- substring slow path: multi-byte escape char vs. multi-
+   1  syntax error at or near "TRANSFORM"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- make a function that uses it too, mainly to exercise pg_
+   1  syntax error at or near "TABLESAMPLE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   SELECT q.* FROM (SELECT * FROM test_tablesample) as q TABL
+   1  syntax error at or near "SUPPORT"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Also test non-default rowcount estimate CREATE FUNCTION
+   1  syntax error at or near "STORAGE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- pg_column_toast_chunk_id CREATE TABLE test_chunk_id (a 
+   1  syntax error at or near "RETURNS"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE FUNCTION functest_F_3(int) RETURNS bool LANGUAGE 'sq
+   1  syntax error at or near "PREPARE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.    -- \gdesc  SELECT     NULL AS zero,     1 AS one,     2.0
+   1  syntax error at or near "ON"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Copy to another large object. -- Note: we intentionally
+   1  syntax error at or near "OFFSET"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- test ruleutils CREATE VIEW limit_thousand_v_1 AS SELECT
+   1  syntax error at or near "NULLS"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   CREATE TABLE UNIQUE_TBL (i int UNIQUE NULLS NOT DISTINCT, 
+   1  syntax error at or near "NULL"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT SUBSTRING('abcdefg' SIMILAR NULL ESCAPE '#') IS NULL
+   1  syntax error at or near "LIMIT"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT ''::text AS five, unique1, unique2, stringu1   FROM 
+   1  syntax error at or near "INTO"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   CREATE TABLE  INSERT INTO foo VALUES(123) foo;
+   1  syntax error at or near "FALSE"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  VACUUM (PARALLEL 1, FULL FALSE) tmp;
+   1  syntax error at or near "ENCRYPTED"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE ROLE regress_encrypted_password ENCRYPTED PASSWORD '
+   1  syntax error at or near "DOCUMENT"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   SET XML OPTION DOCUMENT;
+   1  syntax error at or near "CONTENT"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   SET XML OPTION CONTENT;
+   1  syntax error at or near "BY"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE SEQUENCE sequence_test9 AS integer INCREMENT BY -1;
+   1  syntax error at or near "ARRAY"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- -- array expressions and operators --  -- table creatio
+   1  syntax error at or near "@#@"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Test operator created above SELECT @#@ 24;
+   1  syntax error at or near "999"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  -- to be failed GRANT SELECT, UPDATE ON LARGE OBJECT  999 T
+   1  syntax error at or near "32767"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  CREATE SEQUENCE sequence_test14 AS smallint MAXVALUE 32767 
+   1  syntax error at or near "2121"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   COMMENT ON LARGE OBJECT 2121 IS 'testing comments';
+   1  syntax error at or near "20000"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- fail, max has to be adjusted ALTER SEQUENCE sequence_te
+   1  syntax error at or near "12345"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- ok, backwards compatible noise words should be ignored 
+   1  syntax error at or near "1006"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  GRANT UPDATE ON LARGE OBJECT 1006 TO regress_priv_user3;
+   1  syntax error at or near "1004"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  GRANT SELECT,UPDATE ON LARGE OBJECT 1004 TO regress_priv_us
+   1  syntax error at or near "1003"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  GRANT SELECT ON LARGE OBJECT 1003 TO regress_priv_user2;
+   1  syntax error at or near "1"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   SELECT sum(unique1) over (rows between unbounded(1) preced
+   1  syntax error at or near ".5"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   SELECT _1_000.5;
+   1  syntax error at or near "+"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT U&'wrong: +0061' UESCAPE +;
+   1  syntax error at or near "'twophase_view'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  prepare transaction 'twophase_view';
+   1  syntax error at or near "'twophase_type'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  prepare transaction 'twophase_type';
+   1  syntax error at or near "'twophase_sequence'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  prepare transaction 'twophase_sequence';
+   1  syntax error at or near "'twophase_search'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'twophase_search';
+   1  syntax error at or near "'twophase_operator'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  prepare transaction 'twophase_operator';
+   1  syntax error at or near "'regress_sub2'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_sub2';
+   1  syntax error at or near "'regress_sub1'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_sub1';
+   1  syntax error at or near "'regress_p2'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_p2';
+   1  syntax error at or near "'regress_p1'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_p1';
+   1  syntax error at or near "'regress_foo6'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_foo6';
+   1  syntax error at or near "'regress_foo5'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_foo5';
+   1  syntax error at or near "'regress_foo4'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_foo4';
+   1  syntax error at or near "'regress_foo2'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_foo2';
+   1  syntax error at or near "'regress_foo1'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  PREPARE TRANSACTION 'regress_foo1';
+   1  syntax error at or near "'a|b#"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- Vertical bar in any part affects only that part SELECT 
+   1  syntax error at or near "'a%g'"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT SUBSTRING('abcdefg' SIMILAR 'a%g' ESCAPE '#') AS "ab
+   1  syntax error at or near "'#"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   -- No match should return NULL SELECT SUBSTRING('abcdefg' 
+   1  syntax error at or near "' as f2, '"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.   select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f
+   1  syntax error at or near "!=-"
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  SELECT !=- 10;
+   1  feature not supported: statement xxx
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.    -- -- Test psql's reporting of syntax error location --  
+   1  feature not supported: statement return
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g. RETURN false;
+   1  feature not supported: statement bogus
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  bogus;
+   1  feature not supported: statement 2
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  2 select * from test3;
+   1  feature not supported: statement 1
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  1 baz 2 qux select tableoid::regclass, * from donothingbrtr
+   1  feature not supported: statement **
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  ** Remember the delete rule on rtest_v1: It says ** DO INST
+   1  feature not supported: statement 'new york'
+      reason: grammar variant not modelled yet (see the representative statement)
+      e.g.  'New York' new <-> york | big <-> apple | nyc Moscow moskva

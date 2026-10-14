@@ -1,0 +1,195 @@
+package main
+
+import "atomic"
+import "lever"
+import "mint"
+import "postgres"
+import "quarry"
+import "say"
+import "gauge"
+import "sift"
+import "tide"
+
+shared let completed = atomic.NewInt(0)
+shared let failures = atomic.NewInt(0)
+mut latencies = make([]i64, 0, 1000000)
+
+fn main() ! {
+	let host = lever.Str("host", "127.0.0.1", "database host")
+	let port = lever.Int("port", 5432, "database port")
+	let user = lever.Str("user", "postgres", "database user")
+	let password = lever.Str("password", quarry.Getenv("PGPASSWORD"), "database password")
+	let database = lever.Str("database", "postgres", "database name")
+	let clients = lever.Int("c", 1, "number of client connections")
+	let duration = lever.Int("T", 0, "run for this many seconds")
+	let transactions = lever.Int("t", 0, "transactions per client")
+	let selectOnly = lever.Bool("S", false, "select-only mode")
+	let initMode = lever.Bool("i", false, "initialize pgbench tables")
+	let scale = lever.Int("scale", 1, "scale factor")
+	let script = lever.Str("f", "", "custom script file")
+	try lever.Parse(quarry.Args()[1:])
+	if clients.Val() < 1 || clients.Val() > 1024 { fail "--clients must be between 1 and 1024" }
+	if duration.Val() < 0 { fail "--seconds must be non-negative" }
+	if transactions.Val() < 0 { fail "--transactions must be non-negative" }
+	mut txnCount i64 = transactions.Val()
+	if duration.Val() == 0 && txnCount == 0 { txnCount = 100 }
+	completed.Store(0)
+	failures.Store(0)
+	let addr = "{host.Val()}:{port.Val()}"
+	if initMode.Val() {
+		let db = postgres.Open(postgres.Options{Addr: addr, User: user.Val(), Password: password.Val(), Database: database.Val(), Pool: 1, MaxTotal: 1, Timeout: 10*tide.Second, SSLMode: "disable"})
+		try init_tables(db, scale.Val())
+		say.Line("pgbench init done: scale={scale.Val()}")
+		return
+	}
+	let start = tide.Now()
+	mut until i64 = 0
+	if duration.Val() > 0 { until = start + duration.Val()*tide.Second }
+	scope workers {
+		for i in 0..clients.Val() {
+			let worker = i
+			workers.spawn(fn() ! {
+				worker_loop(addr, user.Val(), password.Val(), database.Val(), selectOnly.Val(), until, txnCount, worker, scale.Val(), script.Val()) catch err {
+					failures.Add(1)
+					say.Line("worker {worker} stopped: {err}")
+				}
+			})
+		}
+	}
+	let elapsed = tide.Since(start)
+	let count = completed.Load()
+	let avg = average_latency(count)
+	let stddev = stddev_latency(count, avg)
+	let p50 = percentile(count, 50)
+	let p95 = percentile(count, 95)
+	let p99 = percentile(count, 99)
+	say.Line("pgbench (tin client)")
+	say.Line("clients: {clients.Val()}")
+	say.Line("transactions: {count}")
+	say.Line("errors: {failures.Load()}")
+	say.Line("elapsed_seconds: {tide.Seconds(elapsed):.3}")
+	say.Line("tps: {f64(count)*1.0e9/f64(elapsed):.2}")
+	say.Line("latency_avg_us: {avg:.2}")
+	say.Line("latency_stddev_us: {stddev:.2}")
+	say.Line("p50_us: {p50:.2}")
+	say.Line("p95_us: {p95:.2}")
+	say.Line("p99_us: {p99:.2}")
+	say.Line("summary: tps={f64(count)*1.0e9/f64(elapsed):.2} latency_avg_us={avg:.2} latency_stddev_us={stddev:.2} p50_us={p50:.2} p95_us={p95:.2} p99_us={p99:.2} failures={failures.Load()} clients={clients.Val()} mode={run_mode(selectOnly.Val(), script.Val())}")
+	if failures.Load() != 0 { fail "one or more workers failed" }
+}
+
+fn run_mode(selectOnly bool, script str) str {
+	if script != "" { return "script" }
+	if selectOnly { return "select-only" }
+	return "tpcb-like"
+}
+
+fn worker_loop(addr str, user str, password str, database str, selectOnly bool, until i64, transactions i64, worker i64, scale i64, script str) ! {
+	let db = postgres.Open(postgres.Options{Addr: addr, User: user, Password: password, Database: database, Pool: 1, MaxTotal: 1, Timeout: 10*tide.Second, SSLMode: "disable"})
+	mut sequence = 0
+	mut done = 0
+	for (until == 0 || tide.Now() < until) && (transactions == 0 || done < transactions) {
+		let started = tide.Now()
+		if selectOnly {
+			let value = (sequence + worker) % 100000
+			let rows = try db.Query("SELECT {value}::int4")
+			if len(rows.Rows) != 1 || rows.Rows[0][0].Int() != value { fail "select workload returned an unexpected result" }
+		} else if script != "" {
+			try run_script_line(db, script)
+		} else {
+			try tpcb_transaction(db, sequence, worker, scale)
+		}
+		let elapsed = tide.Since(started)
+		completed.Add(1)
+		record_latency(elapsed)
+		sequence += 1
+		done += 1
+	}
+}
+
+fn tpcb_transaction(db postgres.Client, sequence i64, worker i64, scale i64) ! {
+	let accountCount = scale*100000
+	let aid = (sequence*7919 + worker*104729) % accountCount + 1
+	let bid = (sequence + worker) % (scale*10) + 1
+	let tid = (sequence*7 + worker) % (scale*100) + 1
+	let delta = (sequence%200)-100
+	mut tx = try db.Begin()
+	let (_, readErr) = tx.Query("SELECT abalance FROM pgbench_accounts WHERE aid = {aid}")
+	if readErr != nil { tx.Rollback() catch _ {}
+		fail readErr }
+	let (_, accountErr) = tx.Exec("UPDATE pgbench_accounts SET abalance = abalance + {delta} WHERE aid = {aid}")
+	if accountErr != nil { tx.Rollback() catch _ {}
+		fail accountErr }
+	let (_, tellerErr) = tx.Exec("UPDATE pgbench_tellers SET tbalance = tbalance + {delta} WHERE tid = {tid}")
+	if tellerErr != nil { tx.Rollback() catch _ {}
+		fail tellerErr }
+	let (_, branchErr) = tx.Exec("UPDATE pgbench_branches SET bbalance = bbalance + {delta} WHERE bid = {bid}")
+	if branchErr != nil { tx.Rollback() catch _ {}
+		fail branchErr }
+	let (_, historyErr) = tx.Exec("INSERT INTO pgbench_history(tid, bid, aid, delta) VALUES ({tid}, {bid}, {aid}, {delta})")
+	if historyErr != nil { tx.Rollback() catch _ {}
+		fail historyErr }
+	try tx.Commit()
+}
+
+fn run_script_line(db postgres.Client, script str) ! {
+	let text = quarry.ReadFile(script) catch _ { "" }
+	_ = text
+	fail "custom scripts require embedding support not available at runtime"
+}
+
+fn init_tables(db postgres.Client, scale i64) ! {
+	try db.Exec("DROP TABLE IF EXISTS pgbench_history")
+	try db.Exec("DROP TABLE IF EXISTS pgbench_accounts")
+	try db.Exec("DROP TABLE IF EXISTS pgbench_tellers")
+	try db.Exec("DROP TABLE IF EXISTS pgbench_branches")
+	try db.Exec("CREATE TABLE pgbench_branches (bid int PRIMARY KEY, bbalance int, filler char(88))")
+	try db.Exec("CREATE TABLE pgbench_tellers (tid int PRIMARY KEY, bid int, tbalance int, filler char(84))")
+	try db.Exec("CREATE TABLE pgbench_accounts (aid int PRIMARY KEY, bid int, abalance int, filler char(84))")
+	try db.Exec("CREATE TABLE pgbench_history (tid int, bid int, aid int, delta int, mtime timestamp, filler char(22))")
+	for bid in 1..scale*1+1 {
+		let _ = try db.Exec("INSERT INTO pgbench_branches (bid, bbalance, filler) VALUES ({bid}, 0, '')")
+	}
+	for tid in 1..scale*10+1 {
+		let bid = ((tid - 1) % (scale*10)) + 1
+		let _ = try db.Exec("INSERT INTO pgbench_tellers (tid, bid, tbalance, filler) VALUES ({tid}, {bid}, 0, '')")
+	}
+	mut aid = 1
+	for aid <= scale*100000 {
+		let bid = ((aid - 1) % (scale*10)) + 1
+		let _ = try db.Exec("INSERT INTO pgbench_accounts (aid, bid, abalance, filler) VALUES ({aid}, {bid}, 0, '')")
+		aid += 1
+	}
+}
+
+fn record_latency(ns i64) {
+	latencies = append(latencies, ns)
+}
+
+fn average_latency(count i64) f64 {
+	mut sum f64 = 0.0
+	for i in 0..count {
+		sum += f64(latencies[i])
+	}
+	if count == 0 { return 0.0 }
+	return sum / f64(count)
+}
+
+fn stddev_latency(count i64, avg f64) f64 {
+	mut sum f64 = 0.0
+	for i in 0..count {
+		let d = f64(latencies[i]) - avg
+		sum += d * d
+	}
+	if count <= 1 { return 0.0 }
+	return gauge.Sqrt(sum / f64(count-1))
+}
+
+fn percentile(count i64, p i64) f64 {
+	if count == 0 { return 0.0 }
+	sift.Ints(mut latencies)
+	let idx = (count * p) / 100
+	mut use = idx
+	if use >= count { use = count - 1 }
+	return f64(latencies[use])
+}

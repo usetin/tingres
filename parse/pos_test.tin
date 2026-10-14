@@ -1,0 +1,487 @@
+package parse
+
+import "crucible"
+
+// This file checks that every AST node carries a real source position: a 1-based character
+// offset that is the start of an actual token (never 0, never a byte offset, never the gap
+// between tokens). The lexer used to accumulate whitespace gaps instead of absolute offsets,
+// so nodes pointed at wrong positions and analyzer errors reported Position 0.
+
+type PosAudit struct {
+	Seen i64
+	Bad i64
+	FirstBadKind str
+	FirstBadPos i64
+}
+
+fn audit(a mut PosAudit, kind str, pos i64, tok []i64) {
+	a.Seen += 1
+	if pos > 0 && containsPos(tok, pos) { return }
+	a.Bad += 1
+	if a.FirstBadKind == "" {
+		a.FirstBadKind = kind
+		a.FirstBadPos = pos
+	}
+}
+
+fn containsPos(tok []i64, pos i64) bool {
+	for t in tok {
+		if t == pos { return true }
+	}
+	return false
+}
+
+fn stripTrailingSemi(sql str) str {
+	mut b = len(sql)
+	for b > 0 && (sql[b - 1] == 59 || sql[b - 1] == 32 || sql[b - 1] == 10 || sql[b - 1] == 9) { b -= 1 }
+	return sql[:b]
+}
+
+fn TestAstNodePositions(t mut crucible.T) {
+	let valid = []str{
+		"SELECT a + b * 3 FROM t WHERE c = 1 GROUP BY a HAVING count(*) > 1 ORDER BY a LIMIT 10 OFFSET 2",
+		"WITH c AS (SELECT 1 AS x) SELECT x FROM c",
+		"SELECT CASE WHEN a > 0 THEN b ELSE c END FROM t",
+		"SELECT f(x) OVER (PARTITION BY a ORDER BY b ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t",
+		"SELECT ARRAY[1, 2, 3][1:2], ROW(1, 2), (a, b) FROM t",
+		"SELECT CAST(x AS numeric(10, 2)), x::text, y COLLATE \"C\", z AT TIME ZONE 'UTC' FROM t",
+		"SELECT count(*) FILTER (WHERE a > 0) FROM t",
+		"SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM t",
+		"SELECT a IS NOT DISTINCT FROM b, x NOT BETWEEN SYMMETRIC 1 AND 2, y NOT IN (1, 2), z = ANY(ARRAY[1, 2]) FROM t",
+		"SELECT x NOT LIKE 'a%' ESCAPE '\\', y SIMILAR TO 'b' FROM t",
+		"INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 3 WHERE a > 0 RETURNING a",
+		"UPDATE t SET a = 1, b = 2 FROM other WHERE t.id = other.id RETURNING t.a",
+		"DELETE FROM t USING other WHERE t.id = other.id",
+		"CREATE TABLE s (id int PRIMARY KEY, v int DEFAULT 0, n text NOT NULL, generated int GENERATED ALWAYS AS (id + 1) STORED, CONSTRAINT pk PRIMARY KEY (id))",
+		"CREATE INDEX ix ON t (a DESC NULLS LAST) WHERE a > 0",
+		"SELECT * FROM t JOIN other ON t.id = other.id LEFT JOIN u USING (id)",
+		"SELECT x FROM (VALUES (1), (2)) AS v(x)",
+		"SELECT EXISTS (SELECT 1), (SELECT 1), ARRAY(SELECT 1) FROM t WHERE a IN (SELECT b FROM other)",
+		"SELECT 1 UNION ALL SELECT 2 INTERSECT SELECT 3",
+		"SELECT a FROM t WINDOW w AS (PARTITION BY b ORDER BY c ROWS UNBOUNDED PRECEDING)",
+		"SELECT grouping(a), sum(x) FROM t GROUP BY GROUPING SETS ((a), (b))",
+		"SELECT * FROM generate_series(1, 3) WITH ORDINALITY AS g(x)",
+		"EXPLAIN (ANALYZE, VERBOSE) SELECT a FROM t WHERE b = 1",
+		"CREATE VIEW v AS SELECT a FROM t",
+		"CREATE TYPE mood AS ENUM ('a', 'b')",
+		"CREATE FUNCTION f(x int) RETURNS int LANGUAGE sql AS 'SELECT $1'",
+	}
+	for sqlText in valid {
+		let sql = stripTrailingSemi(sqlText)
+		let tokens = lex(sql) catch err {
+			t.Error("lex failed for {sql}: {err}")
+			continue
+		}
+		mut tokPos = []i64{}
+		for token in tokens { tokPos = append(tokPos, token.Pos) }
+		let statements = Parse(sql) catch err {
+			t.Error("parse failed for {sql}: {err}")
+			continue
+		}
+		crucible.Equal(mut t, "one statement: {sql}", len(statements), 1)
+		if len(statements) != 1 { continue }
+		mut a = PosAudit{Seen: 0, Bad: 0, FirstBadKind: "", FirstBadPos: 0}
+		checkStmt(statements[0], tokPos, mut a)
+		t.True("nodes seen: {sql}", a.Seen >= 1)
+		if a.Bad != 0 {
+			t.Error("bad positions in {sql}: {a.Bad} of {a.Seen} nodes, e.g. {a.FirstBadKind} at pos {a.FirstBadPos}")
+		}
+	}
+}
+
+fn TestTokenPositionsAreCharacterOffsets(t mut crucible.T) {
+	// Positions are 1-based character offsets into the original text, so a multi-byte
+	// character must not shift later tokens (PostgreSQL counts characters, not bytes).
+	let tokens = lex("SELECT 'é' x FROM t") catch err {
+		t.Error("lex failed: {err}")
+		return
+	}
+	let want = []i64{1, 8, 12, 14, 19}
+	t.True("token count", len(tokens) == len(want))
+	for i in 0..min(len(tokens), len(want)) {
+		crucible.Equal(mut t, "token {i} position", tokens[i].Pos, want[i])
+	}
+	// A multi-byte identifier: café is four characters starting at column 8.
+	let tokens2 = lex("SELECT café FROM t") catch err {
+		t.Error("lex failed: {err}")
+		return
+	}
+	let want2 = []i64{1, 8, 13, 18}
+	for i in 0..min(len(tokens2), len(want2)) {
+		crucible.Equal(mut t, "utf8 token {i} position", tokens2[i].Pos, want2[i])
+	}
+	// Byte spans still index the source.
+	crucible.Equal(mut t, "utf8 token byte span", tokens2[1].EndBytePos - tokens2[1].BytePos, 5)
+}
+
+fn checkStmt(s Stmt, tok []i64, a mut PosAudit) {
+	audit(mut a, "stmt", stmtPos(s), tok)
+	match s {
+		Select(v) => checkSelect(v, tok, mut a)
+		Insert(v) => checkInsert(v, tok, mut a)
+		Update(v) => checkUpdate(v, tok, mut a)
+		Delete(v) => checkDelete(v, tok, mut a)
+		CreateTable(v) => checkCreateTable(v, tok, mut a)
+		CreateIndex(v) => {
+			for k in v.Keys {
+				audit(mut a, "index key", k.Pos, tok)
+				if let e = k.Expression { checkExpr(e, tok, mut a) }
+			}
+			for i in v.Include { audit(mut a, "index include", i.Pos, tok) }
+			if let w = v.Where { checkExpr(w, tok, mut a) }
+		}
+		CreateView(v) => checkSelect(v.Query, tok, mut a)
+		CreateType(v) => {
+			for at in v.Attributes { audit(mut a, "type attribute", at.Pos, tok)
+				checkTypeName(at.TypeName, tok, mut a) }
+		}
+		CreateFunction(v) => {
+			for p in v.Parameters {
+				audit(mut a, "function parameter", p.Pos, tok)
+				checkTypeName(p.TypeName, tok, mut a)
+				if let d = p.Default { checkExpr(d, tok, mut a) }
+			}
+			if let r = v.Returns { checkTypeName(r, tok, mut a) }
+		}
+		Explain(v) => {
+			for o in v.Options { audit(mut a, "explain option", o.Pos, tok)
+				if let e = o.Value { checkExpr(e, tok, mut a) } }
+			checkStmt(v.Statement, tok, mut a)
+		}
+		Copy(v) => { if let q = v.Query { checkSelect(q, tok, mut a) } }
+		Prepare(v) => {
+			for p in v.ParameterTypes { checkTypeName(p, tok, mut a) }
+			checkStmt(v.Statement, tok, mut a)
+		}
+		Execute(v) => {
+			for x in v.Parameters { checkExpr(x, tok, mut a) }
+		}
+		Vacuum(v) => { if let p = v.Parallel { checkExpr(p, tok, mut a) } }
+		Call(v) => {
+			for arg in v.Arguments { audit(mut a, "call argument", arg.Pos, tok)
+				checkExpr(arg.Value, tok, mut a) }
+		}
+		VariableSet(v) => {
+			for x in v.Values { checkExpr(x, tok, mut a) }
+		}
+		AlterTable(v) => {
+			for c in v.Commands { audit(mut a, "alter command", c.Pos, tok)
+				if let e = c.Expression { checkExpr(e, tok, mut a) } }
+		}
+		AlterSequence(v) => {
+			for o in v.Options { audit(mut a, "sequence option", o.Pos, tok)
+				if let e = o.Value { checkExpr(e, tok, mut a) } }
+		}
+		CreateSequence(v) => {
+			for o in v.Options { audit(mut a, "sequence option", o.Pos, tok)
+				if let e = o.Value { checkExpr(e, tok, mut a) } }
+		}
+		_ => {}
+	}
+}
+
+fn checkWith(w WithClause, tok []i64, a mut PosAudit) {
+	audit(mut a, "with", w.Pos, tok)
+	for c in w.Ctes {
+		audit(mut a, "cte", c.Pos, tok)
+		checkSelect(c.Query, tok, mut a)
+	}
+}
+
+fn checkSelect(s SelectStmt, tok []i64, a mut PosAudit) {
+	audit(mut a, "select", s.Pos, tok)
+	if let w = s.With { checkWith(w, tok, mut a) }
+	checkQueryBody(s.Body, tok, mut a)
+	for o in s.OrderBy { checkSortBy(o, tok, mut a) }
+	if let l = s.Limit { checkExpr(l, tok, mut a) }
+	if let o = s.Offset { checkExpr(o, tok, mut a) }
+	if let f = s.FetchCount { checkExpr(f, tok, mut a) }
+	for l in s.Locking { audit(mut a, "locking", l.Pos, tok) }
+}
+
+fn checkQueryBody(b QueryBody, tok []i64, a mut PosAudit) {
+	match b {
+		Core(c) => {
+			audit(mut a, "select core", c.Pos, tok)
+			for d in c.DistinctOn { checkExpr(d, tok, mut a) }
+			for target in c.Targets {
+				audit(mut a, "target", target.Pos, tok)
+				checkExpr(target.Value, tok, mut a)
+			}
+			for f in c.From { checkFromItem(f, tok, mut a) }
+			if let w = c.Where { checkExpr(w, tok, mut a) }
+			for g in c.GroupBy { checkGrouping(g, tok, mut a) }
+			if let h = c.Having { checkExpr(h, tok, mut a) }
+			for n in c.Windows { audit(mut a, "named window", n.Pos, tok)
+				checkWindowSpec(n.Spec, tok, mut a) }
+		}
+		Values(v) => checkValuesQuery(v, tok, mut a)
+		Set(s) => {
+			audit(mut a, "set operation", s.Pos, tok)
+			checkQueryBody(s.Left, tok, mut a)
+			checkQueryBody(s.Right, tok, mut a)
+		}
+	}
+}
+
+fn checkValuesQuery(v ValuesQuery, tok []i64, a mut PosAudit) {
+	audit(mut a, "values", v.Pos, tok)
+	for row in v.Rows {
+		for x in row { checkExpr(x, tok, mut a) }
+	}
+}
+
+fn checkFromItem(f FromItem, tok []i64, a mut PosAudit) {
+	match f {
+		Table(v) => audit(mut a, "table ref", v.Pos, tok)
+		Subquery(v) => { audit(mut a, "subquery ref", v.Pos, tok)
+			checkSelect(v.Query, tok, mut a) }
+		Values(v) => { audit(mut a, "values ref", v.Pos, tok)
+			checkValuesQuery(v.Values, tok, mut a) }
+		Function(v) => { audit(mut a, "function ref", v.Pos, tok)
+			checkExpr(v.Function, tok, mut a) }
+		Join(v) => {
+			audit(mut a, "join", v.Pos, tok)
+			checkFromItem(v.Left, tok, mut a)
+			checkFromItem(v.Right, tok, mut a)
+			if let c = v.Condition {
+				match c {
+					On(o) => { audit(mut a, "join on", o.Pos, tok)
+						checkExpr(o.Value, tok, mut a) }
+					Using(u) => audit(mut a, "join using", u.Pos, tok)
+				}
+			}
+		}
+	}
+}
+
+fn checkGrouping(g GroupingElement, tok []i64, a mut PosAudit) {
+	audit(mut a, "grouping", g.Pos, tok)
+	if let v = g.Value { checkExpr(v, tok, mut a) }
+	for item in g.Items { checkGrouping(item, tok, mut a) }
+}
+
+fn checkSortBy(s SortBy, tok []i64, a mut PosAudit) {
+	audit(mut a, "sort by", s.Pos, tok)
+	checkExpr(s.Value, tok, mut a)
+}
+
+fn checkTypeName(tn TypeName, tok []i64, a mut PosAudit) {
+	audit(mut a, "type", tn.Pos, tok)
+	for m in tn.Modifiers { audit(mut a, "type modifier", m.Pos, tok)
+		checkExpr(m.Value, tok, mut a) }
+	for b in tn.ArrayBounds { audit(mut a, "array bound", b.Pos, tok)
+		if let l = b.Length { checkExpr(l, tok, mut a) } }
+}
+
+fn checkWindowSpec(spec WindowSpec, tok []i64, a mut PosAudit) {
+	audit(mut a, "window spec", spec.Pos, tok)
+	for p in spec.PartitionBy { checkExpr(p, tok, mut a) }
+	for o in spec.OrderBy { checkSortBy(o, tok, mut a) }
+	if let f = spec.Frame {
+		audit(mut a, "window frame", f.Pos, tok)
+		audit(mut a, "frame bound", f.Start.Pos, tok)
+		if let s = f.Start.Offset { checkExpr(s, tok, mut a) }
+		if let e = f.End {
+			audit(mut a, "frame bound", e.Pos, tok)
+			if let o = e.Offset { checkExpr(o, tok, mut a) }
+		}
+	}
+}
+
+fn checkExpr(e Expr, tok []i64, a mut PosAudit) {
+	audit(mut a, "expr", valuePos(e), tok)
+	match e {
+		Literal(_) => {}
+		ColumnRef(_) => {}
+		Param(_) => {}
+		Unary(v) => checkExpr(v.Operand, tok, mut a)
+		Binary(v) => { checkExpr(v.Left, tok, mut a)
+			checkExpr(v.Right, tok, mut a) }
+		Boolean(v) => { for x in v.Args { checkExpr(x, tok, mut a) } }
+		Is(v) => { checkExpr(v.Operand, tok, mut a)
+			if let r = v.Right { checkExpr(r, tok, mut a) } }
+		Between(v) => { checkExpr(v.Operand, tok, mut a)
+			checkExpr(v.Lower, tok, mut a)
+			checkExpr(v.Upper, tok, mut a) }
+		In(v) => { checkExpr(v.Operand, tok, mut a)
+			for x in v.Items { checkExpr(x, tok, mut a) }
+			if let q = v.Query { checkSelect(q, tok, mut a) } }
+		Like(v) => { checkExpr(v.Operand, tok, mut a)
+			checkExpr(v.Pattern, tok, mut a)
+			if let x = v.Escape { checkExpr(x, tok, mut a) } }
+		Quantified(v) => { checkExpr(v.Left, tok, mut a)
+			checkExpr(v.Array, tok, mut a)
+			if let q = v.Query { checkSelect(q, tok, mut a) } }
+		Exists(v) => checkSelect(v.Query, tok, mut a)
+		Subquery(v) => checkSelect(v.Query, tok, mut a)
+		Array(v) => { for x in v.Elements { checkExpr(x, tok, mut a) } }
+		ArraySubquery(v) => checkSelect(v.Query, tok, mut a)
+		Subscript(v) => {
+			checkExpr(v.Array, tok, mut a)
+			for idx in v.Indices {
+				audit(mut a, "subscript index", idx.Pos, tok)
+				if let l = idx.Lower { checkExpr(l, tok, mut a) }
+				if let u = idx.Upper { checkExpr(u, tok, mut a) }
+			}
+		}
+		Row(v) => { for f in v.Fields { checkExpr(f, tok, mut a) } }
+		Field(v) => checkExpr(v.Value, tok, mut a)
+		Case(v) => {
+			if let o = v.Operand { checkExpr(o, tok, mut a) }
+			for w in v.Whens { audit(mut a, "when", w.Pos, tok)
+				checkExpr(w.Condition, tok, mut a)
+				checkExpr(w.Result, tok, mut a) }
+			if let x = v.ElseExpr { checkExpr(x, tok, mut a) }
+		}
+		Call(v) => checkCall(v, tok, mut a)
+		Special(v) => {
+			for x in v.Args { checkExpr(x, tok, mut a) }
+			if let x = v.FromExpr { checkExpr(x, tok, mut a) }
+			if let x = v.ForExpr { checkExpr(x, tok, mut a) }
+		}
+		Cast(v) => { checkExpr(v.Value, tok, mut a)
+			checkTypeName(v.TypeName, tok, mut a) }
+		Collate(v) => checkExpr(v.Value, tok, mut a)
+		AtTimeZone(v) => { checkExpr(v.Value, tok, mut a)
+			checkExpr(v.Zone, tok, mut a) }
+		Default(_) => {}
+	}
+}
+
+fn checkCall(v FunctionCallExpr, tok []i64, a mut PosAudit) {
+	for arg in v.Args {
+		audit(mut a, "function argument", arg.Pos, tok)
+		checkExpr(arg.Value, tok, mut a)
+	}
+	for o in v.OrderBy { checkSortBy(o, tok, mut a) }
+	if let f = v.Filter { checkExpr(f, tok, mut a) }
+	if let o = v.Over { checkWindowSpec(o, tok, mut a) }
+	for o in v.WithinGroup { checkSortBy(o, tok, mut a) }
+}
+
+fn checkAssignments(items []Assignment, tok []i64, a mut PosAudit) {
+	for item in items {
+		audit(mut a, "assignment", item.Pos, tok)
+		checkExpr(item.Value, tok, mut a)
+	}
+}
+
+fn checkTargets(items []TargetEntry, tok []i64, a mut PosAudit) {
+	for target in items {
+		audit(mut a, "returning target", target.Pos, tok)
+		checkExpr(target.Value, tok, mut a)
+	}
+}
+
+fn checkConflict(c OnConflictClause, tok []i64, a mut PosAudit) {
+	audit(mut a, "conflict", c.Pos, tok)
+	if let target = c.Target {
+		audit(mut a, "conflict target", target.Pos, tok)
+		for x in target.Columns { checkExpr(x, tok, mut a) }
+		if let w = target.Where { checkExpr(w, tok, mut a) }
+	}
+	audit(mut a, "conflict action", c.Action.Pos, tok)
+	checkAssignments(c.Action.Assignments, tok, mut a)
+	if let w = c.Action.Where { checkExpr(w, tok, mut a) }
+}
+
+fn checkInsert(v InsertStmt, tok []i64, a mut PosAudit) {
+	if let w = v.With { checkWith(w, tok, mut a) }
+	match v.Source {
+		Values(vv) => checkValuesQuery(vv, tok, mut a)
+		DefaultValues(d) => audit(mut a, "default values", d.Pos, tok)
+		Query(q) => checkSelect(q, tok, mut a)
+	}
+	if let c = v.Conflict { checkConflict(c, tok, mut a) }
+	checkTargets(v.Returning, tok, mut a)
+}
+
+fn checkUpdate(v UpdateStmt, tok []i64, a mut PosAudit) {
+	if let w = v.With { checkWith(w, tok, mut a) }
+	checkAssignments(v.Assignments, tok, mut a)
+	for f in v.From { checkFromItem(f, tok, mut a) }
+	if let w = v.Where { checkExpr(w, tok, mut a) }
+	checkTargets(v.Returning, tok, mut a)
+}
+
+fn checkDelete(v DeleteStmt, tok []i64, a mut PosAudit) {
+	if let w = v.With { checkWith(w, tok, mut a) }
+	for u in v.Using { checkFromItem(u, tok, mut a) }
+	if let w = v.Where { checkExpr(w, tok, mut a) }
+	checkTargets(v.Returning, tok, mut a)
+}
+
+fn checkCreateTable(v CreateTableStmt, tok []i64, a mut PosAudit) {
+	for el in v.Elements {
+		match el {
+			Column(c) => checkColumnDef(c, tok, mut a)
+			Constraint(c) => checkTableConstraint(c, tok, mut a)
+		}
+	}
+	for l in v.Like { audit(mut a, "like", l.Pos, tok) }
+	if let p = v.PartitionBy {
+		audit(mut a, "partition by", p.Pos, tok)
+		for k in p.Keys { checkExpr(k, tok, mut a) }
+	}
+	if let q = v.AsQuery { checkSelect(q, tok, mut a) }
+}
+
+fn checkColumnDef(c ColumnDef, tok []i64, a mut PosAudit) {
+	audit(mut a, "column", c.Pos, tok)
+	checkTypeName(c.TypeName, tok, mut a)
+	if let d = c.Default { checkExpr(d, tok, mut a) }
+	if let g = c.GeneratedExpr { checkExpr(g, tok, mut a) }
+	for cons in c.Constraints { checkTableConstraint(cons, tok, mut a) }
+}
+
+fn checkTableConstraint(c TableConstraint, tok []i64, a mut PosAudit) {
+	audit(mut a, "constraint", c.Pos, tok)
+	for e in c.Expressions { checkExpr(e, tok, mut a) }
+	for r in c.ReferenceActions { audit(mut a, "reference action", r.Pos, tok) }
+	if let w = c.Where { checkExpr(w, tok, mut a) }
+}
+
+fn stmtPos(s Stmt) i64 {
+	return match s {
+		Select(v) => v.Pos
+		Insert(v) => v.Pos
+		Update(v) => v.Pos
+		Delete(v) => v.Pos
+		CreateTable(v) => v.Pos
+		AlterTable(v) => v.Pos
+		Drop(v) => v.Pos
+		CreateIndex(v) => v.Pos
+		CreateView(v) => v.Pos
+		CreateSequence(v) => v.Pos
+		AlterSequence(v) => v.Pos
+		CreateSchema(v) => v.Pos
+		CreateType(v) => v.Pos
+		CreateFunction(v) => v.Pos
+		Truncate(v) => v.Pos
+		Transaction(v) => v.Pos
+		VariableSet(v) => v.Pos
+		Explain(v) => v.Pos
+		Copy(v) => v.Pos
+		Prepare(v) => v.Pos
+		Execute(v) => v.Pos
+		Deallocate(v) => v.Pos
+		Vacuum(v) => v.Pos
+		Analyze(v) => v.Pos
+		Discard(v) => v.Pos
+		Comment(v) => v.Pos
+		Grant(v) => v.Pos
+		Revoke(v) => v.Pos
+		CreateRole(v) => v.Pos
+		AlterRole(v) => v.Pos
+		DropRole(v) => v.Pos
+		Listen(v) => v.Pos
+		Notify(v) => v.Pos
+		Unlisten(v) => v.Pos
+		Lock(v) => v.Pos
+		Do(v) => v.Pos
+		Checkpoint(v) => v.Pos
+		Call(v) => v.Pos
+		Utility(v) => v.Pos
+	}
+}

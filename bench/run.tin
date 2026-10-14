@@ -1,0 +1,11 @@
+package main
+
+import "quarry"
+import "say"
+import "./stats"
+import "tide"
+
+fn main() ! {
+	try stats.WritePendingReport("bench/results/linux.md")
+	say.Line("wrote bench/results/linux.md")
+}

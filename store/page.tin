@@ -2,7 +2,7 @@ package store
 
 type RelId = u32
 type PageNo = u32
-
+type Lsn = u64
 
 const PageSize = 8192
 const pageHeaderSize = 32
@@ -53,6 +53,16 @@ fn (p mut Page) Reset() {
 	p.Seal()
 }
 
+// SealBytes writes the page checksum over a caller-owned 8 KiB page image; the write paths use it
+// because mutators only mark a page dirty and leave the checksum for the next flush.
+fn sealBytes(d mut []u8) {
+	if len(d) != PageSize {
+		return
+	}
+	writeU32(mut d, 8, 0)
+	writeU32(mut d, 8, crc32(d))
+}
+
 // Header decodes the common page header.
 fn (p Page) Header() PageHeader {
 	return PageHeader{
@@ -77,7 +87,6 @@ fn (p Page) FreeSpace() i64 {
 // SetLsn updates the page LSN and checksum.
 fn (p mut Page) SetLsn(lsn u64) {
 	writeU64(mut p.Data, 0, lsn)
-	p.Seal()
 }
 
 // Flags returns the header flag bits.
@@ -88,7 +97,6 @@ fn (p Page) Flags() u16 {
 // SetFlags replaces the header flag bits.
 fn (p mut Page) SetFlags(flags u16) {
 	writeU16(mut p.Data, 12, flags)
-	p.Seal()
 }
 
 // AllVisible reports whether all tuples on this page are visible to every transaction.
@@ -105,7 +113,6 @@ fn (p mut Page) SetAllVisible(v bool) {
 		flags &= ~PageAllVisible
 	}
 	writeU16(mut p.Data, 12, flags)
-	p.Seal()
 }
 
 // PageType returns the page type identifier.
@@ -116,7 +123,6 @@ fn (p Page) PageType() u16 {
 // SetPageType sets the page type identifier.
 fn (p mut Page) SetPageType(pt u16) {
 	writeU16(mut p.Data, 14, pt)
-	p.Seal()
 }
 
 // PrevBlock returns the previous sibling block number.
@@ -127,7 +133,6 @@ fn (p Page) PrevBlock() PageNo {
 // SetPrevBlock updates the previous sibling block number.
 fn (p mut Page) SetPrevBlock(b PageNo) {
 	writeU32(mut p.Data, 24, u32(b))
-	p.Seal()
 }
 
 // NextBlock returns the next sibling block number.
@@ -138,7 +143,6 @@ fn (p Page) NextBlock() PageNo {
 // SetNextBlock updates the next sibling block number.
 fn (p mut Page) SetNextBlock(b PageNo) {
 	writeU32(mut p.Data, 28, u32(b))
-	p.Seal()
 }
 
 // Seal recomputes the page checksum.
@@ -162,6 +166,14 @@ fn (p Page) Valid() bool {
 
 // Insert stores bytes in the page and returns a one-based line pointer.
 fn (p mut Page) Insert(value []u8) !u16 {
+	let slot = try p.InsertRaw(value)
+	p.Seal()
+	return slot
+}
+
+// InsertRaw inserts bytes and returns a one-based line pointer without recomputing the checksum;
+// batch rebuilds use it and the write path seals once.
+fn (p mut Page) InsertRaw(value []u8) !u16 {
 	if len(p.Data) != PageSize || len(value) == 0 {
 		fail "store: invalid page or empty item"
 	}
@@ -180,7 +192,6 @@ fn (p mut Page) Insert(value []u8) !u16 {
 	writeU16(mut p.Data, 16, u16(i64(h.Lower)+linePointerSize))
 	writeU16(mut p.Data, 18, u16(off))
 	writeU16(mut p.Data, 20, slot+1)
-	p.Seal()
 	return slot + 1
 }
 
@@ -216,7 +227,6 @@ fn (p mut Page) InsertAt(targetSlot u16, value []u8) !u16 {
 	writeU16(mut p.Data, 16, u16(i64(h.Lower)+linePointerSize))
 	writeU16(mut p.Data, 18, u16(off))
 	writeU16(mut p.Data, 20, h.Slots+1)
-	p.Seal()
 	return targetSlot
 }
 
@@ -234,7 +244,6 @@ fn (p mut Page) ReserveSlot(itemBytes i64, reservedBytes i64) !u16 {
 				fail "store: page full"
 			}
 			writeU32(mut p.Data, lp+4, 2)
-			p.Seal()
 			return u16(slot)
 		}
 	}
@@ -248,7 +257,6 @@ fn (p mut Page) ReserveSlot(itemBytes i64, reservedBytes i64) !u16 {
 	writeU32(mut p.Data, lp+4, 2)
 	writeU16(mut p.Data, 16, u16(i64(h.Lower)+linePointerSize))
 	writeU16(mut p.Data, 20, slot)
-	p.Seal()
 	return slot
 }
 
@@ -268,7 +276,6 @@ fn (p mut Page) InsertReserved(slot u16, value []u8, reservedBytes i64) ! {
 	writeU16(mut p.Data, lp+2, u16(len(value)))
 	writeU32(mut p.Data, lp+4, 1)
 	writeU16(mut p.Data, 18, u16(off))
-	p.Seal()
 }
 
 // Unreserve releases a tuple slot when the WAL append itself fails.
@@ -282,7 +289,6 @@ fn (p mut Page) Unreserve(slot u16) ! {
 		fail "store: line pointer is not reserved"
 	}
 	writeU32(mut p.Data, lp+4, 0)
-	p.Seal()
 }
 
 // SetItem replaces a live item's bytes without changing its line pointer.
@@ -298,7 +304,6 @@ fn (p mut Page) SetItem(slot u16, value []u8) ! {
 		fail "store: invalid replacement item"
 	}
 	copy(p.Data[off:off+n], value)
-	p.Seal()
 }
 
 // Item returns a copy of a live line-pointer item.
@@ -359,7 +364,6 @@ fn (p mut Page) Compact() {
 	let h = p.Header()
 	if h.Slots == 0 {
 		writeU16(mut p.Data, 18, u16(PageSize))
-		p.Seal()
 		return
 	}
 	mut temp = make([]u8, PageSize)
@@ -381,7 +385,6 @@ fn (p mut Page) Compact() {
 		}
 	}
 	writeU16(mut p.Data, 18, u16(newUpper))
-	p.Seal()
 }
 
 // PruneSlots marks each listed slot dead and compacts the page.
@@ -396,6 +399,37 @@ fn (p mut Page) PruneSlots(deadSlots []u16) {
 		}
 	}
 	p.Compact()
+}
+
+// SlotStatus returns the line pointer status: 0 unused, 1 live, 2 reserved.
+fn (p Page) SlotStatus(slot u16) u32 {
+	let h = p.Header()
+	if slot == 0 || slot > h.Slots {
+		return 0
+	}
+	return readU32(p.Data, pageHeaderSize+i64(slot-1)*linePointerSize+4)
+}
+
+// ItemLen returns the byte length of a live line pointer.
+fn (p Page) ItemLen(slot u16) i64 {
+	if p.SlotStatus(slot) != 1 {
+		return 0
+	}
+	return i64(readU16(p.Data, pageHeaderSize+i64(slot-1)*linePointerSize+2))
+}
+
+// SetItemPrefix overwrites the first bytes of a live item in place, keeping its length.
+fn (p mut Page) SetItemPrefix(slot u16, prefix []u8) ! {
+	if p.SlotStatus(slot) != 1 {
+		fail "store: invalid tuple id"
+	}
+	let lp = pageHeaderSize + i64(slot-1)*linePointerSize
+	let off = i64(readU16(p.Data, lp))
+	let n = i64(readU16(p.Data, lp+2))
+	if len(prefix) > n || off < pageHeaderSize || off+n > PageSize {
+		fail "store: invalid item prefix"
+	}
+	copy(p.Data[off:off+len(prefix)], prefix)
 }
 
 fn writeU16(b mut []u8, off i64, v u16) {
@@ -438,15 +472,26 @@ fn readU64(b []u8, off i64) u64 {
 fn crc32(b []u8) u32 {
 	mut crc = u32(0xffffffff)
 	for x in b {
-		crc ^= u32(x)
-		for bit in 0..8 {
-			_ = bit
-			if crc&1 != 0 {
-				crc = (crc >> 1) ^ 0xedb88320
+		crc = (crc >> 8) ^ crc32Table[(crc ^ u32(x)) & u32(0xff)]
+	}
+	return crc ^ u32(0xffffffff)
+}
+
+// crc32Table is the IEEE reflected CRC lookup table, built once per process.
+let crc32Table = buildCrc32Table()
+
+fn buildCrc32Table() []u32 {
+	mut t = make([]u32, 256)
+	for i in 0..256 {
+		mut c = u32(i)
+		for _k in 0..8 {
+			if c&1 != 0 {
+				c = (c >> 1) ^ u32(0xedb88320)
 			} else {
-				crc >>= 1
+				c >>= 1
 			}
 		}
+		t[i] = c
 	}
-	return crc ^ 0xffffffff
+	return t
 }

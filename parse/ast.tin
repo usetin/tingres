@@ -40,6 +40,17 @@ type Stmt enum {
 	Do(DoStmt)
 	Checkpoint(CheckpointStmt)
 	Call(CallStmt)
+	Utility(UtilityStmt)
+}
+
+// UtilityStmt is a statement form the parser accepts opaquely: it validates the leading
+// keywords and object kind, then preserves the canonical text so deparse round-trips. Used
+// for PostgreSQL utility commands (cursor commands, REINDEX, MERGE, object kinds not modelled
+// by a dedicated node) rather than rejecting valid SQL.
+type UtilityStmt struct {
+	Pos i64
+	Kind str
+	Text str
 }
 
 // Expr is the closed set of expression forms understood by parse.
@@ -658,6 +669,7 @@ type TableConstraint struct {
 	MatchType str
 	Include []Identifier
 	Where ?Expr
+	Raw str
 }
 
 // LikeClause stores CREATE TABLE LIKE options.
@@ -686,6 +698,13 @@ type CreateTableStmt struct {
 	PartitionBy ?PartitionBy
 	AsQuery ?SelectStmt
 	WithData bool
+	Options []str
+	PartitionOf ?QualifiedName
+	PartitionBound str
+	OfType ?TypeName
+	OnCommit str
+	Tablespace str
+	AccessMethod str
 }
 
 // AlterTableCommand is one ALTER TABLE action.
@@ -699,6 +718,7 @@ type AlterTableCommand struct {
 	TypeName ?TypeName
 	Expression ?Expr
 	Behavior str
+	Text str
 }
 
 // AlterTableStmt stores a list of ALTER TABLE actions.
@@ -742,6 +762,8 @@ type CreateIndexStmt struct {
 	Keys []IndexElement
 	Include []IndexElement
 	Where ?Expr
+	WithOptions []str
+	Tablespace str
 }
 
 // CreateViewStmt stores CREATE VIEW query and check-option settings.
@@ -754,6 +776,7 @@ type CreateViewStmt struct {
 	Columns []Identifier
 	Query SelectStmt
 	CheckOption str
+	Options []str
 }
 
 // SequenceOption stores one CREATE/ALTER SEQUENCE option.
@@ -786,6 +809,7 @@ type CreateSchemaStmt struct {
 	IfNotExists bool
 	Name Identifier
 	Authorization ?Identifier
+	Elements []Stmt
 }
 
 // CompositeAttribute is one attribute of a composite type.
@@ -803,6 +827,7 @@ type CreateTypeStmt struct {
 	Kind str
 	Labels []str
 	Attributes []CompositeAttribute
+	RangeOptions str
 }
 
 // FunctionParameter is one CREATE FUNCTION parameter.
@@ -958,6 +983,7 @@ type CommentStmt struct {
 	ObjectType str
 	Name QualifiedName
 	Text ?str
+	OnName ?QualifiedName
 }
 
 // GrantStmt stores GRANT privileges and recipients.

@@ -1,0 +1,406 @@
+package store
+
+import "crucible"
+import "dice"
+import "quarry"
+import "sift"
+
+// Model-driven and buffer-pool stress tests: a deterministic pseudo-random workload is replayed
+// against an ordinary in-memory model and the durable page store must agree with it afterwards.
+
+fn tidKey(t Tid) u64 {
+	return (u64(t.page) << 32) | u64(t.slot)
+}
+
+fn u32Bytes(v u32) []u8 {
+	mut b = make([]u8, 4)
+	writeU32(mut b, 0, v)
+	return b
+}
+
+fn TestBufferPoolEvictsAcrossThousandPages(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-bpool-1000"
+	quarry.RemoveAll(dir) catch _ { }
+	// Build 1000 pages with a pool that holds them, so the build itself is cheap.
+	let (opened, openErr) = Open(dir, Options{BufferPages: 2048})
+	if openErr != nil {
+		t.Error("open failed")
+		return
+	}
+	mut db = opened
+	db.CreateHeap(400) catch err {
+		t.Error("create heap failed: {err}")
+		return
+	}
+	let payload = make([]u8, 4000)
+	for i in 0..2000 {
+		writeU32(mut payload, 0, u32(i))
+		let (_, insErr) = db.HeapInsert(NewXidCtx(2, 0), 400, payload)
+		if insErr != nil {
+			t.Error("insert {i} failed: {insErr}")
+			return
+		}
+	}
+	let pages = db.files.PageCount(400) catch _ { 0 }
+	crucible.True("at least 1000 pages for 2000 tuples", pages >= 1000)
+	let closeErr = db.Close()
+	if closeErr != nil {
+		t.Error("close failed: {closeErr}")
+		return
+	}
+	// Re-read 1000 pages through a 16-frame pool: clock-sweep eviction must keep every tuple.
+	let (reopened, reopenErr) = Open(dir, Options{BufferPages: 16})
+	if reopenErr != nil {
+		t.Error("reopen failed: {reopenErr}")
+		return
+	}
+	mut db2 = reopened
+	mut seen = make([]bool, 2000)
+	mut scan = db2.HeapScan(400)
+	mut count = 0
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		crucible.True("payload long enough", len(tuple.Payload) == 4000)
+		let id = i64(readU32(tuple.Payload, 0))
+		if id < 0 || id >= 2000 {
+			t.Error("payload id {id} out of range")
+			return
+		}
+		seen[id] = true
+		count += 1
+	}
+	crucible.Equal(mut t, "all tuples survived eviction", count, 2000)
+	mut missing = 0
+	for _, v in seen {
+		if !v {
+			missing += 1
+		}
+	}
+	crucible.Equal(mut t, "no missing payload id", missing, 0)
+	// Dirty the 16-frame pool so it writes back under pressure, then check WAL-before-data.
+	let payload2 = make([]u8, 4000)
+	for i in 0..40 {
+		writeU32(mut payload2, 0, u32(900000+i))
+		let (_, insErr) = db2.HeapInsert(NewXidCtx(3, 0), 400, payload2)
+		if insErr != nil {
+			t.Error("dirty insert {i} failed: {insErr}")
+			return
+		}
+	}
+	let pages2 = db2.files.PageCount(400) catch _ { 0 }
+	crucible.True("relation grew past the pool", pages2 > 1000)
+	let checkPages = min(pages2, u32(1000))
+	for block in 0..i64(checkPages) {
+		let (p, readErr) = db2.files.ReadPage(400, PageNo(block))
+		if readErr != nil {
+			t.Error("read page {block} failed: {readErr}")
+			return
+		}
+		if p.Header().Lsn > db2.syncedLsn {
+			t.Error("page {block} was written before its WAL was durable")
+			return
+		}
+	}
+	db2.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+}
+
+fn TestRandomizedHeapVersusModel(t mut crucible.T) {
+	for seed in 0..3 {
+		runHeapModelSeed(mut t, seed)
+	}
+}
+
+fn runHeapModelSeed(t mut crucible.T, seed i64) {
+	let dir = "/tmp/tingres-store-heap-model-{seed}"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 512})
+	if openErr != nil {
+		t.Error("seed {seed}: open failed")
+		return
+	}
+	mut db = opened
+	db.CreateHeap(300) catch err {
+		t.Error("seed {seed}: create heap failed: {err}")
+		return
+	}
+	mut rng = dice.New(u64(seed*104729+11))
+	mut live = map[u64][]u8{}
+	mut dead = map[u64]bool{}
+	mut tids = []Tid{}
+	let payload = make([]u8, 8)
+	mut ops = 0
+	for ops < 50000 {
+		let roll = rng.Intn(100)
+		if roll < 60 || len(tids) == 0 {
+			rng.Fill(mut payload)
+			let (tid, insErr) = db.HeapInsert(NewXidCtx(u32(seed)+2, 0), 300, payload)
+			if insErr != nil {
+				t.Error("seed {seed}: insert failed: {insErr}")
+				return
+			}
+			tids = append(tids, tid)
+			live[tidKey(tid)] = copyBytes(payload)
+		} else if roll < 90 {
+			let idx = rng.Intn(i64(len(tids)))
+			let tid = tids[idx]
+			if !dead[tidKey(tid)] {
+				let delErr = db.HeapDelete(NewXidCtx(u32(seed)+10, 1), 300, tid)
+				if delErr != nil {
+					t.Error("seed {seed}: delete failed: {delErr}")
+					return
+				}
+				delete(live, tidKey(tid))
+				dead[tidKey(tid)] = true
+			}
+		} else {
+			let idx = rng.Intn(i64(len(tids)))
+			let tid = tids[idx]
+			let (tuple, fetchErr) = db.HeapFetch(300, tid, []u8{})
+			if fetchErr != nil {
+				t.Error("seed {seed}: fetch failed: {fetchErr}")
+				return
+			}
+			let expect = live[tidKey(tid)]
+			if len(expect) > 0 && len(tuple.Payload) != len(expect) {
+				t.Error("seed {seed}: fetched payload length changed")
+				return
+			}
+		}
+		ops += 1
+	}
+	mut scan = db.HeapScan(300)
+	mut liveSeen = 0
+	mut totalSeen = 0
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		totalSeen += 1
+		let key = tidKey(tuple.Tid)
+		if tuple.Header.Xmax() == 0 {
+			liveSeen += 1
+			let expect = live[key]
+			if len(expect) == 0 {
+				t.Error("seed {seed}: live tuple {key} not in model")
+				return
+			}
+			if len(expect) != len(tuple.Payload) {
+				t.Error("seed {seed}: live tuple {key} payload length mismatch")
+				return
+			}
+		} else if !dead[key] {
+			t.Error("seed {seed}: tuple {key} has xmax but is not in the dead set")
+			return
+		}
+	}
+	crucible.Equal(mut t, "seed {seed}: live count", liveSeen, len(live))
+	crucible.Equal(mut t, "seed {seed}: every model entry stored", liveSeen, len(live))
+	db.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+	_ = totalSeen
+}
+
+// ---- B-tree versus a sorted-array model ----
+
+type ModelEntry struct {
+	key []u8
+	tid Tid
+}
+
+fn modelLess(a ModelEntry, b ModelEntry) bool {
+	let c = keyCmp(a.key, b.key)
+	if c != 0 {
+		return c < 0
+	}
+	if a.tid.page != b.tid.page {
+		return a.tid.page < b.tid.page
+	}
+	return a.tid.slot < b.tid.slot
+}
+
+fn modelCmp(a ModelEntry, b ModelEntry) i64 {
+	if modelLess(a, b) {
+		return -1
+	}
+	if modelLess(b, a) {
+		return 1
+	}
+	return 0
+}
+
+fn modelSort(ms mut []ModelEntry) {
+	sift.SortFunc(mut ms, modelCmp)
+}
+
+fn modelInRange(e ModelEntry, lo []u8, hi []u8, flags u32) bool {
+	if flags&IndexLoUnbounded == 0 {
+		let cl = keyCmp(e.key, lo)
+		if cl < 0 || (cl == 0 && flags&IndexLoExclusive != 0) {
+			return false
+		}
+	}
+	if flags&IndexHiUnbounded == 0 {
+		let ch = keyCmp(e.key, hi)
+		if ch > 0 || (ch == 0 && flags&IndexHiExclusive != 0) {
+			return false
+		}
+	}
+	return true
+}
+
+fn modelRange(ms []ModelEntry, lo []u8, hi []u8, flags u32) []ModelEntry {
+	mut out = []ModelEntry{}
+	for _, e in ms {
+		if modelInRange(e, lo, hi, flags) {
+			out = append(out, e)
+		}
+	}
+	if flags&IndexBackward != 0 {
+		mut rev = []ModelEntry{}
+		mut i = len(out)-1
+		for i >= 0 {
+			rev = append(rev, out[i])
+			i -= 1
+		}
+		return rev
+	}
+	return out
+}
+
+fn compareIndexScan(t mut crucible.T, label str, scan mut IndexScan, expected []ModelEntry) {
+	crucible.Equal(mut t, label+" error", scan.Error(), "")
+	mut i = 0
+	for {
+		let (item, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		if i >= len(expected) {
+			t.Error("{label}: more items than the model")
+			return
+		}
+		let e = expected[i]
+		if keyCmp(item.Key(), e.key) != 0 {
+			t.Error("{label}: key mismatch at {i}")
+			return
+		}
+		if item.Tid() != e.tid {
+			t.Error("{label}: tid mismatch at {i}")
+			return
+		}
+		i += 1
+	}
+	crucible.Equal(mut t, label+" count", i, len(expected))
+}
+
+fn TestBtreeVersusSortedModel(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-btree-model"
+	quarry.RemoveAll(dir) catch _ { }
+	let (opened, openErr) = Open(dir, Options{BufferPages: 4096})
+	if openErr != nil {
+		t.Error("open failed")
+		return
+	}
+	mut db = opened
+	db.CreateIndex(500, false) catch err {
+		t.Error("create index failed: {err}")
+		return
+	}
+	mut rng = dice.New(20261013)
+	mut model = []ModelEntry{}
+	// Large keys make few entries per page, so a few thousand leaves force thousands of splits.
+	// Every fourth key duplicates the previous one, and every 500th is close to 1 KiB, exercising
+	// duplicate runs that cross leaf boundaries and near-maximum key sizes.
+	let inserts = 50000
+	mut lastKey = []u8{}
+	for i in 0..inserts {
+		mut key = []u8{}
+		if i%500 == 0 {
+			mut big = make([]u8, 1024)
+			rng.Fill(mut big)
+			key = big
+		} else if i%4 == 0 && len(lastKey) > 0 {
+			key = copyBytes(lastKey)
+		} else {
+			mut fresh = make([]u8, 250+rng.Intn(150))
+			rng.Fill(mut fresh)
+			key = fresh
+		}
+		let tid = Tid{page: u32(rng.Intn(1000000)), slot: u16(rng.Intn(65535))}
+		let insErr = db.IndexInsert(500, key, tid)
+		if insErr != nil {
+			t.Error("index insert {i} failed: {insErr}")
+			return
+		}
+		model = append(model, ModelEntry{key: key, tid: tid})
+		lastKey = copyBytes(key)
+	}
+	modelSort(mut model)
+	let leaves = db.files.PageCount(500) catch _ { 0 }
+	crucible.True("thousands of leaves/splits", leaves >= 1000)
+	// Full ordered scan.
+	mut full = db.IndexSeek(500, []u8{}, []u8{}, IndexLoUnbounded|IndexHiUnbounded)
+	compareIndexScan(mut t, "full scan", mut full, model)
+	mut rev = db.IndexSeek(500, []u8{}, []u8{}, IndexLoUnbounded|IndexHiUnbounded|IndexBackward)
+	compareIndexScan(mut t, "full reverse scan", mut rev, modelRange(model, []u8{}, []u8{}, IndexLoUnbounded|IndexHiUnbounded|IndexBackward))
+	// Random ranges with every bound shape.
+	for q in 0..30 {
+		let a = model[rng.Intn(i64(len(model)))].key
+		let b = model[rng.Intn(i64(len(model)))].key
+		let lo = a
+		let hi = b
+		let base = u32(0)
+		let width = rng.Intn(4)
+		let incLo = width == 0 || width == 2
+		let incHi = width == 0 || width == 1
+		let back = rng.Intn(2) == 0
+		mut flags = base
+		if !incLo {
+			flags |= IndexLoExclusive
+		}
+		if !incHi {
+			flags |= IndexHiExclusive
+		}
+		if back {
+			flags |= IndexBackward
+		}
+		mut scan = db.IndexSeek(500, lo, hi, flags)
+		compareIndexScan(mut t, "range {q}", mut scan, modelRange(model, lo, hi, flags))
+	}
+	// Exact lookups.
+	for q in 0..40 {
+		let e = model[rng.Intn(i64(len(model)))]
+		let tids = db.IndexLookupExact(500, e.key) catch err {
+			t.Error("lookup failed: {err}")
+			return
+		}
+		mut found = false
+		for _, tid in tids {
+			if tid == e.tid {
+				found = true
+			}
+		}
+		crucible.True("lookup {q} finds its tid", found)
+	}
+	// Delete a quarter and compare again.
+	let deletes = inserts/4
+	for i in 0..deletes {
+		let idx = rng.Intn(i64(len(model)))
+		let e = model[idx]
+		let delErr = db.IndexDelete(500, e.key, e.tid)
+		if delErr != nil {
+			t.Error("index delete {i} failed: {delErr}")
+			return
+		}
+		model = append(model[0:idx], model[idx+1:]...)
+	}
+	mut after = db.IndexSeek(500, []u8{}, []u8{}, IndexLoUnbounded|IndexHiUnbounded)
+	compareIndexScan(mut t, "after deletes", mut after, model)
+	db.Close() catch _ { }
+	quarry.RemoveAll(dir) catch _ { }
+}
