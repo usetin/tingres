@@ -2,7 +2,7 @@
 TIN ?= $(HOME)/dev/extra/tin/tin
 BIN := bin/server
 
-.PHONY: all build test check fmt clean client diff concurrency protocol fuzz
+.PHONY: all build test check fmt clean client diff concurrency protocol fuzz stats regress
 
 all: build
 
@@ -42,6 +42,14 @@ fuzz: build
 
 fmt:
 	$(TIN) fmt -w .
+
+# Regenerate the README statistics block from real runs (nothing in it is typed by hand).
+# stats keeps the last PostgreSQL regression result: run regress for a fresh one, then stats.
+stats:
+	NO_PGREGRESS=1 tests/stats.sh
+
+regress:
+	tests/pgregress.sh
 
 clean:
 	rm -rf $(BIN)

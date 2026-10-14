@@ -17,12 +17,25 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/tingres-regress.XXXXXX")
 mkdir -p "$OUT"
 : >"$OUT/pgregress.tsv"
 
+# The environment pg_regress gives every psql: the expected/*.out files were written under
+# exactly these settings, so a test that differs here is not a behaviour difference.
+# (src/test/regress/pg_regress.c: PGTZ, PGDATESTYLE, PG_ABS_SRCDIR, PG_LIBDIR, PG_DLSUFFIX.)
+export PGTZ=America/Los_Angeles
+export PGDATESTYLE="Postgres, MDY"
+export PGAPPNAME=pg_regress
+export PG_ABS_SRCDIR=$REG
+export PG_ABS_BUILDDIR=$TMP
+export PG_LIBDIR=$TMP
+export PG_DLSUFFIX=.so
+export LC_MESSAGES=C
+unset LANGUAGE LC_ALL 2>/dev/null || true
+
 [ -f "$REG/parallel_schedule" ] || { echo "PGREGRESS 0 0 (no suite at $REG)"; exit 2; }
 TESTS=$(awk '/^test:/{for(i=2;i<=NF;i++) print $i}' "$REG/parallel_schedule")
 TOTAL=$(echo "$TESTS" | wc -l | tr -d ' ')
 
 PORT=$(perl -MIO::Socket::INET -e '$s=IO::Socket::INET->new(Listen=>1,LocalAddr=>"127.0.0.1",LocalPort=>0); print $s->sockport')
-"$TINGRES" --data "$TMP/data" --listen "127.0.0.1:$PORT" --auth trust >"$TMP/server.log" 2>&1 &
+"$TINGRES" --data "$TMP/data" --listen "127.0.0.1:$PORT" --auth trust --database "" >"$TMP/server.log" 2>&1 &
 SERVER=$!
 cleanup() { kill "$SERVER" 2>/dev/null; wait "$SERVER" 2>/dev/null; rm -rf "$TMP"; }
 trap cleanup EXIT INT TERM
@@ -42,6 +55,13 @@ for t in $TESTS; do
 			-v abs_srcdir="$REG" -v abs_builddir="$TMP" -v libdir="$TMP" -v dlsuffix=.so -v regresslib="$TMP/regress.so" \
 			-f "$REG/sql/$t.sql" >"$TMP/$t.out" 2>&1
 		if diff -w -q "$REG/expected/$t.out" "$TMP/$t.out" >/dev/null 2>&1; then res=pass; PASSED=$((PASSED + 1)); fi
+		if [ "$res" = fail ]; then
+			# Keep what the server answered and how it differs, so a failure can be triaged
+			# without re-running the suite.
+			mkdir -p "$OUT/actual" "$OUT/diffs"
+			cp "$TMP/$t.out" "$OUT/actual/$t.out"
+			diff -w -u "$REG/expected/$t.out" "$TMP/$t.out" >"$OUT/diffs/$t.diff" 2>&1 || true
+		fi
 	fi
 	printf '%s\t%s\n' "$t" "$res" >>"$OUT/pgregress.tsv"
 done
