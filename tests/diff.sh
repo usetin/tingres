@@ -9,6 +9,8 @@ PSQL=${PSQL:-$PG_BIN/psql}
 TINGRES=${TINGRES:-$ROOT/bin/server/tingres}
 CLIENT_PROBE=${CLIENT_PROBE:-$ROOT/bin/server/client_probe}
 SQL_FILE=${1:-$ROOT/tests/smoke.sql}
+CASES=${CASES:-$ROOT/tests/diffcases}
+KNOWN=${KNOWN:-$ROOT/tests/known_diffs.txt}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/tingres-diff.XXXXXX")
 PGDATA=$TMP/pgdata
 
@@ -48,7 +50,9 @@ if [ "$ready" -ne 1 ]; then cat "$TMP/tingres.log" >&2; exit 1; fi
 "$PSQL" "host=127.0.0.1 port=$PGPORT user=postgres dbname=postgres sslmode=disable" -XAtf "$SQL_FILE" | sed 's/[[:space:]]*$//' >"$TMP/postgres.out"
 PGPASSWORD=secret "$PSQL" "host=127.0.0.1 port=$TINPORT user=postgres dbname=postgres sslmode=prefer" -XAtf "$SQL_FILE" | sed 's/[[:space:]]*$//' >"$TMP/tingres.out"
 diff -u "$TMP/postgres.out" "$TMP/tingres.out"
-if PGPASSWORD=secret "$PSQL" "host=127.0.0.1 port=$TINPORT user=postgres dbname=postgres sslmode=prefer" -XAtqc 'SELECT 2' -v VERBOSITY=verbose >"$TMP/unsupported.out" 2>"$TMP/unsupported.err"; then
+# Unsupported SQL must be a clean 0A000, never a wrong answer. A scan needs the planner,
+# which the conformance engine does not have yet, so it is the unsupported case.
+if PGPASSWORD=secret "$PSQL" "host=127.0.0.1 port=$TINPORT user=postgres dbname=postgres sslmode=prefer" -XAtqc 'SELECT 2 FROM nosuchtable' -v VERBOSITY=verbose >"$TMP/unsupported.out" 2>"$TMP/unsupported.err"; then
 	echo "unsupported query unexpectedly succeeded" >&2
 	exit 1
 fi
@@ -61,3 +65,40 @@ grep -q 'password authentication failed' "$TMP/auth.err"
 TINGRES_ADDR="127.0.0.1:$TINPORT" TINGRES_PASSWORD=secret "$CLIENT_PROBE" >"$TMP/client.out"
 test "$(cat "$TMP/client.out")" = "1"
 cat "$TMP/tingres.out"
+
+# --- the directory runner: every tests/diffcases/*.sql on both servers ---------
+# A case either matches PostgreSQL byte for byte, or is listed in tests/known_diffs.txt
+# with the reason it cannot match yet. A case that is neither is a failure: nothing is
+# ever skipped silently.
+if [ -d "$CASES" ]; then
+	PASS=0
+	FAIL=0
+	KNOWN_N=0
+	MISSING=""
+	for file in "$CASES"/*.sql; do
+		[ -f "$file" ] || continue
+		name=$(basename "$file" .sql)
+		"$PSQL" "host=127.0.0.1 port=$PGPORT user=postgres dbname=postgres sslmode=disable" -XAtf "$file" | sed 's/[[:space:]]*$//' >"$TMP/case.pg" 2>/dev/null || true
+		PGPASSWORD=secret "$PSQL" "host=127.0.0.1 port=$TINPORT user=postgres dbname=postgres sslmode=prefer" -XAtf "$file" | sed 's/[[:space:]]*$//' >"$TMP/case.tin" 2>/dev/null || true
+		if diff -q "$TMP/case.pg" "$TMP/case.tin" >/dev/null 2>&1; then
+			PASS=$((PASS + 1))
+			continue
+		fi
+		if [ -f "$KNOWN" ] && grep -q "^$name	" "$KNOWN"; then
+			KNOWN_N=$((KNOWN_N + 1))
+			continue
+		fi
+		FAIL=$((FAIL + 1))
+		MISSING="$MISSING $name"
+		if [ -n "${VERBOSE:-}" ]; then
+			echo "--- $name differs:" >&2
+			diff -u "$TMP/case.pg" "$TMP/case.tin" >&2 || true
+		fi
+	done
+	echo "DIFFCASES pass=$PASS known=$KNOWN_N fail=$FAIL"
+	if [ "$FAIL" -ne 0 ]; then
+		echo "unlisted differences:$MISSING" >&2
+		echo "add them to $KNOWN with a reason, or fix the behaviour" >&2
+		exit 1
+	fi
+fi

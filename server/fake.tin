@@ -53,6 +53,7 @@ type FakeSession struct {
 	Pid u32
 	state u8
 	canceled atomic.Bool
+	cancel CancelHandle
 	gucs map[str]str
 	report map[str]bool
 	stmts map[str]FakeStmt
@@ -60,13 +61,14 @@ type FakeSession struct {
 }
 
 // NewFakeSession creates a conformance session with PostgreSQL's default GUCs.
-fn NewFakeSession(user str, db str, pid u32) FakeSession {
+fn NewFakeSession(user str, db str, pid u32, cancel CancelHandle) FakeSession {
 	return FakeSession{
 		User: user,
 		Database: db,
 		Pid: pid,
 		state: 'I',
 		canceled: atomic.NewBool(false),
+		cancel: cancel,
 		gucs: fake_default_gucs(user),
 		report: fake_report_set(),
 		stmts: make(map[str]FakeStmt),
@@ -87,11 +89,23 @@ fn fake_default_gucs(user str) map[str]str {
 // Cancel flags the session. Safe from the accept task.
 fn (s FakeSession) Cancel() { s.canceled.Store(true) }
 
-// ResetCancel clears the cancel flag.
-fn (s FakeSession) ResetCancel() { s.canceled.Store(false) }
+// ResetCancel clears the cancel flag, including the connection's shared flag, so a
+// cancelled statement does not poison the statements after it.
+fn (s FakeSession) ResetCancel() {
+	s.canceled.Store(false)
+	s.cancel.Clear()
+}
 
-// IsCanceled reports whether Cancel was requested.
-fn (s FakeSession) IsCanceled() bool { return s.canceled.Load() }
+// Clear resets the shared cancellation flag.
+fn (h CancelHandle) Clear() {
+	h.Flag.Store(false)
+}
+
+// IsCanceled reports whether Cancel was requested, either through Cancel() or through the
+// connection's shared flag (a CancelRequest handled by the accept loop).
+fn (s FakeSession) IsCanceled() bool {
+	return s.canceled.Load() || s.cancel.Flag.Load()
+}
 
 // StatusChar is the ReadyForQuery transaction status.
 fn (s FakeSession) StatusChar() u8 {
@@ -125,7 +139,7 @@ fn (s FakeSession) GetGuc(name str) ?str {
 
 // Simple runs every statement of a simple-query string.
 fn (s mut FakeSession) Simple(sql str, out mut dyn exec.Sink) ! {
-	if s.canceled.Load() {
+	if s.IsCanceled() {
 		try fake_error("57014", "canceling statement due to user request")
 	}
 	for raw in fake_split(sql) {
@@ -150,7 +164,9 @@ fn (s mut FakeSession) run_one(sql str, out mut dyn exec.Sink) ! {
 	if kind == "begin" || kind == "start" {
 		if s.state == 'T' { out.Notice(exec.Notice{Message: "there is already a transaction in progress", Code: "25001"}) }
 		s.state = 'T'
-		out.CommandComplete("BEGIN")
+		mut tag = "BEGIN"
+		if kind == "start" { tag = "START TRANSACTION" }
+		out.CommandComplete(tag)
 		return
 	}
 	if kind == "commit" || kind == "end" {
@@ -168,9 +184,14 @@ fn (s mut FakeSession) run_one(sql str, out mut dyn exec.Sink) ! {
 	if kind == "select" {
 		let stmt = try s.analyze(sql)
 		if !stmt.IsQuery { try fake_error("0A000", "feature not supported: " + stmt.Tag) }
+		let rows = try s.rows_of(stmt, []FakeValue{})
 		out.RowDescription(stmt.cols(), []i16{})
-		out.DataRow(s.values(stmt.Items))
-		out.CommandComplete("SELECT 1")
+		for row in rows { out.DataRow(s.row_datum(row)) }
+		out.CommandComplete("SELECT {len(rows)}")
+		return
+	}
+	if kind == "copy" {
+		try s.run_copy(sql, mut out)
 		return
 	}
 	if kind == "show" {
@@ -420,20 +441,28 @@ fn (s FakeSession) analyze_call(fname str, inner str, alias str) !FakeItem {
 	if fname == "pg_backend_pid" { return FakeItem{Name: fake_or(alias, "pg_backend_pid"), Oid: types.Int4Oid, Kind: "pid", Value: ""} }
 	if fname == "pg_is_in_recovery" { return FakeItem{Name: fake_or(alias, "pg_is_in_recovery"), Oid: types.BoolOid, Kind: "bool", Value: "false"} }
 	if fname == "pg_sleep" { return FakeItem{Name: fake_or(alias, "pg_sleep"), Oid: 2278, Kind: "sleep", Value: inner} }
+	if fname == "generate_series" {
+		let parts = fake_split_top(inner, ',')
+		if len(parts) != 2 { try fake_error("0A000", "generate_series with more than one argument is not supported by the conformance engine") }
+		let from = mint.Atoi(twine.TrimSpace(parts[0])) catch _ { 0 }
+		let to = mint.Atoi(twine.TrimSpace(parts[1])) catch _ { 0 }
+		return FakeItem{Name: fake_or(alias, "generate_series"), Oid: types.Int4Oid, Kind: "series", Value: "{from}|{to}"}
+	}
 	try fake_error("0A000", "feature not supported by the tingres conformance engine: " + fname + "()")
 	return FakeItem{}
 }
 
 // values evaluates the select items against the session state.
-fn (s FakeSession) values(items []FakeItem) []types.Datum {
+fn (s FakeSession) values(items []FakeItem) ![]types.Datum {
 	mut row = []types.Datum{}
 	for item in items {
-		row = append(row, s.value_of(item))
+		let value = try s.value_of(item)
+		row = append(row, value)
 	}
 	return row
 }
 
-fn (s FakeSession) value_of(item FakeItem) types.Datum {
+fn (s FakeSession) value_of(item FakeItem) !types.Datum {
 	if item.Kind == "null" { return types.Null() }
 	if item.Kind == "int" {
 		let v = mint.Atoi(item.Value) catch _ { 0 }
@@ -449,17 +478,160 @@ fn (s FakeSession) value_of(item FakeItem) types.Datum {
 	if item.Kind == "database" { return types.FromStr(types.NameOid, s.Database) }
 	if item.Kind == "pid" { return types.FromI64(types.Int4Oid, i64(s.Pid)) }
 	if item.Kind == "sleep" {
-		fake_sleep(item.Value)
+		try s.fake_sleep(item.Value)
 		return types.FromStr(types.TextOid, "")
 	}
 	return types.FromStr(types.TextOid, item.Value)
 }
 
-// fake_sleep waits for the seconds in a pg_sleep argument, letting other tasks run.
-fn fake_sleep(argument str) {
+// fake_sleep waits for the seconds in a pg_sleep argument, letting other tasks run and
+// observing a cancellation request between slices, as a real executor observes it between
+// rows. A cancelled wait raises 57014.
+fn (s FakeSession) fake_sleep(argument str) ! {
 	if argument == "" { return }
 	let seconds = mint.ParseFloat(argument) catch _ { 0.0 }
-	if seconds > 0.0 { tide.Sleep(i64(seconds * 1000000000.0)) }
+	mut left = i64(seconds * 1000000000.0)
+	for left > 0 {
+		if s.IsCanceled() {
+			try fake_error("57014", "canceling statement due to user request")
+		}
+		let slice = min(left, 25 * 1000000)
+		tide.Sleep(slice)
+		left -= slice
+	}
+}
+
+// run_copy implements COPY TO STDOUT for a query source and refuses COPY FROM STDIN, which
+// needs the executor's storage path. PostgreSQL reports a missing relation before it starts
+// the copy, and so does this.
+fn (s FakeSession) run_copy(sql str, out mut dyn exec.Sink) ! {
+	let lower = twine.ToLower(sql)
+	let fromAt = fake_find_keyword(sql, "from")
+	if fromAt >= 0 {
+		let table = fake_copy_target(sql[4:])
+		try fake_error("42P01", "relation \"" + table + "\" does not exist")
+	}
+	let toAt = fake_find_keyword(sql, "to")
+	if toAt < 0 { try fake_error("42601", "syntax error: COPY needs TO STDOUT or FROM STDIN") }
+	let source = twine.TrimSpace(sql[4:toAt])
+	let options = twine.ToLower(sql[toAt+2:])
+	mut format = i8(0)
+	mut csv = false
+	mut header = false
+	if fake_find_keyword(options, "binary") >= 0 { try fake_error("0A000", "COPY BINARY is not supported by the conformance engine") }
+	if fake_find_keyword(options, "csv") >= 0 { csv = true }
+	if fake_find_keyword(options, "header") >= 0 { header = true }
+	let stmt = s.analyze_source(source)
+	let rows = try s.rows_of(stmt, []FakeValue{})
+	out.CopyOut(format, []i16{})
+	if header { out.CopyData([]u8(fake_csv_line(fake_header_values(stmt)))) }
+	for row in rows {
+		out.CopyData([]u8(fake_copy_line(row, csv)))
+	}
+	out.CopyDone()
+	out.CommandComplete("COPY {len(rows)}")
+}
+
+// analyze_source analyzes the source of a COPY TO: a parenthesized query or a table name.
+fn (s FakeSession) analyze_source(source str) FakeStmt {
+	let text = twine.TrimSpace(source)
+	if len(text) > 2 && text[0] == '(' && text[len(text)-1] == ')' {
+		let inner = twine.TrimSpace(text[1:len(text)-1])
+		if fake_keyword(inner) == "select" {
+			return s.analyze(inner) catch _ { FakeStmt{IsQuery: false, Tag: "COPY source"} }
+		}
+	}
+	return FakeStmt{IsQuery: false, Tag: "COPY " + text}
+}
+
+// fake_copy_target reads the relation name of a COPY FROM STDIN.
+fn fake_copy_target(rest str) str {
+	let text = twine.TrimSpace(rest)
+	mut at = i64(0)
+	for at < len(text) {
+		let c = text[at]
+		if c == ' ' || c == '(' { break }
+		at += 1
+	}
+	return text[:at]
+}
+
+// fake_header_values is the CSV header row of a statement's columns.
+fn fake_header_values(stmt FakeStmt) []FakeValue {
+	mut names = []FakeValue{}
+	for item in stmt.Items { names = append(names, FakeValue{Null: false, Text: item.Name}) }
+	return names
+}
+
+// fake_copy_line renders one row in COPY text or CSV format.
+fn fake_copy_line(row []FakeValue, csv bool) str {
+	if csv { return fake_csv_line(row) }
+	mut out = []u8{}
+	for i, value in row {
+		if i > 0 { out = append(out, '\t') }
+		if value.Null {
+			out = append(out, '\\')
+			out = append(out, 'N')
+			continue
+		}
+		for j in 0..len(value.Text) {
+			let c = value.Text[j]
+			if c == '\\' {
+				out = append(out, '\\')
+				out = append(out, '\\')
+				continue
+			}
+			if c == '\n' {
+				out = append(out, '\\')
+				out = append(out, 'n')
+				continue
+			}
+			if c == '\r' {
+				out = append(out, '\\')
+				out = append(out, 'r')
+				continue
+			}
+			if c == '\t' {
+				out = append(out, '\\')
+				out = append(out, 't')
+				continue
+			}
+			out = append(out, c)
+		}
+	}
+	out = append(out, '\n')
+	return str(out)
+}
+
+// fake_csv_line renders one row as CSV, quoting what RFC 4180 requires.
+fn fake_csv_line(row []FakeValue) str {
+	mut out = []u8{}
+	for i, value in row {
+		if i > 0 { out = append(out, ',') }
+		if value.Null { continue }
+		let text = value.Text
+		mut quote = false
+		for j in 0..len(text) {
+			let c = text[j]
+			if c == ',' || c == '"' || c == '\n' || c == '\r' { quote = true }
+		}
+		if !quote {
+			for j in 0..len(text) { out = append(out, text[j]) }
+			continue
+		}
+		out = append(out, '"')
+		for j in 0..len(text) {
+			if text[j] == '"' {
+				out = append(out, '"')
+				out = append(out, '"')
+				continue
+			}
+			out = append(out, text[j])
+		}
+		out = append(out, '"')
+	}
+	out = append(out, '\n')
+	return str(out)
 }
 
 // fake_or picks the alias or a default column name.
@@ -511,23 +683,37 @@ fn fake_is_int(text str) bool {
 	return true
 }
 
-// fake_is_float reports whether text is a plain decimal fraction.
+// fake_is_float reports whether text is a decimal fraction, with an optional exponent
+// (PostgreSQL's own float syntax, so `1e10` is a float and not a feature request).
 fn fake_is_float(text str) bool {
 	if text == "" { return false }
 	mut dots = 0
+	mut digits = 0
+	mut exponent = false
 	mut i = i64(0)
 	if text[0] == '-' || text[0] == '+' { i = 1 }
 	for i < len(text) {
 		let c = text[i]
-		if c == '.' {
+		if c >= '0' && c <= '9' {
+			digits += 1
+			i += 1
+			continue
+		}
+		if c == '.' && !exponent {
 			dots += 1
 			i += 1
 			continue
 		}
-		if c < '0' || c > '9' { return false }
-		i += 1
+		if (c == 'e' || c == 'E') && !exponent && digits > 0 {
+			exponent = true
+			i += 1
+			if i < len(text) && (text[i] == '-' || text[i] == '+') { i += 1 }
+			continue
+		}
+		return false
 	}
-	return dots == 1
+	if digits == 0 { return false }
+	return dots == 1 || exponent
 }
 
 // fake_find_keyword finds a whole-word keyword, ignoring case.
@@ -647,7 +833,7 @@ fn (s mut FakeSession) Execute(portalName str, maxRows i64, out mut dyn exec.Sin
 	}
 	if !p.Ran {
 		p.Ran = true
-		p.Rows = [][]FakeValue{s.materialize(p.Stmt, p.Params)}
+		p.Rows = try s.rows_of(p.Stmt, p.Params)
 	}
 	out.RowDescription(p.Stmt.cols(), p.Formats)
 	mut emitted = i64(0)
@@ -662,8 +848,54 @@ fn (s mut FakeSession) Execute(portalName str, maxRows i64, out mut dyn exec.Sin
 	out.CommandComplete("SELECT {emitted}")
 }
 
+// rows_of materializes every row of a statement. A generate_series item makes more than one
+// row; every other statement is a single row, exactly as the conformance engine's SQL
+// subset allows.
+fn (s FakeSession) rows_of(stmt FakeStmt, params []FakeValue) ![][]FakeValue {
+	mut count = i64(1)
+	mut from = i64(0)
+	for item in stmt.Items {
+		if item.Kind != "series" { continue }
+		let (fromText, toText, _) = fake_cut3(item.Value, "|")
+		let low = mint.Atoi(fromText) catch _ { 0 }
+		let high = mint.Atoi(toText) catch _ { 0 }
+		from = low
+		count = high - low + 1
+		if count < 0 { count = 0 }
+		if count > 100000 { try fake_error("54000", "generate_series range is too large for the conformance engine") }
+	}
+	mut rows = [][]FakeValue{}
+	for index in 0..count {
+		mut row = []FakeValue{}
+		for item in stmt.Items {
+			if item.Kind == "series" {
+				row = append(row, FakeValue{Null: false, Text: mint.Itoa(from + index)})
+				continue
+			}
+			if item.Kind == "param" {
+				let (indexText, _, _) = fake_cut3(item.Value, "|")
+				let at = mint.Atoi(indexText) catch _ { 0 }
+				if at >= 1 && at <= len(params) {
+					row = append(row, params[at-1])
+				} else {
+					row = append(row, FakeValue{Null: true, Text: ""})
+				}
+				continue
+			}
+			if item.Kind == "sleep" {
+				try s.fake_sleep(item.Value)
+				row = append(row, FakeValue{Null: false, Text: ""})
+				continue
+			}
+			row = append(row, FakeValue{Null: false, Text: s.text_of(item)})
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
 // materialize evaluates one query row with its bound parameters.
-fn (s FakeSession) materialize(stmt FakeStmt, params []FakeValue) []FakeValue {
+fn (s FakeSession) materialize(stmt FakeStmt, params []FakeValue) ![]FakeValue {
 	mut row = []FakeValue{}
 	for item in stmt.Items {
 		if item.Kind == "param" {
@@ -677,7 +909,7 @@ fn (s FakeSession) materialize(stmt FakeStmt, params []FakeValue) []FakeValue {
 			continue
 		}
 		if item.Kind == "sleep" {
-			fake_sleep(item.Value)
+			try s.fake_sleep(item.Value)
 			row = append(row, FakeValue{Null: false, Text: ""})
 			continue
 		}
@@ -691,6 +923,11 @@ fn (s FakeSession) text_of(item FakeItem) str {
 	if item.Kind == "user" { return s.User }
 	if item.Kind == "database" { return s.Database }
 	if item.Kind == "pid" { return mint.Itoa(i64(s.Pid)) }
+	if item.Kind == "bool" {
+		// PostgreSQL's boolean text output is t/f.
+		if item.Value == "true" { return "t" }
+		return "f"
+	}
 	return item.Value
 }
 

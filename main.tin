@@ -43,6 +43,7 @@ fn main() ! {
 		MaxConnections: maxConnections.Val(),
 		StartupTimeout: milliseconds(startupTimeout.Val()),
 		IdleTimeout: milliseconds(idleTimeout.Val()),
+		IoTimeout: 0,
 		LogMinDurationMs: logMinDuration.Val(),
 		ShutdownFile: shutdownFile.Val(),
 		ReloadFile: reloadFile.Val(),
@@ -68,6 +69,9 @@ fn main() ! {
 		cfg.Fake = true
 	} else if mode == "real" {
 		cfg.Fake = false
+		if !server.ProbeRealEngine(mut engineState) {
+			say.Line("tingres: WARNING: exec.Session.Simple does not return PostgreSQL results yet; --engine real was forced")
+		}
 	} else if mode == "auto" {
 		let works = guard {
 			server.ProbeRealEngine(mut engineState)
