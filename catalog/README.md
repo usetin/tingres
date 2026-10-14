@@ -62,7 +62,6 @@ fn (c mut Catalog) AnalyzeTable(t txn.Txn, tbl Table) !
 fn (c Catalog)  ColumnStatistics(t txn.Txn, tableOid Oid) []ColumnStat
 fn (c Catalog)  Statistic(t txn.Txn, tableOid Oid, attnum i16) ?f64
 fn (c Catalog)  InformationSchemaView(t txn.Txn, name str) ?str
-
 fn (c mut Catalog) AlterTableAddColumn(t txn.Txn, tbl Table, def ColumnDef) !Column
 fn (c mut Catalog) AlterTableDropColumn(t txn.Txn, tbl Table, name str, cascade bool) !
 fn (c mut Catalog) AlterTableRenameColumn(t txn.Txn, tbl Table, oldName str, newName str) !
@@ -94,7 +93,16 @@ Errors use PostgreSQL SQLSTATEs: `42P01`, `42P07`, `42701`, `42703`, `42P06`, `3
 `tin test catalog` — bootstrap oids/column sets; golden differential of the seeded
 `pg_type`/`pg_namespace` rows against PostgreSQL 17; transactional DDL (same-command
 hiding, cross-transaction visibility, abort restores); reopen persistence; SQLSTATEs;
-sequences; ALTER TABLE; indexes and schemas (8 tests).
+sequences; ALTER TABLE; indexes and schemas; the planner surface (index keys, reltuples,
+pg_statistic slots); the built-in information_schema views (10 tests).
+
+## information_schema
+
+`informationSchemaViews()` registers `tables`, `columns`, `schemata`,
+`table_constraints` and `key_column_usage` as real `pg_class`/`pg_attribute` view rows with
+their SQL text in `pg_rewrite`; `InformationSchemaView(t, name)` returns the stored
+definition. The executor does not run these definitions yet.
+
 
 ## Known gaps
 

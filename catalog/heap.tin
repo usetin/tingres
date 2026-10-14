@@ -435,6 +435,103 @@ fn (b mut Bootstrapper) bootstrap() ! {
 		try b.writeSeedChunks(rel.Name, rows)
 	}
 	try b.seedExtras()
+	let nsOid = informationSchemaOid(seedRows)
+	if nsOid != 0 {
+		try b.seedInformationSchema(nsOid)
+	}
+}
+
+// ViewSeed is one built-in information_schema view.
+type ViewSeed struct {
+	Name str
+	Cols []ColDef
+	Sql str
+}
+
+fn informationSchemaViews() []ViewSeed {
+	return []ViewSeed{
+		ViewSeed{Name: "tables", Cols: []ColDef{
+			ColDef{Name: "table_catalog", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "table_schema", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "table_name", Type: 19, Storage: 25, Number: 3},
+			ColDef{Name: "table_type", Type: 25, Storage: 25, Number: 4},
+		}, Sql: "SELECT current_database() AS table_catalog, n.nspname AS table_schema, c.relname AS table_name, CASE WHEN c.relkind = 'v' THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p', 'v') AND n.nspname NOT IN ('pg_catalog', 'pg_toast')"},
+		ViewSeed{Name: "columns", Cols: []ColDef{
+			ColDef{Name: "table_catalog", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "table_schema", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "table_name", Type: 19, Storage: 25, Number: 3},
+			ColDef{Name: "column_name", Type: 19, Storage: 25, Number: 4},
+			ColDef{Name: "ordinal_position", Type: 23, Storage: 23, Number: 5},
+			ColDef{Name: "column_default", Type: 25, Storage: 25, Number: 6},
+			ColDef{Name: "is_nullable", Type: 19, Storage: 25, Number: 7},
+			ColDef{Name: "data_type", Type: 25, Storage: 25, Number: 8},
+		}, Sql: "SELECT current_database() AS table_catalog, n.nspname AS table_schema, c.relname AS table_name, a.attname AS column_name, a.attnum AS ordinal_position, d.adbin AS column_default, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, t.typname AS data_type FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace JOIN pg_catalog.pg_type t ON t.oid = a.atttypid LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE a.attnum > 0 AND NOT a.attisdropped"},
+		ViewSeed{Name: "schemata", Cols: []ColDef{
+			ColDef{Name: "catalog_name", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "schema_name", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "schema_owner", Type: 19, Storage: 25, Number: 3},
+		}, Sql: "SELECT current_database() AS catalog_name, nspname AS schema_name, pg_get_userbyid(nspowner) AS schema_owner FROM pg_catalog.pg_namespace"},
+		ViewSeed{Name: "table_constraints", Cols: []ColDef{
+			ColDef{Name: "constraint_catalog", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "constraint_schema", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "constraint_name", Type: 19, Storage: 25, Number: 3},
+			ColDef{Name: "table_name", Type: 19, Storage: 25, Number: 4},
+			ColDef{Name: "constraint_type", Type: 25, Storage: 25, Number: 5},
+		}, Sql: "SELECT current_database() AS constraint_catalog, n.nspname AS constraint_schema, con.conname AS constraint_name, c.relname AS table_name, con.contype AS constraint_type FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class c ON c.oid = con.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace"},
+		ViewSeed{Name: "key_column_usage", Cols: []ColDef{
+			ColDef{Name: "constraint_name", Type: 19, Storage: 25, Number: 1},
+			ColDef{Name: "table_name", Type: 19, Storage: 25, Number: 2},
+			ColDef{Name: "column_name", Type: 19, Storage: 25, Number: 3},
+			ColDef{Name: "ordinal_position", Type: 23, Storage: 23, Number: 4},
+		}, Sql: "SELECT con.conname AS constraint_name, c.relname AS table_name, a.attname AS column_name, u.ord AS ordinal_position FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class c ON c.oid = con.conrelid JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY (con.conkey) CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS u(attnum, ord)"},
+	}
+}
+
+fn informationSchemaOid(seedRows []SeedRow) u32 {
+	for row in seedRows {
+		if row.Rel != "pg_namespace" || len(row.Cells) < 2 {
+			continue
+		}
+		if str(hexByte(row.Cells[1])) == "information_schema" {
+			let oidNum = mint.Atoi(str(hexByte(row.Cells[0]))) catch _ { 0 }
+			return u32(oidNum)
+		}
+	}
+	return 0
+}
+
+// seedInformationSchema writes pg_class/pg_attribute/pg_rewrite rows for the built-in
+// information_schema views.
+fn (b mut Bootstrapper) seedInformationSchema(nsOid u32) ! {
+	mut oid = u32(14000)
+	for view in informationSchemaViews() {
+		mut vals = make(map[str]types.Datum)
+		vals["oid"] = types.FromI64(26, i64(oid))
+		vals["relname"] = types.FromStr(25, view.Name)
+		vals["relnamespace"] = types.FromI64(26, i64(nsOid))
+		vals["reltype"] = types.FromI64(26, 0)
+		vals["relowner"] = types.FromI64(26, 10)
+		vals["relfilenode"] = types.FromI64(26, 0)
+		vals["relkind"] = types.FromStr(25, "v")
+		vals["relnatts"] = types.FromI64(21, i64(len(view.Cols)))
+		vals["relpersistence"] = types.FromStr(25, "p")
+		vals["relreplident"] = types.FromStr(25, "n")
+		try b.insertSeedRow("pg_class", b.buildRow("pg_class", vals))
+		for col in view.Cols {
+			try b.insertSeedRow("pg_attribute", b.attributeRow(oid, "", col))
+		}
+		mut rv = make(map[str]types.Datum)
+		rv["oid"] = types.FromI64(26, i64(oid+100))
+		rv["rulename"] = types.FromStr(25, "_RETURN")
+		rv["ev_class"] = types.FromI64(26, i64(oid))
+		rv["ev_type"] = types.FromStr(25, "1")
+		rv["ev_enabled"] = types.FromStr(25, "O")
+		rv["is_instead"] = types.FromBool(true)
+		rv["ev_qual"] = types.FromStr(25, "")
+		rv["ev_action"] = types.FromStr(25, view.Sql)
+		try b.insertSeedRow("pg_rewrite", b.buildRow("pg_rewrite", rv))
+		oid += 1
+	}
 }
 
 fn (b mut Bootstrapper) writeSeedChunks(rel str, rows []SeedRow) ! {
