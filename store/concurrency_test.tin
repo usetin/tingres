@@ -1,0 +1,75 @@
+package store
+
+import "crucible"
+import "quarry"
+import "say"
+
+// Concurrency test: several tasks insert into one heap and one B-tree relation through the shared
+// Store. Tin tasks on a lane share it cooperatively; a content latch is only ever held across
+// synchronous page work, never across a wait, so the tasks may interleave at WAL sync points.
+
+fn concurrentWorkload(dir str, tasks i64, per i64) !i64 {
+	mut db = try Open(dir, Options{BufferPages: 128})
+	try db.CreateHeap(700)
+	try db.CreateIndex(701, false)
+	scope sc {
+		for tk in 0..tasks {
+			sc.spawn(fn() ! {
+				for j in 0..per {
+					let k = u32(tk*per+j)
+					let bytes = u32Bytes(k)
+					let tid = try db.HeapInsert(NewXidCtx(2, 0), 700, bytes)
+					try db.IndexInsert(701, bytes, tid)
+				}
+			})
+		}
+	}
+	mut heapCount = i64(0)
+	mut scan = db.HeapScan(700)
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		if len(tuple.Payload) != 4 {
+			fail say.Fault("concurrent heap payload length")
+		}
+		heapCount += 1
+	}
+	mut btreeCount = i64(0)
+	mut iscan = db.IndexSeek(701, []u8{}, []u8{}, IndexLoUnbounded|IndexHiUnbounded)
+	if iscan.Error() != "" {
+		fail say.Fault("concurrent btree scan: %s", iscan.Error())
+	}
+	for {
+		let (item, ok) = iscan.Next()
+		if !ok {
+			break
+		}
+		btreeCount += 1
+	}
+	if heapCount != tasks*per || btreeCount != tasks*per {
+		fail say.Fault("concurrent counts heap=%d btree=%d", heapCount, btreeCount)
+	}
+	// Every key must be findable by exact lookup.
+	for k in 0..tasks*per {
+		let tids = try db.IndexLookupExact(701, u32Bytes(u32(k)))
+		if len(tids) != 1 {
+			fail say.Fault("concurrent lookup missing key %d", k)
+		}
+	}
+	db.Close() catch _ { }
+	return heapCount
+}
+
+fn TestConcurrentHeapAndBtreeTasks(t mut crucible.T) {
+	let dir = "/tmp/tingres-store-concurrent"
+	quarry.RemoveAll(dir) catch _ { }
+	let (count, err) = concurrentWorkload(dir, 4, 500)
+	if err != nil {
+		t.Error("concurrent workload failed: {err}")
+		return
+	}
+	crucible.Equal(mut t, "all concurrent rows are present", count, 2000)
+	quarry.RemoveAll(dir) catch _ { }
+}

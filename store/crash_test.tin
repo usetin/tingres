@@ -1,0 +1,191 @@
+package store
+
+import "crucible"
+import "dice"
+import "quarry"
+
+// Crash recovery tests: build a committed workload, then reopen copies of the data directory with
+// the WAL truncated at every record boundary and at random byte offsets. The heap and B-tree must
+// both come back as the same prefix of the workload, containing at least the committed records.
+
+const crashCommitKind u8 = 200
+const crashOps = 30
+
+fn copyTree(src str, dst str) ! {
+	try quarry.MkdirAll(dst)
+	let names = try quarry.ReadDir(src)
+	for _, name in names {
+		let sp = src + "/" + name
+		let dp = dst + "/" + name
+		if quarry.IsDir(sp) {
+			try copyTree(sp, dp)
+		} else {
+			let data = try quarry.ReadFile(sp)
+			try quarry.WriteFile(dp, data)
+		}
+	}
+}
+
+fn walRecordBoundaries(b []u8) []i64 {
+	mut out = []i64{}
+	mut off = i64(0)
+	for off+walHeaderSize <= i64(len(b)) {
+		let total = i64(readU32(b, off))
+		if total < walHeaderSize || off+total > i64(len(b)) {
+			break
+		}
+		if crc32c(b[off+8:off+total]) != readU32(b, off+4) {
+			break
+		}
+		off += total
+		out = append(out, off)
+	}
+	return out
+}
+
+// countCrashKinds returns the valid heap-insert, B-tree-insert and commit records in the first
+// upto bytes. This workload never splits, so every B-tree insert is one physiological record.
+fn countCrashKinds(b []u8, upto i64) (i64, i64, i64) {
+	let end = min(upto, i64(len(b)))
+	mut heapInserts = i64(0)
+	mut btreeInserts = i64(0)
+	mut commits = i64(0)
+	mut off = i64(0)
+	for off+walHeaderSize <= end {
+		let total = i64(readU32(b, off))
+		if total < walHeaderSize || off+total > end {
+			break
+		}
+		if crc32c(b[off+8:off+total]) != readU32(b, off+4) {
+			break
+		}
+		let kind = b[off+8]
+		if kind == walKindHeapInsert {
+			heapInserts += 1
+		}
+		if kind == walKindBtreeInsert {
+			btreeInserts += 1
+		}
+		if kind == crashCommitKind {
+			commits += 1
+		}
+		off += total
+	}
+	return heapInserts, btreeInserts, commits
+}
+
+fn makeCrashWorkload(src str) []u8 {
+	quarry.RemoveAll(src) catch _ { }
+	let (opened, openErr) = Open(src, Options{BufferPages: 64})
+	if openErr != nil {
+		return []u8{}
+	}
+	mut db = opened
+	db.CreateHeap(600) catch _ { return []u8{} }
+	db.CreateIndex(601, false) catch _ { return []u8{} }
+	db.RegisterRecordKind(crashCommitKind, "crash test commit") catch _ { return []u8{} }
+	for i in 0..crashOps {
+		let bytes = []u8{u8(i)}
+		let (tid, insErr) = db.HeapInsert(NewXidCtx(2, 0), 600, bytes)
+		if insErr != nil {
+			return []u8{}
+		}
+		db.IndexInsert(601, bytes, tid) catch _ { return []u8{} }
+		db.LogRecord(crashCommitKind, bytes) catch _ { return []u8{} }
+		db.Sync(db.CurrentLsn()) catch _ { return []u8{} }
+	}
+	let data = quarry.ReadFile(src + "/wal/00000001.wal") catch _ { "" }
+	return []u8(data)
+}
+
+fn verifyCrashCopy(t mut crucible.T, src str, dst str, upto i64, walBytes []u8, label str) {
+	quarry.RemoveAll(dst) catch _ { }
+	copyTree(src, dst) catch err {
+		t.Error("{label}: copy failed: {err}")
+		return
+	}
+	let seg1 = dst + "/wal/00000001.wal"
+	if upto < i64(len(walBytes)) {
+		quarry.WriteFile(seg1, str(walBytes[0:upto])) catch err {
+			t.Error("{label}: truncate failed: {err}")
+			return
+		}
+	}
+	let (expHeap, expBtree, expCommit) = countCrashKinds(walBytes, upto)
+	let (opened, openErr) = Open(dst, Options{BufferPages: 64})
+	if openErr != nil {
+		t.Error("{label}: reopen failed: {openErr}")
+		return
+	}
+	mut db = opened
+	mut heapCount = i64(0)
+	mut scan = db.HeapScan(600)
+	for {
+		let (tuple, ok) = scan.Next()
+		if !ok {
+			break
+		}
+		if len(tuple.Payload) != 1 || i64(tuple.Payload[0]) != heapCount {
+			t.Error("{label}: heap payload out of prefix at {heapCount}")
+			break
+		}
+		heapCount += 1
+	}
+	crucible.Equal(mut t, "{label}: heap prefix", heapCount, expHeap)
+	mut btreeCount = i64(0)
+	mut iscan = db.IndexSeek(601, []u8{}, []u8{}, IndexLoUnbounded|IndexHiUnbounded)
+	crucible.Equal(mut t, "{label}: btree scan error", iscan.Error(), "")
+	for {
+		let (item, ok) = iscan.Next()
+		if !ok {
+			break
+		}
+		if len(item.Key()) != 1 || i64(item.Key()[0]) != btreeCount {
+			t.Error("{label}: btree key out of prefix at {btreeCount}")
+			break
+		}
+		btreeCount += 1
+	}
+	crucible.Equal(mut t, "{label}: btree prefix", btreeCount, expBtree)
+	crucible.True("{label}: committed prefix recovered", heapCount >= expCommit)
+	crucible.True("{label}: btree committed prefix recovered", btreeCount >= expCommit)
+	db.Close() catch _ { }
+}
+
+fn TestCrashTruncatesAtEveryRecordBoundary(t mut crucible.T) {
+	let src = "/tmp/tingres-store-crash-src"
+	let dst = "/tmp/tingres-store-crash-dst"
+	let walBytes = makeCrashWorkload(src)
+	if len(walBytes) == 0 {
+		t.Error("crash workload setup failed")
+		return
+	}
+	let bounds = walRecordBoundaries(walBytes)
+	crucible.True("workload produced WAL records", len(bounds) > 10)
+	for i, upto in bounds {
+		if i%2 == 0 {
+			verifyCrashCopy(mut t, src, dst, upto, walBytes, "boundary {i}")
+		}
+	}
+	// Also the full, untruncated copy.
+	verifyCrashCopy(mut t, src, dst, i64(len(walBytes)), walBytes, "full")
+	quarry.RemoveAll(src) catch _ { }
+	quarry.RemoveAll(dst) catch _ { }
+}
+
+fn TestCrashTruncatesAtRandomOffsets(t mut crucible.T) {
+	let src = "/tmp/tingres-store-crash-src2"
+	let dst = "/tmp/tingres-store-crash-dst2"
+	let walBytes = makeCrashWorkload(src)
+	if len(walBytes) == 0 {
+		t.Error("crash workload setup failed")
+		return
+	}
+	mut rng = dice.New(424242)
+	for q in 0..20 {
+		let upto = rng.Intn(i64(len(walBytes))+1)
+		verifyCrashCopy(mut t, src, dst, upto, walBytes, "random {q}")
+	}
+	quarry.RemoveAll(src) catch _ { }
+	quarry.RemoveAll(dst) catch _ { }
+}
