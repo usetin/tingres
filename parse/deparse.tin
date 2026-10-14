@@ -495,7 +495,21 @@ fn deparseColumn(v ColumnDef) str {
 	mut out = identifierText(v.Name) + " " + deparseType(v.TypeName)
 	if let defaultExpr = v.Default { out += " DEFAULT " + deparseExpr(defaultExpr) }
 	if v.Nullability == "not null" { out += " NOT NULL" } else if v.Nullability == "null" { out += " NULL" }
-	for constraint in v.Constraints { out += " " + deparseConstraint(constraint) }
+	for constraint in v.Constraints { out += " " + deparseColumnConstraint(constraint) }
+	return out
+}
+
+// deparseColumnConstraint renders a column-level constraint, whose column is implicit and
+// must not be repeated in parentheses the way a table-level constraint prints it.
+fn deparseColumnConstraint(v TableConstraint) str {
+	mut out = ""
+	if let name = v.Name { out = "CONSTRAINT " + identifierText(name) + " " }
+	out += upperAscii(v.Kind)
+	if len(v.Expressions) > 0 { out += " (" + deparseExpr(v.Expressions[0]) + ")" }
+	if let references = v.References {
+		out += " REFERENCES " + nameText(references)
+		if len(v.ReferenceColumns) > 0 { out += " (" + deparseIdentifierList(v.ReferenceColumns) + ")" }
+	}
 	return out
 }
 

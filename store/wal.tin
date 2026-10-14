@@ -1,0 +1,307 @@
+package store
+
+import "quarry"
+import "say"
+import "tide"
+
+// WAL is a stream of CRC32C-framed records split into 16 MiB segment files named 00000001.wal,
+// 00000002.wal, ... An LSN is the byte position of the record's first byte in that stream, so a
+// record's segment is lsn/SegmentSize+1. Group commit is one fsync serving every waiter whose
+// target LSN is already handed to the OS: a waiter takes the WAL gate, flushes everything pending
+// and fsyncs once, and the others see their LSN covered. A record never straddles a segment
+// boundary; the writer pads the rest of a segment first. The reader stops at the first short or
+// CRC-bad record and recovery truncates the torn tail.
+
+const WalSegmentSize i64 = 16*1024*1024
+const walHeaderSize i64 = 24
+const walPadKind u8 = 0
+
+// walBufBytes is how many unflushed record bytes accumulate before a write to the OS.
+const walBufBytes i64 = 1*1024*1024
+
+// Record kinds below 16 are store's own; 16 and up are registered by neighbour packages.
+const walKindRelCreate u8 = 1
+const walKindRelDrop u8 = 2
+const walKindHeapInsert u8 = 3
+const walKindHeapDelete u8 = 4
+const walKindHeapHint u8 = 5
+const walKindHeapPrune u8 = 6
+const walKindPageImages u8 = 7
+const walKindCheckpoint u8 = 8
+const walKindShutdown u8 = 9
+const walKindBtreeInsert u8 = 10
+const walKindBtreeDelete u8 = 11
+
+const walFlagFpi u8 = 1
+
+// Relation kinds recorded in a rel-create record and in Store.rels.
+const relKindHeap u8 = 1
+const relKindBtree u8 = 2
+
+// walPageImage is one 8 KiB block image inside a page-images record.
+type WalPageImage struct {
+	Block u32
+	Image []u8
+}
+
+fn segmentName(seg u64) str {
+	return say.Fmt("%08d", seg) + ".wal"
+}
+
+fn segmentOf(lsn u64) u64 {
+	return lsn/u64(WalSegmentSize) + 1
+}
+
+fn segmentPath(dir str, seg u64) str {
+	return dir + "/" + segmentName(seg)
+}
+
+fn segmentOffset(lsn u64) i64 {
+	return i64(lsn%u64(WalSegmentSize))
+}
+
+// crc32c is the Castagnoli polynomial used for WAL record framing.
+fn crc32c(b []u8) u32 {
+	mut crc = u32(0xffffffff)
+	for x in b {
+		crc ^= u32(x)
+		for _i in 0..8 {
+			if crc&1 != 0 {
+				crc = (crc >> 1) ^ u32(0x82f63b78)
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc ^ u32(0xffffffff)
+}
+
+fn walEncode(kind u8, flags u8, rel u32, block u32, slot u16, body []u8) []u8 {
+	let total = walHeaderSize + i64(len(body))
+	mut rec = make([]u8, total)
+	writeU32(mut rec, 0, u32(total))
+	rec[8] = kind
+	rec[9] = flags
+	writeU32(mut rec, 12, rel)
+	writeU32(mut rec, 16, block)
+	writeU16(mut rec, 20, slot)
+	copy(rec[walHeaderSize:], body)
+	writeU32(mut rec, 4, crc32c(rec[8:]))
+	return rec
+}
+
+// splitFpi separates an optional full-page image from a record body.
+fn splitFpi(flags u8, body []u8) ([]u8, []u8) {
+	if flags&walFlagFpi == 0 {
+		return []u8{}, body
+	}
+	if len(body) < PageSize {
+		return []u8{}, body
+	}
+	return body[0:PageSize], body[PageSize:]
+}
+
+// appendWal frames one record and returns its ending LSN. It may flush record bytes to the OS but
+// never fsyncs; a caller that needs durability calls Sync.
+fn (s mut Store) appendWal(kind u8, flags u8, rel u32, block u32, slot u16, body []u8) !Lsn {
+	if s.walFailed {
+		fail "store: WAL writer failed; reopen after recovery"
+	}
+	let recLen = walHeaderSize + i64(len(body))
+	if recLen >= WalSegmentSize {
+		fail "store: WAL record exceeds segment size"
+	}
+	let off = segmentOffset(s.lastLsn)
+	if WalSegmentSize-off < recLen {
+		let padLen = WalSegmentSize - off
+		mut pad = make([]u8, padLen)
+		writeU32(mut pad, 0, u32(padLen))
+		if padLen >= walHeaderSize {
+			writeU32(mut pad, 4, crc32c(pad[8:padLen]))
+		}
+		s.walBuf = append(s.walBuf, pad...)
+		s.lastLsn += u64(padLen)
+	}
+	let rec = walEncode(kind, flags, rel, block, slot, body)
+	s.walBuf = append(s.walBuf, rec...)
+	s.lastLsn += u64(len(rec))
+	let end = s.lastLsn
+	if i64(len(s.walBuf)) >= walBufBytes {
+		try s.flushWalBuffer()
+	}
+	return Lsn(end)
+}
+
+// flushWalBuffer hands every buffered record byte to the segment files, rolling over at segment
+// boundaries. It does not fsync.
+fn (s mut Store) flushWalBuffer() ! {
+	if len(s.walBuf) == 0 {
+		return
+	}
+	mut pos = i64(0)
+	let base = s.writtenLsn
+	for pos < i64(len(s.walBuf)) {
+		let lsn = base+u64(pos)
+		let seg = segmentOf(lsn)
+		let off = segmentOffset(lsn)
+		let chunkLen = min(i64(len(s.walBuf))-pos, WalSegmentSize-off)
+		try s.writeSegmentChunk(seg, s.walBuf[pos:pos+chunkLen])
+		pos += chunkLen
+		if off+chunkLen >= WalSegmentSize {
+			try quarry.Sync(segmentPath(s.walDir, seg))
+		}
+	}
+	s.writtenLsn = s.lastLsn
+	s.walBuf = s.walBuf[0:0]
+}
+
+fn (s mut Store) writeSegmentChunk(seg u64, data []u8) ! {
+	if len(data) == 0 {
+		return
+	}
+	let path = segmentPath(s.walDir, seg)
+	let existed = quarry.Exists(path)
+	try quarry.AppendFile(path, str(data))
+	if !existed {
+		try quarry.Sync(s.walDir)
+	}
+	s.walActiveSeg = seg
+}
+
+// fsyncWal makes every segment between the synced and written positions durable.
+fn (s mut Store) fsyncWal() ! {
+	mut last = u64(1)
+	if s.writtenLsn != 0 { last = segmentOf(s.writtenLsn-1) }
+	mut seg = segmentOf(s.syncedLsn)
+	for seg <= last {
+		let path = segmentPath(s.walDir, seg)
+		if quarry.Exists(path) {
+			try quarry.Sync(path)
+		}
+		seg += 1
+	}
+	quarry.Sync(s.walDir) catch _ { }
+}
+
+// Sync flushes the WAL through lsn, batching concurrent waiters into one fsync.
+fn (s mut Store) Sync(lsn Lsn) ! {
+	if s.walFailed {
+		fail "store: WAL writer failed; reopen after recovery"
+	}
+	if u64(lsn) <= s.syncedLsn {
+		return
+	}
+	// One yield lets other committers append and register before the single fsync below.
+	tide.Sleep(1)
+	for {
+		let token = try s.walGate.Recv()
+		if u64(lsn) <= s.syncedLsn {
+			try s.walGate.Send(token)
+			return
+		}
+		try s.flushWalBuffer()
+		try s.fsyncWal()
+		if s.writtenLsn > s.syncedLsn {
+			s.syncedLsn = s.writtenLsn
+		}
+		let done = u64(lsn) <= s.syncedLsn
+		try s.walGate.Send(token)
+		if done {
+			return
+		}
+	}
+}
+
+// openWalForWrite prepares the writer state after recovery: the next append continues at lsn.
+fn (s mut Store) openWalForWrite(lsn u64) {
+	s.lastLsn = lsn
+	s.writtenLsn = lsn
+	s.syncedLsn = lsn
+	s.walActiveSeg = segmentOf(lsn)
+	s.walBuf = s.walBuf[0:0]
+}
+
+// truncateWal discards everything past endLsn and removes later segments.
+fn (s mut Store) truncateWal(endLsn u64) ! {
+	let lastSeg = segmentOf(endLsn)
+	let off = segmentOffset(endLsn)
+	let names = quarry.ReadDir(s.walDir) catch _ { []str{} }
+	for _, name in names {
+		let (seg, ok) = parseSegmentName(name)
+		if ok && seg > lastSeg {
+			quarry.Remove(segmentPath(s.walDir, seg)) catch _ { }
+		}
+	}
+	let path = segmentPath(s.walDir, lastSeg)
+	if quarry.Exists(path) {
+		if off > 0 {
+			let data = try quarry.ReadFile(path)
+			if i64(len(data)) > off {
+				try quarry.WriteFile(path, data[0:off])
+			}
+		} else if endLsn > 0 {
+			try quarry.Remove(path)
+		}
+	}
+	try quarry.Sync(s.walDir)
+}
+
+fn parseSegmentName(name str) (u64, bool) {
+	if len(name) != 12 || name[8:] != ".wal" {
+		return 0, false
+	}
+	mut v = u64(0)
+	for i in 0..8 {
+		let c = name[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		v = v*10 + u64(c-'0')
+	}
+	return v, true
+}
+
+// walkWal parses every valid record from start to the end of the stream and applies each
+// non-padding record. It stops at the first short or bad-checksum record and returns the ending
+// LSN of the last valid record.
+fn (s mut Store) walkWal(start u64) !u64 {
+	mut end = start
+	let startSeg = segmentOf(start)
+	mut seg = startSeg
+	for _guard in 0..1000000 {
+		let path = segmentPath(s.walDir, seg)
+		if !quarry.Exists(path) {
+			break
+		}
+		let data = try quarry.ReadFile(path)
+		let b = []u8(data)
+		mut off = i64(0)
+		if seg == startSeg {
+			off = segmentOffset(start)
+		}
+		mut torn = false
+		for off+walHeaderSize <= i64(len(b)) {
+			let total = i64(readU32(b, off))
+			if total < walHeaderSize || off+total > i64(len(b)) {
+				torn = true
+				break
+			}
+			if crc32c(b[off+8:off+total]) != readU32(b, off+4) {
+				torn = true
+				break
+			}
+			let kind = b[off+8]
+			let recStart = (seg-1)*u64(WalSegmentSize)+u64(off)
+			if kind != walPadKind {
+				try s.applyWalRecord(kind, b[off+9], readU32(b, off+12), readU32(b, off+16), readU16(b, off+20), copyBytes(b[off+walHeaderSize:off+total]), recStart, recStart+u64(total))
+			}
+			off += total
+			end = recStart+u64(total)
+		}
+		if torn {
+			break
+		}
+		seg += 1
+	}
+	return end
+}

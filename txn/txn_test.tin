@@ -605,3 +605,107 @@ fn BenchmarkContendedLockAcquire(b mut crucible.B) {
 	m.Abort(mut holder) catch _ { }
 	hearth.Reset()
 }
+
+fn TestSavepointsAndSubtransactions(t mut crucible.T) {
+	let (_, db0, manager) = testManager("savepoints") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create heap", db.CreateHeap(77))
+	mut w = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let parentTid = m.HeapInsert(w, 77, []u8{1}) catch err {
+		t.Error("insert parent: {err}")
+		return
+	}
+	crucible.NoFault("savepoint s1", m.Savepoint(mut w, "s1"))
+	let sub1 = w.WriteXid()
+	let subTid = m.HeapInsert(w, 77, []u8{2}) catch err {
+		t.Error("insert sub: {err}")
+		return
+	}
+	w.CommandCounterIncrement()
+	let parentRow = db.HeapFetch(77, parentTid, []u8{}) catch err {
+		t.Error("fetch parent: {err}")
+		return
+	}
+	let subRow = db.HeapFetch(77, subTid, []u8{}) catch err {
+		t.Error("fetch sub: {err}")
+		return
+	}
+	let before = m.Snapshot(w)
+	crucible.Equal(mut t, "subtransaction insert visible before rollback", m.VisibleTuple(before, 77, subRow), true)
+	crucible.NoFault("rollback to s1", m.RollbackTo(mut w, "s1"))
+	w.CommandCounterIncrement()
+	let after = m.Snapshot(w)
+	crucible.Equal(mut t, "rolled-back subtransaction row invisible", m.VisibleTuple(after, 77, subRow), false)
+	crucible.Equal(mut t, "parent row survives rollback", m.VisibleTuple(after, 77, parentRow), true)
+	crucible.Equal(mut t, "aborted subxid state", m.State(sub1), XidState.Aborted)
+	// A released subtransaction commits with its parent.
+	crucible.NoFault("savepoint s2", m.Savepoint(mut w, "s2"))
+	let releasedTid = m.HeapInsert(w, 77, []u8{3}) catch err {
+		t.Error("insert released: {err}")
+		return
+	}
+	crucible.NoFault("release s2", m.Release(mut w, "s2"))
+	crucible.NoFault("commit writer", m.Commit(mut w))
+	mut reader = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let readerSnap = m.Snapshot(reader)
+	let releasedRow = db.HeapFetch(77, releasedTid, []u8{}) catch err {
+		t.Error("fetch released: {err}")
+		return
+	}
+	crucible.Equal(mut t, "released subtransaction row visible after commit", m.VisibleTuple(readerSnap, 77, releasedRow), true)
+	crucible.Equal(mut t, "aborted subtransaction row still invisible", m.VisibleTuple(readerSnap, 77, subRow), false)
+	abortForTest(mut t, mut m, mut reader)
+}
+
+fn TestCrashRecoveryAbortsInFlightTuples(t mut crucible.T) {
+	let (dir, db0, manager) = testManager("crash-tuples") catch err {
+		t.Error("manager: {err}")
+		return
+	}
+	mut db = db0
+	mut m = manager
+	crucible.NoFault("create heap", db.CreateHeap(88))
+	mut committed = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let committedTid = m.HeapInsert(committed, 88, []u8{1}) catch err {
+		t.Error("insert committed: {err}")
+		return
+	}
+	crucible.NoFault("commit", m.Commit(mut committed))
+	mut inflight = beginForTest(mut t, mut m, Isolation.ReadCommitted)
+	let inflightXid = inflight.Xid()
+	let inflightTid = m.HeapInsert(inflight, 88, []u8{2}) catch err {
+		t.Error("insert inflight: {err}")
+		return
+	}
+	crucible.NoFault("close before simulated crash", db.Close())
+	mut reopened = store.Open(dir, store.Options{BufferPages: 8, SyncOnWrite: false}) catch err {
+		t.Error("reopen: {err}")
+		return
+	}
+	mut recovered = NewManager(mut reopened) catch err {
+		t.Error("recover: {err}")
+		return
+	}
+	crucible.Equal(mut t, "in-flight xid aborted at restart", recovered.State(inflightXid), XidState.Aborted)
+	mut reader = recovered.Begin(Isolation.ReadCommitted) catch err {
+		t.Error("reader begin: {err}")
+		return
+	}
+	let snap = recovered.Snapshot(reader)
+	let committedRow = reopened.HeapFetch(88, committedTid, []u8{}) catch err {
+		t.Error("fetch committed: {err}")
+		return
+	}
+	let inflightRow = reopened.HeapFetch(88, inflightTid, []u8{}) catch err {
+		t.Error("fetch inflight: {err}")
+		return
+	}
+	crucible.Equal(mut t, "committed tuple visible after restart", recovered.VisibleTuple(snap, 88, committedRow), true)
+	crucible.Equal(mut t, "in-flight tuple invisible after restart", recovered.VisibleTuple(snap, 88, inflightRow), false)
+	recovered.Abort(mut reader) catch _ { }
+	reopened.Close() catch _ { }
+}

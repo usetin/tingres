@@ -1,0 +1,71 @@
+package types
+
+// array.tin is the home of PostgreSQL array-type helpers owned by the
+// typesarray implementation agent. Array values are kept in the on-Datum
+// text field (`Datum.s`) under their array OIDs, mirroring PostgreSQL's
+// array type identifiers.
+
+// isArrayOid reports whether oid names a PostgreSQL array type.
+fn isArrayOid(oid Oid) bool {
+	return arrayOidNamedReverse(oid) != ""
+}
+
+// arrayOidElement returns the scalar element OID stored by an array OID.
+fn arrayElemOid(oid Oid) Oid {
+	return match oid {
+		1000 => BoolOid
+		1001 => ByteaOid
+		1003 => NameOid
+		1005 => Int2Oid
+		1007 => Int4Oid
+		1009 => TextOid
+		1014 => BpcharOid
+		1015 => VarcharOid
+		1016 => Int8Oid
+		1021 => Float4Oid
+		1022 => Float8Oid
+		1028 => OidOid
+		1115 => TimestampOid
+		1182 => DateOid
+		1183 => TimeOid
+		1185 => TimestamptzOid
+		1187 => IntervalOid
+		1231 => NumericOid
+		2951 => UuidOid
+		_ => 0
+	}
+}
+
+// arrayOidNamedReverse maps an array OID back to its canonical registry name.
+fn arrayOidNamedReverse(oid Oid) str {
+	match oid {
+		1000 => { return "_bool" }
+		1001 => { return "_bytea" }
+		1003 => { return "_name" }
+		1005 => { return "_int2" }
+		1007 => { return "_int4" }
+		1009 => { return "_text" }
+		1014 => { return "_bpchar" }
+		1015 => { return "_varchar" }
+		1016 => { return "_int8" }
+		1021 => { return "_float4" }
+		1022 => { return "_float8" }
+		1028 => { return "_oid" }
+		1115 => { return "_timestamp" }
+		1182 => { return "_date" }
+		1183 => { return "_time" }
+		1185 => { return "_timestamptz" }
+		1187 => { return "_interval" }
+		1231 => { return "_numeric" }
+		2951 => { return "_uuid" }
+	}
+	return ""
+}
+
+// registerArrayFuncs is the registration hook called from builtinFuncs().
+fn registerArrayFuncs(funcs mut []Func) {
+	_ = funcs
+}
+
+// registerArrayFuncsPlaceholder keeps the export name stable for future work.
+fn registerArrayFuncsByName(funcs mut []Func) { registerArrayFuncs(mut funcs) }
