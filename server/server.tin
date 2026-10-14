@@ -254,7 +254,21 @@ fn client_loop(client mut wire.Conn, cfg mut Config, slot mut ConnSlot, registry
 			let user = startup.User
 			mut database = startup.Database
 			if database == "" { database = user }
-			let session = try new_session(engine, cfg.Fake, user, database, pid, slot.Cancel)
+			mut sessionFailed = false
+			let session = new_session(engine, cfg.Fake, user, database, pid, slot.Cancel) catch err {
+				sessionFailed = true
+				say.Line("tingres: cannot create a session: {fault.Message(err)}")
+				FakeSessionOf(NewFakeSession(user, database, pid, slot.Cancel))
+			}
+			if sessionFailed {
+				// Say why instead of closing the connection silently.
+				c.SendError(proto.ErrorFields{Severity: "FATAL", Code: "58000", Message: "tingres: the query engine is not available"}) catch _ {
+				}
+				c.Flush() catch _ {
+				}
+				c.Close()
+				return
+			}
 			mut current dyn QuerySession = session
 			slot.SecretKey = c.SecretKey()
 			slot.Ready.Store(true)
