@@ -105,21 +105,9 @@
 
 ## Sibling-package blockers found from the server
 
-- `exec` is not end to end: `Simple("SELECT 1")` answers with the command tag `OK` instead
-  of `SELECT 1`, so `tingres --engine auto` keeps choosing the conformance engine (the probe
-  in `server/engine.tin` checks exactly that tag). `store -> txn -> catalog -> exec` itself
-  works across queries: `tin run tests/repro/two_transactions.tin` finishes both of them.
-  Owner: the exec agent.
 - `exec.Session.BindBytes` trips E701 (`paramValues`/`resultFormats`); the server decodes Bind
   parameters itself (see above).
-- Handing the engine to a connection task is blocked by three compiler rules at once:
-  as a parameter of the task's function it is E312 ("stores request memory into its mut
-  parameter"), as a global it is E310 (the engine is long-lived; `keep()` would deep-copy
-  the store and split it from the one the WAL gate belongs to, and assigning it from `main`
-  trips E310 too), and through a captured function literal it is E703 for a mut parameter.
-  `server/session.tin` therefore wraps the session in a `dyn QuerySession` shape (dyn calls
-  are not region-checked, which is what makes the session loop compile at all), and the
-  engine global stays nil so `--engine real` answers 58000 instead of silently misbehaving.
-  A session factory passed as a function value is the intended fix; it currently makes
-  exec's own E312 errors (`FunctionScanCursor.Next`, `LockRowsCursor.Next`) surface, so it
-  waits for exec to compile cleanly.
+- RESOLVED: the engine reaches connection tasks through the accept loop's closure (`server.tin`:
+  `client_loop(..., engine)` -> `new_session(engine, ...)`); struct copies share the one store,
+  txn manager and catalog, so `--engine real` serves queries and `--engine auto` selects it.
+  `SELECT 1` in `exec` now answers the tag `SELECT 1`, so the probe passes.
